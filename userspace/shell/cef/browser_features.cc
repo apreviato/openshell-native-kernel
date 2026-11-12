@@ -1016,9 +1016,8 @@ bool Run(Session& session, const std::string& command, CefRefPtr<CefDictionaryVa
     return true;
   }
   if (command == "shell/overlay") {
-    // A part of the Desktop's page that stays above the tabs (the volume and
-    // brightness display, the list of saved logins): its picture, drawn by the
-    // page, where the page shows it. Without a picture, it goes away.
+    // A part of the Desktop's page that stays above the tabs, drawn by the
+    // page where it shows the element. Without a picture, it goes away.
     const auto name = args->GetString("name").ToString();
     if (!GuestName(name)) {
       respond(Error(400, "The picture takes a name"));
@@ -1057,6 +1056,7 @@ bool Run(Session& session, const std::string& command, CefRefPtr<CefDictionaryVa
       auto picture = CefLabelButton::CreateLabelButton(new OverlayPicture(session.weak_from_this(), name), "");
       picture->SetInkDropEnabled(false);
       picture->SetFocusable(false);
+      picture->SetBackgroundColor(CefColorSetARGB(0, 0, 0, 0));
       picture->SetInsets(CefInsets(0, 0, 0, 0));
       picture->SetHorizontalAlignment(CEF_HORIZONTAL_ALIGNMENT_CENTER);
       // Added after the tabs' views, it is above them.

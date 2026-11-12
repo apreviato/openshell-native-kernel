@@ -543,10 +543,13 @@ async function smoke(launcher, bundle, host, outputArg) {
         const pagePixel = screenPixel(screenshot("browser-before-switcher"), pageX, pageY);
         tool("xdotool", ["keydown", "Alt_L", "key", "Tab"]);
         try {
-          await pause(1);
-          const switcherPixel = screenPixel(screenshot("browser-switcher"), pageX, pageY);
-          if (pagePixel !== null && switcherPixel !== null) {
-            assert.notEqual(switcherPixel, pagePixel, "The switcher did not uncover the Desktop while Alt was held");
+          if (pagePixel === null) {
+            await pause(1);
+          } else {
+            await waitFor("the switcher to uncover the Desktop while Alt is held", () => {
+              const pixel = screenPixel(screenshot("browser-switcher"), pageX, pageY);
+              return pixel !== null && pixel !== pagePixel;
+            }, 15_000);
           }
           clickPage();
           await pause(1);
@@ -578,12 +581,31 @@ async function smoke(launcher, bundle, host, outputArg) {
         await waitFor("console input to reach the inspected page", () => evidence.devtools, 30_000);
         tool("xdotool", ["key", X11_F12_KEYCODE]);
         await waitFor("F12 to close DevTools from its frontend", () => evidence.heights.at(-1) === height, 30_000);
+        // The notification's left corner overlaps the tab, clear of the
+        // Downloads sidebar that opens on the right.
+        const toastX = display[0] - 14 - Math.min(420, display[0] - 28);
+        const toastY = display[1] - 89;
+        const beforeToast = await waitFor("the tab behind the notification position", () => {
+          const shot = screenshot("browser-before-notification");
+          const pixel = screenPixel(shot, toastX, toastY);
+          return pixel === null ? { canCheck: false } : (pixel & 0xffffff) === 0x228844 && { canCheck: true };
+        }, 10_000);
         // A download goes to Home > Downloads.
         tool("xdotool", ["key", "z"]);
         const download = join(home, "Downloads", "openshell-probe.txt");
         await waitFor("the download", () => existsSync(download) && readFileSync(download, "utf8") === "OpenShell Native download\n", 30_000);
-        // The download's notification covers the page for a moment; the page keeps the keyboard.
-        await pause(1);
+        if (beforeToast.canCheck) {
+          const shown = await waitFor("the download notification above the tab", () => {
+            const shot = screenshot("browser-notification");
+            const pixel = screenPixel(shot, toastX + 40, toastY - 18);
+            return pixel !== null && (pixel & 0xffffff) !== 0x228844 && shot;
+          }, 10_000);
+          assert.equal(screenPixel(shown, pageX, pageY) & 0xffffff, 0x228844, "The notification hid the tab");
+          const corner = screenPixel(shown, toastX, toastY);
+          // The CSS shadow can darken the corner. The green page must still show through.
+          const green = ((corner >> 8) & 255) - Math.max((corner >> 16) & 255, corner & 255);
+          assert.ok(green >= 50, "The notification's rounded corner covered the tab");
+        }
         // An upload opens the Desktop's file picker, not a dialog of its own.
         const windowsBefore = tool("xdotool", ["search", "--onlyvisible", "--name", ".+"], { optional: true }).split("\n").length;
         tool("xdotool", ["key", "u"]);
@@ -634,11 +656,14 @@ async function smoke(launcher, bundle, host, outputArg) {
         const osdY = display[1] - 100;
         const underOsd = screenPixel(screenshot("browser-before-osd"), osdX, osdY);
         tool("xdotool", ["key", "XF86MonBrightnessUp"]);
-        await pause(1);
-        const overTab = screenPixel(screenshot("browser-osd"), osdX, osdY);
-        if (underOsd !== null && overTab !== null && (underOsd & 0xffffff) === 0x228844) {
-          assert.notEqual(overTab & 0xffffff, 0x228844, "The volume and brightness display is hidden under the Browser tab");
-          assert.equal(screenPixel(screenshot("browser-osd-page"), pageX, pageY) & 0xffffff, 0x228844, "The tab was hidden under the volume and brightness display");
+        if (underOsd !== null && (underOsd & 0xffffff) === 0x228844) {
+          // The OSD expires after 1.6 seconds, even when smoke delays are scaled.
+          const shown = await waitFor("the brightness display above the tab", () => {
+            const shot = screenshot("browser-osd");
+            const pixel = screenPixel(shot, osdX, osdY);
+            return pixel !== null && (pixel & 0xffffff) !== 0x228844 && shot;
+          }, 10_000);
+          assert.equal(screenPixel(shown, pageX, pageY) & 0xffffff, 0x228844, "The tab was hidden under the volume and brightness display");
         }
         await pause(3);
         // Saved passwords: a new password field gets a strong one from the list above the tab,

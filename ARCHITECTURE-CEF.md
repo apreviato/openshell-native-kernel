@@ -197,9 +197,9 @@ O launcher reinicia o `hostd` até 5 vezes por minuto, com espera crescente, na 
 - **Certificados.** Um certificado não confiável é recusado, a menos que a pessoa abra uma exceção para aquele host e aquela impressão digital.
 - **Protocolo DevTools.** As ferramentas do agente usam `ExecuteDevToolsMethod`, limitado a uma lista de métodos: avaliação, captura, PDF, entrada sintética e limpeza de cache nas abas, e só captura e entrada na página do Desktop.
 - **Impressão.** Ctrl+P exporta a aba para PDF, em `openshell-print` na pasta temporária, e o Desktop abre o arquivo.
-- **Capturas.** A captura do shell combina a imagem da página do Desktop com a captura de cada aba visível, no retângulo do último layout aplicado. Assim, Print e Shift+Print incluem as abas, que são views nativas fora da página.
+- **Capturas.** A captura do shell combina a imagem da página do Desktop com cada aba visível, no retângulo do último layout aplicado, e recompõe as sobreposições dentro desse retângulo. Assim, Print e Shift+Print incluem as abas e as notificações que passam sobre elas.
 - **Clipboard.** Um observador XFixes, com thread e conexão X próprias, recebe cada cópia do sistema, em texto UTF-8 ou PNG, inclusive por transferência INCR, até 1 MB de texto e 16 MB de imagem. O Desktop guarda a cópia no histórico, exceto quando o programa a marca como secreta. Super+V, numa aba ou no Desktop, abre o histórico, e colar devolve o item à aba ou ao campo onde a tecla foi pressionada.
-- **Teclas de hardware.** Volume, mudo e brilho seguem `shared/hardwareKeys.ts`, mesmo quando uma aba tem o teclado. A tabela de teclas do host inclui seus códigos, e o OSD do Desktop aparece por cima. Enquanto o OSD cobre a aba, ela fica oculta e, quando reaparece, recebe o teclado de volta, a menos que a pessoa tenha usado o Desktop nesse intervalo.
+- **Teclas de hardware.** Volume, mudo e brilho seguem `shared/hardwareKeys.ts`, mesmo quando uma aba tem o teclado. O OSD aparece por cima da aba, que continua visível e com o teclado.
 
 O smoke abre um site pelo `xdg-open` do Terminal e comprova:
 
@@ -208,6 +208,7 @@ O smoke abre um site pelo `xdg-open` do Terminal e comprova:
 - clique e tecla confiáveis, navegação digitada após Ctrl+L, prioridade do seletor sobre a aba com Alt mantido e retorno do clique após dispensar o seletor;
 - Alt+S pressionado num pop-up abre a busca do Desktop, e o texto digitado em seguida chega a ela;
 - zoom e download para a pasta `Downloads` do perfil descartável;
+- transparência do canto arredondado da notificação de download sobre a aba e apresentação do indicador de brilho;
 - abertura do DevTools com F12, execução de um comando no console da aba e fechamento com F12 a partir do próprio painel;
 - seleção de arquivos de um `<input type=file>` da aba pelo seletor do OpenShell, sem janela nova no X;
 - Ctrl+P gera o PDF da aba;
@@ -221,11 +222,11 @@ Limites conhecidos desta composição:
 
 - **WebSocket.** A API de recursos do CEF não intercepta o handshake de WebSocket. O `hostd` recusa a origem estrangeira sem cookie e fecha o socket antes da primeira mensagem, e o smoke exige esse resultado.
 - **DNS rebinding.** O bloqueio do host compara o endereço literal da URL. Um domínio que resolve para o loopback na porta do `hostd` passa pelo CEF. Quando escuta em loopback, o `hostd` responde 421 a qualquer `Host` que não seja `127.0.0.1`, `localhost` ou `[::1]` na sua porta, e recusa o upgrade de WebSocket nesse caso.
-- **Sobreposição.** Quando há interseção, a view CEF é ocultada inteira. Falta recorte parcial, e elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
+- **Sobreposição.** Menus, diálogos e janelas que cruzam a aba podem ocultar a view CEF inteira. Falta recorte parcial, e elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
 - **Atalhos.** A entrega depende das teclas que chegam ao CEF pelo X11. Sessões com outro gerenciador de janelas podem capturar teclas antes do CEF. Outros layouts de teclado e IME ainda precisam de validação.
-- **Recursos de Browser.** Ainda faltam o cofre de senhas, que exige script no renderer das abas e um cofre no `hostd`, e a persistência das decisões de permissão entre sessões. O indicador de áudio da aba também falta, porque o CEF 147 não expõe se uma aba toca som. O mute funciona. A pergunta de câmera e microfone não tem prova no smoke, porque a VM não tem dispositivos.
+- **Recursos de Browser.** O cofre de senhas usa um script no renderer das abas e o serviço de senhas do `hostd`. A persistência das decisões de permissão entre sessões segue pendente. O indicador de áudio da aba também falta, porque o CEF 147 não expõe se uma aba toca som. O mute funciona. A pergunta de câmera e microfone não tem prova no smoke, porque a VM não tem dispositivos.
 - **Miniaturas do dock.** Não há miniaturas das janelas no dock (`captureRect`). Capturar a página do Desktop a cada poucos segundos deixava a tela preta durante a captura.
-- **OSD e camadas do Desktop.** O OSD de volume e brilho, como qualquer camada do Desktop, oculta a aba que cobre, em vez de aparecer por cima dela como no Live (`setHardwareOsd`).
+- **Sobreposições transparentes.** O OSD, o pop-up de senhas e as notificações são desenhados em imagens PNG com transparência sobre as abas. A composição preserva os cantos CSS. O recorte ainda termina no retângulo do elemento, e o desfoque do fundo da aba não faz parte da imagem.
 - **Uma tela, sem bloqueio e sem gravação.** O Native mostra uma única tela, e sem `screens` o Desktop mantém esse comportamento. O bloqueio de tela do Live (`onScreenLocked`) depende da autenticação nativa. A gravação de tela (`recordSource`) depende de uma fonte de captura do X para `getUserMedia`.
 
 A composição off-screen continua sendo a alternativa se a sobreposição de elementos se mostrar insuficiente.
