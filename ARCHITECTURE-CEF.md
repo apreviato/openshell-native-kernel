@@ -5,7 +5,7 @@
 
 O alvo do OpenShell Native passa a ser um shell em espaço de usuário que incorpora Chromium via **Chromium Embedded Framework (CEF)**. O shell em Rust, provisoriamente chamado `openshell-shell`, gerencia a sessão gráfica e integra a UI existente ao sistema. Chromium continua multiprocesso. O `hostd` atual em Node.js continua como processo local de serviços na primeira versão.
 
-Este documento atualiza a direção das etapas gráficas, de integração do Desktop e de supervisão do [plano original](ARCHITECTURE.md). A edição OpenShell Live, baseada em Debian, continua como referência funcional e opção de retorno, com o Electron existente. Os marcos de ABI Linux, armazenamento, instalação, atualização A/B e recuperação continuam definidos no plano original. A validação do boot real do Native e a execução do CEF no guest ainda estão pendentes.
+Este documento atualiza a direção das etapas gráficas, de integração do Desktop e de supervisão do [plano original](ARCHITECTURE.md). A edição OpenShell Live, baseada em Debian, continua como referência funcional e opção de retorno, com o Electron existente. Os marcos de ABI Linux, armazenamento, instalação, atualização A/B e recuperação continuam definidos no plano original. A seção 10 registra as provas em Linux e no guest Asterinas.
 
 ## 1. Decisão e alternativas
 
@@ -180,18 +180,21 @@ As provas abaixo passam no Linux de controle, com o sandbox do Chromium efetivo,
 
 O launcher reinicia o `hostd` até 5 vezes por minuto, com espera crescente, na mesma porta e com a mesma origem. O stdin do host CEF continua aberto como canal de controle. Por ele, o launcher envia o novo bootstrap, e o host só aceita uma URL de bootstrap na origem original. Quando o launcher fecha o canal, a sessão termina. O host recarrega o Desktop até 3 vezes por minuto quando o renderer morre e reativa a janela: a view mantém o foco do Views, mas o renderer novo não o recebe. Os erros do `hostd` ficam em `hostd.log`, no estado da sessão. O segredo de bootstrap trafega só por pipes.
 
-**Fase 3, primeira composição.** As abas do Browser são views do host sobrepostas à janela (`CefWindow::AddOverlayView`, modo custom), no retângulo do elemento da aba. A UI é a fonte do layout: publica o retângulo sempre que ele muda, com um número de geração por aba, e o host descarta posicionamentos mais antigos que o último aplicado, porque as requisições podem chegar fora de ordem.
+**Fase 3, composição.** As abas do Browser são views do host sobrepostas à janela (`CefWindow::AddOverlayView`, modo custom), no retângulo do elemento da aba. A UI publica em `browser/layout` um snapshot da sessão com geração crescente, visibilidade, retângulo de cada aba e, na primeira apresentação de uma aba ativa, uma solicitação opcional de foco. O host valida o snapshot antes de aplicá-lo, descarta gerações obsoletas e oculta as views de saída antes de exibir as de entrada na mesma tarefa do CEF. O `hello` anuncia `surfaceLayout` e `shortcutPhases`. Bundles anteriores continuam usando `browser/bounds` por aba.
 
 - **Ponte.** A página do Desktop envia `POST /_shell/<comando>`. O host responde no processo principal e nunca repassa a requisição ao `hostd`. Só o frame principal do browser do Desktop é aceito; frames, abas e navegações recebem 403. Os eventos das abas chegam à página como `openshell-native-browser`. O adaptador fica em `apps/desktop/src/host/nativeBrowser.tsx`, no repositório `openshell`. O Browser usa o mesmo componente de aba do Electron, com um elemento que implementa a interface do `<webview>`.
 - **Contextos.** Uma aba normal usa o perfil `cef/browser`, separado do Desktop. Uma aba privada usa um contexto em memória, descartado quando termina a sessão privada.
 - **Política.** As abas abrem http(s), `about:blank` e os serviços locais do usuário. Nenhum alias de loopback alcança a porta do `hostd`: `localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`, `[::1]` e o IPv4 mapeado. Outros esquemas, como `file:` e `chrome:`, são recusados. Pop-ups e links para uma janela nova abrem uma aba, criada pelo Desktop.
-- **Visibilidade.** A view só aparece com a janela do Browser em primeiro plano, sem menu de contexto nem diálogo do Desktop e sem nenhum elemento do Desktop sobre a área da aba. A UI confere esta última condição numa grade de pontos com `elementFromPoint`, a 16 px das bordas, onde ficam as alças de redimensionamento da janela. Assim, sugestões da barra de endereço, menus e outra janela por cima aparecem: a view se oculta enquanto estão abertos.
+- **Visibilidade.** Uma aba pode permanecer visível atrás de outra janela quando as áreas não se cruzam. A UI verifica os retângulos de janelas acima e de elementos como sugestões da barra de endereço, menus e o seletor de janelas. Para os demais elementos, consulta `elementFromPoint` numa grade com margem para as alças de redimensionamento. Um diálogo do Desktop pode suspender a apresentação. A UI adia a reexibição de uma aba oculta enquanto um campo editável ou iframe do Desktop mantém o teclado, pois mostrar o overlay CEF pode tomar o foco. Clicar numa view visível ativa sua janela lógica.
+- **Teclado.** O Desktop registra os atalhos que compartilha com as abas e indica quais precisam transferir o foco antes de executar. O host encaminha pressionamento e soltura aos bundles que anunciam suporte na inscrição. Ctrl+L transfere o foco para o Desktop, que seleciona o endereço. O Openbox empacotado libera Alt+Tab, Alt+F4 e as combinações com Super para o OpenShell. O seletor usa a soltura real de Alt. Quando uma aba focada se oculta, o Desktop recebe o foco. Uma aba focada antes de ter renderer, como um pop-up, recebe o teclado quando a página termina de carregar. Depois que o overlay de uma aba teve o teclado, o Chromium pode deixar as teclas sem destino, embora o Views conte um navegador como focado: elas chegam à janela sem passar por nenhum navegador. A janela entrega essas teclas ao navegador focado, com o caractere que digitam, e deixa em paz as que uma página recebeu e não tratou.
 
 O smoke abre um site pelo `xdg-open` do Terminal e comprova:
 
 - a página e um Web Worker;
 - WebGL;
-- clique e tecla confiáveis;
+- clique e tecla confiáveis, navegação digitada após Ctrl+L, prioridade do seletor sobre a aba com Alt mantido e retorno do clique após dispensar o seletor;
+- Alt+S pressionado num pop-up abre a busca do Desktop, e o texto digitado em seguida chega a ela;
+- zoom e download para a pasta `Downloads` do perfil descartável;
 - um pop-up aberto como aba;
 - renderers filtrados;
 - que a página não alcança o `hostd`.
@@ -200,11 +203,24 @@ Limites conhecidos desta composição:
 
 - **WebSocket.** A API de recursos do CEF não intercepta o handshake de WebSocket. O `hostd` recusa a origem estrangeira sem cookie e fecha o socket antes da primeira mensagem, e o smoke exige esse resultado.
 - **DNS rebinding.** O bloqueio do host compara o endereço literal da URL. Um domínio que resolve para o loopback na porta do `hostd` passa pelo CEF. Quando escuta em loopback, o `hostd` responde 421 a qualquer `Host` que não seja `127.0.0.1`, `localhost` ou `[::1]` na sua porta, e recusa o upgrade de WebSocket nesse caso.
-- **Sobreposição.** Enquanto um elemento do Desktop cobre a aba, a área da página fica vazia, sem o último quadro da página, e um elemento menor que o espaçamento da grade pode escapar da detecção.
-- **Atalhos.** Os atalhos do Desktop não chegam enquanto a aba tem o foco do teclado.
-- **Recursos de Electron.** O Browser ainda não tem localizar, zoom, downloads, senhas e DevTools.
+- **Sobreposição.** Quando há interseção, a view CEF é ocultada inteira. Falta recorte parcial, e elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
+- **Atalhos.** A entrega depende das teclas que chegam ao CEF pelo X11. Sessões com outro gerenciador de janelas podem capturar teclas antes do CEF. Outros layouts de teclado e IME ainda precisam de validação.
+- **Recursos de Browser.** A ponte oferece localizar, zoom e downloads básicos. Permissões por origem, gestão de downloads, senhas e DevTools ainda estão pendentes.
 
 A composição off-screen continua sendo a alternativa se a sobreposição de elementos se mostrar insuficiente.
+
+**Apps Linux.** O Desktop integra Xpra por meio do `hostd`, como no OpenShell Live: para cada app, o `hostd` inicia um servidor Xpra com Xvfb próprio, protegido por senha e ligado ao loopback, e a janela do OpenShell mostra o cliente HTML5 do Xpra num `iframe` servido pelo `hostd`. A ação `apps` acrescenta à imagem o perfil de apps de [initramfs.nix](userspace/compatibility/initramfs.nix): Xpra 6.4 com Xvfb, o cliente HTML5 17.1, D-Bus, o Python com dbus-python e PyGObject que o portal do `hostd` usa, e dois apps de prova, um GTK 3 e um Qt 6, em [probes](userspace/compatibility/probes). A imagem põe o cliente HTML5, a configuração de sessão do D-Bus e as entradas `.desktop` onde o `hostd` e o D-Bus as procuram no Debian.
+
+Fazer o caminho funcionar com essas versões exigiu correções no `hostd` e na UI, no repositório `openshell`:
+
+- a autenticação do socket usa `auth=file,filename=…`; o Xpra 6.4 ignora a forma `auth=file:filename=…` e então recusa qualquer senha;
+- o servidor recebe `XPRA_DELAY_KEYBOARD_DATA=0`; sem isso, o Xpra 6 só aplica o mapa de teclado do cliente quando o cliente avisa uma mudança de mapa, o que o cliente HTML5 nunca faz, e toda tecla resolve para nada;
+- o lançador do app nomeia o `python3` e o `dbus-run-session` do `hostd`, porque o wrapper do Xpra no Nix põe o próprio Python no PATH dos filhos;
+- a UI lê o tipo das janelas do cliente nas duas formas, lista ou valor único (o cliente 17 removeu `has_windowtype`), e dá o teclado à janela do app quando ela aparece e quando é clicada, porque o cliente só foca uma janela pela barra de título, que o OpenShell esconde;
+- os atalhos do Desktop pressionados dentro do app vão para o Desktop, pelas mesmas definições de `shellKeys`, quando não há Electron para encaminhá-los;
+- o launcher repassa `XDG_DATA_DIRS` ao `hostd`.
+
+O [smoke de apps](tools/desktop/apps-smoke.mjs) prova pela API do `hostd` o catálogo, o lançamento, a página do cliente, o WebSocket até o Xpra e a senha que a UI recebe, e o encerramento sem órfãos (app, Xpra e Xvfb), tanto pelo Desktop quanto pelo próprio app. A fase `linux-apps` do smoke do Desktop abre os dois apps pela busca, digita na janela do OpenShell, maximiza com Super+↑ e exige que o app assuma o tamanho, e fecha o GTK com Alt+F4 e o Qt pelo próprio app.
 
 **Gráficos.** O image inclui o Mesa do nixpkgs fixado em `/run/opengl-driver`, como no NixOS. O Xvfb oferece GLX, e o ANGLE renderiza com llvmpipe. O host passa `ignore-gpu-blocklist`, porque o blocklist do Chromium, feito para drivers desconhecidos, recusa WebGL no llvmpipe e o image fixa o driver. Os smokes registram o renderer efetivo e conferem um pixel lido de volta.
 
@@ -227,7 +243,7 @@ A proposta de evolução de 12/11/2026 (*OpenShell Native — Arquitetura final 
 
 | Decisão | Situação |
 | --- | --- |
-| A UI define o layout, e o shell valida e apresenta as superfícies | Adotada. Retângulo, visibilidade e geração já seguem esse modelo. Recorte, escala, z-order e foco entram no mesmo contrato quando houver um segundo tipo de superfície. |
+| A UI define o layout, e o shell valida e apresenta as superfícies | Adotada. As abas enviam retângulo, visibilidade e solicitação de foco em um snapshot por geração. A UI usa z-order para decidir quais views retangulares podem aparecer. Recorte parcial, escala e um segundo tipo de superfície seguem pendentes. |
 | Views sobrepostas como composição de base, com off-screen só se a sobreposição não bastar | Adotada. Composição off-screen e compositor próprio dependem de medição de cópias, CPU, latência e quadros descartados. |
 | X11 e Xpra mantidos até uma alternativa ter paridade | Adotada. Openbox e Xorg só saem do caminho quando os apps Linux tiverem outro caminho validado. |
 | Proteção do `hostd` independente do bloqueio no CEF | Adotada: Origin, cookie e validação de `Host`. |
@@ -238,9 +254,9 @@ A proposta de evolução de 12/11/2026 (*OpenShell Native — Arquitetura final 
 
 Próximos passos, em ordem:
 
-1. Apps Linux no guest: Xpra, um app GTK e um app Qt reais abertos pelo launcher e pelo Terminal como janelas do OpenShell. A prova inclui foco, resize, encerramento sem órfãos e a recuperação de Xpra e do app.
+1. Apps Linux: completar a prova com a abertura pelo Terminal e pelo Files, a recuperação depois que o Xpra ou o app morrem, apps com várias janelas e diálogos, clipboard e o cursor do app, que hoje usa o padrão porque o script de tema não encontra a libX11 fora do Debian.
 2. Contrato de superfícies comum às abas do Browser e às janelas Xpra: recorte, escala, z-order, foco e região de entrada, com a matriz de foco e menus da proposta (drag and drop, clipboard, IME, fullscreen e dois monitores).
-3. Recursos do Browser: localizar, zoom, downloads, permissões e atalhos do Desktop com a aba em foco.
+3. Paridade do Browser: permissões por origem, downloads concorrentes e cancelamento, mais a matriz de atalhos, layouts de teclado e IME.
 4. Testes de contrato do `host-api` e baseline de desempenho do Electron no mesmo Linux de controle, antes de portar serviços do `hostd`.
 5. Autenticação nativa antes da sessão e Xorg sobre DRM.
 6. Imagem com partições `system_a`, `system_b`, `recovery` e `data`, seleção de slot no boot, manifesto assinado e confirmação do slot pelo supervisor.

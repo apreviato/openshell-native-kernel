@@ -39,19 +39,28 @@ bundle=/tmp/openshell-native-bundle
 shell_sources=/tmp/openshell-native-shell
 ab_sources=/tmp/openshell-native-ab
 
+# What each action builds and runs. apps is the kiosk with the Linux apps profile.
+uses_bundle() { [[ "$action" == desktop || "$action" == kiosk || "$action" == apps ]]; }
+uses_graphics() { [[ "$action" == graphics || "$action" == kiosk || "$action" == apps ]]; }
+drives_desktop() { [[ "$action" == kiosk || "$action" == apps ]]; }
+
 prepare_compat() {
     install -m 0644 "$compat/initramfs.nix" test/initramfs/nix/openshell-compat.nix
     rm -rf test/initramfs/nix/openshell-probes test/initramfs/nix/openshell-bundle \
-        test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab
+        test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab test/initramfs/nix/openshell-apps
     cp -R "$probes" test/initramfs/nix/openshell-probes
     cp -R "$ab_sources" test/initramfs/nix/openshell-ab
-    # The Desktop and kiosk profiles add the OpenShell bundle to the initramfs.
-    if [[ "$action" == desktop || "$action" == kiosk ]]; then
+    # The Desktop profiles add the OpenShell bundle to the initramfs.
+    if uses_bundle; then
         cp -R "$bundle" test/initramfs/nix/openshell-bundle
     fi
-    # The graphics and kiosk profiles build the shell and add an X server.
-    if [[ "$action" == graphics || "$action" == kiosk ]]; then
+    # The graphics profiles build the shell and add an X server.
+    if uses_graphics; then
         cp -R "$shell_sources" test/initramfs/nix/openshell-shell
+    fi
+    # The apps profile adds Xpra and the probe applications (initramfs.nix).
+    if [[ "$action" == apps ]]; then
+        mkdir test/initramfs/nix/openshell-apps
     fi
 }
 
@@ -82,11 +91,13 @@ run_control_graphics() {
         > "$artifacts/control-openbox.log" 2>&1 &
     local wm=$!
     sleep 2
+    # The Linux apps profile's environment, for the smokes of the apps action.
+    local apps_env=()
     control_smoke() {
         local name=$1
         shift
         if DISPLAY=:7 HOME="$scratch" PATH="$path" FONTCONFIG_FILE="$work/control-fonts" \
-            OPENSHELL_CEF_SMOKE_TIMEOUT_MS=90000 timeout --kill-after=10s 15m \
+            OPENSHELL_CEF_SMOKE_TIMEOUT_MS=90000 env "${apps_env[@]}" timeout --kill-after=10s 15m \
             "$work/control-python/bin/python3" -I "$probes/unprivileged.py" \
             "$work/control-node/bin/node" "$@" "$scratch/$name" 2>&1 | tee "$artifacts/$name.log"; then
             record_check "$name" passed
@@ -99,7 +110,22 @@ run_control_graphics() {
     local host="$work/control-cefHost/runtime/openshell-cef-host"
     control_smoke control-cef "$probes/cef-smoke.mjs" host "$host"
     control_smoke control-cef-isolation "$probes/cef-smoke.mjs" isolation "$host"
-    if [[ "$action" == kiosk ]]; then
+    if [[ "$action" == apps ]]; then
+        if ! timeout --kill-after=15s 60m nix-build test/initramfs/nix/openshell-compat.nix \
+            -A appsTools -o "$work/control-appsTools" >> "$artifacts/control-graphics-build.log" 2>&1; then
+            record_check control-apps failed
+            return 1
+        fi
+        local apps="$work/control-appsTools"
+        # The image's layout (initramfs.nix): where hostd and D-Bus look, as on Debian.
+        mkdir -p /usr/share/xpra /etc/dbus-1
+        ln -sfn "$(readlink -f "$apps/share/xpra/www")" /usr/share/xpra/www
+        ln -sfn "$(readlink -f "$apps/etc/dbus-1/session.conf")" /etc/dbus-1/session.conf
+        path="$apps/bin:$path"
+        apps_env=(XDG_DATA_DIRS="$apps/share" OPENSHELL_SMOKE_LINUX_APPS=1)
+        control_smoke control-apps "$probes/apps-smoke.mjs" "$bundle"
+    fi
+    if drives_desktop; then
         control_smoke control-shell "$probes/shell-smoke.mjs" \
             "$work/control-launcher/bin/openshell-shell" "$bundle" "$host"
         # The supervisor runs as root and starts the session as the user.
@@ -189,11 +215,11 @@ if [[ "$action" == control || "$action" == baseline ]]; then
     fi
 fi
 
-if [[ "$action" == desktop || "$action" == kiosk ]]; then
+if uses_bundle; then
     prepare_compat
     run_control_hostd || control_status=1
 fi
-if [[ "$action" == graphics || "$action" == kiosk ]]; then
+if uses_graphics; then
     prepare_compat
     run_control_graphics || control_status=1
 fi
@@ -315,19 +341,26 @@ run_compat() {
         memory=12G
         cpus=4
         boot_timeout=90m
+    elif [[ "$action" == apps ]]; then
+        memory=12G
+        cpus=4
+        boot_timeout=120m
     fi
     boot_args=("MEM=$memory" "SMP=$cpus" "CARGO_OSDK_INITRAMFS_OPTION=--initramfs=$work/compat-initramfs")
     local status=0 sandbox_status=0 console="$artifacts/native-compat-console.txt"
     local markers=(OPENSHELL_NATIVE_PYTHON_OK OPENSHELL_NATIVE_NODE_OK OPENSHELL_NATIVE_AB_OK)
     local workloads=(ab)
-    if [[ "$action" == desktop || "$action" == kiosk ]]; then
+    if uses_bundle; then
         workloads+=(hostd)
     fi
-    if [[ "$action" == graphics || "$action" == kiosk ]]; then
+    if uses_graphics; then
         workloads+=(x11 cef cef_isolation)
     fi
-    if [[ "$action" == kiosk ]]; then
+    if drives_desktop; then
         workloads+=(shell session)
+    fi
+    if [[ "$action" == apps ]]; then
+        workloads+=(apps)
     fi
     local workload
     for workload in "${workloads[@]}"; do
@@ -362,7 +395,7 @@ run_compat() {
     return "$status"
 }
 
-if [[ "$action" == compat || "$action" == sandbox || "$action" == desktop || "$action" == graphics || "$action" == kiosk ]]; then
+if [[ "$action" == compat || "$action" == sandbox ]] || uses_bundle || uses_graphics; then
     prepare_compat
     compat_status=0
     run_compat || compat_status=1

@@ -113,7 +113,7 @@ async function freePort() {
 // A site for the Desktop's Browser: it reports what the page saw and did,
 // and tries to reach hostd, which the shell must prevent.
 async function startSite(hostdPort) {
-  const evidence = { page: false, worker: false, webgl: null, click: false, key: false, popup: false, reachedHostd: false, blocked: { fetch: false, socket: false } };
+  const evidence = { page: false, worker: false, webgl: null, clicks: 0, addressNavigation: false, key: false, popup: false, widths: [], downloaded: false, reachedHostd: false, blocked: { fetch: false, socket: false } };
   const page = `<!doctype html><meta charset="utf-8"><title>OpenShell Browser Probe</title>
 <style>html, body { margin: 0; height: 100%; background: #284; color: #fff; font: 24px sans-serif; }</style>
 <body><h1>OpenShell Browser Probe</h1><script src="probe.js"></script></body>`;
@@ -138,14 +138,23 @@ try {
 } catch {}
 fetch("webgl", { method: "POST", body: webgl.slice(0, 200) }).catch(() => undefined);
 document.addEventListener("click", (event) => { if (event.isTrusted) post("click"); });
+// The page's CSS width shrinks when the Browser zooms in.
+const reportWidth = () => post("width?value=" + innerWidth);
+addEventListener("resize", reportWidth);
+reportWidth();
+// z downloads a file.
+addEventListener("keydown", (event) => { if (event.isTrusted && event.key === "z") location.href = "download"; });
+let opened = false;
 window.addEventListener("keydown", (event) => {
-  if (!event.isTrusted || event.key !== "k") return;
+  if (!event.isTrusted || event.key !== "k" || opened) return;
+  opened = true;
   post("key");
   window.open("popup", "_blank");
-}, { once: true });`;
+});`;
   const worker = `self.onmessage = ({ data }) => { if (data === "ping") self.postMessage("pong"); };`;
   const files = new Map([
     ["/", ["text/html; charset=utf-8", page]],
+    ["/address-focus", ["text/html; charset=utf-8", page]],
     ["/probe.js", ["text/javascript", probe]],
     ["/worker.js", ["text/javascript", worker]],
     ["/popup", ["text/html; charset=utf-8", "<!doctype html><title>OpenShell Browser Popup</title><p>Popup</p>"]],
@@ -159,14 +168,22 @@ window.addEventListener("keydown", (event) => {
       request.on("end", () => {
         const name = url.pathname.slice(1);
         if (name === "blocked" && Object.hasOwn(evidence.blocked, url.searchParams.get("kind"))) evidence.blocked[url.searchParams.get("kind")] = true;
+        else if (name === "width") evidence.widths.push(Number(url.searchParams.get("value")));
         else if (name === "reached") evidence.reachedHostd = true;
         else if (name === "webgl") evidence.webgl = body;
-        else if (["page", "worker", "click", "key"].includes(name)) evidence[name] = true;
+        else if (name === "click") evidence.clicks++;
+        else if (["page", "worker", "key"].includes(name)) evidence[name] = true;
         response.writeHead(204).end();
       });
       return;
     }
     if (url.pathname === "/popup") evidence.popup = true;
+    if (url.pathname === "/address-focus") evidence.addressNavigation = true;
+    if (url.pathname === "/download") {
+      evidence.downloaded = true;
+      response.writeHead(200, { "Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="openshell-probe.txt"' }).end("OpenShell Native download\n");
+      return;
+    }
     const file = request.method === "GET" && files.get(url.pathname);
     if (!file) {
       response.writeHead(404).end();
@@ -201,7 +218,17 @@ async function smoke(launcher, bundle, host, outputArg) {
   console.log(`Artifacts: ${output}`);
 
   function screenshot(name) {
-    tool("xwd", ["-root", "-silent", "-out", join(output, `${name}.xwd`)], { optional: true });
+    const path = join(output, `${name}.xwd`);
+    return tool("xwd", ["-root", "-silent", "-out", path], { optional: true }) === null ? null : path;
+  }
+
+  function screenPixel(path, x, y) {
+    if (!path) return null;
+    const data = readFileSync(path);
+    const field = index => data.readUInt32BE(index * 4);
+    if (field(2) !== 2 || field(11) !== 32 || x >= field(4) || y >= field(5)) return null;
+    const offset = field(0) + field(19) * 12 + y * field(12) + x * 4;
+    return data.readUInt32LE(offset);
   }
 
   async function waitFor(label, predicate, duration = 60_000) {
@@ -246,6 +273,8 @@ async function smoke(launcher, bundle, host, outputArg) {
         DISPLAY: process.env.DISPLAY,
         ...(process.env.XAUTHORITY ? { XAUTHORITY: process.env.XAUTHORITY } : {}),
         ...(process.env.FONTCONFIG_FILE ? { FONTCONFIG_FILE: process.env.FONTCONFIG_FILE } : {}),
+        // Where the Linux applications' desktop entries are, when not in /usr/share.
+        ...(process.env.XDG_DATA_DIRS ? { XDG_DATA_DIRS: process.env.XDG_DATA_DIRS } : {}),
         OPENSHELL_NATIVE_PORT: String(port),
       },
     });
@@ -362,8 +391,53 @@ async function smoke(launcher, bundle, host, outputArg) {
         screenshot("browser");
         // The Browser window opens in the middle of the screen, its page under the pointer.
         const display = tool("xdotool", ["getdisplaygeometry"]).split(" ").map(Number);
-        tool("xdotool", ["mousemove", String(Math.floor(display[0] / 2)), String(Math.floor(display[1] / 2) + 40), "click", "1"]);
-        await waitFor("a click in the page", () => evidence.click, 30_000);
+        const pageX = Math.floor(display[0] / 2);
+        const pageY = Math.floor(display[1] / 2) + 40;
+        const clickPage = () => tool("xdotool", ["mousemove", String(pageX), String(pageY), "click", "1"]);
+        clickPage();
+        await waitFor("a click in the page", () => evidence.clicks === 1, 30_000);
+        // Send directly to the focused view. Activating the top-level X11
+        // window here would move the keyboard away from the Browser tab.
+        tool("xdotool", ["key", "ctrl+l"]);
+        await pause(1.5);
+        await type(`${site.url}address-focus`);
+        screenshot("browser-address");
+        tool("xdotool", ["key", "Return"]);
+        await waitFor("navigation typed into the Desktop address bar from the page", () => evidence.addressNavigation, 30_000);
+        await pause(2);
+        clickPage();
+        await waitFor("a click after address navigation", () => evidence.clicks === 2, 30_000);
+        // The Desktop switcher stays above the tab until the held Alt key is released.
+        const pagePixel = screenPixel(screenshot("browser-before-switcher"), pageX, pageY);
+        tool("xdotool", ["keydown", "Alt_L", "key", "Tab"]);
+        try {
+          await pause(1);
+          const switcherPixel = screenPixel(screenshot("browser-switcher"), pageX, pageY);
+          if (pagePixel !== null && switcherPixel !== null) {
+            assert.notEqual(switcherPixel, pagePixel, "The switcher did not uncover the Desktop while Alt was held");
+          }
+          clickPage();
+          await pause(1);
+          assert.equal(evidence.clicks, 2, "The page received a click through the Desktop switcher");
+          tool("xdotool", ["key", "Escape"]);
+        } finally {
+          tool("xdotool", ["keyup", "Alt_L"]);
+        }
+        await pause(1);
+        clickPage();
+        await waitFor("page input after dismissing the switcher", () => evidence.clicks === 3, 30_000);
+        // The Browser's shortcuts work with the keyboard in the page.
+        const before = evidence.widths.at(-1);
+        tool("xdotool", ["key", "ctrl+equal"]);
+        await waitFor("the page to zoom in", () => evidence.widths.at(-1) < before, 30_000);
+        tool("xdotool", ["key", "ctrl+0"]);
+        await waitFor("the zoom to reset", () => evidence.widths.at(-1) === before, 30_000);
+        // A download goes to Home > Downloads.
+        tool("xdotool", ["key", "z"]);
+        const download = join(home, "Downloads", "openshell-probe.txt");
+        await waitFor("the download", () => existsSync(download) && readFileSync(download, "utf8") === "OpenShell Native download\n", 30_000);
+        // The download's notification covers the page for a moment; the page keeps the keyboard.
+        await pause(1);
         tool("xdotool", ["key", "k"]);
         await waitFor("a key in the page", () => evidence.key, 30_000);
         await waitFor("the page's popup in a new tab", () => evidence.popup, 30_000);
@@ -372,15 +446,66 @@ async function smoke(launcher, bundle, host, outputArg) {
           return renderers.length > 1 && renderers.every((renderer) => renderer.filtered) && renderers;
         }, 15_000);
         sample("withBrowser");
-        // The Desktop takes the keyboard back: a click outside the Browser window.
-        tool("xdotool", ["mousemove", "4", String(display[1] - 4), "click", "1"]);
-        await pause(2);
+        // The Desktop's shortcuts reach it from the page: Alt+S opens the search.
+        await terminal("terminal-from-tab");
       } finally {
         report.browser = site.evidence;
         site.server.closeAllConnections();
         site.server.close();
       }
     });
+
+    // With the Linux apps profile (OPENSHELL_SMOKE_LINUX_APPS=1): a GTK and a
+    // Qt application open from the Desktop's search in Desktop windows, through
+    // Xpra and its HTML5 client, take the keyboard and the window's size, and
+    // close with their window or by themselves, leaving no process behind.
+    if (process.env.OPENSHELL_SMOKE_LINUX_APPS === "1") {
+      await check("linux-apps", async () => {
+        const log = join(home, "openshell-app-probe.log");
+        const events = (app) => (existsSync(log) ? readFileSync(log, "utf8") : "").split("\n").filter(Boolean)
+          .map((line) => JSON.parse(line)).filter((event) => event.app === app);
+        const sizes = (app) => events(app).filter((event) => event.event === "size");
+        // Xpra maps an application's window once a client shows it.
+        const shownBy = (start, title) => spawnSync("xdotool", ["search", "--onlyvisible", "--name", `^${title}$`], {
+          env: { ...process.env, DISPLAY: start.display, XAUTHORITY: start.xauthority }, encoding: "utf8",
+        }).stdout.trim();
+        const xpraServers = () => [...processes().values()].filter(({ cmdline }) => cmdline.some((arg) => arg.startsWith("--start-child=")));
+        const [width, height] = tool("xdotool", ["getdisplaygeometry"]).split(" ").map(Number);
+        report.linuxApps = {};
+        for (const probe of [
+          // Alt+F4 closes the Desktop window, which ends the application.
+          { app: "gtk", title: "OpenShell GTK Probe", close: "alt+F4" },
+          // Escape makes the application close itself, which closes its window.
+          { app: "qt", title: "OpenShell Qt Probe", close: "Escape" },
+        ]) {
+          const began = performance.now();
+          await keys("Escape", "alt+s");
+          await type(probe.title);
+          await keys("Return");
+          const start = await waitFor(`the ${probe.app} application`, () => events(probe.app).find((event) => event.event === "start"), 120_000);
+          await waitFor(`the ${probe.app} window in the Desktop`, () => shownBy(start, probe.title), 120_000);
+          const shown = Math.round(performance.now() - began);
+          screenshot(`linux-${probe.app}`);
+          // The new window is in the middle of the screen, above the others.
+          tool("xdotool", ["mousemove", String(Math.floor(width / 2)), String(Math.floor(height / 2)), "click", "1"]);
+          await pause(1);
+          await type(`native ${probe.app}`);
+          tool("xdotool", ["key", "Return"]);
+          await waitFor(`text typed into the ${probe.app} window`, () => events(probe.app).some((event) => event.event === "text" && event.value === `native ${probe.app}`), 60_000);
+          // The Desktop's shortcut maximizes the window, and the application takes its size.
+          const before = sizes(probe.app).at(-1);
+          tool("xdotool", ["key", "super+Up"]);
+          await waitFor(`the ${probe.app} application to take the maximized size`, () => {
+            const last = sizes(probe.app).at(-1);
+            return last && before && last.width > before.width && last.height > before.height;
+          }, 60_000);
+          screenshot(`linux-${probe.app}-maximized`);
+          tool("xdotool", ["key", probe.close]);
+          await waitFor(`the ${probe.app} application and its Xpra to exit`, () => !alive(start.pid) && xpraServers().length === 0, 60_000);
+          report.linuxApps[probe.app] = { toolkit: start.toolkit, shownMs: shown, size: sizes(probe.app).at(-1), totalMs: Math.round(performance.now() - began) };
+        }
+      });
+    }
 
     await check("sandbox", async () => {
       report.desktopSandbox = await waitFor("filtered Desktop renderers", () => {

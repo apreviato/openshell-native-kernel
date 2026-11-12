@@ -17,6 +17,7 @@ node tools/build/native.mjs baseline
 node tools/build/native.mjs graphics
 node tools/build/native.mjs desktop <openshell-desktop-bundle>
 node tools/build/native.mjs kiosk <openshell-desktop-bundle>
+node tools/build/native.mjs apps <openshell-desktop-bundle>
 ```
 
 | Comando | Resultado esperado |
@@ -30,7 +31,8 @@ node tools/build/native.mjs kiosk <openshell-desktop-bundle>
 | `baseline` | Executa o controle Linux, os testes Rust do launcher, os três boots do smoke e o boot de compatibilidade. Registra os resultados de seccomp e de namespaces para decidir se os testes gráficos podem avançar. |
 | `graphics` | Compila o shell Rust e o host CEF contra o CEF 147 do nixpkgs fixado e inicia um initramfs com Xvfb, Mesa, Openbox, xdotool e o host. Exige, além das sondas do `compat`, as checagens de sandbox do Chromium, o servidor X e o [smoke do CEF](tools/desktop/cef-smoke.mjs) com o sandbox ativo, nos modos `host` e `isolation`. Os mesmos smokes rodam antes no Linux do builder, com o sandbox. Usa 12 GB e 4 vCPUs no QEMU. |
 | `desktop` | Inclui no initramfs o bundle OpenShell Desktop indicado e executa o [smoke do hostd](tools/desktop/hostd-smoke.mjs) como usuário sem privilégios, primeiro no Linux do builder e depois no guest, além das sondas do `compat`. |
-| `kiosk` | Reúne `graphics` e `desktop` e abre o bundle indicado no shell. O [smoke do shell](tools/desktop/shell-smoke.mjs) dirige o Desktop real com entrada X11: Files, Terminal, Browser com uma aba nativa, recuperação do renderer e do hostd, encerramento e segunda sessão. O [smoke da sessão](tools/desktop/session-smoke.mjs) executa o supervisor `openshell-session` como root. Os dois rodam antes no Linux do builder. |
+| `kiosk` | Reúne `graphics` e `desktop` e abre o bundle indicado no shell. O [smoke do shell](tools/desktop/shell-smoke.mjs) dirige o Desktop real com entrada X11: Files, Terminal, atalhos e foco do Browser nativo, zoom, download, recuperação do renderer e do hostd, encerramento e segunda sessão. O [smoke da sessão](tools/desktop/session-smoke.mjs) executa o supervisor `openshell-session` como root. Os dois rodam antes no Linux do builder. |
+| `apps` | A `kiosk` com o perfil de apps Linux: Xpra, seu cliente HTML5, D-Bus e um app de prova GTK e um Qt. O [smoke de apps](tools/desktop/apps-smoke.mjs) abre os apps pela API do `hostd` e exige o encerramento sem órfãos. O smoke do shell acrescenta a fase `linux-apps`: os apps abrem pela busca em janelas do OpenShell, recebem teclado e o tamanho da janela e fecham. Usa 12 GB e 4 vCPUs no QEMU, com até 120 minutos de boot. |
 
 Cada execução de build ou teste salva os artefatos em `out/native-*/`. `run.json` registra o resultado, inclusive falhas de conexão com o Docker, o digest do builder e os resultados de `checks.tsv` quando disponíveis. Quando há build de kernel, `toolchain.txt` registra firmware e perfil QEMU, e `SHA256SUMS` cobre a ISO de diagnóstico. Consulte `native-compat-console.txt` para diagnosticar falhas de ABI ou de sandbox no guest. `native-seccomp` e `native-namespaces` ficam como `unverified` quando o console não comprova que a sonda chegou a executar.
 
@@ -60,7 +62,7 @@ Resultados no perfil QEMU do baseline, com o kernel v0.19.0 e a série de patche
 | OpenShell Desktop real no shell: Files, Terminal, Browser com aba nativa, recuperação do renderer e do hostd, segunda sessão e segredo fora dos logs | [shell-smoke.mjs](tools/desktop/shell-smoke.mjs) | Passa com o sandbox | Passa com o sandbox e os patches 0001 a 0015 |
 | Sessão supervisionada: X, Openbox e shell como usuário comum, reinício do shell sem processos remanescentes e encerramento ordenado | [session-smoke.mjs](tools/desktop/session-smoke.mjs) | Passa | Passa |
 
-[^control]: O builder das ações `graphics` e `kiosk` roda sem o perfil seccomp do Docker, que bloqueia user namespaces. Em CI, o runner precisa permitir user namespaces sem privilégios.
+[^control]: O builder das ações `graphics`, `kiosk` e `apps` roda sem o perfil seccomp do Docker, que bloqueia user namespaces. Em CI, o runner precisa permitir user namespaces sem privilégios.
 
 As duas camadas do sandbox do Chromium, seccomp e namespaces, estão comprovadas nas sondas e no processo Chromium real: os renderers do CEF rodam no guest com `Seccomp: 2`, `NoNewPrivs: 1` e um filtro instalado pelo próprio Chromium. A renderização é por software: o image inclui o Mesa em `/run/opengl-driver`, o Xvfb oferece GLX, e o ANGLE usa o llvmpipe. Os smokes registram o renderer efetivo, `ANGLE (Mesa, llvmpipe ...)`, e conferem um pixel de WebGL lido de volta. O host passa `ignore-gpu-blocklist`, porque o blocklist do Chromium recusa WebGL no llvmpipe. Xorg sobre `/dev/dri/card0` é a próxima etapa gráfica.
 
@@ -114,13 +116,13 @@ Faltam a assinatura do manifesto, a escolha do slot pelo bootloader, as partiç�
 
 ## Integração com o OpenShell
 
-O Native consome o bundle Linux do Desktop gerado no repositório `openshell` por `pnpm desktop:bundle`, em `apps/desktop/dist-bundle/openshell-desktop`. O bundle precisa conter `BUILD.json`, `hostd/openshell-hostd.mjs` e `ui/index.html`. O `run.json` da ação `desktop` registra a versão, a data de build, a versão do Electron e o SHA-256 do hostd.
+O Native consome o bundle Linux do Desktop gerado no repositório `openshell` por `pnpm desktop:bundle`, em `apps/desktop/dist-bundle/openshell-desktop`. O bundle precisa conter `BUILD.json`, `hostd/openshell-hostd.mjs` e `ui/index.html`. O `run.json` das ações `desktop`, `kiosk` e `apps` registra a versão, a data de build, a versão do Electron e o SHA-256 do hostd e do `ui/index.html`.
 
 ```bash
 node tools/build/native.mjs desktop ../openshell/apps/desktop/dist-bundle/openshell-desktop
 ```
 
-O hostd usa o Node e o Python do mesmo nixpkgs do guest. O `node-pty` do bundle é opcional, e o hostd usa o backend `python-pty` quando ele falta. Na ação `desktop`, a UI é servida e verificada por HTTP, sem renderer. A ação `kiosk` abre a mesma UI no shell. O Browser usa abas nativas quando o bundle inclui o adaptador `apps/desktop/src/host/nativeBrowser.tsx` do repositório `openshell`; sem ele, as páginas abrem em iframes.
+O hostd usa o Node e o Python do mesmo nixpkgs do guest. O `node-pty` do bundle é opcional, e o hostd usa o backend `python-pty` quando ele falta. Na ação `desktop`, a UI é servida e verificada por HTTP, sem renderer. A ação `kiosk` abre a mesma UI no shell. O Browser usa abas nativas quando o bundle inclui o adaptador `apps/desktop/src/host/nativeBrowser.tsx` do repositório `openshell`. Para validar o layout agrupado e a soltura real dos atalhos, gere o bundle com a versão do adaptador que negocia `surfaceLayout` e `shortcutPhases`.
 
 ```bash
 node tools/build/native.mjs kiosk ../openshell/apps/desktop/dist-bundle/openshell-desktop

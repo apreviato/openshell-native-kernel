@@ -2,14 +2,17 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -23,6 +26,10 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
+#include "include/cef_download_handler.h"
+#include "include/cef_find_handler.h"
+#include "include/cef_focus_handler.h"
+#include "include/cef_keyboard_handler.h"
 #include "include/cef_frame.h"
 #include "include/cef_parser.h"
 #include "include/cef_request.h"
@@ -101,6 +108,7 @@ struct Tab {
   bool incognito = false;
   bool closing = false;
   bool visible = false;
+  bool focus_on_show = false;
   // The page numbers its placements; requests may arrive out of order.
   int generation = -1;
   CefRect bounds;
@@ -110,8 +118,26 @@ struct Tab {
   CefRefPtr<CefBrowser> browser;
 };
 
-// The state of the session, used on the browser process UI thread only,
-// except desktop_id.
+// A key press that a focused tab hands to the Desktop page, which derives the
+// list from its own shortcut definitions: the DOM key (lowercase) and the
+// exact modifiers.
+struct Shortcut {
+  std::string key;
+  int modifiers = 0;
+  bool focus_desktop = false;
+};
+
+constexpr int kShortcutModifiers =
+    EVENTFLAG_ALT_DOWN | EVENTFLAG_SHIFT_DOWN | EVENTFLAG_CONTROL_DOWN | EVENTFLAG_COMMAND_DOWN;
+
+// Session state belongs to the browser UI thread, except desktop_id.
+// A key event that a page left unhandled, to tell it from a lost key.
+struct SeenKey {
+  int type;
+  int code;
+  std::chrono::steady_clock::time_point at;
+};
+
 struct Session : std::enable_shared_from_this<Session> {
   Startup startup;
   std::string profile;
@@ -119,12 +145,18 @@ struct Session : std::enable_shared_from_this<Session> {
   bool failed = false;
   bool closing = false;
   CefRefPtr<CefBrowser> desktop;
+  // The latest key events that pages left unhandled.
+  std::deque<SeenKey> seen_keys;
   // Read on the IO thread to recognize requests of the Desktop page.
   std::atomic<int> desktop_id{0};
   CefRefPtr<CefWindow> window;
   std::string pending_bootstrap;
   std::deque<std::chrono::steady_clock::time_point> renderer_restarts;
   std::map<std::string, Tab> tabs;
+  int layout_generation = -1;
+  // The key presses that go to the Desktop page even from a tab.
+  std::vector<Shortcut> shortcuts;
+  bool shortcut_phases = false;
   // The Browser's contexts are created with its first tab. The private one
   // lasts until the private session ends.
   CefRefPtr<CefRequestContext> browser_context;
@@ -199,28 +231,132 @@ CefRefPtr<CefDictionaryValue> TabEvent(const std::string& id, const char* type) 
   return event;
 }
 
-void FocusDesktop(Session& session) {
-  if (session.desktop) {
-    if (auto view = CefBrowserView::GetForBrowser(session.desktop)) {
-      view->RequestFocus();
+// The DOM `key` and `code` of a key press, for the keys that shortcuts use.
+// Letters take the layout's letter, as the DOM `key` does.
+bool DomKey(const CefKeyEvent& event, std::string& key, std::string& code) {
+  const int vk = event.windows_key_code;
+  if (vk >= 'A' && vk <= 'Z') {
+    key = std::string(1, static_cast<char>(vk - 'A' + 'a'));
+    code = std::string("Key") + static_cast<char>(vk);
+    return true;
+  }
+  if (vk >= '0' && vk <= '9') {
+    key = std::string(1, static_cast<char>(vk));
+    code = std::string("Digit") + static_cast<char>(vk);
+    return true;
+  }
+  if (vk >= 0x70 && vk <= 0x87) {
+    key = code = "F" + std::to_string(vk - 0x6f);
+    return true;
+  }
+  static const struct {
+    int vk;
+    const char* key;
+    const char* code;
+  } kKeys[] = {
+      {0x08, "Backspace", "Backspace"}, {0x09, "Tab", "Tab"},
+      {0x0d, "Enter", "Enter"},         {0x1b, "Escape", "Escape"},
+      {0x12, "Alt", "AltLeft"},        {0xa4, "Alt", "AltLeft"},
+      {0xa5, "Alt", "AltRight"},
+      {0x20, " ", "Space"},             {0x21, "PageUp", "PageUp"},
+      {0x22, "PageDown", "PageDown"},   {0x23, "End", "End"},
+      {0x24, "Home", "Home"},           {0x25, "ArrowLeft", "ArrowLeft"},
+      {0x26, "ArrowUp", "ArrowUp"},     {0x27, "ArrowRight", "ArrowRight"},
+      {0x28, "ArrowDown", "ArrowDown"}, {0x2d, "Insert", "Insert"},
+      {0x2e, "Delete", "Delete"},       {0x5b, "Meta", "MetaLeft"},
+      {0x5c, "Meta", "MetaRight"},      {0xba, ";", "Semicolon"},
+      {0xbb, "=", "Equal"},             {0xbc, ",", "Comma"},
+      {0xbd, "-", "Minus"},             {0xbe, ".", "Period"},
+      {0xbf, "/", "Slash"},             {0xc0, "`", "Backquote"},
+      {0xdb, "[", "BracketLeft"},       {0xdc, "\\", "Backslash"},
+      {0xdd, "]", "BracketRight"},      {0xde, "'", "Quote"},
+  };
+  for (const auto& entry : kKeys) {
+    if (entry.vk == vk) {
+      key = entry.key;
+      code = entry.code;
+      return true;
     }
   }
+  return false;
+}
+
+std::string Lowercase(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return text;
+}
+
+// A file name for a download: the last path element, without leading dots,
+// control characters or separators, and short enough for any filesystem.
+std::string DownloadName(std::string name) {
+  name = std::filesystem::path(name).filename().string();
+  std::string clean;
+  for (unsigned char c : name) {
+    if (c >= 0x20 && c != 0x7f && c != '/' && c != '\\') {
+      clean += static_cast<char>(c);
+    }
+  }
+  while (!clean.empty() && (clean.front() == '.' || clean.front() == ' ')) {
+    clean.erase(clean.begin());
+  }
+  if (clean.size() > 200) {
+    clean.resize(200);
+  }
+  return clean.empty() ? "download" : clean;
+}
+
+// The first free name in the Downloads folder: "name", "name (1)", ...
+std::filesystem::path FreeDownloadPath(const std::filesystem::path& folder, const std::string& name) {
+  const auto stem = std::filesystem::path(name).stem().string();
+  const auto extension = std::filesystem::path(name).extension().string();
+  auto candidate = folder / name;
+  for (int copy = 1; std::filesystem::exists(candidate) && copy < 1000; ++copy) {
+    candidate = folder / (stem + " (" + std::to_string(copy) + ")" + extension);
+  }
+  return candidate;
+}
+
+void FocusDesktop(Session& session) {
+  for (auto& [id, tab] : session.tabs) {
+    tab.focus_on_show = false;
+  }
+  if (session.desktop) {
+    if (auto view = CefBrowserView::GetForBrowser(session.desktop)) {
+      if (session.window) {
+        session.window->Activate();
+      }
+      view->RequestFocus();
+      session.desktop->GetHost()->SetFocus(true);
+    }
+  }
+}
+
+bool TabIsShown(const Tab& tab) {
+  return tab.visible && !tab.closing && tab.bounds.width > 0 && tab.bounds.height > 0;
 }
 
 void ApplyBounds(Session& session, Tab& tab) {
   if (!tab.overlay) {
     return;
   }
-  const bool shown = tab.visible && !tab.closing && tab.bounds.width > 0 &&
-                     tab.bounds.height > 0;
+  const bool shown = TabIsShown(tab);
   if (shown) {
     tab.overlay->SetBounds(tab.bounds);
   }
   if (tab.overlay->IsVisible() != shown) {
+    const bool return_focus = !shown && tab.view->HasFocus();
     tab.overlay->SetVisible(shown);
-    if (!shown && tab.view && tab.view->HasFocus()) {
-      FocusDesktop(session);
+    if (return_focus && session.desktop) {
+      if (auto desktop = CefBrowserView::GetForBrowser(session.desktop)) {
+        desktop->RequestFocus();
+        session.desktop->GetHost()->SetFocus(true);
+      }
     }
+  }
+  if (shown && tab.focus_on_show && session.window->IsActive()) {
+    tab.focus_on_show = false;
+    tab.view->RequestFocus();
   }
 }
 
@@ -236,6 +372,10 @@ class ViewDelegate final : public CefBrowserViewDelegate {
 
 class BrowserClient final : public CefClient,
                             public CefDisplayHandler,
+                            public CefDownloadHandler,
+                            public CefFindHandler,
+                            public CefFocusHandler,
+                            public CefKeyboardHandler,
                             public CefLifeSpanHandler,
                             public CefLoadHandler,
                             public CefRequestHandler {
@@ -246,6 +386,10 @@ class BrowserClient final : public CefClient,
         session_(std::move(session)), tab_(std::move(tab)) {}
 
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+  CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
+  CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
+  CefRefPtr<CefFocusHandler> GetFocusHandler() override { return this; }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
@@ -283,6 +427,159 @@ class BrowserClient final : public CefClient,
     return true;
   }
 
+  // Route the real press and release so the Desktop can keep its switcher
+  // open while Alt is held.
+  bool OnPreKeyEvent(CefRefPtr<CefBrowser> browser, const CefKeyEvent& event, CefEventHandle,
+                     bool*) override {
+    if (!IsTab() || (event.modifiers & EVENTFLAG_ALTGR_DOWN) ||
+        (event.type != KEYEVENT_RAWKEYDOWN && event.type != KEYEVENT_KEYUP)) {
+      return false;
+    }
+    std::string key;
+    std::string code;
+    if (!DomKey(event, key, code)) {
+      return false;
+    }
+    const auto lower = Lowercase(key);
+    const int modifiers = event.modifiers & kShortcutModifiers;
+    const bool pressed = event.type == KEYEVENT_RAWKEYDOWN;
+    bool move_focus = false;
+    if (!pressed && !session_->shortcut_phases) {
+      return false;
+    }
+    if (pressed) {
+      const auto shortcut = std::find_if(
+          session_->shortcuts.begin(), session_->shortcuts.end(), [&](const Shortcut& entry) {
+            return entry.key == lower && entry.modifiers == modifiers;
+          });
+      if (shortcut == session_->shortcuts.end()) {
+        routed_keys_.erase(event.windows_key_code);
+        return false;
+      }
+      if (session_->shortcut_phases) {
+        routed_keys_.insert(event.windows_key_code);
+      }
+      move_focus = shortcut->focus_desktop;
+    } else if (routed_keys_.erase(event.windows_key_code) == 0) {
+      // Alt or Super may have been pressed before this tab got the focus.
+      if ((key != "Alt" && key != "Meta") || session_->shortcuts.empty()) {
+        return false;
+      }
+    }
+    auto stroke = TabEvent(tab_, "key");
+    stroke->SetString("key", key);
+    stroke->SetString("code", code);
+    stroke->SetString("phase", pressed ? "keydown" : "keyup");
+    stroke->SetBool("repeat", event.modifiers & EVENTFLAG_IS_REPEAT);
+    stroke->SetBool("alt", event.modifiers & EVENTFLAG_ALT_DOWN);
+    stroke->SetBool("shift", event.modifiers & EVENTFLAG_SHIFT_DOWN);
+    stroke->SetBool("ctrl", event.modifiers & EVENTFLAG_CONTROL_DOWN);
+    stroke->SetBool("meta", event.modifiers & EVENTFLAG_COMMAND_DOWN);
+    if (move_focus) {
+      // Let Chromium finish handling the consumed key before moving focus
+      // from the overlay widget to the Desktop's top-level widget.
+      CefPostTask(TID_UI, base::BindOnce(
+                              [](std::shared_ptr<Session> session, CefRefPtr<CefBrowser> source,
+                                 CefRefPtr<CefDictionaryValue> stroke) {
+                                if (session->closing || !source->IsValid()) {
+                                  return;
+                                }
+                                source->GetHost()->SetFocus(false);
+                                FocusDesktop(*session);
+                                Emit(*session, stroke);
+                              },
+                              session_, browser, stroke));
+    } else {
+      Emit(*session_, stroke);
+    }
+    return true;
+  }
+
+  // A key the page left unhandled goes on to the window, which must not
+  // deliver it again.
+  bool OnKeyEvent(CefRefPtr<CefBrowser>, const CefKeyEvent& event, CefEventHandle) override {
+    auto& seen = session_->seen_keys;
+    seen.push_back({event.type, event.windows_key_code, std::chrono::steady_clock::now()});
+    if (seen.size() > 32) {
+      seen.pop_front();
+    }
+    return false;
+  }
+
+  void OnGotFocus(CefRefPtr<CefBrowser>) override {
+    if (!IsTab()) {
+      return;
+    }
+    const auto tab = session_->tabs.find(tab_);
+    if (tab != session_->tabs.end() && TabIsShown(tab->second)) {
+      Emit(*session_, TabEvent(tab_, "focused"));
+    }
+  }
+
+  void OnFindResult(CefRefPtr<CefBrowser>, int, int count, const CefRect&, int active,
+                    bool final_update) override {
+    if (IsTab()) {
+      auto event = TabEvent(tab_, "found");
+      event->SetInt("total", count);
+      event->SetInt("active", active);
+      event->SetBool("final", final_update);
+      Emit(*session_, event);
+    }
+  }
+
+  // Only the Browser's tabs download, into the Downloads folder of the
+  // session's home, which Files shows.
+  bool CanDownload(CefRefPtr<CefBrowser>, const CefString&, const CefString&) override {
+    return IsTab();
+  }
+
+  bool OnBeforeDownload(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDownloadItem> item,
+                        const CefString& suggested_name,
+                        CefRefPtr<CefBeforeDownloadCallback> callback) override {
+    const char* home = std::getenv("HOME");
+    if (!IsTab() || !home || *home != '/') {
+      return false;
+    }
+    std::error_code error;
+    const auto folder = std::filesystem::path(home) / "Downloads";
+    std::filesystem::create_directories(folder, error);
+    if (error) {
+      return false;
+    }
+    auto path = FreeDownloadPath(folder, DownloadName(suggested_name.ToString()));
+    callback->Continue(path.string(), false);
+    // Starting a download takes the keyboard from the page; it goes back.
+    CefPostTask(TID_UI, base::BindOnce(
+                            [](CefRefPtr<CefBrowser> page) {
+                              if (auto view = CefBrowserView::GetForBrowser(page)) {
+                                view->RequestFocus();
+                              }
+                              page->GetHost()->SetFocus(true);
+                            },
+                            browser));
+    auto event = TabEvent(tab_, "download");
+    event->SetInt("download", static_cast<int>(item->GetId()));
+    event->SetString("name", path.filename().string());
+    event->SetString("url", item->GetURL());
+    event->SetString("state", "started");
+    Emit(*session_, event);
+    return true;
+  }
+
+  void OnDownloadUpdated(CefRefPtr<CefBrowser>, CefRefPtr<CefDownloadItem> item,
+                         CefRefPtr<CefDownloadItemCallback>) override {
+    if (!IsTab() || !(item->IsComplete() || item->IsCanceled() || item->IsInterrupted())) {
+      return;
+    }
+    auto event = TabEvent(tab_, "download");
+    event->SetInt("download", static_cast<int>(item->GetId()));
+    event->SetString("name", std::filesystem::path(item->GetFullPath().ToString()).filename().string());
+    event->SetString("url", item->GetURL());
+    event->SetString("state", item->IsComplete() ? "complete" : "failed");
+    event->SetDouble("bytes", static_cast<double>(item->GetReceivedBytes()));
+    Emit(*session_, event);
+  }
+
   void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                        const CefString& url) override {
     if (IsTab() && frame && frame->IsMain()) {
@@ -307,19 +604,25 @@ class BrowserClient final : public CefClient,
   // keyboard focus. The Desktop owns the window, so it takes the focus back.
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame,
                  int) override {
-    if (IsDesktop() && frame && frame->IsMain()) {
-      auto view = CefBrowserView::GetForBrowser(browser);
-      auto window = view ? view->GetWindow() : nullptr;
-      if (window && window->IsActive()) {
-        // The view keeps its focus when only the renderer changed, and the
-        // new renderer never learns it. Activating the window again restores
-        // the focus to the page.
-        window->Deactivate();
-        window->Activate();
-      }
-      if (view) {
-        view->RequestFocus();
-      }
+    if (!frame || !frame->IsMain() || !(IsDesktop() || IsTab())) {
+      return;
+    }
+    auto view = CefBrowserView::GetForBrowser(browser);
+    // A tab focused before its renderer existed (a popup, say) holds the
+    // view's focus, but its page never got the keyboard; the same goes for a
+    // new renderer of the Desktop.
+    if (IsTab() && !(view && view->HasFocus())) {
+      return;
+    }
+    auto window = view ? view->GetWindow() : nullptr;
+    if (window && window->IsActive()) {
+      // Activating the window again tells the focused renderer.
+      window->Deactivate();
+      window->Activate();
+    }
+    if (view) {
+      view->RequestFocus();
+      browser->GetHost()->SetFocus(true);
     }
   }
 
@@ -447,6 +750,7 @@ class BrowserClient final : public CefClient,
   const bool desktop_;
   const std::shared_ptr<Session> session_;
   const std::string tab_;
+  std::set<int> routed_keys_;
   IMPLEMENT_REFCOUNTING(BrowserClient);
 };
 
@@ -537,6 +841,65 @@ int Coordinate(CefRefPtr<CefDictionaryValue> args, const char* key, int low) {
   return 0;
 }
 
+CefRect PlacementBounds(CefRefPtr<CefDictionaryValue> placement) {
+  return CefRect(Coordinate(placement, "x", -kMaxViewSize),
+                 Coordinate(placement, "y", -kMaxViewSize),
+                 Coordinate(placement, "width", 0), Coordinate(placement, "height", 0));
+}
+
+Reply ApplyLayout(Session& session, CefRefPtr<CefDictionaryValue> args) {
+  const int generation = args->GetType("generation") == VTYPE_INT ? args->GetInt("generation") : -1;
+  auto surfaces = args->GetList("surfaces");
+  if (generation < 0 || !surfaces || surfaces->GetSize() > kMaxTabs) {
+    return Error(400, "The layout needs a generation and a list of surfaces");
+  }
+  if (generation <= session.layout_generation) {
+    return {};
+  }
+
+  std::map<std::string, CefRefPtr<CefDictionaryValue>> placements;
+  const auto focus = args->GetString("focus").ToString();
+  for (std::size_t index = 0; index < surfaces->GetSize(); ++index) {
+    auto placement = surfaces->GetDictionary(index);
+    const auto id = placement ? placement->GetString("id").ToString() : std::string();
+    if (!ValidTabId(id) || placement->GetType("visible") != VTYPE_BOOL ||
+        !placements.emplace(id, placement).second) {
+      return Error(400, "Each surface needs a unique tab id and visibility");
+    }
+    for (const char* coordinate : {"x", "y", "width", "height"}) {
+      const auto type = placement->GetType(coordinate);
+      if (type != VTYPE_INT && type != VTYPE_DOUBLE) {
+        return Error(400, "Each surface needs numeric bounds");
+      }
+    }
+  }
+  if (!focus.empty() && (!placements.count(focus) || !placements.at(focus)->GetBool("visible"))) {
+    return Error(400, "The focus target must be visible");
+  }
+
+  session.layout_generation = generation;
+  for (auto& [id, tab] : session.tabs) {
+    const auto placement = placements.find(id);
+    tab.visible = placement != placements.end() && placement->second->GetBool("visible");
+    if (placement != placements.end()) {
+      tab.bounds = PlacementBounds(placement->second);
+    }
+    tab.focus_on_show = TabIsShown(tab) && (id == focus || (focus.empty() && tab.focus_on_show));
+  }
+  // Hide outgoing surfaces before showing incoming surfaces in this UI task.
+  for (auto& [id, tab] : session.tabs) {
+    if (!TabIsShown(tab)) {
+      ApplyBounds(session, tab);
+    }
+  }
+  for (auto& [id, tab] : session.tabs) {
+    if (TabIsShown(tab)) {
+      ApplyBounds(session, tab);
+    }
+  }
+  return {};
+}
+
 void CloseTabs(Session& session) {
   std::vector<std::string> ids;
   for (const auto& [id, tab] : session.tabs) {
@@ -551,10 +914,15 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
   if (command == "hello") {
     // A new Desktop page: the tabs of the previous one have no window anymore.
     CloseTabs(session);
+    session.layout_generation = -1;
+    session.shortcuts.clear();
+    session.shortcut_phases = false;
     auto value = CefValue::Create();
     auto hello = CefDictionaryValue::Create();
     hello->SetInt("version", kBridgeVersion);
     hello->SetBool("browser", true);
+    hello->SetBool("surfaceLayout", true);
+    hello->SetBool("shortcutPhases", true);
     hello->SetString("event", kBrowserEvent);
     value->SetDictionary(hello);
     return {200, CefWriteJSON(value, JSON_WRITER_DEFAULT).ToString()};
@@ -564,6 +932,48 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
     return Error(400, "The command takes a JSON object");
   }
   auto args = parsed->GetDictionary();
+  if (command == "focus-desktop") {
+    FocusDesktop(session);
+    return {};
+  }
+  if (command == "browser/layout") {
+    return ApplyLayout(session, args);
+  }
+  if (command == "browser/shortcuts") {
+    if (args->GetType("shortcuts") != VTYPE_LIST) {
+      return Error(400, "The shortcuts are a list");
+    }
+    auto list = args->GetList("shortcuts");
+    if (list->GetSize() > 1024) {
+      return Error(400, "Too many shortcuts");
+    }
+    std::vector<Shortcut> shortcuts;
+    static const struct {
+      const char* name;
+      int flag;
+    } kModifiers[] = {{"alt", EVENTFLAG_ALT_DOWN},
+                      {"shift", EVENTFLAG_SHIFT_DOWN},
+                      {"ctrl", EVENTFLAG_CONTROL_DOWN},
+                      {"meta", EVENTFLAG_COMMAND_DOWN}};
+    for (std::size_t index = 0; index < list->GetSize(); ++index) {
+      auto entry = list->GetDictionary(index);
+      if (!entry || entry->GetString("key").ToString().empty()) {
+        return Error(400, "A shortcut names a key");
+      }
+      Shortcut shortcut;
+      shortcut.key = Lowercase(entry->GetString("key").ToString().substr(0, 32));
+      shortcut.focus_desktop = entry->GetBool("focusDesktop");
+      for (const auto& modifier : kModifiers) {
+        if (entry->GetBool(modifier.name)) {
+          shortcut.modifiers |= modifier.flag;
+        }
+      }
+      shortcuts.push_back(std::move(shortcut));
+    }
+    session.shortcuts = std::move(shortcuts);
+    session.shortcut_phases = args->GetBool("keyPhases");
+    return {};
+  }
   if (command == "browser/end-private") {
     std::vector<std::string> ids;
     for (const auto& [id, tab] : session.tabs) {
@@ -612,9 +1022,7 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
       return {};  // A newer placement was applied already.
     }
     tab.generation = generation;
-    tab.bounds = CefRect(Coordinate(args, "x", -kMaxViewSize),
-                         Coordinate(args, "y", -kMaxViewSize),
-                         Coordinate(args, "width", 0), Coordinate(args, "height", 0));
+    tab.bounds = PlacementBounds(args);
     tab.visible = args->GetBool("visible");
     ApplyBounds(session, tab);
     return {};
@@ -630,10 +1038,35 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
     }
     return {};
   }
+  if (command == "browser/find") {
+    const auto text = args->GetString("text").ToString();
+    if (!tab.browser || text.empty() || text.size() > 1000) {
+      return Error(400, "Nothing to find");
+    }
+    tab.browser->GetHost()->Find(text, !args->HasKey("forward") || args->GetBool("forward"),
+                                 false, args->GetBool("next"));
+    return {};
+  }
+  if (command == "browser/stop-find") {
+    if (tab.browser) {
+      tab.browser->GetHost()->StopFinding(args->GetBool("clear"));
+    }
+    return {};
+  }
+  if (command == "browser/zoom") {
+    const double factor = args->GetType("factor") == VTYPE_INT ? args->GetInt("factor")
+                                                                : args->GetDouble("factor");
+    if (!tab.browser || !(factor >= 0.25 && factor <= 5)) {
+      return Error(400, "Zoom is a factor from 0.25 to 5");
+    }
+    // Chromium's zoom levels are powers of 1.2.
+    tab.browser->GetHost()->SetZoomLevel(std::log(factor) / std::log(1.2));
+    return {};
+  }
   if (command == "browser/action") {
     const auto action = args->GetString("action").ToString();
     if (action == "focus") {
-      if (tab.view && tab.visible) {
+      if (tab.overlay && tab.overlay->IsVisible() && session.window->IsActive()) {
         tab.view->RequestFocus();
       }
       return {};
@@ -907,6 +1340,44 @@ class WindowDelegate final : public CefWindowDelegate {
       window->SetFullscreen(true);
     }
     primary_->RequestFocus();
+  }
+
+  // After a tab's overlay had the keyboard, Chromium can leave the keyboard
+  // with no browser even though Views counts a browser as focused, and every
+  // key then reaches the window unseen. Such keys go to that browser. A key
+  // that a page left unhandled also reaches the window, and stays there.
+  bool OnKeyEvent(CefRefPtr<CefWindow> window, const CefKeyEvent& event) override {
+    auto& seen = session_->seen_keys;
+    const auto now = std::chrono::steady_clock::now();
+    while (!seen.empty() && now - seen.front().at > std::chrono::seconds(2)) {
+      seen.pop_front();
+    }
+    const auto match = std::find_if(seen.begin(), seen.end(), [&](const SeenKey& key) {
+      return key.type == event.type && key.code == event.windows_key_code;
+    });
+    if (match != seen.end()) {
+      seen.erase(match);
+      return false;
+    }
+    auto focused = window->GetFocusedView();
+    auto view = focused ? focused->AsBrowserView() : nullptr;
+    auto browser = view ? view->GetBrowser() : nullptr;
+    if (!browser) {
+      return false;
+    }
+    browser->GetHost()->SendKeyEvent(event);
+    // The window gets no character events: a key that types text sends one.
+    const bool command = (event.modifiers & (EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN)) &&
+                         !(event.modifiers & EVENTFLAG_ALTGR_DOWN);
+    const auto character = event.character;
+    if (event.type == KEYEVENT_RAWKEYDOWN && !command &&
+        ((character >= 0x20 && character != 0x7f) || character == 0x0d)) {
+      CefKeyEvent typed = event;
+      typed.type = KEYEVENT_CHAR;
+      seen.push_back({typed.type, typed.windows_key_code, now});
+      browser->GetHost()->SendKeyEvent(typed);
+    }
+    return true;
   }
 
   void OnWindowClosing(CefRefPtr<CefWindow>) override {

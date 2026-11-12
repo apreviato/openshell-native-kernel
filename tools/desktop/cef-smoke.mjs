@@ -279,7 +279,10 @@ async function smoke(mode, executable, outputArg) {
       report.sandbox = sandboxSample(child.pid);
       return report.sandbox.length >= fixtures.length && report.sandbox.every((renderer) => renderer.filtered);
     }, 8000);
-    tool("xdotool", ["windowactivate", "--sync", window, "key", "alt+F4"]);
+    // The kiosk gives Alt+F4 to the Desktop. Ask X11 to close the fixture.
+    if (tool("xdotool", ["windowquit", window], { optional: true }) === null) {
+      tool("xdotool", ["windowactivate", "--sync", window, "key", "alt+F4"]);
+    }
     await waitFor("graceful exit", () => child.exitCode === 0, 15000);
     report.ok = true;
   } catch (error) {

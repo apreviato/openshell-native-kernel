@@ -101,9 +101,25 @@ if [ -e /opt/openshell-cef ]; then
             grep -v file_path_watcher "$scratch"/out-isolation/cef-*/cef.log 2>/dev/null | tail -n 100 || true
             cef_status=$isolation_status
         fi
+        # The Linux apps profile: hostd opens the probe applications through Xpra,
+        # and the Desktop smoke opens them in Desktop windows.
+        linux_apps=0
+        if [ -d /opt/openshell ] && [ -f ./apps-smoke.mjs ]; then
+            linux_apps=1
+            apps_status=0
+            cef_smoke apps ./apps-smoke.mjs /opt/openshell || apps_status=$?
+            cat "$scratch"/out-apps/apps-*/apps-smoke.json 2>/dev/null || true
+            if [ "$apps_status" -eq 0 ]; then
+                echo OPENSHELL_NATIVE_APPS_OK
+            else
+                tail -n 60 "$scratch"/out-apps/apps-*/*.log 2>/dev/null || true
+                cef_status=$apps_status
+            fi
+        fi
         # The kiosk: the Rust launcher with hostd and the real Desktop bundle.
         if [ -d /opt/openshell ] && [ -x /opt/openshell-compat/bin/openshell-shell ]; then
             shell_status=0
+            export OPENSHELL_SMOKE_LINUX_APPS=$linux_apps
             cef_smoke shell ./shell-smoke.mjs /opt/openshell-compat/bin/openshell-shell /opt/openshell \
                 /opt/openshell-cef/openshell-cef-host || shell_status=$?
             cat "$scratch"/out-shell/shell-*/shell-smoke.json 2>/dev/null || true

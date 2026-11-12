@@ -117,8 +117,9 @@ fn hostd_url(child: &mut Child, port: u16) -> Result<Option<String>, Box<dyn Err
 fn session_command(executable: &OsStr) -> Command {
     let mut command = Command::new(executable);
     command.env_clear().process_group(0);
-    // A system without /etc/fonts, such as NixOS, names its font configuration.
-    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE"] {
+    // A system without /etc/fonts, such as NixOS, names its font configuration,
+    // and XDG_DATA_DIRS says where the installed applications' entries are.
+    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE", "XDG_DATA_DIRS"] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
         }
