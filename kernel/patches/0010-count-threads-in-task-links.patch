@@ -1,0 +1,46 @@
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs
+--- a/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs
+@@ -191,6 +191,12 @@ impl TidDirOps {
+ }
+ 
+ impl ProcDirOps for TaskDirOps {
++    fn extra_hard_links(&self) -> usize {
++        // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/fs/proc/base.c#L3949>
++        self.process()
++            .map_or(0, |process| process.tasks().lock().as_slice().len())
++    }
++
+     fn owner_thread(&self) -> Option<Arc<Thread>> {
+         self.0.thread()
+     }
+diff --git a/kernel/core/src/fs/fs_impls/procfs/template/dir.rs b/kernel/core/src/fs/fs_impls/procfs/template/dir.rs
+--- a/kernel/core/src/fs/fs_impls/procfs/template/dir.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/template/dir.rs
+@@ -176,7 +176,9 @@ impl<D: ProcDirOps + 'static> Inode for ProcDir<D> {
+ 
+     fn metadata(&self) -> Result<Metadata> {
+         let owner_thread = self.inner.owner_thread();
+-        Ok(self.common.metadata_with_owner(owner_thread))
++        let mut metadata = self.common.metadata_with_owner(owner_thread);
++        metadata.nr_hard_links += self.inner.extra_hard_links();
++        Ok(metadata)
+     }
+ 
+     fn resize(&self, _self_dentry: &Dentry, _new_size: usize) -> Result<()> {
+@@ -287,6 +289,15 @@ pub(in procfs) trait ProcDirOps: Sync + Send + Sized {
+         Ok(())
+     }
+ 
++    /// Returns the number of hard links in addition to `.` and the parent entry.
++    ///
++    /// Linux counts a hard link for each subdirectory, and user space relies on
++    /// this count for some directories. For example, Chromium counts the threads
++    /// of a process from the link count of `/proc/self/task`.
++    fn extra_hard_links(&self) -> usize {
++        0
++    }
++
+     /// Returns the dentry cache revalidation policy for this directory.
+     fn revalidation_policy(&self) -> RevalidationPolicy {
+         RevalidationPolicy::empty()

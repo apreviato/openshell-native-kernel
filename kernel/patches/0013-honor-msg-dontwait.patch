@@ -1,0 +1,163 @@
+diff --git a/kernel/core/src/net/socket/ip/datagram/mod.rs b/kernel/core/src/net/socket/ip/datagram/mod.rs
+--- a/kernel/core/src/net/socket/ip/datagram/mod.rs
++++ b/kernel/core/src/net/socket/ip/datagram/mod.rs
+@@ -237,7 +237,7 @@ impl Socket for DatagramSocket {
+         }
+ 
+         let (output, peer_addr) =
+-            self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
++            self.block_on_unless(IoEvents::IN, self.timeouts.recv_timeout(), flags.contains(RecvFlags::MSG_DONTWAIT), || {
+                 self.try_recv(writer, flags)
+             })?;
+ 
+diff --git a/kernel/core/src/net/socket/ip/stream/mod.rs b/kernel/core/src/net/socket/ip/stream/mod.rs
+--- a/kernel/core/src/net/socket/ip/stream/mod.rs
++++ b/kernel/core/src/net/socket/ip/stream/mod.rs
+@@ -628,7 +628,7 @@ impl Socket for StreamSocket {
+             warn!("sending control message is not supported");
+         }
+ 
+-        self.block_on(IoEvents::OUT, self.timeouts.send_timeout(), || {
++        self.block_on_unless(IoEvents::OUT, self.timeouts.send_timeout(), flags.contains(SendFlags::MSG_DONTWAIT), || {
+             self.try_send(reader, flags)
+         })
+ 
+@@ -646,7 +646,7 @@ impl Socket for StreamSocket {
+         }
+ 
+         let (received_bytes, _) =
+-            self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
++            self.block_on_unless(IoEvents::IN, self.timeouts.recv_timeout(), flags.contains(RecvFlags::MSG_DONTWAIT), || {
+                 self.try_recv(writer, flags)
+             })?;
+ 
+diff --git a/kernel/core/src/net/socket/mod.rs b/kernel/core/src/net/socket/mod.rs
+--- a/kernel/core/src/net/socket/mod.rs
++++ b/kernel/core/src/net/socket/mod.rs
+@@ -68,6 +68,28 @@ mod private {
+             }
+         }
+ 
++        /// Runs `try_op` like [`Self::block_on`], but returns at once when `dont_wait` is set.
++        ///
++        /// Send and receive operations pass `MSG_DONTWAIT` here, which makes a single
++        /// call non-blocking regardless of the file status flags.
++        fn block_on_unless<F, R>(
++            &self,
++            events: IoEvents,
++            timeout: Option<Duration>,
++            dont_wait: bool,
++            mut try_op: F,
++        ) -> Result<R>
++        where
++            Self: Sized,
++            F: FnMut() -> Result<R>,
++        {
++            if dont_wait {
++                try_op()
++            } else {
++                self.block_on(events, timeout, try_op)
++            }
++        }
++
+         /// Handles commands specific to its protocol or socket type.
+         fn protocol_ioctl(&self, _raw_ioctl: RawIoctl) -> Result<i32> {
+             return_errno_with_message!(Errno::ENOTTY, "the socket ioctl command is unknown");
+diff --git a/kernel/core/src/net/socket/netlink/common/mod.rs b/kernel/core/src/net/socket/netlink/common/mod.rs
+--- a/kernel/core/src/net/socket/netlink/common/mod.rs
++++ b/kernel/core/src/net/socket/netlink/common/mod.rs
+@@ -182,7 +182,7 @@ where
+         writer: &mut dyn MultiWrite,
+         flags: RecvFlags,
+     ) -> Result<(RecvOutput, MessageHeader)> {
+-        let (output, addr) = self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
++        let (output, addr) = self.block_on_unless(IoEvents::IN, self.timeouts.recv_timeout(), flags.contains(RecvFlags::MSG_DONTWAIT), || {
+             self.try_recv(writer, flags)
+         })?;
+ 
+diff --git a/kernel/core/src/net/socket/unix/datagram/socket.rs b/kernel/core/src/net/socket/unix/datagram/socket.rs
+--- a/kernel/core/src/net/socket/unix/datagram/socket.rs
++++ b/kernel/core/src/net/socket/unix/datagram/socket.rs
+@@ -307,9 +307,12 @@ impl Socket for UnixDatagramSocket {
+         }
+ 
+         let (output, control_messages, peer_addr) =
+-            self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
+-                self.local_receiver.try_recv(writer, flags)
+-            })?;
++            self.block_on_unless(
++                IoEvents::IN,
++                self.timeouts.recv_timeout(),
++                flags.contains(RecvFlags::MSG_DONTWAIT),
++                || self.local_receiver.try_recv(writer, flags),
++            )?;
+ 
+         let message_header = MessageHeader::new(Some(peer_addr.into()), control_messages);
+ 
+diff --git a/kernel/core/src/net/socket/unix/stream/socket.rs b/kernel/core/src/net/socket/unix/stream/socket.rs
+--- a/kernel/core/src/net/socket/unix/stream/socket.rs
++++ b/kernel/core/src/net/socket/unix/stream/socket.rs
+@@ -510,7 +510,8 @@ impl Socket for UnixStreamSocket {
+         }
+         let mut auxiliary_data = AuxiliaryData::from_control(control_messages)?;
+ 
+-        self.block_on(IoEvents::OUT, self.timeouts.send_timeout(), || {
++        let dont_wait = flags.contains(SendFlags::MSG_DONTWAIT);
++        self.block_on_unless(IoEvents::OUT, self.timeouts.send_timeout(), dont_wait, || {
+             self.try_send(reader, &mut auxiliary_data, flags)
+         })
+     }
+@@ -526,7 +527,7 @@ impl Socket for UnixStreamSocket {
+         }
+ 
+         let (output, control_messages) =
+-            self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
++            self.block_on_unless(IoEvents::IN, self.timeouts.recv_timeout(), flags.contains(RecvFlags::MSG_DONTWAIT), || {
+                 self.try_recv(writer, flags)
+             })?;
+ 
+diff --git a/kernel/core/src/net/socket/util/message_flags.rs b/kernel/core/src/net/socket/util/message_flags.rs
+--- a/kernel/core/src/net/socket/util/message_flags.rs
++++ b/kernel/core/src/net/socket/util/message_flags.rs
+@@ -23,7 +23,8 @@ bitflags! {
+         const MSG_ZEROCOPY  = 0x4000000;
+         const MSG_FASTOPEN  = 0x20000000;
+ 
+-        const SUPPORTED     = 0x0;
++        // The kernel never raises `SIGPIPE` for sockets, so `MSG_NOSIGNAL` always holds.
++        const SUPPORTED     = SendFlags::MSG_DONTWAIT.bits | SendFlags::MSG_NOSIGNAL.bits;
+     }
+ }
+ 
+@@ -50,7 +51,9 @@ bitflags! {
+         const MSG_SOCK_DEVMEM  = 0x2000000;
+         const MSG_CMSG_CLOEXEC = 0x40000000;
+ 
+-        const SUPPORTED        = RecvFlags::MSG_PEEK.bits | RecvFlags::MSG_TRUNC.bits;
++        const SUPPORTED        = RecvFlags::MSG_PEEK.bits
++            | RecvFlags::MSG_TRUNC.bits
++            | RecvFlags::MSG_DONTWAIT.bits;
+     }
+ }
+ 
+diff --git a/kernel/core/src/net/socket/vsock/stream/mod.rs b/kernel/core/src/net/socket/vsock/stream/mod.rs
+--- a/kernel/core/src/net/socket/vsock/stream/mod.rs
++++ b/kernel/core/src/net/socket/vsock/stream/mod.rs
+@@ -390,7 +390,7 @@ impl Socket for VsockStreamSocket {
+             warn!("sending control message is not supported");
+         }
+ 
+-        self.block_on(IoEvents::OUT, None, || self.try_send(reader, flags))
++        self.block_on_unless(IoEvents::OUT, None, flags.contains(SendFlags::MSG_DONTWAIT), || self.try_send(reader, flags))
+ 
+         // TODO: Trigger `SIGPIPE` if the error code is `EPIPE` and `MSG_NOSIGNAL` is not specified
+     }
+@@ -405,7 +405,7 @@ impl Socket for VsockStreamSocket {
+             warn!("unsupported flags: {:?}", flags);
+         }
+ 
+-        let received_bytes = self.block_on(IoEvents::IN, None, || self.try_recv(writer, flags))?;
++        let received_bytes = self.block_on_unless(IoEvents::IN, None, flags.contains(RecvFlags::MSG_DONTWAIT), || self.try_recv(writer, flags))?;
+ 
+         // TODO: Receive control message
+         let message_header = MessageHeader::new(None, Vec::new());

@@ -1,0 +1,36 @@
+diff --git a/kernel/core/src/fs/fs_impls/devpts/slave.rs b/kernel/core/src/fs/fs_impls/devpts/slave.rs
+--- a/kernel/core/src/fs/fs_impls/devpts/slave.rs
++++ b/kernel/core/src/fs/fs_impls/devpts/slave.rs
+@@ -17,7 +17,7 @@ use crate::{
+         },
+     },
+     prelude::*,
+-    process::{Gid, Uid},
++    process::{Gid, Uid, posix_thread::AsPosixThread},
+ };
+ 
+ /// Same major number with Linux, the minor number is the index of slave.
+@@ -34,13 +34,22 @@ pub(crate) struct PtySlaveInode {
+ impl PtySlaveInode {
+     pub(crate) fn new(device: Arc<PtySlave>, fs: Weak<DevPts>) -> Arc<Self> {
+         let devpts = fs.upgrade().unwrap();
+-        let metadata = Metadata::new_device(
++        let mut metadata = Metadata::new_device(
+             device.index() as u64 + FIRST_SLAVE_INO,
+             mkmod!(u+rw, g+w),
+             BLOCK_SIZE,
+             device.as_ref(),
+             devpts.sb().container_dev_id,
+         );
++        // The terminal belongs to the thread that opened `ptmx`, so that the C
++        // library can grant it to an unprivileged user.
++        //
++        // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/fs/devpts/inode.c#L560>
++        if let Some(posix_thread) = current_thread!().as_posix_thread() {
++            let credentials = posix_thread.credentials();
++            metadata.uid = credentials.fsuid();
++            metadata.gid = credentials.fsgid();
++        }
+         Arc::new(Self {
+             device,
+             metadata: RwLock::new(metadata),

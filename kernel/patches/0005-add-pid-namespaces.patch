@@ -1,0 +1,1612 @@
+diff --git a/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs b/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs
+--- a/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs
++++ b/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs
+@@ -392,7 +392,6 @@ pub(crate) enum NsType {
+     Mnt,
+     #[expect(unused)]
+     Net,
+-    #[expect(unused)]
+     Pid,
+     #[expect(unused)]
+     Time,
+diff --git a/kernel/core/src/fs/vfs/path/resolver.rs b/kernel/core/src/fs/vfs/path/resolver.rs
+--- a/kernel/core/src/fs/vfs/path/resolver.rs
++++ b/kernel/core/src/fs/vfs/path/resolver.rs
+@@ -517,7 +517,7 @@ impl PathResolver {
+ 
+         // TODO: This method should only iterate threads in the current PID namespace instead of
+         // the whole PID table.
+-        for thread in pid_table.iter_threads() {
++        for thread in pid_table.iter_threads_unfiltered() {
+             let posix_thread = thread.as_posix_thread().unwrap();
+             let ns_proxy = posix_thread.ns_proxy().lock();
+             let Some(ns_proxy) = ns_proxy.as_ref() else {
+diff --git a/kernel/core/src/net/socket/unix/cred.rs b/kernel/core/src/net/socket/unix/cred.rs
+--- a/kernel/core/src/net/socket/unix/cred.rs
++++ b/kernel/core/src/net/socket/unix/cred.rs
+@@ -39,7 +39,7 @@ impl<R: TRights> SocketCred<R> {
+     #[require(R > Read)]
+     pub(super) fn to_effective_c_cred(&self) -> CUserCred {
+         CUserCred {
+-            pid: self.pid,
++            pid: crate::process::pid_to_user(self.pid),
+             uid: self.cred.euid(),
+             gid: self.cred.egid(),
+         }
+@@ -49,7 +49,7 @@ impl<R: TRights> SocketCred<R> {
+     #[require(R > Read)]
+     pub(super) fn to_real_c_cred(&self) -> CUserCred {
+         CUserCred {
+-            pid: self.pid,
++            pid: crate::process::pid_to_user(self.pid),
+             uid: self.cred.ruid(),
+             gid: self.cred.rgid(),
+         }
+diff --git a/kernel/core/src/process/clone.rs b/kernel/core/src/process/clone.rs
+--- a/kernel/core/src/process/clone.rs
++++ b/kernel/core/src/process/clone.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use super::{PidNamespace, pid_to_user};
+ use alloc::borrow::Cow;
+ use core::{num::NonZeroU64, sync::atomic::Ordering};
+ 
+@@ -278,6 +279,7 @@ impl CloneFlags {
+             | CloneFlags::CLONE_NEWNS
+             | CloneFlags::CLONE_NEWUTS
+             | CloneFlags::CLONE_NEWUSER
++            | CloneFlags::CLONE_NEWPID
+             | CloneFlags::CLONE_PARENT;
+         let unsupported_flags = *self - supported_flags;
+         if !unsupported_flags.is_empty() {
+@@ -437,7 +439,17 @@ fn clone_child_task(
+     // Inherit the thread name.
+     let thread_name = *posix_thread.thread_name().lock();
+ 
++    // After `unshare(CLONE_NEWPID)`, new threads would be in another PID
++    // namespace than their process.
++    if !Arc::ptr_eq(child_ns_proxy.pid_ns_for_children(), process.pid_ns()) {
++        return_errno_with_message!(
++            Errno::EINVAL,
++            "the PID namespace for children differs from the PID namespace of the process"
++        );
++    }
++
+     let child_tid = allocate_posix_tid();
++    let pid_registration = process.pid_ns().register(child_tid)?;
+     let child_task = {
+         let credentials = {
+             let credentials = ctx.posix_thread.credentials();
+@@ -493,6 +505,7 @@ fn clone_child_task(
+ 
+     let child_thread = child_task.as_thread().unwrap();
+     pid_table::pid_table_mut().insert_thread(child_tid, child_thread);
++    pid_registration.commit();
+ 
+     Ok(child_task)
+ }
+@@ -575,6 +588,8 @@ fn clone_child_process(
+     let child_oom_score_adj = process.oom_score_adj().load(Ordering::Relaxed);
+ 
+     let child_tid = allocate_posix_tid();
++    let child_pid_ns = child_ns_proxy.pid_ns_for_children().clone();
++    let pid_registration = child_pid_ns.register(child_tid)?;
+ 
+     let child = {
+         let child_vmar_arc = child_vmar.clone_arc();
+@@ -629,6 +644,7 @@ fn clone_child_process(
+             child_oom_score_adj,
+             child_sig_dispositions,
+             child_user_ns,
++            child_pid_ns,
+             child_thread_builder,
+         )
+     };
+@@ -641,6 +657,12 @@ fn clone_child_process(
+ 
+     // Sets parent process and group for child process.
+     set_parent_and_group(clone_flags, process, &child);
++    pid_registration.commit();
++
++    // The first process of a PID namespace adopts the orphans of the namespace.
++    if child.pid_ns().is_init_process(child_tid) {
++        child.set_child_subreaper();
++    }
+ 
+     Ok(child)
+ }
+@@ -677,7 +699,7 @@ fn clone_parent_settid(
+     if let Some(addr) =
+         parent_tidptr.filter(|_| clone_flags.contains(CloneFlags::CLONE_PARENT_SETTID))
+     {
+-        current_userspace!().write_val(addr, &child_tid)?;
++        current_userspace!().write_val(addr, &pid_to_user(child_tid))?;
+     }
+     Ok(())
+ }
+@@ -848,6 +870,7 @@ fn create_child_process(
+     oom_score_adj: i16,
+     sig_dispositions: Arc<Mutex<SigDispositions>>,
+     user_ns: Arc<UserNamespace>,
++    pid_ns: Arc<PidNamespace>,
+     thread_builder: PosixThreadBuilder,
+ ) -> Arc<Process> {
+     let child_proc = Process::new(
+@@ -858,6 +881,7 @@ fn create_child_process(
+         oom_score_adj,
+         sig_dispositions,
+         user_ns,
++        pid_ns,
+     );
+ 
+     let child_task = thread_builder.process(Arc::downgrade(&child_proc)).build();
+diff --git a/kernel/core/src/process/exit.rs b/kernel/core/src/process/exit.rs
+--- a/kernel/core/src/process/exit.rs
++++ b/kernel/core/src/process/exit.rs
+@@ -27,6 +27,8 @@ pub(super) fn exit_process(current_process: &Process) {
+     send_parent_death_signal(&children);
+     drop(children);
+ 
++    kill_pid_ns_members(current_process);
++
+     // Mark the current process as a zombie. After this point, it may be reaped concurrently and
+     // removed from the process tree. For example, the process may no longer have a live parent if
+     // the parent exits after reaping the process.
+@@ -45,6 +47,31 @@ pub(super) fn exit_process(current_process: &Process) {
+     drop(cgroup_guard);
+ }
+ 
++/// Kills the processes of a PID namespace when its first process exits.
++///
++/// The first process reaps the orphans of its namespace, so the namespace cannot
++/// continue without it. No new process can enter the namespace afterwards.
++fn kill_pid_ns_members(current_process: &Process) {
++    use crate::process::signal::constants::SIGKILL;
++
++    let pid_ns = current_process.pid_ns();
++    if !pid_ns.is_init_process(current_process.pid()) {
++        return;
++    }
++    pid_ns.set_dead();
++
++    let members: Vec<Arc<Process>> = pid_table::pid_table_mut()
++        .iter_processes_unfiltered()
++        .filter(|process| {
++            process.pid() != current_process.pid()
++                && pid_ns.is_same_or_ancestor_of(process.pid_ns())
++        })
++        .collect();
++    for process in members {
++        process.enqueue_signal(Box::new(KernelSignal::new(SIGKILL)));
++    }
++}
++
+ /// Drops a value after releasing the lock or borrow guard.
+ ///
+ /// For example, [`ThreadLocal::vmar`] needs to be borrowed during a context switch. This means that
+@@ -81,7 +108,7 @@ fn move_children_to_reaper_process(current_process: &Process) -> BTreeMap<Pid, A
+     }
+ 
+     let init_process = pid_table::pid_table_mut()
+-        .get_process(INIT_PROCESS_PID)
++        .get_process_unfiltered(INIT_PROCESS_PID)
+         .unwrap();
+     let children = move_process_children(current_process, &init_process).unwrap();
+     init_process.children_wait_queue().wake_all();
+diff --git a/kernel/core/src/process/mod.rs b/kernel/core/src/process/mod.rs
+--- a/kernel/core/src/process/mod.rs
++++ b/kernel/core/src/process/mod.rs
+@@ -28,7 +28,10 @@ pub(crate) use credentials::{Credentials, Gid, Uid};
+ pub(crate) use execve::do_execve;
+ pub(crate) use kill::{kill, kill_all, kill_group, tgkill};
+ pub use namespace::user_ns::UserNamespace;
+-pub(crate) use namespace::user_ns::IdKind;
++pub(crate) use namespace::{
++    pid_ns::{PidNamespace, pid_from_user, pid_to_user},
++    user_ns::IdKind,
++};
+ pub(crate) use namespace::{
+     nsproxy::{ContextSetNsAdminApi, NsProxy, NsProxyBuilder, check_unsupported_ns_flags},
+     unshare::ContextUnshareAdminApi,
+diff --git a/kernel/core/src/process/namespace/mod.rs b/kernel/core/src/process/namespace/mod.rs
+--- a/kernel/core/src/process/namespace/mod.rs
++++ b/kernel/core/src/process/namespace/mod.rs
+@@ -2,4 +2,5 @@
+ 
+ pub(super) mod nsproxy;
+ pub(super) mod unshare;
++pub(crate) mod pid_ns;
+ pub(super) mod user_ns;
+diff --git a/kernel/core/src/process/namespace/nsproxy.rs b/kernel/core/src/process/namespace/nsproxy.rs
+--- a/kernel/core/src/process/namespace/nsproxy.rs
++++ b/kernel/core/src/process/namespace/nsproxy.rs
+@@ -7,7 +7,7 @@ use crate::{
+     ipc::IpcNamespace,
+     net::uts_ns::UtsNamespace,
+     prelude::*,
+-    process::{CloneFlags, Process, UserNamespace, posix_thread::PosixThread},
++    process::{CloneFlags, PidNamespace, Process, UserNamespace, posix_thread::PosixThread},
+ };
+ 
+ /// A struct that acts as a per-thread proxy to give access to most namespaces.
+@@ -16,8 +16,10 @@ use crate::{
+ /// and keeps a local copy in `ThreadLocal` for fast access.
+ /// `NsProxy` contains all types of namespaces except
+ /// 1. The user namespace, which is included in the `Process` struct.
+-/// 2. The PID namespace, which is included in the `Process` struct (TODO).
++/// 2. The PID namespace of the process itself, which is included in the `Process` struct.
++///    The proxy holds the PID namespace that new child processes will be in.
+ pub(crate) struct NsProxy {
++    pid_ns_for_children: Arc<PidNamespace>,
+     cgroup_ns: Arc<CgroupNamespace>,
+     ipc_ns: Arc<IpcNamespace>,
+     mnt_ns: Arc<MountNamespace>,
+@@ -30,6 +32,7 @@ impl NsProxy {
+         static INIT: Once<Arc<NsProxy>> = Once::new();
+         INIT.call_once(|| {
+             Arc::new(NsProxy {
++                pid_ns_for_children: PidNamespace::get_init_singleton().clone(),
+                 cgroup_ns: CgroupNamespace::get_init_singleton().clone(),
+                 ipc_ns: IpcNamespace::get_init_singleton().clone(),
+                 mnt_ns: MountNamespace::get_init_singleton().clone(),
+@@ -91,11 +94,23 @@ impl NsProxy {
+             builder.uts_ns(new_uts_ns);
+         }
+ 
++        if clone_ns_flags.contains(CloneFlags::CLONE_NEWPID) {
++            let new_pid_ns = self
++                .pid_ns_for_children
++                .new_child(user_ns.clone(), posix_thread)?;
++            builder.pid_ns_for_children(new_pid_ns);
++        }
++
+         // TODO: Support other namespaces.
+ 
+         Ok(Arc::new(builder.build()))
+     }
+ 
++    /// Returns the PID namespace that new child processes will be in.
++    pub(crate) fn pid_ns_for_children(&self) -> &Arc<PidNamespace> {
++        &self.pid_ns_for_children
++    }
++
+     /// Returns the associated cgroup namespace.
+     pub(crate) fn cgroup_ns(&self) -> &Arc<CgroupNamespace> {
+         &self.cgroup_ns
+@@ -123,6 +138,7 @@ pub(crate) struct NsProxyBuilder<'a> {
+     old_proxy: &'a NsProxy,
+ 
+     // Fields for new namespaces.
++    pid_ns_for_children: Option<Arc<PidNamespace>>,
+     cgroup_ns: Option<Arc<CgroupNamespace>>,
+     ipc_ns: Option<Arc<IpcNamespace>>,
+     mnt_ns: Option<Arc<MountNamespace>>,
+@@ -134,6 +150,7 @@ impl<'a> NsProxyBuilder<'a> {
+     pub(crate) fn new(old_proxy: &'a NsProxy) -> Self {
+         Self {
+             old_proxy,
++            pid_ns_for_children: None,
+             cgroup_ns: None,
+             ipc_ns: None,
+             mnt_ns: None,
+@@ -141,6 +158,12 @@ impl<'a> NsProxyBuilder<'a> {
+         }
+     }
+ 
++    /// Sets the new PID namespace for the children of the context being built.
++    pub(crate) fn pid_ns_for_children(&mut self, pid_ns: Arc<PidNamespace>) -> &mut Self {
++        self.pid_ns_for_children = Some(pid_ns);
++        self
++    }
++
+     /// Sets the new cgroup namespace for the context being built.
+     pub(crate) fn cgroup_ns(&mut self, cgroup_ns: Arc<CgroupNamespace>) -> &mut Self {
+         self.cgroup_ns = Some(cgroup_ns);
+@@ -169,18 +192,21 @@ impl<'a> NsProxyBuilder<'a> {
+     pub(crate) fn build(self) -> NsProxy {
+         let Self {
+             old_proxy,
++            pid_ns_for_children: new_pid,
+             cgroup_ns: new_cgroup,
+             ipc_ns: new_ipc,
+             mnt_ns: new_mnt,
+             uts_ns: new_uts,
+         } = self;
+ 
++        let new_pid = new_pid.unwrap_or_else(|| old_proxy.pid_ns_for_children.clone());
+         let new_cgroup = new_cgroup.unwrap_or_else(|| old_proxy.cgroup_ns.clone());
+         let new_ipc = new_ipc.unwrap_or_else(|| old_proxy.ipc_ns.clone());
+         let new_mnt = new_mnt.unwrap_or_else(|| old_proxy.mnt_ns.clone());
+         let new_uts = new_uts.unwrap_or_else(|| old_proxy.uts_ns.clone());
+ 
+         NsProxy {
++            pid_ns_for_children: new_pid,
+             cgroup_ns: new_cgroup,
+             ipc_ns: new_ipc,
+             mnt_ns: new_mnt,
+@@ -196,6 +222,7 @@ pub(crate) fn check_unsupported_ns_flags(flags: CloneFlags) -> Result<()> {
+     const SUPPORTED_FLAGS: CloneFlags = CloneFlags::CLONE_NEWCGROUP
+         .union(CloneFlags::CLONE_NEWIPC)
+         .union(CloneFlags::CLONE_NEWNS)
++        .union(CloneFlags::CLONE_NEWPID)
+         .union(CloneFlags::CLONE_NEWUTS);
+ 
+     let unsupported_flags =
+diff --git a/kernel/core/src/process/namespace/pid_ns.rs b/kernel/core/src/process/namespace/pid_ns.rs
+new file mode 100755
+--- /dev/null
++++ b/kernel/core/src/process/namespace/pid_ns.rs
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! PID namespaces.
++//!
++//! The kernel identifies every thread, process, process group and session by one
++//! global ID, which is the ID in the initial PID namespace. A process in another
++//! PID namespace additionally has a local ID in its namespace and in each ancestor
++//! of that namespace.
++//!
++//! Local IDs only exist at the system call boundary: [`pid_from_user`] converts an
++//! ID that user space passes in, and [`pid_to_user`] converts an ID before it is
++//! shown to user space. As a second line of defense, the PID table hides entries
++//! from threads whose namespace does not contain them, so a missing conversion
++//! cannot reach a process outside the namespace.
++
++use spin::Once;
++
++use crate::{
++    fs::pseudofs::{NsCommonOps, NsType, StashedDentry},
++    prelude::*,
++    process::{
++        Pid, UserNamespace, credentials::capabilities::CapSet, posix_thread::{AsPosixThread, PosixThread},
++    },
++    security::lsm::hooks as lsm_hooks,
++};
++
++/// The maximum nesting depth of PID namespaces.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/include/linux/pid_namespace.h#L18>
++const MAX_LEVEL: u32 = 32;
++
++/// The largest local ID.
++const MAX_LOCAL_ID: u32 = 4 * 1024 * 1024;
++
++/// The local ID of the first process in a PID namespace.
++const LOCAL_INIT_ID: u32 = 1;
++
++/// A global ID that never identifies anything.
++pub(crate) const NO_SUCH_ID: u32 = u32::MAX;
++
++/// The PID namespace.
++pub(crate) struct PidNamespace {
++    parent: Option<Arc<PidNamespace>>,
++    owner: Arc<UserNamespace>,
++    /// The nesting depth. The initial namespace has level zero.
++    level: u32,
++    ids: Mutex<LocalIds>,
++    stashed_dentry: StashedDentry,
++}
++
++/// The local IDs of a PID namespace.
++struct LocalIds {
++    last_local: u32,
++    to_global: BTreeMap<u32, u32>,
++    to_local: BTreeMap<u32, u32>,
++    /// Whether the first process of the namespace has exited.
++    ///
++    /// No new process can enter such a namespace.
++    is_dead: bool,
++}
++
++impl PidNamespace {
++    /// Returns a reference to the singleton initial PID namespace.
++    pub(crate) fn get_init_singleton() -> &'static Arc<PidNamespace> {
++        static INIT: Once<Arc<PidNamespace>> = Once::new();
++
++        INIT.call_once(|| {
++            Self::new(None, UserNamespace::get_init_singleton().clone(), 0)
++        })
++    }
++
++    fn new(parent: Option<Arc<PidNamespace>>, owner: Arc<UserNamespace>, level: u32) -> Arc<Self> {
++        Arc::new(Self {
++            parent,
++            owner,
++            level,
++            ids: Mutex::new(LocalIds {
++                last_local: 0,
++                to_global: BTreeMap::new(),
++                to_local: BTreeMap::new(),
++                is_dead: false,
++            }),
++            stashed_dentry: StashedDentry::new(),
++        })
++    }
++
++    /// Creates an empty PID namespace as a child of this namespace.
++    pub(crate) fn new_child(
++        self: &Arc<Self>,
++        owner: Arc<UserNamespace>,
++        posix_thread: &PosixThread,
++    ) -> Result<Arc<Self>> {
++        lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
++            owner.as_ref(),
++            posix_thread,
++            CapSet::SYS_ADMIN,
++        ))?;
++        if self.level >= MAX_LEVEL {
++            return_errno_with_message!(Errno::EINVAL, "too many nested PID namespaces");
++        }
++        Ok(Self::new(Some(self.clone()), owner, self.level + 1))
++    }
++
++    /// Returns whether this is the initial PID namespace.
++    pub(crate) fn is_init(&self) -> bool {
++        self.parent.is_none()
++    }
++
++    /// Returns whether this namespace is the same as, or an ancestor of, the other namespace.
++    pub(crate) fn is_same_or_ancestor_of(&self, other: &PidNamespace) -> bool {
++        let mut current = other;
++        loop {
++            if core::ptr::eq(self, current) {
++                return true;
++            }
++            match current.parent.as_deref() {
++                Some(parent) if current.level > self.level => current = parent,
++                _ => return false,
++            }
++        }
++    }
++
++    /// Gives a global ID a local ID in this namespace and in all of its ancestors.
++    ///
++    /// The global ID must belong to a new thread or process of this namespace.
++    pub(crate) fn register(self: &Arc<Self>, global: u32) -> Result<PidRegistration> {
++        let mut registered = 0;
++        let mut result = Ok(());
++
++        let mut current = Some(self.as_ref());
++        while let Some(pid_ns) = current.filter(|pid_ns| !pid_ns.is_init()) {
++            result = pid_ns.ids.lock().insert(global);
++            if result.is_err() {
++                break;
++            }
++            registered += 1;
++            current = pid_ns.parent.as_deref();
++        }
++
++        if let Err(err) = result {
++            // Undo the registrations in the namespaces below the failing one.
++            let mut current = Some(self.as_ref());
++            for _ in 0..registered {
++                let pid_ns = current.unwrap();
++                pid_ns.ids.lock().remove(global);
++                current = pid_ns.parent.as_deref();
++            }
++            return Err(err);
++        }
++
++        Ok(PidRegistration {
++            pid_ns: self.clone(),
++            global,
++            is_committed: false,
++        })
++    }
++
++    /// Removes the local IDs of a global ID in this namespace and in its ancestors.
++    pub(crate) fn unregister(&self, global: u32) {
++        let mut current = Some(self);
++        while let Some(pid_ns) = current.filter(|pid_ns| !pid_ns.is_init()) {
++            pid_ns.ids.lock().remove(global);
++            current = pid_ns.parent.as_deref();
++        }
++    }
++
++    /// Returns the ID in this namespace for a global ID.
++    pub(crate) fn local_of(&self, global: u32) -> Option<u32> {
++        if self.is_init() {
++            return Some(global);
++        }
++        self.ids.lock().to_local.get(&global).copied()
++    }
++
++    /// Returns the global ID for an ID in this namespace.
++    pub(crate) fn global_of(&self, local: u32) -> Option<u32> {
++        if self.is_init() {
++            return Some(local);
++        }
++        self.ids.lock().to_global.get(&local).copied()
++    }
++
++    /// Returns whether the process is the first process of this namespace.
++    pub(crate) fn is_init_process(&self, global: Pid) -> bool {
++        !self.is_init() && self.local_of(global) == Some(LOCAL_INIT_ID)
++    }
++
++    /// Marks the namespace as dead because its first process has exited.
++    pub(crate) fn set_dead(&self) {
++        self.ids.lock().is_dead = true;
++    }
++}
++
++impl LocalIds {
++    fn insert(&mut self, global: u32) -> Result<()> {
++        if self.is_dead {
++            return_errno_with_message!(
++                Errno::ENOMEM,
++                "the init process of the PID namespace has exited"
++            );
++        }
++        debug_assert!(!self.to_local.contains_key(&global));
++
++        // Allocate local IDs in increasing order and wrap around like Linux does.
++        let mut local = self.last_local;
++        for _ in 0..MAX_LOCAL_ID {
++            local = if local >= MAX_LOCAL_ID { LOCAL_INIT_ID } else { local + 1 };
++            // After a wrap, the ID of the first process stays reserved.
++            if (local == LOCAL_INIT_ID && self.last_local != 0)
++                || self.to_global.contains_key(&local)
++            {
++                continue;
++            }
++            self.last_local = local;
++            self.to_global.insert(local, global);
++            self.to_local.insert(global, local);
++            return Ok(());
++        }
++        return_errno_with_message!(Errno::EAGAIN, "the PID namespace has no free IDs");
++    }
++
++    fn remove(&mut self, global: u32) {
++        if let Some(local) = self.to_local.remove(&global) {
++            self.to_global.remove(&local);
++        }
++    }
++}
++
++/// A pending registration of a global ID in a PID namespace.
++///
++/// Dropping the value removes the local IDs again, unless the registration has
++/// been committed because the ID entered the PID table. The PID table then
++/// removes the local IDs together with the table entry.
++pub(crate) struct PidRegistration {
++    pid_ns: Arc<PidNamespace>,
++    global: u32,
++    is_committed: bool,
++}
++
++impl PidRegistration {
++    pub(crate) fn commit(mut self) {
++        self.is_committed = true;
++    }
++}
++
++impl Drop for PidRegistration {
++    fn drop(&mut self) {
++        if !self.is_committed {
++            self.pid_ns.unregister(self.global);
++        }
++    }
++}
++
++impl NsCommonOps for PidNamespace {
++    const TYPE: NsType = NsType::Pid;
++
++    fn owner_user_ns(&self) -> Option<&Arc<UserNamespace>> {
++        Some(&self.owner)
++    }
++
++    fn parent(&self) -> Result<&Arc<Self>> {
++        self.parent.as_ref().ok_or_else(|| {
++            Error::with_message(Errno::EPERM, "the initial PID namespace has no parent")
++        })
++    }
++
++    fn stashed_dentry(&self) -> &StashedDentry {
++        &self.stashed_dentry
++    }
++}
++
++/// Returns the PID namespace of the current thread, unless it is the initial one.
++///
++/// Kernel threads and threads in the initial namespace see all global IDs.
++pub(crate) fn current_restricted_pid_ns() -> Option<Arc<PidNamespace>> {
++    let task = ostd::task::Task::current()?;
++    let process = task.as_posix_thread()?.weak_process().upgrade()?;
++    let pid_ns = process.pid_ns();
++    (!pid_ns.is_init()).then(|| pid_ns.clone())
++}
++
++/// Converts an ID that the current thread passed to a system call to a global ID.
++///
++/// Zero keeps its meaning of "the caller". An ID that does not exist in the PID
++/// namespace of the caller becomes [`NO_SUCH_ID`].
++pub(crate) fn pid_from_user(id: u32) -> u32 {
++    if id == 0 {
++        return 0;
++    }
++    match current_restricted_pid_ns() {
++        None => id,
++        Some(pid_ns) => pid_ns.global_of(id).unwrap_or(NO_SUCH_ID),
++    }
++}
++
++/// Converts a global ID to the ID that the current thread sees.
++///
++/// An ID that does not exist in the PID namespace of the current thread, such as
++/// the ID of a parent process outside the namespace, becomes zero.
++pub(crate) fn pid_to_user(global: u32) -> u32 {
++    match current_restricted_pid_ns() {
++        None => global,
++        Some(pid_ns) => pid_ns.local_of(global).unwrap_or(0),
++    }
++}
+diff --git a/kernel/core/src/process/namespace/unshare.rs b/kernel/core/src/process/namespace/unshare.rs
+--- a/kernel/core/src/process/namespace/unshare.rs
++++ b/kernel/core/src/process/namespace/unshare.rs
+@@ -66,6 +66,19 @@ impl ContextUnshareAdminApi for Context<'_> {
+         let mut thread_local_ns_proxy_ref = self.thread_local.borrow_ns_proxy_mut();
+         let thread_local_ns_proxy = thread_local_ns_proxy_ref.unwrap();
+ 
++        // A process can change the PID namespace of its future children only once.
++        if flags.contains(CloneFlags::CLONE_NEWPID)
++            && !Arc::ptr_eq(
++                thread_local_ns_proxy.pid_ns_for_children(),
++                self.process.pid_ns(),
++            )
++        {
++            return_errno_with_message!(
++                Errno::EINVAL,
++                "the PID namespace for children has already been changed"
++            );
++        }
++
+         let new_ns_proxy = thread_local_ns_proxy.new_clone(
+             &user_ns_ref,
+             self.process.as_ref(),
+diff --git a/kernel/core/src/process/pid_table.rs b/kernel/core/src/process/pid_table.rs
+--- a/kernel/core/src/process/pid_table.rs
++++ b/kernel/core/src/process/pid_table.rs
+@@ -7,6 +7,7 @@
+ //! the kernel objects that share the same numeric identifier, which eliminates
+ //! the need for separate per-type lookup tables.
+ 
++use super::namespace::pid_ns::{PidNamespace, current_restricted_pid_ns};
+ use alloc::collections::btree_map::Entry;
+ 
+ use super::{Pgid, Pid, Process, ProcessGroup, Session, Sid};
+@@ -54,6 +55,8 @@ impl PidTable {
+         let mut entry = self.get_or_create_entry(tid).lock();
+         debug_assert!(!entry.has_live_process());
+ 
++        let process = thread.as_posix_thread().unwrap().process();
++        entry.pid_ns = Some(process.pid_ns().clone());
+         entry.set_thread(thread);
+     }
+ 
+@@ -76,7 +79,8 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            map_entry.remove();
++            let id = *map_entry.key();
++            map_entry.remove().forget_local_ids(id);
+         }
+     }
+ 
+@@ -99,7 +103,8 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            map_entry.remove();
++            let id = *map_entry.key();
++            map_entry.remove().forget_local_ids(id);
+         }
+ 
+         Some(thread)
+@@ -113,15 +118,26 @@ impl PidTable {
+         entry.lock().replace_thread(thread);
+     }
+ 
+-    /// Gets a thread by a TID.
++    /// Returns the entry for a global ID if the current thread may see it.
++    ///
++    /// A thread in a PID namespace other than the initial one only sees the
++    /// entries of its namespace and of the namespaces below it.
++    fn visible_entry(&self, id: u32) -> Option<&Arc<PidEntry>> {
++        let entry = self.entries.get(&id)?;
++        match current_restricted_pid_ns() {
++            None => Some(entry),
++            Some(viewer) => entry.lock().is_visible_in(&viewer).then_some(entry),
++        }
++    }
++
++    /// Gets a thread by a global TID.
+     pub(crate) fn get_thread(&self, tid: Tid) -> Option<Arc<Thread>> {
+-        self.entries
+-            .get(&tid)
++        self.visible_entry(tid)
+             .and_then(|entry| entry.lock().thread())
+     }
+ 
+     /// Returns an iterator over threads that have a live thread reference.
+-    pub(crate) fn iter_threads(&self) -> impl Iterator<Item = Arc<Thread>> + '_ {
++    pub(crate) fn iter_threads_unfiltered(&self) -> impl Iterator<Item = Arc<Thread>> + '_ {
+         self.entries
+             .values()
+             .filter_map(|entry| entry.lock().thread())
+@@ -136,6 +152,7 @@ impl PidTable {
+ 
+         let entry = self.get_or_create_entry(pid);
+         let mut entry = entry.lock();
++        entry.pid_ns = Some(process.pid_ns().clone());
+         entry.set_process(process);
+         entry.set_thread(&process.main_thread());
+     }
+@@ -163,12 +180,23 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            map_entry.remove();
++            let id = *map_entry.key();
++            map_entry.remove().forget_local_ids(id);
+         }
+     }
+ 
+-    /// Gets a process by a PID.
++    /// Gets a process by a global PID.
+     pub(crate) fn get_process(&self, pid: Pid) -> Option<Arc<Process>> {
++        self.visible_entry(pid)
++            .and_then(|entry| entry.lock().process())
++    }
++
++    /// Gets a process by a global PID, regardless of the PID namespace of the
++    /// current thread.
++    ///
++    /// This is for kernel-internal lookups. An ID from user space must not reach
++    /// this method.
++    pub(crate) fn get_process_unfiltered(&self, pid: Pid) -> Option<Arc<Process>> {
+         self.entries
+             .get(&pid)
+             .and_then(|entry| entry.lock().process())
+@@ -176,6 +204,22 @@ impl PidTable {
+ 
+     /// Returns an iterator over processes that have a live process reference.
+     pub(crate) fn iter_processes(&self) -> impl Iterator<Item = Arc<Process>> + '_ {
++        let viewer = current_restricted_pid_ns();
++        self.entries.values().filter_map(move |entry| {
++            let entry = entry.lock();
++            if viewer
++                .as_ref()
++                .is_some_and(|viewer| !entry.is_visible_in(viewer))
++            {
++                return None;
++            }
++            entry.process()
++        })
++    }
++
++    /// Returns an iterator over all processes, regardless of the PID namespace
++    /// of the current thread.
++    pub(crate) fn iter_processes_unfiltered(&self) -> impl Iterator<Item = Arc<Process>> + '_ {
+         self.entries
+             .values()
+             .filter_map(|entry| entry.lock().process())
+@@ -208,21 +252,20 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            map_entry.remove();
++            let id = *map_entry.key();
++            map_entry.remove().forget_local_ids(id);
+         }
+     }
+ 
+     /// Gets a process group by a PGID.
+     pub(crate) fn get_process_group(&self, pgid: &Pgid) -> Option<Arc<ProcessGroup>> {
+-        self.entries
+-            .get(pgid)
++        self.visible_entry(*pgid)
+             .and_then(|entry| entry.lock().process_group())
+     }
+ 
+     /// Returns whether a process group with the given PGID exists.
+     pub(crate) fn contains_process_group(&self, pgid: &Pgid) -> bool {
+-        self.entries
+-            .get(pgid)
++        self.visible_entry(*pgid)
+             .is_some_and(|entry| entry.lock().has_live_process_group())
+     }
+ 
+@@ -248,13 +291,14 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            map_entry.remove();
++            let id = *map_entry.key();
++            map_entry.remove().forget_local_ids(id);
+         }
+     }
+ 
+     /// Returns the entry for the given numeric identifier.
+     pub(crate) fn get_entry(&self, id: u32) -> Option<Arc<PidEntry>> {
+-        self.entries.get(&id).cloned()
++        self.visible_entry(id).cloned()
+     }
+ }
+ 
+@@ -282,6 +326,11 @@ pub(crate) struct PidEntry {
+ }
+ 
+ struct PidEntryInner {
++    /// The PID namespace of the thread or process that first used the ID.
++    ///
++    /// Process groups and sessions take the ID of a process, so they are in the
++    /// PID namespace of that process.
++    pid_ns: Option<Arc<PidNamespace>>,
+     thread: Weak<Thread>,
+     process: Weak<Process>,
+     process_group: Weak<ProcessGroup>,
+@@ -309,6 +358,13 @@ impl PidEntry {
+         }
+     }
+ 
++    /// Removes the local IDs of the entry after it has left the PID table.
++    fn forget_local_ids(&self, id: u32) {
++        if let Some(pid_ns) = self.lock().pid_ns.take() {
++            pid_ns.unregister(id);
++        }
++    }
++
+     /// Locks and returns access to the entry internals.
+     fn lock(&self) -> MutexGuard<'_, PidEntryInner> {
+         self.inner.lock()
+@@ -364,6 +420,7 @@ impl PidEntryInner {
+     /// Creates a new empty `PidEntryInner`.
+     fn new() -> Self {
+         Self {
++            pid_ns: None,
+             thread: Weak::new(),
+             process: Weak::new(),
+             process_group: Weak::new(),
+@@ -371,6 +428,13 @@ impl PidEntryInner {
+         }
+     }
+ 
++    /// Returns whether a thread in the PID namespace may see the entry.
++    fn is_visible_in(&self, viewer: &PidNamespace) -> bool {
++        self.pid_ns
++            .as_ref()
++            .is_some_and(|pid_ns| viewer.is_same_or_ancestor_of(pid_ns))
++    }
++
+     /// Sets the thread reference.
+     fn set_thread(&mut self, thread: &Arc<Thread>) {
+         debug_assert!(!self.has_live_thread());
+diff --git a/kernel/core/src/process/posix_thread/exit.rs b/kernel/core/src/process/posix_thread/exit.rs
+--- a/kernel/core/src/process/posix_thread/exit.rs
++++ b/kernel/core/src/process/posix_thread/exit.rs
+@@ -100,7 +100,8 @@ fn exit_internal(
+ 
+     wake_clear_ctid(thread_local);
+ 
+-    wake_robust_list(thread_local, posix_thread.tid());
++    // User space records the owner of a robust futex by the ID that it sees.
++    wake_robust_list(thread_local, crate::process::pid_to_user(posix_thread.tid()));
+ 
+     // According to Linux behavior, the main thread shouldn't be removed from the table until the
+     // process is reaped by its parent.
+diff --git a/kernel/core/src/process/process/init_proc.rs b/kernel/core/src/process/process/init_proc.rs
+--- a/kernel/core/src/process/process/init_proc.rs
++++ b/kernel/core/src/process/process/init_proc.rs
+@@ -2,6 +2,7 @@
+ 
+ //! This module defines functions related to spawning the init process.
+ 
++use crate::process::PidNamespace;
+ use ostd::{arch::cpu::context::UserContext, task::Task, user::UserContextApi};
+ 
+ use super::{Process, Session};
+@@ -70,6 +71,7 @@ fn create_init_process(
+         oom_score_adj,
+         sig_dispositions,
+         user_ns,
++        PidNamespace::get_init_singleton().clone(),
+     );
+ 
+     let init_task = create_init_task(pid, &init_proc, fs, vmar, executable_path, argv, envp)?;
+diff --git a/kernel/core/src/process/process/mod.rs b/kernel/core/src/process/process/mod.rs
+--- a/kernel/core/src/process/process/mod.rs
++++ b/kernel/core/src/process/process/mod.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use super::PidNamespace;
+ use core::{
+     sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering},
+     time::Duration,
+@@ -86,6 +87,8 @@ pub(super) fn init_on_each_cpu() {
+ pub struct Process {
+     // Immutable Part
+     pid: Pid,
++    /// The PID namespace of the process.
++    pid_ns: Arc<PidNamespace>,
+ 
+     vmar: Mutex<Option<Arc<Vmar>>>,
+     /// Wait for child status changed
+@@ -234,6 +237,7 @@ impl Process {
+         oom_score_adj: i16,
+         sig_dispositions: Arc<Mutex<SigDispositions>>,
+         user_ns: Arc<UserNamespace>,
++        pid_ns: Arc<PidNamespace>,
+     ) -> Arc<Self> {
+         Arc::new_cyclic(|process_ref: &Weak<Process>| {
+             // SIGCHID does not interrupt pauser. Child process will
+@@ -245,6 +249,7 @@ impl Process {
+ 
+             Self {
+                 pid,
++                pid_ns,
+                 vmar: Mutex::new(Some(vmar)),
+                 children_wait_queue,
+                 pidfile_pollee: Pollee::new(),
+@@ -782,6 +787,13 @@ impl Process {
+         }
+     }
+ 
++    /// Returns the PID namespace that the process is in.
++    ///
++    /// A process never leaves the PID namespace in which it was created.
++    pub(crate) fn pid_ns(&self) -> &Arc<PidNamespace> {
++        &self.pid_ns
++    }
++
+     pub(crate) fn user_ns(&self) -> &Mutex<Arc<UserNamespace>> {
+         &self.user_ns
+     }
+diff --git a/kernel/core/src/process/process/terminal.rs b/kernel/core/src/process/process/terminal.rs
+--- a/kernel/core/src/process/process/terminal.rs
++++ b/kernel/core/src/process/process/terminal.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::{pid_from_user, pid_to_user};
+ use super::{JobControl, Pgid, Process, Session, session::SessionGuard};
+ use crate::{
+     device::Device, dispatch_ioctl, prelude::*, process::pid_table, util::ioctl::RawIoctl,
+@@ -63,7 +64,7 @@ impl dyn Terminal {
+                     self.is_control_and(&current!(), |_, _| Ok(operate()))?
+                 };
+ 
+-                cmd.write(&pgid)?;
++                cmd.write(&pid_to_user(pgid))?;
+             }
+             cmd @ SetForegroundPgid => {
+                 let pgid = cmd.read()?;
+@@ -71,7 +72,7 @@ impl dyn Terminal {
+                     return_errno_with_message!(Errno::EINVAL, "negative PGIDs are not valid");
+                 }
+ 
+-                self.set_foreground(pgid, &current!())?;
++                self.set_foreground(pid_from_user(pgid), &current!())?;
+             }
+ 
+             // Commands about sessions
+@@ -107,7 +108,7 @@ impl dyn Terminal {
+                     self.is_control_and(&current!(), |session, _| Ok(session.sid()))?
+                 };
+ 
+-                cmd.write(&sid)?;
++                cmd.write(&pid_to_user(sid))?;
+             }
+ 
+             // Commands that are invalid or not supported
+diff --git a/kernel/core/src/process/process_filter.rs b/kernel/core/src/process/process_filter.rs
+--- a/kernel/core/src/process/process_filter.rs
++++ b/kernel/core/src/process/process_filter.rs
+@@ -1,12 +1,13 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::{Pgid, Pid};
++use super::{Pgid, Pid, pid_from_user};
+ use crate::{
+     fs::file::file_table::{FileDesc, get_file_fast},
+     prelude::*,
+     process::PidFile,
+ };
+ 
++/// A selection of processes by global IDs.
+ #[derive(Clone, Debug)]
+ pub(crate) enum ProcessFilter {
+     Any,
+@@ -27,8 +28,8 @@ impl ProcessFilter {
+ 
+         match which {
+             P_ALL => Ok(ProcessFilter::Any),
+-            P_PID => Ok(ProcessFilter::WithPid(id)),
+-            P_PGID => Ok(ProcessFilter::WithPgid(id)),
++            P_PID => Ok(ProcessFilter::WithPid(pid_from_user(id))),
++            P_PGID => Ok(ProcessFilter::WithPgid(pid_from_user(id))),
+             P_PIDFD => {
+                 let fd = FileDesc::try_from(id.cast_signed())
+                     .map_err(|_| Error::with_message(Errno::EINVAL, "the pidfd is invalid"))?;
+@@ -56,7 +57,9 @@ impl ProcessFilter {
+         } else if wait_pid < -1 {
+             // "wait for any child process whose process group ID is equal to the absolute value of
+             // `pid`"
+-            Ok(ProcessFilter::WithPgid((-wait_pid).cast_unsigned()))
++            Ok(ProcessFilter::WithPgid(pid_from_user(
++                (-wait_pid).cast_unsigned(),
++            )))
+         } else if wait_pid == -1 {
+             // "wait for any child process"
+             Ok(ProcessFilter::Any)
+@@ -67,7 +70,7 @@ impl ProcessFilter {
+             Ok(ProcessFilter::WithPgid(pgid))
+         } else {
+             // "wait for the child whose process ID is equal to the value of `pid`"
+-            Ok(ProcessFilter::WithPid(wait_pid.cast_unsigned()))
++            Ok(ProcessFilter::WithPid(pid_from_user(wait_pid.cast_unsigned())))
+         }
+     }
+ }
+diff --git a/kernel/core/src/process/signal/c_types.rs b/kernel/core/src/process/signal/c_types.rs
+--- a/kernel/core/src/process/signal/c_types.rs
++++ b/kernel/core/src/process/signal/c_types.rs
+@@ -55,7 +55,12 @@ impl siginfo_t {
+         self.siginfo_fields.sigfault_mut().addr = si_addr;
+     }
+ 
++    /// Sets the sender of the signal.
++    ///
++    /// The thread that reads the signal information calls this method, and it
++    /// sees the ID of the sender in its own PID namespace.
+     pub(crate) fn set_pid_uid(&mut self, pid: Pid, uid: Uid) {
++        let pid = crate::process::pid_to_user(pid);
+         let pid_uid = {
+             let pid_uid = siginfo_piduid_t { pid, uid };
+             siginfo_common_first_t::new_piduid(pid_uid)
+diff --git a/kernel/core/src/syscall/capget.rs b/kernel/core/src/syscall/capget.rs
+--- a/kernel/core/src/syscall/capget.rs
++++ b/kernel/core/src/syscall/capget.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use ostd::mm::VmIo;
+ 
+ use super::SyscallReturn;
+@@ -43,7 +44,7 @@ pub(super) fn sys_capget(
+ 
+     let credentials = if cap_user_header.pid != 0 {
+         pid_table::pid_table_mut()
+-            .get_thread(cap_user_header.pid)
++            .get_thread(pid_from_user(cap_user_header.pid))
+             .ok_or_else(|| Error::with_message(Errno::ESRCH, "the target thread does not exist"))?
+             .as_posix_thread()
+             .unwrap()
+diff --git a/kernel/core/src/syscall/capset.rs b/kernel/core/src/syscall/capset.rs
+--- a/kernel/core/src/syscall/capset.rs
++++ b/kernel/core/src/syscall/capset.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use ostd::mm::VmIo;
+ 
+ use super::SyscallReturn;
+@@ -36,7 +37,7 @@ pub(super) fn sys_capset(
+     // Reference: The "With VFS capabilities support" section in
+     // <https://man7.org/linux/man-pages/man2/capset.2.html>.
+     let header_pid = cap_user_header.pid;
+-    if header_pid != 0 && header_pid != ctx.posix_thread.tid() {
++    if header_pid != 0 && pid_from_user(header_pid) != ctx.posix_thread.tid() {
+         return_errno_with_message!(
+             Errno::EPERM,
+             "setting other threads' capabilities is not allowed"
+diff --git a/kernel/core/src/syscall/clock_gettime.rs b/kernel/core/src/syscall/clock_gettime.rs
+--- a/kernel/core/src/syscall/clock_gettime.rs
++++ b/kernel/core/src/syscall/clock_gettime.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use core::time::Duration;
+ 
+ use int_to_c_enum::TryFromInt;
+@@ -121,7 +122,7 @@ pub(super) fn read_clock(clockid: clockid_t, ctx: &Context) -> Result<Duration>
+         match dynamic_clockid_info {
+             DynamicClockIdInfo::Pid(pid, clock_type) => {
+                 let process = pid_table::pid_table_mut()
+-                    .get_process(pid)
++                    .get_process(pid_from_user(pid))
+                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+                 match clock_type {
+                     DynamicClockType::Profiling => Ok(process.prof_clock().read_time()),
+@@ -130,7 +131,7 @@ pub(super) fn read_clock(clockid: clockid_t, ctx: &Context) -> Result<Duration>
+             }
+             DynamicClockIdInfo::Tid(tid, clock_type) => {
+                 let thread = pid_table::pid_table_mut()
+-                    .get_thread(tid)
++                    .get_thread(pid_from_user(tid))
+                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+                 let posix_thread = thread.as_posix_thread().unwrap();
+                 match clock_type {
+diff --git a/kernel/core/src/syscall/clone.rs b/kernel/core/src/syscall/clone.rs
+--- a/kernel/core/src/syscall/clone.rs
++++ b/kernel/core/src/syscall/clone.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use core::num::NonZeroU64;
+ 
+ use ostd::{arch::cpu::context::UserContext, mm::VmIo};
+@@ -26,7 +27,7 @@ pub(super) fn sys_clone(
+     debug!("clone args = {:x?}", args);
+ 
+     let child_pid = clone_child(ctx, parent_context, args)?;
+-    Ok(SyscallReturn::Return(child_pid as _))
++    Ok(SyscallReturn::Return(pid_to_user(child_pid) as _))
+ }
+ 
+ pub(super) fn sys_clone3(
+@@ -52,7 +53,7 @@ pub(super) fn sys_clone3(
+ 
+     let child_pid = clone_child(ctx, parent_context, clone_args)?;
+     debug!("child pid = {}", child_pid);
+-    Ok(SyscallReturn::Return(child_pid as _))
++    Ok(SyscallReturn::Return(pid_to_user(child_pid) as _))
+ }
+ 
+ #[repr(C)]
+diff --git a/kernel/core/src/syscall/fcntl.rs b/kernel/core/src/syscall/fcntl.rs
+--- a/kernel/core/src/syscall/fcntl.rs
++++ b/kernel/core/src/syscall/fcntl.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use ostd::mm::VmIo;
+ 
+ use super::SyscallReturn;
+@@ -189,7 +190,7 @@ fn handle_setown(fd: FileDesc, arg: u64, ctx: &Context) -> Result<SyscallReturn>
+     let owner_process = if pid == 0 {
+         None
+     } else {
+-        Some(pid_table::pid_table_mut().get_process(pid).ok_or_else(|| {
++        Some(pid_table::pid_table_mut().get_process(pid_from_user(pid)).ok_or_else(|| {
+             Error::with_message(
+                 Errno::ESRCH,
+                 "the process to be a file owner does not exist",
+diff --git a/kernel/core/src/syscall/fork.rs b/kernel/core/src/syscall/fork.rs
+--- a/kernel/core/src/syscall/fork.rs
++++ b/kernel/core/src/syscall/fork.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use ostd::arch::cpu::context::UserContext;
+ 
+ use super::SyscallReturn;
+@@ -11,11 +12,11 @@ use crate::{
+ pub(super) fn sys_fork(ctx: &Context, parent_context: &UserContext) -> Result<SyscallReturn> {
+     let clone_args = CloneArgs::for_fork();
+     let child_pid = clone_child(ctx, parent_context, clone_args)?;
+-    Ok(SyscallReturn::Return(child_pid as _))
++    Ok(SyscallReturn::Return(pid_to_user(child_pid) as _))
+ }
+ 
+ pub(super) fn sys_vfork(ctx: &Context, parent_context: &UserContext) -> Result<SyscallReturn> {
+     let clone_args = CloneArgs::for_vfork();
+     let child_pid = clone_child(ctx, parent_context, clone_args)?;
+-    Ok(SyscallReturn::Return(child_pid as _))
++    Ok(SyscallReturn::Return(pid_to_user(child_pid) as _))
+ }
+diff --git a/kernel/core/src/syscall/get_ioprio.rs b/kernel/core/src/syscall/get_ioprio.rs
+--- a/kernel/core/src/syscall/get_ioprio.rs
++++ b/kernel/core/src/syscall/get_ioprio.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use core::sync::atomic::Ordering;
+ 
+ use super::SyscallReturn;
+@@ -29,7 +30,7 @@ impl IoPrioWho {
+                 let target_tid = if who == 0 {
+                     ctx.posix_thread.tid()
+                 } else {
+-                    who
++                    pid_from_user(who)
+                 };
+ 
+                 let thread = crate::process::pid_table::pid_table_mut()
+diff --git a/kernel/core/src/syscall/get_priority.rs b/kernel/core/src/syscall/get_priority.rs
+--- a/kernel/core/src/syscall/get_priority.rs
++++ b/kernel/core/src/syscall/get_priority.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use core::sync::atomic::Ordering;
+ 
+ use super::SyscallReturn;
+@@ -36,13 +37,13 @@ pub(super) fn get_processes(prio_target: PriorityTarget) -> Result<Vec<Arc<Proce
+     Ok(match prio_target {
+         PriorityTarget::Process(pid) => {
+             let process = pid_table::pid_table_mut()
+-                .get_process(pid)
++                .get_process(pid_from_user(pid))
+                 .ok_or(Error::new(Errno::ESRCH))?;
+             vec![process]
+         }
+         PriorityTarget::ProcessGroup(pgid) => {
+             let process_group = pid_table::pid_table_mut()
+-                .get_process_group(&pgid)
++                .get_process_group(&pid_from_user(pgid))
+                 .ok_or(Error::new(Errno::ESRCH))?;
+             let processes: Vec<Arc<Process>> = process_group.lock().iter().collect();
+             if processes.is_empty() {
+diff --git a/kernel/core/src/syscall/getpgid.rs b/kernel/core/src/syscall/getpgid.rs
+--- a/kernel/core/src/syscall/getpgid.rs
++++ b/kernel/core/src/syscall/getpgid.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::{pid_from_user, pid_to_user};
+ use super::SyscallReturn;
+ use crate::{
+     prelude::*,
+@@ -15,10 +16,10 @@ pub(super) fn sys_getpgid(pid: Pid, ctx: &Context) -> Result<SyscallReturn> {
+     // "If `pid` is equal to 0, getpgid() shall return the process group ID of the calling
+     // process."
+     if pid == 0 {
+-        return Ok(SyscallReturn::Return(ctx.process.pgid() as _));
++        return Ok(SyscallReturn::Return(pid_to_user(ctx.process.pgid()) as _));
+     }
+ 
+-    let process = pid_table::pid_table_mut().get_process(pid).ok_or_else(|| {
++    let process = pid_table::pid_table_mut().get_process(pid_from_user(pid)).ok_or_else(|| {
+         Error::with_message(Errno::ESRCH, "the process to get the PGID does not exist")
+     })?;
+ 
+@@ -26,5 +27,5 @@ pub(super) fn sys_getpgid(pid: Pid, ctx: &Context) -> Result<SyscallReturn> {
+     // session than the current process. Linux does not perform this check by default, but some
+     // strict security policies (e.g. SELinux) may do so.
+ 
+-    Ok(SyscallReturn::Return(process.pgid() as _))
++    Ok(SyscallReturn::Return(pid_to_user(process.pgid()) as _))
+ }
+diff --git a/kernel/core/src/syscall/getpgrp.rs b/kernel/core/src/syscall/getpgrp.rs
+--- a/kernel/core/src/syscall/getpgrp.rs
++++ b/kernel/core/src/syscall/getpgrp.rs
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use super::SyscallReturn;
+ use crate::prelude::*;
+ 
+ pub(super) fn sys_getpgrp(ctx: &Context) -> Result<SyscallReturn> {
+-    Ok(SyscallReturn::Return(ctx.process.pgid() as _))
++    Ok(SyscallReturn::Return(pid_to_user(ctx.process.pgid()) as _))
+ }
+diff --git a/kernel/core/src/syscall/getpid.rs b/kernel/core/src/syscall/getpid.rs
+--- a/kernel/core/src/syscall/getpid.rs
++++ b/kernel/core/src/syscall/getpid.rs
+@@ -1,10 +1,11 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use super::SyscallReturn;
+ use crate::prelude::*;
+ 
+ pub(super) fn sys_getpid(ctx: &Context) -> Result<SyscallReturn> {
+-    let pid = ctx.process.pid();
++    let pid = pid_to_user(ctx.process.pid());
+     debug!("pid = {}", pid);
+     Ok(SyscallReturn::Return(pid as _))
+ }
+diff --git a/kernel/core/src/syscall/getppid.rs b/kernel/core/src/syscall/getppid.rs
+--- a/kernel/core/src/syscall/getppid.rs
++++ b/kernel/core/src/syscall/getppid.rs
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use super::SyscallReturn;
+ use crate::prelude::*;
+ 
+ pub(super) fn sys_getppid(ctx: &Context) -> Result<SyscallReturn> {
+-    Ok(SyscallReturn::Return(ctx.process.parent().pid() as _))
++    Ok(SyscallReturn::Return(pid_to_user(ctx.process.parent().pid()) as _))
+ }
+diff --git a/kernel/core/src/syscall/getsid.rs b/kernel/core/src/syscall/getsid.rs
+--- a/kernel/core/src/syscall/getsid.rs
++++ b/kernel/core/src/syscall/getsid.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::{pid_from_user, pid_to_user};
+ use super::SyscallReturn;
+ use crate::{
+     prelude::*,
+@@ -14,10 +15,10 @@ pub(super) fn sys_getsid(pid: Pid, ctx: &Context) -> Result<SyscallReturn> {
+ 
+     // "If `pid` is 0, getsid() returns the session ID of the calling process."
+     if pid == 0 {
+-        return Ok(SyscallReturn::Return(ctx.process.sid() as _));
++        return Ok(SyscallReturn::Return(pid_to_user(ctx.process.sid()) as _));
+     }
+ 
+-    let process = pid_table::pid_table_mut().get_process(pid).ok_or_else(|| {
++    let process = pid_table::pid_table_mut().get_process(pid_from_user(pid)).ok_or_else(|| {
+         Error::with_message(Errno::ESRCH, "the process to get the SID does not exist")
+     })?;
+ 
+@@ -25,5 +26,5 @@ pub(super) fn sys_getsid(pid: Pid, ctx: &Context) -> Result<SyscallReturn> {
+     // session than the current process. Linux does not perform this check by default, but some
+     // strict security policies (e.g. SELinux) may do so.
+ 
+-    Ok(SyscallReturn::Return(process.sid() as _))
++    Ok(SyscallReturn::Return(pid_to_user(process.sid()) as _))
+ }
+diff --git a/kernel/core/src/syscall/gettid.rs b/kernel/core/src/syscall/gettid.rs
+--- a/kernel/core/src/syscall/gettid.rs
++++ b/kernel/core/src/syscall/gettid.rs
+@@ -1,9 +1,10 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use super::SyscallReturn;
+ use crate::prelude::*;
+ 
+ pub(super) fn sys_gettid(ctx: &Context) -> Result<SyscallReturn> {
+-    let tid = ctx.posix_thread.tid();
++    let tid = pid_to_user(ctx.posix_thread.tid());
+     Ok(SyscallReturn::Return(tid as _))
+ }
+diff --git a/kernel/core/src/syscall/pidfd_open.rs b/kernel/core/src/syscall/pidfd_open.rs
+--- a/kernel/core/src/syscall/pidfd_open.rs
++++ b/kernel/core/src/syscall/pidfd_open.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use crate::{
+     fs::file::{StatusFlags, file_table::FdFlags},
+     prelude::*,
+@@ -20,7 +21,7 @@ pub(super) fn sys_pidfd_open(pid: Pid, flags: u32, ctx: &Context) -> Result<Sysc
+     }
+ 
+     let process = pid_table::pid_table_mut()
+-        .get_process(pid)
++        .get_process(pid_from_user(pid))
+         .ok_or_else(|| Error::with_message(Errno::ESRCH, "the process does not exist"))?;
+ 
+     let pid_fd = {
+diff --git a/kernel/core/src/syscall/prlimit64.rs b/kernel/core/src/syscall/prlimit64.rs
+--- a/kernel/core/src/syscall/prlimit64.rs
++++ b/kernel/core/src/syscall/prlimit64.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use ostd::mm::VmIo;
+ 
+ use super::SyscallReturn;
+@@ -53,7 +54,7 @@ pub(super) fn sys_prlimit64(
+     let old_raw = if pid == 0 || pid == ctx.process.pid() {
+         do_prlimit64(&ctx.process, resource, new_raw, ctx)?
+     } else {
+-        let target_process = pid_table::pid_table_mut().get_process(pid).ok_or_else(|| {
++        let target_process = pid_table::pid_table_mut().get_process(pid_from_user(pid)).ok_or_else(|| {
+             Error::with_message(Errno::ESRCH, "the target process does not exist")
+         })?;
+         // Check permissions
+diff --git a/kernel/core/src/syscall/sched_affinity.rs b/kernel/core/src/syscall/sched_affinity.rs
+--- a/kernel/core/src/syscall/sched_affinity.rs
++++ b/kernel/core/src/syscall/sched_affinity.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use core::{cmp, sync::atomic::Ordering};
+ 
+ use ostd::{
+@@ -19,7 +20,7 @@ pub(super) fn sys_sched_getaffinity(
+ ) -> Result<SyscallReturn> {
+     let cpu_set = match tid {
+         0 => ctx.thread.atomic_cpu_affinity().load(Ordering::Relaxed),
+-        _ => match pid_table::pid_table_mut().get_thread(tid) {
++        _ => match pid_table::pid_table_mut().get_thread(pid_from_user(tid)) {
+             Some(thread) => thread.atomic_cpu_affinity().load(Ordering::Relaxed),
+             None => return_errno_with_message!(Errno::ESRCH, "the target thread does not exist"),
+         },
+@@ -47,7 +48,7 @@ pub(super) fn sys_sched_setaffinity(
+             .thread
+             .atomic_cpu_affinity()
+             .store(&user_cpu_set, Ordering::Relaxed),
+-        _ => match pid_table::pid_table_mut().get_thread(tid) {
++        _ => match pid_table::pid_table_mut().get_thread(pid_from_user(tid)) {
+             Some(thread) => {
+                 thread
+                     .atomic_cpu_affinity()
+diff --git a/kernel/core/src/syscall/sched_getattr.rs b/kernel/core/src/syscall/sched_getattr.rs
+--- a/kernel/core/src/syscall/sched_getattr.rs
++++ b/kernel/core/src/syscall/sched_getattr.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use ostd::{const_assert, mm::VmIo};
+ 
+ use super::{
+@@ -207,7 +208,7 @@ pub(super) fn access_sched_attr_with<T>(
+         return f(ctx.thread.sched_attr());
+     }
+ 
+-    let Some(thread) = pid_table::pid_table_mut().get_thread(tid) else {
++    let Some(thread) = pid_table::pid_table_mut().get_thread(pid_from_user(tid)) else {
+         return_errno_with_message!(Errno::ESRCH, "the target thread does not exist");
+     };
+     f(thread.sched_attr())
+diff --git a/kernel/core/src/syscall/set_tid_address.rs b/kernel/core/src/syscall/set_tid_address.rs
+--- a/kernel/core/src/syscall/set_tid_address.rs
++++ b/kernel/core/src/syscall/set_tid_address.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use super::SyscallReturn;
+ use crate::prelude::*;
+ 
+@@ -15,6 +16,6 @@ pub(super) fn sys_set_tid_address(tidptr: Vaddr, ctx: &Context) -> Result<Syscal
+ 
+     ctx.thread_local.set_child_tid().set(clear_child_tid);
+ 
+-    let tid = ctx.posix_thread.tid();
++    let tid = pid_to_user(ctx.posix_thread.tid());
+     Ok(SyscallReturn::Return(tid as _))
+ }
+diff --git a/kernel/core/src/syscall/setpgid.rs b/kernel/core/src/syscall/setpgid.rs
+--- a/kernel/core/src/syscall/setpgid.rs
++++ b/kernel/core/src/syscall/setpgid.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use super::SyscallReturn;
+ use crate::{
+     prelude::*,
+@@ -17,10 +18,18 @@ pub(super) fn sys_setpgid(pid: Pid, pgid: Pgid, ctx: &Context) -> Result<Syscall
+     }
+ 
+     // "If `pid` is zero, then the process ID of the calling process is used."
+-    let pid = if pid == 0 { current.pid() } else { pid };
++    let pid = if pid == 0 {
++        current.pid()
++    } else {
++        pid_from_user(pid)
++    };
+     // "If `pgid` is zero, then the PGID of the process specified by `pid` is made the same as its
+     // process ID."
+-    let pgid = if pgid == 0 { pid } else { pgid };
++    let pgid = if pgid == 0 {
++        pid
++    } else {
++        pid_from_user(pgid)
++    };
+ 
+     debug!("pid = {}, pgid = {}", pid, pgid);
+ 
+diff --git a/kernel/core/src/syscall/setsid.rs b/kernel/core/src/syscall/setsid.rs
+--- a/kernel/core/src/syscall/setsid.rs
++++ b/kernel/core/src/syscall/setsid.rs
+@@ -1,10 +1,11 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use super::SyscallReturn;
+ use crate::prelude::*;
+ 
+ pub(super) fn sys_setsid(ctx: &Context) -> Result<SyscallReturn> {
+     let sid = ctx.process.to_new_session()?;
+ 
+-    Ok(SyscallReturn::Return(sid as _))
++    Ok(SyscallReturn::Return(pid_to_user(sid) as _))
+ }
+diff --git a/kernel/core/src/syscall/tgkill.rs b/kernel/core/src/syscall/tgkill.rs
+--- a/kernel/core/src/syscall/tgkill.rs
++++ b/kernel/core/src/syscall/tgkill.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use super::SyscallReturn;
+ use crate::{
+     prelude::*,
+@@ -39,6 +40,9 @@ fn do_sys_tgkill(tgid: Option<Pid>, tid: Tid, sig_num: u8, ctx: &Context) -> Res
+         return_errno_with_message!(Errno::EINVAL, "non-positive TGIDs or TIDs are not valid");
+     }
+ 
++    let tgid = tgid.map(pid_from_user);
++    let tid = pid_from_user(tid);
++
+     let signal = sig_num.map(|sig_num| {
+         let pid = ctx.process.pid();
+         let uid = ctx.posix_thread.credentials().ruid();
+diff --git a/kernel/core/src/syscall/timer_create.rs b/kernel/core/src/syscall/timer_create.rs
+--- a/kernel/core/src/syscall/timer_create.rs
++++ b/kernel/core/src/syscall/timer_create.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_from_user;
+ use ostd::mm::VmIo;
+ 
+ use super::{
+@@ -69,7 +70,7 @@ pub(super) fn sys_timer_create(
+                 // Send a signal to the specified thread when the timer is expired.
+                 SigNotify::SIGEV_THREAD_ID => {
+                     let tid = sig_event.sigev_un.read_tid() as u32;
+-                    let thread = pid_table::pid_table_mut().get_thread(tid).ok_or_else(|| {
++                    let thread = pid_table::pid_table_mut().get_thread(pid_from_user(tid)).ok_or_else(|| {
+                         Error::with_message(Errno::EINVAL, "the target thread does not exist")
+                     })?;
+                     let posix_thread = thread.as_posix_thread().unwrap();
+@@ -134,7 +135,7 @@ where
+         match dynamic_clockid_info {
+             DynamicClockIdInfo::Pid(pid, clock_type) => {
+                 let process = pid_table::pid_table_mut()
+-                    .get_process(pid)
++                    .get_process(pid_from_user(pid))
+                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+                 let process_timer_manager = process.timer_manager();
+                 match clock_type {
+@@ -144,7 +145,7 @@ where
+             }
+             DynamicClockIdInfo::Tid(tid, clock_type) => {
+                 let thread = pid_table::pid_table_mut()
+-                    .get_thread(tid)
++                    .get_thread(pid_from_user(tid))
+                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid clock ID"))?;
+                 let posix_thread = thread.as_posix_thread().unwrap();
+                 match clock_type {
+diff --git a/kernel/core/src/syscall/wait4.rs b/kernel/core/src/syscall/wait4.rs
+--- a/kernel/core/src/syscall/wait4.rs
++++ b/kernel/core/src/syscall/wait4.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use crate::process::pid_to_user;
+ use ostd::mm::VmIo;
+ 
+ use super::{SyscallReturn, getrusage::rusage_t};
+@@ -57,7 +58,7 @@ pub(super) fn sys_wait4(
+         ctx.user_space().write_val(rusage_addr, &rusage)?;
+     }
+ 
+-    Ok(SyscallReturn::Return(return_pid as _))
++    Ok(SyscallReturn::Return(pid_to_user(return_pid) as _))
+ }
+ 
+ fn calculate_status_code(wait_status: &WaitStatus) -> u32 {
+diff --git a/kernel/core/src/thread/task.rs b/kernel/core/src/thread/task.rs
+--- a/kernel/core/src/thread/task.rs
++++ b/kernel/core/src/thread/task.rs
+@@ -52,7 +52,10 @@ pub(crate) fn create_new_user_task(
+         if is_userspace_vaddr(child_tid_ptr) {
+             // At this point, we can do almost nothing if the address is not valid and the store
+             // operation fails. So we ignore the error here.
+-            let _ = current_userspace!().write_val(child_tid_ptr, &current_posix_thread.tid());
++            let _ = current_userspace!().write_val(
++                child_tid_ptr,
++                &crate::process::pid_to_user(current_posix_thread.tid()),
++            );
+         }
+ 
+         let ctx = Context {

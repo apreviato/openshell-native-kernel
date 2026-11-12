@@ -1,0 +1,172 @@
+diff --git a/kernel/core/src/net/socket/unix/ctrl_msg.rs b/kernel/core/src/net/socket/unix/ctrl_msg.rs
+--- a/kernel/core/src/net/socket/unix/ctrl_msg.rs
++++ b/kernel/core/src/net/socket/unix/ctrl_msg.rs
+@@ -6,7 +6,7 @@ use aster_bigtcp::socket::ReceiveBehavior;
+ use aster_rights::ReadOp;
+ use ostd::task::Task;
+ 
+-use super::{CUserCred, UnixStreamSocket, cred::SocketCred};
++use super::{CUserCred, UnixDatagramSocket, UnixStreamSocket, cred::SocketCred};
+ use crate::{
+     fs::file::{
+         FileLike,
+@@ -14,7 +14,10 @@ use crate::{
+     },
+     net::socket::util::{CControlHeader, ControlMessage, RecvFlags},
+     prelude::*,
+-    process::{UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
++    process::{
++        ResourceType, UserNamespace, credentials::capabilities::CapSet,
++        posix_thread::AsPosixThread,
++    },
+     security::lsm::hooks as lsm_hooks,
+     util::net::CSocketOptionLevel,
+ };
+@@ -215,6 +218,75 @@ enum CControlType {
+ pub(super) struct AuxiliaryData {
+     files: Vec<Arc<dyn FileLike>>,
+     cred: Option<SocketCred>,
++    /// The charge for the UNIX sockets among `files`.
++    inflight: Option<InflightCharge>,
++}
++
++/// The UNIX sockets in flight of each user.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.15/source/net/unix/af_unix.c#L1914>
++static INFLIGHT_SOCKETS: SpinLock<BTreeMap<u32, usize>> = SpinLock::new(BTreeMap::new());
++
++/// UNIX sockets that a user has sent and that no one has received yet.
++///
++/// Dropping the charge releases it, when the receiver takes the sockets or when the
++/// message is discarded.
++pub(super) struct InflightCharge {
++    uid: u32,
++    count: usize,
++}
++
++impl InflightCharge {
++    /// Charges the sockets to the current user.
++    ///
++    /// Fails with `ETOOMANYREFS` if the user would have more sockets in flight than its
++    /// `RLIMIT_NOFILE`, unless it has `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`.
++    fn new(count: usize) -> Result<Option<Self>> {
++        if count == 0 {
++            return Ok(None);
++        }
++
++        let current = current_thread!();
++        let posix_thread = current.as_posix_thread().unwrap();
++        let uid = u32::from(posix_thread.credentials().ruid());
++        let limit = posix_thread
++            .process()
++            .resource_limits()
++            .get_rlimit(ResourceType::RLIMIT_NOFILE)
++            .get_cur();
++        let is_privileged = [CapSet::SYS_RESOURCE, CapSet::SYS_ADMIN].into_iter().any(|cap| {
++            lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
++                UserNamespace::get_init_singleton().as_ref(),
++                posix_thread,
++                cap,
++            ))
++            .is_ok()
++        });
++
++        let mut inflight = INFLIGHT_SOCKETS.lock();
++        let charged = inflight.entry(uid).or_insert(0);
++        if !is_privileged && (*charged + count) as u64 > limit {
++            return_errno_with_message!(
++                Errno::ETOOMANYREFS,
++                "the user has too many UNIX sockets in flight"
++            );
++        }
++        *charged += count;
++
++        Ok(Some(Self { uid, count }))
++    }
++}
++
++impl Drop for InflightCharge {
++    fn drop(&mut self) {
++        let mut inflight = INFLIGHT_SOCKETS.lock();
++        if let Some(charged) = inflight.get_mut(&self.uid) {
++            *charged -= self.count;
++            if *charged == 0 {
++                inflight.remove(&self.uid);
++            }
++        }
++    }
+ }
+ 
+ impl AuxiliaryData {
+@@ -253,25 +325,28 @@ impl AuxiliaryData {
+             }
+         }
+ 
+-        // FIXME: Sending UNIX sockets over UNIX sockets can easily lead to circular references and
+-        // memory leaks. Linux uses a complex garbage collection algorithm to address these issues.
++        // FIXME: Sending UNIX sockets over UNIX sockets can lead to circular references, which
++        // keep the sockets alive after their last file descriptor is closed. Linux collects
++        // such cycles with a garbage collector.
+         // See also <https://elixir.bootlin.com/linux/v6.15/source/net/unix/garbage.c#L592>.
+-        if files
++        //
++        // Until there is a collector, the sockets in flight are charged to the sending user and
++        // limited by its `RLIMIT_NOFILE`, as Linux limits the descriptors in flight. A cycle can
++        // therefore hold at most that many sockets of each user.
++        let nr_sockets = files
+             .iter()
+-            .any(|file| (&**file as &dyn Any).is::<UnixStreamSocket>())
+-        {
+-            warn!("UNIX sockets in SCM_RIGHTS messages can leak kernel resource");
+-
+-            let current = current_thread!();
+-            let posix_thread = current.as_posix_thread().unwrap();
+-            lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+-                UserNamespace::get_init_singleton().as_ref(),
+-                posix_thread,
+-                CapSet::SYS_ADMIN,
+-            ))?;
+-        }
+-
+-        Ok(Self { files, cred })
++            .filter(|file| {
++                let file = &***file as &dyn Any;
++                file.is::<UnixStreamSocket>() || file.is::<UnixDatagramSocket>()
++            })
++            .count();
++        let inflight = InflightCharge::new(nr_sockets)?;
++
++        Ok(Self {
++            files,
++            cred,
++            inflight,
++        })
+     }
+ 
+     /// Fills the current credentials if there are no credentials.
+@@ -289,7 +364,11 @@ impl AuxiliaryData {
+     ) -> Vec<ControlMessage> {
+         let mut ctrl_msgs = Vec::new();
+ 
+-        let Self { files, cred } = self;
++        let Self {
++            files,
++            cred,
++            inflight,
++        } = self;
+ 
+         if is_pass_cred {
+             let unix_ctrl_msg = UnixControlMessage(Message::Cred(CredMessage {
+@@ -303,7 +382,11 @@ impl AuxiliaryData {
+ 
+         if !files.is_empty() {
+             let files = match behavior {
+-                ReceiveBehavior::Recv => mem::take(files),
++                ReceiveBehavior::Recv => {
++                    // The sockets leave the flight when they reach the receiver.
++                    drop(inflight.take());
++                    mem::take(files)
++                }
+                 ReceiveBehavior::Peek => files.clone(),
+             };
+             let unix_ctrl_msg = UnixControlMessage(Message::Files(FileMessage { files }));

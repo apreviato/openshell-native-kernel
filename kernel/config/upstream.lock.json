@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/asterinas/asterinas.git",
+  "tag": "v0.19.0",
+  "commit": "c4b7ed575b7b32773475b194d2ad41fb6d03765b",
+  "rust": "nightly-2026-07-21",
+  "builderRepository": "docker.io/asterinas/kernel-dev",
+  "builderTag": "0.19.0-20261012",
+  "builderDigest": "sha256:97d370e2260fec73f59d9ee02a128edb84141789248e4c1c4b18f05da8bf4e51"
+}

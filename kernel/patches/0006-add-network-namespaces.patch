@@ -1,0 +1,703 @@
+diff --git a/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs b/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs
+--- a/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs
++++ b/kernel/core/src/fs/fs_impls/pseudofs/nsfs.rs
+@@ -390,7 +390,6 @@ pub(crate) enum NsType {
+     Cgroup,
+     Ipc,
+     Mnt,
+-    #[expect(unused)]
+     Net,
+     Pid,
+     #[expect(unused)]
+diff --git a/kernel/core/src/net/iface/init.rs b/kernel/core/src/net/iface/init.rs
+--- a/kernel/core/src/net/iface/init.rs
++++ b/kernel/core/src/net/iface/init.rs
+@@ -18,10 +18,18 @@ fn virtio_iface() -> Option<&'static Arc<Iface>> {
+     IFACES.get().unwrap().get(1)
+ }
+ 
+-pub(in crate::net) fn iter_all_ifaces() -> Iter<'static, Arc<Iface>> {
++/// Returns the interfaces that the kernel found at boot.
++///
++/// They belong to the initial network namespace.
++pub(in crate::net) fn iter_init_ifaces() -> Iter<'static, Arc<Iface>> {
+     IFACES.get().unwrap().iter()
+ }
+ 
++/// Returns the interfaces of the network namespace of the current thread.
++pub(in crate::net) fn iter_all_ifaces() -> vec::IntoIter<Arc<Iface>> {
++    crate::net::net_ns::current_net_ns().ifaces().to_vec().into_iter()
++}
++
+ // TODO: Support multiple network devices and avoid the hardcoded device name.
+ const VIRTIO_DEVICE_NAME: &str = aster_virtio::device::network::DEVICE_NAME;
+ 
+@@ -49,7 +57,7 @@ pub(in crate::net) fn init() {
+     poll_ifaces();
+ }
+ 
+-fn new_loopback() -> Arc<Iface> {
++pub(in crate::net) fn new_loopback() -> Arc<Iface> {
+     use aster_bigtcp::{
+         device::Loopback,
+         iface::IpIface,
+diff --git a/kernel/core/src/net/iface/mod.rs b/kernel/core/src/net/iface/mod.rs
+--- a/kernel/core/src/net/iface/mod.rs
++++ b/kernel/core/src/net/iface/mod.rs
+@@ -5,8 +5,8 @@ mod init;
+ mod poll;
+ mod sched;
+ 
+-pub(super) use init::{init, iter_all_ifaces};
+-pub(super) use poll::init_in_first_kthread;
++pub(super) use init::{init, iter_all_ifaces, iter_init_ifaces, new_loopback};
++pub(super) use poll::{init_in_first_kthread, spawn_background_poll_thread};
+ 
+ pub(super) type Iface = dyn aster_bigtcp::iface::Iface<ext::BigtcpExt>;
+ pub(super) type BoundTcpPort = aster_bigtcp::iface::BoundTcpPort<ext::BigtcpExt>;
+diff --git a/kernel/core/src/net/iface/poll.rs b/kernel/core/src/net/iface/poll.rs
+--- a/kernel/core/src/net/iface/poll.rs
++++ b/kernel/core/src/net/iface/poll.rs
+@@ -5,7 +5,7 @@ use core::time::Duration;
+ 
+ use ostd::{debug, timer::Jiffies};
+ 
+-use super::{Iface, iter_all_ifaces};
++use super::{Iface, iter_init_ifaces};
+ use crate::{
+     sched::{Nice, SchedPolicy},
+     thread::kernel_thread::ThreadOptions,
+@@ -13,18 +13,18 @@ use crate::{
+ };
+ 
+ pub(in crate::net) fn init_in_first_kthread() {
+-    for iface in iter_all_ifaces() {
++    for iface in iter_init_ifaces() {
+         spawn_background_poll_thread(iface.clone());
+     }
+ }
+ 
+ pub(super) fn poll_ifaces() {
+-    for iface in iter_all_ifaces() {
++    for iface in iter_init_ifaces() {
+         iface.poll();
+     }
+ }
+ 
+-fn spawn_background_poll_thread(iface: Arc<Iface>) {
++pub(in crate::net) fn spawn_background_poll_thread(iface: Arc<Iface>) {
+     let task_fn = move || {
+         debug!("spawn background poll thread for {:?}", iface.name());
+ 
+diff --git a/kernel/core/src/net/mod.rs b/kernel/core/src/net/mod.rs
+--- a/kernel/core/src/net/mod.rs
++++ b/kernel/core/src/net/mod.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ mod iface;
++pub(crate) mod net_ns;
+ mod route;
+ pub(crate) mod socket;
+ pub(crate) mod uts_ns;
+diff --git a/kernel/core/src/net/net_ns.rs b/kernel/core/src/net/net_ns.rs
+new file mode 100755
+--- /dev/null
++++ b/kernel/core/src/net/net_ns.rs
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Network namespaces.
++//!
++//! A network namespace owns its interfaces, its routing tables and the abstract
++//! names of its UNIX sockets. The initial namespace holds the interfaces that the
++//! kernel found at boot. A new namespace starts with a loopback interface only,
++//! so processes in it can talk to each other but cannot reach other namespaces.
++
++use core::sync::atomic::{AtomicU64, Ordering};
++
++use ostd::task::Task;
++use spin::Once;
++
++use super::{
++    iface::{self, Iface},
++    route::RouteTables,
++};
++use crate::{
++    fs::pseudofs::{NsCommonOps, NsType, StashedDentry},
++    prelude::*,
++    process::{UserNamespace, credentials::capabilities::CapSet, posix_thread::PosixThread},
++    security::lsm::hooks as lsm_hooks,
++};
++
++/// The network namespace.
++pub(crate) struct NetNamespace {
++    id: u64,
++    ifaces: Vec<Arc<Iface>>,
++    routes: RouteTables,
++    owner: Arc<UserNamespace>,
++    stashed_dentry: StashedDentry,
++}
++
++static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++
++impl NetNamespace {
++    /// Returns a reference to the singleton initial network namespace.
++    pub(crate) fn get_init_singleton() -> &'static Arc<NetNamespace> {
++        static INIT: Once<Arc<NetNamespace>> = Once::new();
++
++        INIT.call_once(|| {
++            Self::new(
++                iface::iter_init_ifaces().cloned().collect(),
++                UserNamespace::get_init_singleton().clone(),
++            )
++        })
++    }
++
++    fn new(ifaces: Vec<Arc<Iface>>, owner: Arc<UserNamespace>) -> Arc<Self> {
++        let routes = RouteTables::new(&ifaces);
++        Arc::new(Self {
++            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
++            ifaces,
++            routes,
++            owner,
++            stashed_dentry: StashedDentry::new(),
++        })
++    }
++
++    /// Creates a network namespace with a new loopback interface.
++    pub(crate) fn new_clone(
++        &self,
++        owner: Arc<UserNamespace>,
++        posix_thread: &PosixThread,
++    ) -> Result<Arc<Self>> {
++        lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
++            owner.as_ref(),
++            posix_thread,
++            CapSet::SYS_ADMIN,
++        ))?;
++
++        let loopback = iface::new_loopback();
++        // FIXME: The polling thread keeps the interface alive after the last process
++        // of the namespace has exited. Stop the thread when the namespace is dropped.
++        iface::spawn_background_poll_thread(loopback.clone());
++        Ok(Self::new(vec![loopback], owner))
++    }
++
++    /// Returns the identifier that tells namespaces apart.
++    pub(in crate::net) fn id(&self) -> u64 {
++        self.id
++    }
++
++    /// Returns the interfaces of the namespace.
++    pub(in crate::net) fn ifaces(&self) -> &[Arc<Iface>] {
++        &self.ifaces
++    }
++
++    /// Returns the routing tables of the namespace.
++    pub(in crate::net) fn routes(&self) -> &RouteTables {
++        &self.routes
++    }
++}
++
++impl NsCommonOps for NetNamespace {
++    const TYPE: NsType = NsType::Net;
++
++    fn owner_user_ns(&self) -> Option<&Arc<UserNamespace>> {
++        Some(&self.owner)
++    }
++
++    fn parent(&self) -> Result<&Arc<Self>> {
++        return_errno_with_message!(Errno::EINVAL, "network namespaces do not have a parent")
++    }
++
++    fn stashed_dentry(&self) -> &StashedDentry {
++        &self.stashed_dentry
++    }
++}
++
++/// Returns the network namespace of the current thread.
++///
++/// Kernel threads, and threads that are exiting, use the initial namespace.
++//
++// TODO: Linux binds a socket to the namespace of its creator. Here the namespace
++// of the thread that operates the socket applies. The two differ only if a socket
++// is passed to a process in another network namespace.
++pub(in crate::net) fn current_net_ns() -> Arc<NetNamespace> {
++    let Some(task) = Task::current() else {
++        return NetNamespace::get_init_singleton().clone();
++    };
++    let Some(thread_local) = task.as_thread_local() else {
++        return NetNamespace::get_init_singleton().clone();
++    };
++    let Ok(ns_proxy) = thread_local.try_borrow_ns_proxy() else {
++        return NetNamespace::get_init_singleton().clone();
++    };
++    match ns_proxy {
++        Some(ns_proxy) => ns_proxy.net_ns().clone(),
++        None => NetNamespace::get_init_singleton().clone(),
++    }
++}
+diff --git a/kernel/core/src/net/route/mod.rs b/kernel/core/src/net/route/mod.rs
+--- a/kernel/core/src/net/route/mod.rs
++++ b/kernel/core/src/net/route/mod.rs
+@@ -10,10 +10,9 @@ use aster_bigtcp::{
+     iface::InterfaceType,
+     wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr},
+ };
+-use spin::Once;
+ 
+ use self::{manager::RouteManager, rule::Rule};
+-use super::iface::{self, Iface};
++use super::iface::Iface;
+ use crate::prelude::*;
+ 
+ mod entry;
+@@ -23,8 +22,11 @@ mod table;
+ 
+ use entry::{RouteAddressFamily, RouteEntry, RouteMetric, RouteTableId, RouteType};
+ 
+-static IPV4_ROUTE_MANAGER: Once<RouteManager<Ipv4Address>> = Once::new();
+-static IPV6_ROUTE_MANAGER: Once<RouteManager<Ipv6Address>> = Once::new();
++/// The routing tables of a network namespace.
++pub(in crate::net) struct RouteTables {
++    ipv4: RouteManager<Ipv4Address>,
++    ipv6: RouteManager<Ipv6Address>,
++}
+ 
+ /// A route lookup key for one address family.
+ #[derive(Clone, Debug)]
+@@ -46,12 +48,20 @@ impl<A: RouteAddressFamily> RouteLookupKey<A> {
+ }
+ 
+ pub(super) fn init() {
++    // Build the routing tables of the initial namespace from the boot interfaces.
++    super::net_ns::NetNamespace::get_init_singleton();
++}
++
++impl RouteTables {
++    /// Derives the routing tables for a set of interfaces.
++    pub(in crate::net) fn new(ifaces: &[Arc<Iface>]) -> Self {
+     const LOCAL_RULE_PRIORITY: u32 = 0;
+     const MAIN_RULE_PRIORITY: u32 = 32766;
+     const DEFAULT_RULE_PRIORITY: u32 = 32767;
+ 
+-    IPV4_ROUTE_MANAGER.call_once(|| {
+-        let routes = iface::iter_all_ifaces()
++    let ipv4 = {
++        let routes = ifaces
++            .iter()
+             .flat_map(iface_ipv4_routes)
+             .collect();
+         RouteManager::new(
+@@ -62,10 +72,11 @@ pub(super) fn init() {
+             ],
+             routes,
+         )
+-    });
++    };
+ 
+-    IPV6_ROUTE_MANAGER.call_once(|| {
+-        let routes = iface::iter_all_ifaces()
++    let ipv6 = {
++        let routes = ifaces
++            .iter()
+             .flat_map(iface_ipv6_routes)
+             .collect();
+         RouteManager::new(
+@@ -75,7 +86,10 @@ pub(super) fn init() {
+             ],
+             routes,
+         )
+-    });
++    };
++
++    Self { ipv4, ipv6 }
++    }
+ }
+ 
+ fn iface_ipv4_routes(iface: &Arc<Iface>) -> Vec<RouteEntry<Ipv4Address>> {
+@@ -190,16 +204,13 @@ fn iface_ipv6_routes(iface: &Arc<Iface>) -> Vec<RouteEntry<Ipv6Address>> {
+ 
+ /// Looks up the output interface for an IP destination.
+ pub(super) fn lookup_iface(dst: IpAddress) -> Result<Arc<Iface>> {
++    let net_ns = super::net_ns::current_net_ns();
+     let iface = match dst {
+-        IpAddress::Ipv4(dst) => IPV4_ROUTE_MANAGER
+-            .get()
+-            .unwrap()
++        IpAddress::Ipv4(dst) => net_ns.routes().ipv4
+             .lookup_entry(&RouteLookupKey::new(dst))?
+             .output_iface()
+             .clone(),
+-        IpAddress::Ipv6(dst) => IPV6_ROUTE_MANAGER
+-            .get()
+-            .unwrap()
++        IpAddress::Ipv6(dst) => net_ns.routes().ipv6
+             .lookup_entry(&RouteLookupKey::new(dst))?
+             .output_iface()
+             .clone(),
+@@ -209,11 +220,10 @@ pub(super) fn lookup_iface(dst: IpAddress) -> Result<Arc<Iface>> {
+ 
+ /// Looks up the interface that owns a local IP address.
+ pub(super) fn lookup_local_iface(address: IpAddress) -> Result<Arc<Iface>> {
++    let net_ns = super::net_ns::current_net_ns();
+     let (type_, iface) = match address {
+         IpAddress::Ipv4(address) => {
+-            let entry = IPV4_ROUTE_MANAGER
+-                .get()
+-                .unwrap()
++            let entry = net_ns.routes().ipv4
+                 .lookup_in_local_table(&RouteLookupKey::new(address))
+                 .ok_or_else(|| {
+                     Error::with_message(
+@@ -224,9 +234,7 @@ pub(super) fn lookup_local_iface(address: IpAddress) -> Result<Arc<Iface>> {
+             (entry.type_(), entry.output_iface().clone())
+         }
+         IpAddress::Ipv6(address) => {
+-            let entry = IPV6_ROUTE_MANAGER
+-                .get()
+-                .unwrap()
++            let entry = net_ns.routes().ipv6
+                 .lookup_in_local_table(&RouteLookupKey::new(address))
+                 .ok_or_else(|| {
+                     Error::with_message(
+@@ -255,14 +263,13 @@ pub(super) fn lookup_local_iface(address: IpAddress) -> Result<Arc<Iface>> {
+ /// IPv6 does not define broadcast addresses,
+ /// so IPv6 endpoints always return `false`.
+ pub(super) fn is_broadcast_endpoint(endpoint: &IpEndpoint) -> bool {
++    let net_ns = super::net_ns::current_net_ns();
+     let IpAddress::Ipv4(address) = endpoint.addr else {
+         return false;
+     };
+ 
+     address.is_broadcast()
+-        || IPV4_ROUTE_MANAGER
+-            .get()
+-            .unwrap()
++        || net_ns.routes().ipv4
+             .lookup_entry(&RouteLookupKey::new(address))
+             .is_ok_and(|entry| entry.type_() == RouteType::Broadcast)
+ }
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/addr.rs b/kernel/core/src/net/socket/netlink/route/kernel/addr.rs
+--- a/kernel/core/src/net/socket/netlink/route/kernel/addr.rs
++++ b/kernel/core/src/net/socket/netlink/route/kernel/addr.rs
+@@ -34,7 +34,11 @@ pub(super) fn do_get_addr(request_segment: &AddrSegment) -> Result<Vec<RtnlSegme
+ 
+     let requested_family = request_segment.body().family;
+     let mut addr_segments: Vec<AddrSegment> = iter_all_ifaces()
+-        .flat_map(|iface| iface_to_new_addrs(request_segment.header(), requested_family, iface))
++        .flat_map(|iface| {
++            iface_to_new_addrs(request_segment.header(), requested_family, &iface)
++                .into_iter()
++                .collect::<Vec<_>>()
++        })
+         .collect();
+ 
+     // Linux dumps IPv4 addresses before IPv6 addresses
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/link.rs b/kernel/core/src/net/socket/netlink/route/kernel/link.rs
+--- a/kernel/core/src/net/socket/netlink/route/kernel/link.rs
++++ b/kernel/core/src/net/socket/netlink/route/kernel/link.rs
+@@ -32,7 +32,7 @@ pub(super) fn do_get_link(request_segment: &LinkSegment) -> Result<Vec<RtnlSegme
+             FilterBy::Name(name) => *name == iface.name().as_cstr(),
+             FilterBy::Dump => true,
+         })
+-        .map(|iface| iface_to_new_link(request_segment.header(), iface))
++        .map(|iface| iface_to_new_link(request_segment.header(), &iface))
+         .map(RtnlSegment::NewLink)
+         .collect();
+ 
+diff --git a/kernel/core/src/net/socket/unix/ns/abs.rs b/kernel/core/src/net/socket/unix/ns/abs.rs
+--- a/kernel/core/src/net/socket/unix/ns/abs.rs
++++ b/kernel/core/src/net/socket/unix/ns/abs.rs
+@@ -6,12 +6,16 @@ use keyable_arc::KeyableArc;
+ 
+ use crate::prelude::*;
+ 
++/// An abstract name in the namespace of a network namespace.
++///
++/// Abstract names are scoped by network namespace, so a sandboxed process in a
++/// new network namespace cannot reach the abstract sockets of other processes.
+ #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+-pub(crate) struct AbstractHandle(KeyableArc<[u8]>);
++pub(crate) struct AbstractHandle(KeyableArc<[u8]>, u64);
+ 
+ impl AbstractHandle {
+-    fn new(name: Arc<[u8]>) -> Self {
+-        Self(KeyableArc::from(name))
++    fn new(name: Arc<[u8]>, net_ns_id: u64) -> Self {
++        Self(KeyableArc::from(name), net_ns_id)
+     }
+ 
+     pub(crate) fn name(&self) -> Arc<[u8]> {
+@@ -21,14 +25,21 @@ impl AbstractHandle {
+ 
+ impl Drop for AbstractHandle {
+     fn drop(&mut self) {
+-        HANDLE_TABLE.remove(self.name());
++        HANDLE_TABLE.remove((self.1, self.name()));
+     }
+ }
+ 
++/// The key of an abstract name: the network namespace and the name.
++type HandleKey = (u64, Arc<[u8]>);
++
++fn current_ns_id() -> u64 {
++    crate::net::net_ns::current_net_ns().id()
++}
++
+ static HANDLE_TABLE: HandleTable = HandleTable::new();
+ 
+ struct HandleTable {
+-    handles: RwLock<BTreeMap<Arc<[u8]>, Weak<AbstractHandle>>>,
++    handles: RwLock<BTreeMap<HandleKey, Weak<AbstractHandle>>>,
+ }
+ 
+ impl HandleTable {
+@@ -38,10 +49,10 @@ impl HandleTable {
+         }
+     }
+ 
+-    fn create(&self, name: Arc<[u8]>) -> Option<Arc<AbstractHandle>> {
++    fn create(&self, name: Arc<[u8]>, ns_id: u64) -> Option<Arc<AbstractHandle>> {
+         let mut handles = self.handles.write();
+ 
+-        let mut entry = handles.entry(name.clone());
++        let mut entry = handles.entry((ns_id, name.clone()));
+ 
+         if let Entry::Occupied(ref occupied) = entry {
+             // The handle is in use only if its strong count is greater than zero.
+@@ -50,7 +61,7 @@ impl HandleTable {
+             }
+         }
+ 
+-        let new_handle = Arc::new(AbstractHandle::new(name));
++        let new_handle = Arc::new(AbstractHandle::new(name, ns_id));
+         let weak_handle = Arc::downgrade(&new_handle);
+ 
+         match entry {
+@@ -65,10 +76,10 @@ impl HandleTable {
+         Some(new_handle)
+     }
+ 
+-    fn remove(&self, name: Arc<[u8]>) {
++    fn remove(&self, key: HandleKey) {
+         let mut handles = self.handles.write();
+ 
+-        let Entry::Occupied(occupied) = handles.entry(name) else {
++        let Entry::Occupied(occupied) = handles.entry(key) else {
+             return;
+         };
+ 
+@@ -81,13 +92,15 @@ impl HandleTable {
+         }
+     }
+ 
+-    fn lookup(&self, name: &[u8]) -> Option<Arc<AbstractHandle>> {
++    fn lookup(&self, name: &[u8], ns_id: u64) -> Option<Arc<AbstractHandle>> {
+         let handles = self.handles.read();
+ 
+-        handles.get(name).and_then(Weak::upgrade)
++        handles
++            .get(&(ns_id, Arc::from(name)))
++            .and_then(Weak::upgrade)
+     }
+ 
+-    fn alloc_ephemeral(&self) -> Option<Arc<AbstractHandle>> {
++    fn alloc_ephemeral(&self, ns_id: u64) -> Option<Arc<AbstractHandle>> {
+         // See "Autobind feature" in the man pages:
+         // <https://man7.org/linux/man-pages/man7/unix.7.html>.
+         //
+@@ -98,25 +111,25 @@ impl HandleTable {
+         (0..(1 << 20))
+             .map(|num| format!("{:05x}", num))
+             .map(|name| Arc::from(name.as_bytes()))
+-            .filter_map(|name| self.create(name))
++            .filter_map(|name| self.create(name, ns_id))
+             .next()
+     }
+ }
+ 
+ pub(crate) fn create_abstract_name(name: Arc<[u8]>) -> Result<Arc<AbstractHandle>> {
+-    HANDLE_TABLE.create(name).ok_or_else(|| {
++    HANDLE_TABLE.create(name, current_ns_id()).ok_or_else(|| {
+         Error::with_message(Errno::EADDRINUSE, "the abstract name is already in use")
+     })
+ }
+ 
+ pub(crate) fn alloc_ephemeral_abstract_name() -> Result<Arc<AbstractHandle>> {
+-    HANDLE_TABLE.alloc_ephemeral().ok_or_else(|| {
++    HANDLE_TABLE.alloc_ephemeral(current_ns_id()).ok_or_else(|| {
+         Error::with_message(Errno::ENOSPC, "no ephemeral abstract name is available")
+     })
+ }
+ 
+ pub(crate) fn lookup_abstract_name(name: &[u8]) -> Result<Arc<AbstractHandle>> {
+     HANDLE_TABLE
+-        .lookup(name)
++        .lookup(name, current_ns_id())
+         .ok_or_else(|| Error::with_message(Errno::ECONNREFUSED, "the abstract name does not exist"))
+ }
+diff --git a/kernel/core/src/net/socket/util/ioctl.rs b/kernel/core/src/net/socket/util/ioctl.rs
+--- a/kernel/core/src/net/socket/util/ioctl.rs
++++ b/kernel/core/src/net/socket/util/ioctl.rs
+@@ -265,13 +265,13 @@ impl CIfReq {
+         self.data = CIfReqData::new_addr(socket_addr);
+     }
+ 
+-    pub(in crate::net::socket) fn get_iface_by_name(&mut self) -> Result<&'static Arc<Iface>> {
++    pub(in crate::net::socket) fn get_iface_by_name(&mut self) -> Result<Arc<Iface>> {
+         iter_all_ifaces()
+             .find(|iface| iface.name() == &self.name)
+             .ok_or_else(|| Error::with_message(Errno::ENODEV, "no interface found"))
+     }
+ 
+-    fn get_iface_by_index(&self) -> Result<&'static Arc<Iface>> {
++    fn get_iface_by_index(&self) -> Result<Arc<Iface>> {
+         let index = *self.data.value();
+         iter_all_ifaces()
+             .find(|iface| iface.index().cast_signed() == index)
+diff --git a/kernel/core/src/process/clone.rs b/kernel/core/src/process/clone.rs
+--- a/kernel/core/src/process/clone.rs
++++ b/kernel/core/src/process/clone.rs
+@@ -280,6 +280,7 @@ impl CloneFlags {
+             | CloneFlags::CLONE_NEWUTS
+             | CloneFlags::CLONE_NEWUSER
+             | CloneFlags::CLONE_NEWPID
++            | CloneFlags::CLONE_NEWNET
+             | CloneFlags::CLONE_PARENT;
+         let unsupported_flags = *self - supported_flags;
+         if !unsupported_flags.is_empty() {
+diff --git a/kernel/core/src/process/namespace/nsproxy.rs b/kernel/core/src/process/namespace/nsproxy.rs
+--- a/kernel/core/src/process/namespace/nsproxy.rs
++++ b/kernel/core/src/process/namespace/nsproxy.rs
+@@ -5,7 +5,7 @@ use spin::Once;
+ use crate::{
+     fs::{cgroupfs::CgroupNamespace, vfs::path::MountNamespace},
+     ipc::IpcNamespace,
+-    net::uts_ns::UtsNamespace,
++    net::{net_ns::NetNamespace, uts_ns::UtsNamespace},
+     prelude::*,
+     process::{CloneFlags, PidNamespace, Process, UserNamespace, posix_thread::PosixThread},
+ };
+@@ -23,6 +23,7 @@ pub(crate) struct NsProxy {
+     cgroup_ns: Arc<CgroupNamespace>,
+     ipc_ns: Arc<IpcNamespace>,
+     mnt_ns: Arc<MountNamespace>,
++    net_ns: Arc<NetNamespace>,
+     uts_ns: Arc<UtsNamespace>,
+ }
+ 
+@@ -36,6 +37,7 @@ impl NsProxy {
+                 cgroup_ns: CgroupNamespace::get_init_singleton().clone(),
+                 ipc_ns: IpcNamespace::get_init_singleton().clone(),
+                 mnt_ns: MountNamespace::get_init_singleton().clone(),
++                net_ns: NetNamespace::get_init_singleton().clone(),
+                 uts_ns: UtsNamespace::get_init_singleton().clone(),
+             })
+         })
+@@ -89,6 +91,11 @@ impl NsProxy {
+             builder.mnt_ns(new_mnt_ns);
+         }
+ 
++        if clone_ns_flags.contains(CloneFlags::CLONE_NEWNET) {
++            let new_net_ns = self.net_ns.new_clone(user_ns.clone(), posix_thread)?;
++            builder.net_ns(new_net_ns);
++        }
++
+         if clone_ns_flags.contains(CloneFlags::CLONE_NEWUTS) {
+             let new_uts_ns = self.uts_ns.new_clone(user_ns.clone(), posix_thread)?;
+             builder.uts_ns(new_uts_ns);
+@@ -126,6 +133,11 @@ impl NsProxy {
+         &self.mnt_ns
+     }
+ 
++    /// Returns the associated network namespace.
++    pub(crate) fn net_ns(&self) -> &Arc<NetNamespace> {
++        &self.net_ns
++    }
++
+     /// Returns the associated UTS namespace.
+     pub(crate) fn uts_ns(&self) -> &Arc<UtsNamespace> {
+         &self.uts_ns
+@@ -142,6 +154,7 @@ pub(crate) struct NsProxyBuilder<'a> {
+     cgroup_ns: Option<Arc<CgroupNamespace>>,
+     ipc_ns: Option<Arc<IpcNamespace>>,
+     mnt_ns: Option<Arc<MountNamespace>>,
++    net_ns: Option<Arc<NetNamespace>>,
+     uts_ns: Option<Arc<UtsNamespace>>,
+ }
+ 
+@@ -154,6 +167,7 @@ impl<'a> NsProxyBuilder<'a> {
+             cgroup_ns: None,
+             ipc_ns: None,
+             mnt_ns: None,
++            net_ns: None,
+             uts_ns: None,
+         }
+     }
+@@ -182,6 +196,12 @@ impl<'a> NsProxyBuilder<'a> {
+         self
+     }
+ 
++    /// Sets the new network namespace for the context being built.
++    pub(crate) fn net_ns(&mut self, net_ns: Arc<NetNamespace>) -> &mut Self {
++        self.net_ns = Some(net_ns);
++        self
++    }
++
+     /// Sets the new UTS namespace for the context being built.
+     pub(crate) fn uts_ns(&mut self, uts_ns: Arc<UtsNamespace>) -> &mut Self {
+         self.uts_ns = Some(uts_ns);
+@@ -196,6 +216,7 @@ impl<'a> NsProxyBuilder<'a> {
+             cgroup_ns: new_cgroup,
+             ipc_ns: new_ipc,
+             mnt_ns: new_mnt,
++            net_ns: new_net,
+             uts_ns: new_uts,
+         } = self;
+ 
+@@ -203,6 +224,7 @@ impl<'a> NsProxyBuilder<'a> {
+         let new_cgroup = new_cgroup.unwrap_or_else(|| old_proxy.cgroup_ns.clone());
+         let new_ipc = new_ipc.unwrap_or_else(|| old_proxy.ipc_ns.clone());
+         let new_mnt = new_mnt.unwrap_or_else(|| old_proxy.mnt_ns.clone());
++        let new_net = new_net.unwrap_or_else(|| old_proxy.net_ns.clone());
+         let new_uts = new_uts.unwrap_or_else(|| old_proxy.uts_ns.clone());
+ 
+         NsProxy {
+@@ -210,6 +232,7 @@ impl<'a> NsProxyBuilder<'a> {
+             cgroup_ns: new_cgroup,
+             ipc_ns: new_ipc,
+             mnt_ns: new_mnt,
++            net_ns: new_net,
+             uts_ns: new_uts,
+         }
+     }
+@@ -222,6 +245,7 @@ pub(crate) fn check_unsupported_ns_flags(flags: CloneFlags) -> Result<()> {
+     const SUPPORTED_FLAGS: CloneFlags = CloneFlags::CLONE_NEWCGROUP
+         .union(CloneFlags::CLONE_NEWIPC)
+         .union(CloneFlags::CLONE_NEWNS)
++        .union(CloneFlags::CLONE_NEWNET)
+         .union(CloneFlags::CLONE_NEWPID)
+         .union(CloneFlags::CLONE_NEWUTS);
+ 
+diff --git a/kernel/core/src/process/posix_thread/thread_local.rs b/kernel/core/src/process/posix_thread/thread_local.rs
+--- a/kernel/core/src/process/posix_thread/thread_local.rs
++++ b/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -201,6 +201,16 @@ impl ThreadLocal {
+         ThreadLocalOptionRef(self.ns_proxy.borrow())
+     }
+ 
++    /// Borrows the namespace proxy without panicking.
++    ///
++    /// Returns an error if the proxy is borrowed mutably, and `None` after the
++    /// thread has dropped it on exit.
++    pub(crate) fn try_borrow_ns_proxy(
++        &self,
++    ) -> core::result::Result<Option<Arc<NsProxy>>, core::cell::BorrowError> {
++        self.ns_proxy.try_borrow().map(|ns_proxy| ns_proxy.clone())
++    }
++
+     pub(in crate::process) fn borrow_ns_proxy_mut(&self) -> NsProxyRefMut<'_> {
+         ThreadLocalOptionRefMut(self.ns_proxy.borrow_mut())
+     }

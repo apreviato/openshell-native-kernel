@@ -1,0 +1,53 @@
+diff --git a/kernel/core/src/net/net_ns.rs b/kernel/core/src/net/net_ns.rs
+--- a/kernel/core/src/net/net_ns.rs
++++ b/kernel/core/src/net/net_ns.rs
+@@ -82,6 +82,11 @@ impl NetNamespace {
+         self.id
+     }
+ 
++    /// Returns the user namespace that owns the namespace.
++    pub(in crate::net) fn owner(&self) -> &Arc<UserNamespace> {
++        &self.owner
++    }
++
+     /// Returns the interfaces of the namespace.
+     pub(in crate::net) fn ifaces(&self) -> &[Arc<Iface>] {
+         &self.ifaces
+diff --git a/kernel/core/src/net/socket/util/port_privilege.rs b/kernel/core/src/net/socket/util/port_privilege.rs
+--- a/kernel/core/src/net/socket/util/port_privilege.rs
++++ b/kernel/core/src/net/socket/util/port_privilege.rs
+@@ -4,11 +4,16 @@ use core::ops::Range;
+ 
+ use crate::{
+     prelude::*,
+-    process::{UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
++    process::{credentials::capabilities::CapSet, posix_thread::AsPosixThread},
+     security::lsm::hooks as lsm_hooks,
+ };
+ 
+-const PRIVILEGED_PORTS: Range<u16> = 0..1024;
++/// The ports that need `CAP_NET_BIND_SERVICE`.
++///
++/// Port zero asks for an ephemeral port, which any thread may bind.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/net/ipv4/af_inet.c#L493>
++const PRIVILEGED_PORTS: Range<u16> = 1..1024;
+ 
+ /// Checks if the port is privileged and, if so, whether the thread is allowed to bind to it.
+ pub(crate) fn check_port_privilege(port: u16) -> Result<()> {
+@@ -16,12 +21,12 @@ pub(crate) fn check_port_privilege(port: u16) -> Result<()> {
+         return Ok(());
+     }
+ 
+-    // This should be checked under the network namespace's owner user namespace, if we later
+-    // support those namespaces.
++    // The capability is checked in the user namespace that owns the network namespace.
+     let thread = current_thread!();
+     let posix_thread = thread.as_posix_thread().unwrap();
++    let net_ns = crate::net::net_ns::current_net_ns();
+     if lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+-        UserNamespace::get_init_singleton().as_ref(),
++        net_ns.owner().as_ref(),
+         posix_thread,
+         CapSet::NET_BIND_SERVICE,
+     ))

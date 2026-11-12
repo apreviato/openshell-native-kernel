@@ -1,0 +1,194 @@
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = fileURLToPath(new URL("../../", import.meta.url));
+const lock = JSON.parse(readFileSync(join(root, "kernel", "config", "upstream.lock.json"), "utf8"));
+const actions = ["doctor", "build", "smoke", "compat", "control", "sandbox", "baseline", "graphics", "desktop"];
+const usage = `Usage: node tools/build/native.mjs <${actions.filter((name) => name !== "desktop").join("|")}>
+       node tools/build/native.mjs desktop <openshell-desktop-bundle>`;
+
+function docker(args, { optional = false, inherit = false } = {}) {
+  const result = spawnSync("docker", args, {
+    encoding: "utf8",
+    stdio: ["ignore", inherit ? "inherit" : "pipe", inherit ? "inherit" : "pipe"],
+  });
+  if (result.error?.code === "ENOENT") {
+    throw new Error("Docker CLI unavailable. Install Docker and start its Linux engine.");
+  }
+  if (result.status !== 0 || result.error) {
+    if (optional) return null;
+    const detail = result.error?.message || result.stderr?.trim() || `exit status ${result.status}`;
+    throw new Error(`docker ${args[0]} failed: ${detail}`);
+  }
+  return result.stdout?.trim() ?? "";
+}
+
+function checkEngine() {
+  let server;
+  try {
+    server = docker(["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]);
+  } catch (error) {
+    throw new Error(`Docker Linux engine is inaccessible to this session. ${error.message}`);
+  }
+  if (server !== "linux/amd64") {
+    throw new Error(`The baseline requires a linux/amd64 Docker engine, found ${server || "unknown"}.`);
+  }
+  return server;
+}
+
+function resolveBuilder() {
+  const requestedDigest = process.env.OPENSHELL_NATIVE_BUILDER_DIGEST ?? lock.builderDigest;
+  if (!/^sha256:[0-9a-f]{64}$/.test(requestedDigest)) {
+    throw new Error("The builder lock or OPENSHELL_NATIVE_BUILDER_DIGEST must provide a sha256 digest.");
+  }
+  const repository = lock.builderRepository;
+  const reference = `${repository}@${requestedDigest}`;
+  let info = docker(["image", "inspect", reference], { optional: true });
+  if (info === null) {
+    docker(["pull", "--platform", "linux/amd64", reference], { inherit: true });
+    info = docker(["image", "inspect", reference]);
+  }
+  const [image] = JSON.parse(info);
+  const repositoryName = repository.replace(/^docker\.io\//, "");
+  const expectedPrefix = `${repositoryName}@`;
+  const digestRef = image?.RepoDigests?.find((entry) => {
+    const value = entry.replace(/^docker\.io\//, "");
+    return value === `${expectedPrefix}${requestedDigest}`;
+  });
+  if (image?.Os !== "linux" || image?.Architecture !== "amd64" || !digestRef) {
+    throw new Error(`Unable to identify the linux/amd64 registry digest for ${reference}.`);
+  }
+  return reference;
+}
+
+async function startContainer(container) {
+  const child = spawn("docker", ["start", "--attach", container], { stdio: ["ignore", "inherit", "inherit"] });
+  let interrupted = false;
+  const stop = () => {
+    interrupted = true;
+    spawnSync("docker", ["stop", "--time", "5", container], { stdio: "ignore", timeout: 15_000 });
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    const status = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+    if (interrupted) throw new Error("Native build interrupted.");
+    const state = docker(["inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", container]);
+    if (status !== 0 || state !== "exited 0") {
+      throw new Error(`Native container failed (Docker status ${status}, state ${state}).`);
+    }
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
+  }
+}
+
+// Reads the identity of an OpenShell Desktop bundle and checks that it has the
+// files that the Native session starts.
+function readBundle(path) {
+  const bundle = resolve(path);
+  for (const file of ["BUILD.json", "hostd/openshell-hostd.mjs", "ui/index.html"]) {
+    if (!existsSync(join(bundle, file))) throw new Error(`The Desktop bundle lacks ${file}: ${bundle}`);
+  }
+  const build = JSON.parse(readFileSync(join(bundle, "BUILD.json"), "utf8"));
+  const hostd = createHash("sha256").update(readFileSync(join(bundle, "hostd", "openshell-hostd.mjs"))).digest("hex");
+  return { path: bundle, version: build.version, builtAt: build.builtAt, electron: build.electron, hostdSha256: hostd };
+}
+
+async function run(action, bundlePath) {
+  if (action === "doctor") {
+    const engine = checkEngine();
+    console.log(`Docker engine: ${engine}\nAsterinas: ${lock.tag} (${lock.commit})\nRust: ${lock.rust}`);
+    return;
+  }
+
+  const outputRoot = join(root, "out");
+  mkdirSync(outputRoot, { recursive: true });
+  const output = mkdtempSync(join(outputRoot, "native-"));
+  const reportPath = join(output, "run.json");
+  const report = { action, upstream: lock.commit, image: null, status: "running", checks: {} };
+  const bundle = action === "desktop" ? readBundle(bundlePath) : null;
+  if (bundle) report.bundle = { version: bundle.version, builtAt: bundle.builtAt, electron: bundle.electron, hostdSha256: bundle.hostdSha256 };
+  const saveReport = () => writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  saveReport();
+  console.log(`Artifacts: ${output}`);
+
+  let container;
+  try {
+    checkEngine();
+    const image = resolveBuilder();
+    report.image = image;
+    saveReport();
+    console.log(`Builder: ${image}`);
+    container = docker([
+      "create", "--init", "--platform", "linux/amd64", "--entrypoint", "/bin/bash",
+      image, "/tmp/openshell-native-run.sh", action,
+      lock.repository, lock.tag, lock.commit, lock.rust,
+    ]);
+    docker(["cp", join(root, "tools", "qemu", "run.sh"), `${container}:/tmp/openshell-native-run.sh`]);
+    docker(["cp", join(root, "userspace", "compatibility"), `${container}:/tmp/openshell-native-compat`]);
+    for (const name of ["hostd-smoke.mjs", "cef-smoke.mjs", "linux-sandbox.mjs"]) {
+      docker(["cp", join(root, "tools", "desktop", name), `${container}:/tmp/openshell-native-compat/probes/${name}`]);
+    }
+    if (action === "graphics") {
+      // The guest builds the Rust shell and the CEF host from these sources.
+      // The recipe ignores a local Cargo target directory.
+      docker(["cp", join(root, "userspace", "shell"), `${container}:/tmp/openshell-native-shell`]);
+    }
+    if (bundle) {
+      docker(["cp", bundle.path, `${container}:/tmp/openshell-native-bundle`]);
+    }
+    if (action !== "control") {
+      docker(["cp", join(root, "kernel", "patches"), `${container}:/tmp/openshell-native-patches`]);
+    }
+    if (action === "baseline") {
+      for (const name of ["Cargo.toml", "Cargo.lock", "src"]) {
+        docker(["cp", join(root, "userspace", "shell", name), `${container}:/tmp/openshell-native-compat/${name}`]);
+      }
+    }
+    try {
+      await startContainer(container);
+    } catch (error) {
+      docker(["cp", `${container}:/tmp/openshell-native-out/.`, output], { optional: true });
+      throw error;
+    }
+    docker(["cp", `${container}:/tmp/openshell-native-out/.`, output]);
+    report.status = "passed";
+  } catch (error) {
+    report.status = "failed";
+    report.error = error.message;
+    throw error;
+  } finally {
+    if (container && docker(["rm", "--force", container], { optional: true }) === null) {
+      console.error(`Could not remove container ${container}.`);
+    }
+    const checksPath = join(output, "checks.tsv");
+    if (existsSync(checksPath)) {
+      const rows = readFileSync(checksPath, "utf8").trim().split(/\r?\n/);
+      report.checks = Object.fromEntries(rows.filter((row) => row.includes("\t")).map((row) => row.split("\t", 2)));
+    }
+    saveReport();
+  }
+}
+
+const [action, ...extra] = process.argv.slice(2);
+const expected = action === "desktop" ? 1 : 0;
+if ((action === "--help" || action === "-h") && extra.length === 0) {
+  console.log(usage);
+} else if (extra.length !== expected || !actions.includes(action)) {
+  console.error(usage);
+  process.exitCode = 2;
+} else {
+  try {
+    await run(action, extra[0]);
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}

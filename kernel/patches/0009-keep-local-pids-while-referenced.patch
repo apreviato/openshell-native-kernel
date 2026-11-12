@@ -1,0 +1,293 @@
+diff --git a/kernel/core/src/process/clone.rs b/kernel/core/src/process/clone.rs
+--- a/kernel/core/src/process/clone.rs
++++ b/kernel/core/src/process/clone.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::{PidNamespace, pid_to_user};
++use super::{PidNamespace, namespace::pid_ns::PidRegistration, pid_to_user};
+ use alloc::borrow::Cow;
+ use core::{num::NonZeroU64, sync::atomic::Ordering};
+ 
+@@ -472,7 +472,8 @@ fn clone_child_task(
+         .user_ns(child_user_ns)
+         .ns_proxy(child_ns_proxy)
+         .default_timer_slack_ns(default_timer_slack_ns)
+-        .inherit_seccomp(posix_thread.seccomp());
++        .inherit_seccomp(posix_thread.seccomp())
++        .tid_registration(pid_registration);
+         #[cfg(target_arch = "x86_64")]
+         {
+             thread_builder = thread_builder.fs_base(child_fs_base).gs_base(child_gs_base);
+@@ -506,7 +507,6 @@ fn clone_child_task(
+ 
+     let child_thread = child_task.as_thread().unwrap();
+     pid_table::pid_table_mut().insert_thread(child_tid, child_thread);
+-    pid_registration.commit();
+ 
+     Ok(child_task)
+ }
+@@ -646,6 +646,7 @@ fn clone_child_process(
+             child_sig_dispositions,
+             child_user_ns,
+             child_pid_ns,
++            pid_registration,
+             child_thread_builder,
+         )
+     };
+@@ -658,7 +659,6 @@ fn clone_child_process(
+ 
+     // Sets parent process and group for child process.
+     set_parent_and_group(clone_flags, process, &child);
+-    pid_registration.commit();
+ 
+     // The first process of a PID namespace adopts the orphans of the namespace.
+     if child.pid_ns().is_init_process(child_tid) {
+@@ -872,6 +872,7 @@ fn create_child_process(
+     sig_dispositions: Arc<Mutex<SigDispositions>>,
+     user_ns: Arc<UserNamespace>,
+     pid_ns: Arc<PidNamespace>,
++    pid_registration: PidRegistration,
+     thread_builder: PosixThreadBuilder,
+ ) -> Arc<Process> {
+     let child_proc = Process::new(
+@@ -883,6 +884,7 @@ fn create_child_process(
+         sig_dispositions,
+         user_ns,
+         pid_ns,
++        Some(pid_registration),
+     );
+ 
+     let child_task = thread_builder.process(Arc::downgrade(&child_proc)).build();
+diff --git a/kernel/core/src/process/namespace/pid_ns.rs b/kernel/core/src/process/namespace/pid_ns.rs
+--- a/kernel/core/src/process/namespace/pid_ns.rs
++++ b/kernel/core/src/process/namespace/pid_ns.rs
+@@ -151,7 +151,6 @@ impl PidNamespace {
+         Ok(PidRegistration {
+             pid_ns: self.clone(),
+             global,
+-            is_committed: false,
+         })
+     }
+ 
+@@ -226,28 +225,21 @@ impl LocalIds {
+     }
+ }
+ 
+-/// A pending registration of a global ID in a PID namespace.
++/// The local IDs of a global ID in a PID namespace and its ancestors.
+ ///
+-/// Dropping the value removes the local IDs again, unless the registration has
+-/// been committed because the ID entered the PID table. The PID table then
+-/// removes the local IDs together with the table entry.
++/// The process or thread that owns the ID keeps the registration. The local IDs
++/// stay valid while the object exists, so a reaped process still has its local
++/// ID when `wait4` reports it, as Linux keeps a `struct pid` while it is used.
++/// Global IDs are not reused, so the local IDs cannot be confused with those of
++/// a newer process.
+ pub(crate) struct PidRegistration {
+     pid_ns: Arc<PidNamespace>,
+     global: u32,
+-    is_committed: bool,
+-}
+-
+-impl PidRegistration {
+-    pub(crate) fn commit(mut self) {
+-        self.is_committed = true;
+-    }
+ }
+ 
+ impl Drop for PidRegistration {
+     fn drop(&mut self) {
+-        if !self.is_committed {
+-            self.pid_ns.unregister(self.global);
+-        }
++        self.pid_ns.unregister(self.global);
+     }
+ }
+ 
+diff --git a/kernel/core/src/process/pid_table.rs b/kernel/core/src/process/pid_table.rs
+--- a/kernel/core/src/process/pid_table.rs
++++ b/kernel/core/src/process/pid_table.rs
+@@ -79,8 +79,7 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            let id = *map_entry.key();
+-            map_entry.remove().forget_local_ids(id);
++            map_entry.remove();
+         }
+     }
+ 
+@@ -103,8 +102,7 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            let id = *map_entry.key();
+-            map_entry.remove().forget_local_ids(id);
++            map_entry.remove();
+         }
+ 
+         Some(thread)
+@@ -180,8 +178,7 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            let id = *map_entry.key();
+-            map_entry.remove().forget_local_ids(id);
++            map_entry.remove();
+         }
+     }
+ 
+@@ -252,8 +249,7 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            let id = *map_entry.key();
+-            map_entry.remove().forget_local_ids(id);
++            map_entry.remove();
+         }
+     }
+ 
+@@ -291,8 +287,7 @@ impl PidTable {
+         };
+ 
+         if should_remove {
+-            let id = *map_entry.key();
+-            map_entry.remove().forget_local_ids(id);
++            map_entry.remove();
+         }
+     }
+ 
+@@ -358,13 +353,6 @@ impl PidEntry {
+         }
+     }
+ 
+-    /// Removes the local IDs of the entry after it has left the PID table.
+-    fn forget_local_ids(&self, id: u32) {
+-        if let Some(pid_ns) = self.lock().pid_ns.take() {
+-            pid_ns.unregister(id);
+-        }
+-    }
+-
+     /// Locks and returns access to the entry internals.
+     fn lock(&self) -> MutexGuard<'_, PidEntryInner> {
+         self.inner.lock()
+diff --git a/kernel/core/src/process/posix_thread/builder.rs b/kernel/core/src/process/posix_thread/builder.rs
+--- a/kernel/core/src/process/posix_thread/builder.rs
++++ b/kernel/core/src/process/posix_thread/builder.rs
+@@ -18,6 +18,7 @@ use crate::{
+     prelude::*,
+     process::{
+         Credentials, NsProxy, Process, UserNamespace,
++        namespace::pid_ns::PidRegistration,
+         posix_thread::{ThreadName, seccomp::SeccompState, thread_local::SuppUserContext},
+         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
+     },
+@@ -50,6 +51,7 @@ pub(crate) struct PosixThreadBuilder {
+     ns_proxy: Option<Arc<NsProxy>>,
+     default_timer_slack_ns: u64,
+     seccomp: SeccompState,
++    tid_registration: Option<PidRegistration>,
+ }
+ 
+ impl PosixThreadBuilder {
+@@ -79,6 +81,7 @@ impl PosixThreadBuilder {
+             ns_proxy: None,
+             default_timer_slack_ns: 50_000, // 50 usec default slack
+             seccomp: SeccompState::new(),
++            tid_registration: None,
+         }
+     }
+ 
+@@ -150,6 +153,12 @@ impl PosixThreadBuilder {
+         self
+     }
+ 
++    /// Gives the thread the local IDs of its TID, which live as long as the thread.
++    pub(crate) fn tid_registration(mut self, registration: PidRegistration) -> Self {
++        self.tid_registration = Some(registration);
++        self
++    }
++
+     /// Starts the thread with the seccomp state of its creator.
+     pub(crate) fn inherit_seccomp(self, parent: &SeccompState) -> Self {
+         self.seccomp.inherit_from(parent);
+@@ -176,6 +185,7 @@ impl PosixThreadBuilder {
+             ns_proxy,
+             default_timer_slack_ns,
+             seccomp,
++            tid_registration,
+         } = self;
+ 
+         let file_table = file_table.unwrap_or_else(FileTable::new);
+@@ -217,6 +227,7 @@ impl PosixThreadBuilder {
+                     personality: AtomicU32::new(0),
+                     user_ns: SpinLock::new(user_ns.clone()),
+                     seccomp,
++                    tid_registration,
+                 }
+             };
+ 
+diff --git a/kernel/core/src/process/posix_thread/mod.rs b/kernel/core/src/process/posix_thread/mod.rs
+--- a/kernel/core/src/process/posix_thread/mod.rs
++++ b/kernel/core/src/process/posix_thread/mod.rs
+@@ -116,6 +116,10 @@ pub struct PosixThread {
+ 
+     /// The secure computing state of this thread.
+     seccomp: seccomp::SeccompState,
++
++    /// The local IDs of a thread that is not the main thread of its process.
++    #[expect(dead_code, reason = "dropping the registration releases the local IDs")]
++    tid_registration: Option<super::namespace::pid_ns::PidRegistration>,
+ }
+ 
+ impl PosixThread {
+diff --git a/kernel/core/src/process/process/init_proc.rs b/kernel/core/src/process/process/init_proc.rs
+--- a/kernel/core/src/process/process/init_proc.rs
++++ b/kernel/core/src/process/process/init_proc.rs
+@@ -72,6 +72,7 @@ fn create_init_process(
+         sig_dispositions,
+         user_ns,
+         PidNamespace::get_init_singleton().clone(),
++        None,
+     );
+ 
+     let init_task = create_init_task(pid, &init_proc, fs, vmar, executable_path, argv, envp)?;
+diff --git a/kernel/core/src/process/process/mod.rs b/kernel/core/src/process/process/mod.rs
+--- a/kernel/core/src/process/process/mod.rs
++++ b/kernel/core/src/process/process/mod.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::PidNamespace;
++use super::{PidNamespace, namespace::pid_ns::PidRegistration};
+ use core::{
+     sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering},
+     time::Duration,
+@@ -89,6 +89,9 @@ pub struct Process {
+     pid: Pid,
+     /// The PID namespace of the process.
+     pid_ns: Arc<PidNamespace>,
++    /// The local IDs of the process, which live as long as the process.
++    #[expect(dead_code, reason = "dropping the registration releases the local IDs")]
++    pid_registration: Option<PidRegistration>,
+ 
+     vmar: Mutex<Option<Arc<Vmar>>>,
+     /// Wait for child status changed
+@@ -238,6 +241,7 @@ impl Process {
+         sig_dispositions: Arc<Mutex<SigDispositions>>,
+         user_ns: Arc<UserNamespace>,
+         pid_ns: Arc<PidNamespace>,
++        pid_registration: Option<PidRegistration>,
+     ) -> Arc<Self> {
+         Arc::new_cyclic(|process_ref: &Weak<Process>| {
+             // SIGCHID does not interrupt pauser. Child process will
+@@ -250,6 +254,7 @@ impl Process {
+             Self {
+                 pid,
+                 pid_ns,
++                pid_registration,
+                 vmar: Mutex::new(Some(vmar)),
+                 children_wait_queue,
+                 pidfile_pollee: Pollee::new(),

@@ -1,0 +1,95 @@
+name: Native baseline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Linux validation to run
+        type: choice
+        options: [smoke, compat, sandbox, control, baseline]
+        default: smoke
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check build scripts
+        run: |
+          node --check tools/build/native.mjs
+          node tools/build/native.mjs --help
+          node --check tools/desktop/smoke.mjs
+          node --check tools/desktop/cef-smoke.mjs
+          node --check tools/desktop/hostd-smoke.mjs
+          node --test tools/desktop/linux-sandbox.test.mjs
+          bash -n tools/desktop/build-cef.sh
+          bash -n tools/desktop/cef-baseline.sh
+          bash -n tools/qemu/run.sh
+          sh -n userspace/compatibility/probes/boot.sh
+          sh -n userspace/compatibility/probes/compat-boot.sh
+      - name: Check the Rust shell
+        run: cargo test --locked --manifest-path userspace/shell/Cargo.toml
+      - name: Check the static ELF probe
+        run: |
+          as --64 -o "$RUNNER_TEMP/static-exit.o" userspace/compatibility/probes/static-exit.S
+          ld -m elf_x86_64 -static -o "$RUNNER_TEMP/static-exit" "$RUNNER_TEMP/static-exit.o"
+          status=0
+          "$RUNNER_TEMP/static-exit" || status=$?
+          test "$status" -eq 42
+      - name: Check userspace probes on Linux
+        run: |
+          mkdir "$RUNNER_TEMP/tls"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes             -keyout "$RUNNER_TEMP/tls/key.pem" -out "$RUNNER_TEMP/tls/cert.pem" -days 1             -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1
+          OPENSHELL_PROBE_TLS="$RUNNER_TEMP/tls" node userspace/compatibility/probes/node.mjs
+          python3 -I userspace/compatibility/probes/python.py
+          python3 -I userspace/compatibility/probes/inotify.py
+          cc -O2 -Wall -Wextra -Werror -pthread -o "$RUNNER_TEMP/seccomp-probe" userspace/compatibility/probes/seccomp.c
+          "$RUNNER_TEMP/seccomp-probe"
+      - name: Check the namespace probe on Linux
+        run: |
+          # The runner restricts unprivileged user namespaces by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo python3 -I userspace/compatibility/probes/namespaces.py
+          cc -O2 -Wall -Wextra -Werror -pthread -o "$RUNNER_TEMP/chromium-userns" \
+            userspace/compatibility/probes/chromium-userns.c
+          "$RUNNER_TEMP/chromium-userns"
+      - name: Check that the kernel patches are well formed
+        run: |
+          for patch in kernel/patches/*.patch; do
+            git apply --stat "$patch" > /dev/null
+          done
+
+  qemu:
+    if: github.event_name == 'workflow_dispatch'
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 210
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Run Linux validation
+        env:
+          MODE: ${{ inputs.mode }}
+        run: node tools/build/native.mjs "$MODE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: openshell-native-baseline
+          path: out/native-*/
+          retention-days: 7

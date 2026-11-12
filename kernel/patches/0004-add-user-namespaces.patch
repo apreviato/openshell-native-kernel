@@ -1,0 +1,1217 @@
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/gid_map.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/gid_map.rs
+old mode 100644
+new mode 100755
+--- a/kernel/core/src/fs/fs_impls/procfs/pid/task/gid_map.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/gid_map.rs
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use aster_util::printer::VmPrinter;
+-
+-use super::TidDirOps;
++use super::{
++    TidDirOps,
++    uid_map::{read_id_map, write_id_map},
++};
+ use crate::{
+     fs::{
+         file::mkmod,
+@@ -10,7 +11,7 @@ use crate::{
+         vfs::inode::Inode,
+     },
+     prelude::*,
+-    process::Gid,
++    process::IdKind,
+     thread::Thread,
+ };
+ 
+@@ -30,19 +31,10 @@ impl ProcFileOps for GidMapFileOps {
+     }
+ 
+     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+-        let mut printer = VmPrinter::new_skip(writer, offset);
+-
+-        // This is the default GID map for the initial user namespace.
+-        // TODO: Retrieve the GID map from the user namespace of the current process
+-        // instead of returning this hard-coded value.
+-        writeln!(
+-            printer,
+-            "{:>10} {:>10} {:>10}",
+-            0,
+-            0,
+-            u32::from(Gid::INVALID)
+-        )?;
++        read_id_map(&self.0, IdKind::Group, offset, writer)
++    }
+ 
+-        Ok(printer.bytes_written())
++    fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        write_id_map(&self.0, IdKind::Group, offset, reader)
+     }
+ }
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs
+--- a/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/mod.rs
+@@ -14,7 +14,7 @@ use crate::{
+                 gid_map::GidMapFileOps, maps::MapsFileOps, mem::MemFileOps,
+                 mountinfo::MountInfoFileOps, mounts::MountsFileOps, mountstats::MountStatsFileOps,
+                 ns::NsDirOps, oom_score_adj::OomScoreAdjFileOps, stat::StatFileOps,
+-                status::StatusFileOps, uid_map::UidMapFileOps,
++                setgroups::SetgroupsFileOps, status::StatusFileOps, uid_map::UidMapFileOps,
+             },
+             template::{
+                 ListedEntry, ProcDir, ProcDirOps, ReaddirEntry, keyed_readdir_entries,
+@@ -44,6 +44,7 @@ mod mounts;
+ mod mountstats;
+ mod ns;
+ mod oom_score_adj;
++mod setgroups;
+ pub(super) mod stat;
+ mod status;
+ mod uid_map;
+@@ -127,6 +128,7 @@ impl TidDirOps {
+             InodeType::File,
+             OomScoreAdjFileOps::new_inode,
+         ),
++        ("setgroups", InodeType::File, SetgroupsFileOps::new_inode),
+         ("stat", InodeType::File, StatFileOps::new_thread_inode),
+         ("status", InodeType::File, StatusFileOps::new_inode),
+         ("uid_map", InodeType::File, UidMapFileOps::new_inode),
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/setgroups.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/setgroups.rs
+new file mode 100755
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/setgroups.rs
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use aster_util::printer::VmPrinter;
++
++use super::{TidDirOps, uid_map::user_ns_of};
++use crate::{
++    fs::{
++        file::mkmod,
++        procfs::template::{ProcFile, ProcFileOps},
++        vfs::inode::Inode,
++    },
++    prelude::*,
++    process::posix_thread::AsPosixThread,
++    thread::Thread,
++};
++
++/// The longest accepted setting: `"allow\n"`.
++const MAX_SETTING_LEN: usize = 8;
++
++/// Represents the inode at `/proc/[pid]/task/[tid]/setgroups` (and also `/proc/[pid]/setgroups`).
++pub(super) struct SetgroupsFileOps(TidDirOps);
++
++impl SetgroupsFileOps {
++    pub(super) fn new_inode(dir: &TidDirOps, parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/fs/proc/base.c#L3405>
++        ProcFile::new(Self(dir.clone()), parent, mkmod!(a+r, u+w))
++    }
++}
++
++impl ProcFileOps for SetgroupsFileOps {
++    fn owner_thread(&self) -> Option<Arc<Thread>> {
++        self.0.thread()
++    }
++
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++
++        let setting = if user_ns_of(&self.0)?.is_setgroups_denied() {
++            "deny"
++        } else {
++            "allow"
++        };
++        writeln!(printer, "{}", setting)?;
++
++        Ok(printer.bytes_written())
++    }
++
++    fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        if offset != 0 {
++            return_errno_with_message!(Errno::EINVAL, "the setting must be written at once");
++        }
++        let (text, read_bytes) = reader.read_cstring_until_end(MAX_SETTING_LEN)?;
++        if reader.has_remain() {
++            return_errno_with_message!(Errno::EINVAL, "invalid setgroups setting");
++        }
++        let Ok(text) = text.to_str() else {
++            return_errno_with_message!(Errno::EINVAL, "invalid setgroups setting");
++        };
++
++        let current_thread = current_thread!();
++        let writer = current_thread.as_posix_thread().unwrap();
++        user_ns_of(&self.0)?.write_setgroups(text, writer)?;
++
++        Ok(read_bytes)
++    }
++}
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/uid_map.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/uid_map.rs
+old mode 100644
+new mode 100755
+--- a/kernel/core/src/fs/fs_impls/procfs/pid/task/uid_map.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/uid_map.rs
+@@ -10,10 +10,13 @@ use crate::{
+         vfs::inode::Inode,
+     },
+     prelude::*,
+-    process::Uid,
++    process::{IdKind, UserNamespace, posix_thread::AsPosixThread},
+     thread::Thread,
+ };
+ 
++/// The longest accepted ID map: three decimal `u32` values, separators and a newline.
++const MAX_ID_MAP_LEN: usize = 64;
++
+ /// Represents the inode at `/proc/[pid]/task/[tid]/uid_map` (and also `/proc/[pid]/uid_map`).
+ pub(super) struct UidMapFileOps(TidDirOps);
+ 
+@@ -30,19 +33,58 @@ impl ProcFileOps for UidMapFileOps {
+     }
+ 
+     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+-        let mut printer = VmPrinter::new_skip(writer, offset);
+-
+-        // This is the default UID map for the initial user namespace.
+-        // TODO: Retrieve the UID map from the user namespace of the current process
+-        // instead of returning this hard-coded value.
+-        writeln!(
+-            printer,
+-            "{:>10} {:>10} {:>10}",
+-            0,
+-            0,
+-            u32::from(Uid::INVALID)
+-        )?;
+-
+-        Ok(printer.bytes_written())
++        read_id_map(&self.0, IdKind::User, offset, writer)
++    }
++
++    fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        write_id_map(&self.0, IdKind::User, offset, reader)
++    }
++}
++
++/// Returns the user namespace of the thread that the directory describes.
++pub(super) fn user_ns_of(dir: &TidDirOps) -> Result<Arc<UserNamespace>> {
++    let Some(thread) = dir.thread() else {
++        return_errno_with_message!(Errno::ESRCH, "the thread does not exist");
++    };
++    Ok(thread.as_posix_thread().unwrap().user_ns())
++}
++
++pub(super) fn read_id_map(
++    dir: &TidDirOps,
++    kind: IdKind,
++    offset: usize,
++    writer: &mut VmWriter,
++) -> Result<usize> {
++    let mut printer = VmPrinter::new_skip(writer, offset);
++
++    // A namespace without a map shows an empty file.
++    if let Some((inside, outside, count)) = user_ns_of(dir)?.id_map(kind) {
++        writeln!(printer, "{:>10} {:>10} {:>10}", inside, outside, count)?;
++    }
++
++    Ok(printer.bytes_written())
++}
++
++pub(super) fn write_id_map(
++    dir: &TidDirOps,
++    kind: IdKind,
++    offset: usize,
++    reader: &mut VmReader,
++) -> Result<usize> {
++    if offset != 0 {
++        return_errno_with_message!(Errno::EINVAL, "an ID map must be written at once");
++    }
++    let (text, read_bytes) = reader.read_cstring_until_end(MAX_ID_MAP_LEN)?;
++    if reader.has_remain() {
++        return_errno_with_message!(Errno::EINVAL, "the ID map is too long");
+     }
++    let Ok(text) = text.to_str() else {
++        return_errno_with_message!(Errno::EINVAL, "the ID map is not valid text");
++    };
++
++    let current_thread = current_thread!();
++    let writer = current_thread.as_posix_thread().unwrap();
++    user_ns_of(dir)?.write_id_map(kind, text, writer)?;
++
++    Ok(read_bytes)
+ }
+diff --git a/kernel/core/src/fs/vfs/fs_apis/inode.rs b/kernel/core/src/fs/vfs/fs_apis/inode.rs
+--- a/kernel/core/src/fs/vfs/fs_apis/inode.rs
++++ b/kernel/core/src/fs/vfs/fs_apis/inode.rs
+@@ -651,7 +651,7 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
+         let mode = metadata.mode;
+ 
+         // With DAC_OVERRIDE capability, the user can bypass some permission checks.
+-        if has_dac_override_capability(&task, posix_thread) {
++        if has_dac_override_capability(&task, posix_thread, metadata.uid, metadata.gid) {
+             if metadata.type_ == InodeType::Dir {
+                 // DACs are overridable for directories, including the search permission
+                 // even when the directory has no execute bits set.
+@@ -702,9 +702,19 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
+     }
+ }
+ 
+-fn has_dac_override_capability(task: &CurrentTask, posix_thread: &PosixThread) -> bool {
++fn has_dac_override_capability(
++    task: &CurrentTask,
++    posix_thread: &PosixThread,
++    inode_uid: Uid,
++    inode_gid: Gid,
++) -> bool {
+     let thread_local = task.as_thread_local().unwrap();
+     let user_ns = thread_local.borrow_user_ns();
++    // A capability of a user namespace only covers inodes whose owner and group
++    // are mapped in that namespace.
++    if !user_ns.maps_uid(inode_uid) || !user_ns.maps_gid(inode_gid) {
++        return false;
++    }
+     lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+         user_ns.as_ref(),
+         posix_thread,
+diff --git a/kernel/core/src/fs/vfs/path/mod.rs b/kernel/core/src/fs/vfs/path/mod.rs
+--- a/kernel/core/src/fs/vfs/path/mod.rs
++++ b/kernel/core/src/fs/vfs/path/mod.rs
+@@ -917,10 +917,11 @@ fn capable_modify_file_cap(inode: &dyn Inode, ctx: &Context) -> Result<()> {
+         CapSet::SETFCAP,
+     ))?;
+ 
+-    // With the currently supported identity user-namespace mapping, only invalid IDs are
+-    // unmapped. Replace this with mount-idmap-aware namespace mapping checks when supported.
++    // A capability of a user namespace only covers inodes whose owner and group
++    // are mapped in that namespace.
+     let metadata = inode.metadata()?;
+-    if metadata.uid == Uid::INVALID || metadata.gid == Gid::INVALID {
++    let user_ns = ctx.thread_local.borrow_user_ns();
++    if !user_ns.maps_uid(metadata.uid) || !user_ns.maps_gid(metadata.gid) {
+         return_errno_with_message!(
+             Errno::EPERM,
+             "the inode owner or group is not mapped in the current user namespace"
+diff --git a/kernel/core/src/process/clone.rs b/kernel/core/src/process/clone.rs
+--- a/kernel/core/src/process/clone.rs
++++ b/kernel/core/src/process/clone.rs
+@@ -277,6 +277,7 @@ impl CloneFlags {
+             | CloneFlags::CLONE_NEWCGROUP
+             | CloneFlags::CLONE_NEWNS
+             | CloneFlags::CLONE_NEWUTS
++            | CloneFlags::CLONE_NEWUSER
+             | CloneFlags::CLONE_PARENT;
+         let unsupported_flags = *self - supported_flags;
+         if !unsupported_flags.is_empty() {
+@@ -542,7 +543,7 @@ fn clone_child_process(
+     let child_fpu_context = thread_local.supp_user_context().fpu().get();
+ 
+     // Clone the namespaces
+-    let child_user_ns = clone_user_ns(clone_flags, thread_local)?;
++    let child_user_ns = clone_user_ns(clone_flags, ctx)?;
+     let child_ns_proxy = clone_ns_proxy(
+         thread_local.borrow_ns_proxy().unwrap(),
+         &child_user_ns,
+@@ -586,6 +587,9 @@ fn clone_child_process(
+                 let credentials = ctx.posix_thread.credentials();
+                 Credentials::new_from(&credentials)
+             };
++            if clone_flags.contains(CloneFlags::CLONE_NEWUSER) {
++                credentials.enter_user_ns();
++            }
+ 
+             PosixThreadBuilder::new(
+                 child_tid,
+@@ -815,17 +819,13 @@ fn clone_pidfd(
+     }
+ }
+ 
+-fn clone_user_ns(
+-    clone_flags: CloneFlags,
+-    thread_local: &ThreadLocal,
+-) -> Result<Arc<UserNamespace>> {
++fn clone_user_ns(clone_flags: CloneFlags, ctx: &Context) -> Result<Arc<UserNamespace>> {
++    let user_ns = ctx.thread_local.borrow_user_ns();
+     if clone_flags.contains(CloneFlags::CLONE_NEWUSER) {
+-        return_errno_with_message!(
+-            Errno::EINVAL,
+-            "cloning a new user namespace is not supported"
+-        );
++        let credentials = ctx.posix_thread.credentials();
++        user_ns.new_child(credentials.euid(), credentials.egid())
+     } else {
+-        Ok(thread_local.borrow_user_ns().clone())
++        Ok(user_ns.clone())
+     }
+ }
+ 
+diff --git a/kernel/core/src/process/credentials/credentials_.rs b/kernel/core/src/process/credentials/credentials_.rs
+--- a/kernel/core/src/process/credentials/credentials_.rs
++++ b/kernel/core/src/process/credentials/credentials_.rs
+@@ -637,6 +637,20 @@ impl Credentials_ {
+         self.no_new_privs.store(true, Ordering::Relaxed);
+     }
+ 
++    /// Resets the capabilities for a thread that enters a new user namespace.
++    ///
++    /// The thread holds every capability in the new namespace. The capabilities
++    /// only apply to the namespace and to resources that it owns.
++    pub(super) fn enter_user_ns(&self) {
++        self.set_inheritable_capset(CapSet::empty());
++        self.set_permitted_capset(CapSet::all());
++        self.set_effective_capset(CapSet::all());
++        self.bounding_capset.store(CapSet::all(), Ordering::Relaxed);
++        self.ambient_capset.store(CapSet::empty(), Ordering::Relaxed);
++        // The secure bits are kept. Locked bits must stay locked, and the other
++        // bits only restrict how capabilities are gained.
++    }
++
+     //  ******* execve() methods *******
+ 
+     /// Calculates and validates credentials for `execve()`.
+diff --git a/kernel/core/src/process/credentials/static_cap.rs b/kernel/core/src/process/credentials/static_cap.rs
+--- a/kernel/core/src/process/credentials/static_cap.rs
++++ b/kernel/core/src/process/credentials/static_cap.rs
+@@ -381,6 +381,14 @@ impl<R: TRights> Credentials<R> {
+         self.0.set_no_new_privs();
+     }
+ 
++    /// Resets the capabilities for a thread that enters a new user namespace.
++    ///
++    /// This method requires the `Write` right.
++    #[require(R > Write)]
++    pub(crate) fn enter_user_ns(&self) {
++        self.0.enter_user_ns();
++    }
++
+     // *********** execve() methods **********
+ 
+     /// Calculates and validates credentials for `execve()`.
+diff --git a/kernel/core/src/process/execve.rs b/kernel/core/src/process/execve.rs
+--- a/kernel/core/src/process/execve.rs
++++ b/kernel/core/src/process/execve.rs
+@@ -170,13 +170,18 @@ fn prepare_exec_cred(elf_path: &Path, ctx: &Context) -> Result<ExecCred> {
+                 })
+         });
+     let elf_mode = elf_path.mode()?;
+-    let setuid = if elf_mode.has_set_uid() {
+-        Some(elf_path.owner()?)
++    // The set-user-ID and set-group-ID bits only take effect for IDs that are
++    // mapped in the user namespace of the thread.
++    let user_ns = ctx.thread_local.borrow_user_ns();
++    let (owner, group) = (elf_path.owner()?, elf_path.group()?);
++    let is_mapped = user_ns.maps_uid(owner) && user_ns.maps_gid(group);
++    let setuid = if elf_mode.has_set_uid() && is_mapped {
++        Some(owner)
+     } else {
+         None
+     };
+-    let setgid = if elf_mode.has_set_gid() {
+-        Some(elf_path.group()?)
++    let setgid = if elf_mode.has_set_gid() && is_mapped {
++        Some(group)
+     } else {
+         None
+     };
+diff --git a/kernel/core/src/process/mod.rs b/kernel/core/src/process/mod.rs
+--- a/kernel/core/src/process/mod.rs
++++ b/kernel/core/src/process/mod.rs
+@@ -28,6 +28,7 @@ pub(crate) use credentials::{Credentials, Gid, Uid};
+ pub(crate) use execve::do_execve;
+ pub(crate) use kill::{kill, kill_all, kill_group, tgkill};
+ pub use namespace::user_ns::UserNamespace;
++pub(crate) use namespace::user_ns::IdKind;
+ pub(crate) use namespace::{
+     nsproxy::{ContextSetNsAdminApi, NsProxy, NsProxyBuilder, check_unsupported_ns_flags},
+     unshare::ContextUnshareAdminApi,
+diff --git a/kernel/core/src/process/namespace/unshare.rs b/kernel/core/src/process/namespace/unshare.rs
+--- a/kernel/core/src/process/namespace/unshare.rs
++++ b/kernel/core/src/process/namespace/unshare.rs
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use crate::{fs::file::file_table::FileTable, prelude::*, process::CloneFlags};
++use crate::{
++    fs::file::file_table::FileTable,
++    prelude::*,
++    process::{CloneFlags, posix_thread::ContextPthreadAdminApi},
++};
+ 
+ /// Provides administrative APIs for disassociating execution contexts.
+ pub(crate) trait ContextUnshareAdminApi {
+@@ -41,10 +45,18 @@ impl ContextUnshareAdminApi for Context<'_> {
+ 
+     fn unshare_namespaces(&self, flags: CloneFlags) -> Result<()> {
+         if flags.contains(CloneFlags::CLONE_NEWUSER) {
+-            return_errno_with_message!(
+-                Errno::EINVAL,
+-                "cloning a new user namespace is not supported"
+-            );
++            // `sys_unshare` has checked that the process is single-threaded, so the
++            // process and its only thread enter the new namespace together.
++            let new_user_ns = {
++                let credentials = self.posix_thread.credentials();
++                self.thread_local
++                    .borrow_user_ns()
++                    .new_child(credentials.euid(), credentials.egid())?
++            };
++            self.posix_thread.set_user_ns(new_user_ns.clone());
++            *self.process.user_ns().lock() = new_user_ns.clone();
++            self.thread_local.set_user_ns(new_user_ns);
++            self.credentials_mut().enter_user_ns();
+         }
+ 
+         let user_ns_ref = self.thread_local.borrow_user_ns();
+diff --git a/kernel/core/src/process/namespace/user_ns.rs b/kernel/core/src/process/namespace/user_ns.rs
+old mode 100644
+new mode 100755
+--- a/kernel/core/src/process/namespace/user_ns.rs
++++ b/kernel/core/src/process/namespace/user_ns.rs
+@@ -1,15 +1,62 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use core::sync::atomic::{AtomicBool, Ordering};
++
+ use spin::Once;
+ 
+ use crate::{
+     fs::pseudofs::{NsCommonOps, NsType, StashedDentry},
+     prelude::*,
+-    process::Uid,
++    process::{
++        Gid, Uid, credentials::capabilities::CapSet, posix_thread::PosixThread,
++    },
++    security::lsm::hooks as lsm_hooks,
+ };
+ 
++/// The maximum nesting depth of user namespaces.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/user_namespace.c#L97>
++const MAX_LEVEL: u32 = 32;
++
++/// A contiguous range of IDs that a user namespace maps to the same IDs outside.
++///
++/// The kernel keeps every UID and GID as an ID of the initial user namespace.
++/// Only identity mappings are supported, so an ID is either visible in a
++/// namespace under its own value or not mapped at all.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct IdRange {
++    first: u32,
++    count: u32,
++}
++
++impl IdRange {
++    fn contains(&self, id: u32) -> bool {
++        id >= self.first && id - self.first < self.count
++    }
++}
++
++/// The kind of IDs in an ID map.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum IdKind {
++    User,
++    Group,
++}
++
+ /// The user namespace.
+ pub struct UserNamespace {
++    /// The namespace in which this namespace was created.
++    parent: Option<Arc<UserNamespace>>,
++    /// The effective user ID of the creator.
++    owner_uid: Uid,
++    /// The nesting depth. The initial namespace has level zero.
++    level: u32,
++    /// The ID maps. Each map can be written once.
++    uid_map: Once<IdRange>,
++    gid_map: Once<IdRange>,
++    /// Whether `setgroups` is permanently denied in this namespace.
++    setgroups_denied: AtomicBool,
++    /// Serializes writes to the ID maps and the `setgroups` setting.
++    config_lock: Mutex<()>,
+     stashed_dentry: StashedDentry,
+ }
+ 
+@@ -20,27 +67,283 @@ impl UserNamespace {
+ 
+         INIT.call_once(|| {
+             Arc::new(Self {
++                parent: None,
++                owner_uid: Uid::new_root(),
++                level: 0,
++                uid_map: Once::new(),
++                gid_map: Once::new(),
++                setgroups_denied: AtomicBool::new(false),
++                config_lock: Mutex::new(()),
+                 stashed_dentry: StashedDentry::new(),
+             })
+         })
+     }
+ 
++    /// Creates a user namespace as a child of this namespace.
++    ///
++    /// The creator becomes the owner of the new namespace. Its effective IDs must
++    /// be mapped in this namespace, so that the owner has a name in the parent.
++    pub(crate) fn new_child(
++        self: &Arc<Self>,
++        owner_uid: Uid,
++        owner_gid: Gid,
++    ) -> Result<Arc<Self>> {
++        if self.level >= MAX_LEVEL {
++            return_errno_with_message!(Errno::EUSERS, "too many nested user namespaces");
++        }
++        if !self.maps_uid(owner_uid) || !self.maps_gid(owner_gid) {
++            return_errno_with_message!(
++                Errno::EPERM,
++                "the creator's IDs are not mapped in the parent user namespace"
++            );
++        }
++
++        Ok(Arc::new(Self {
++            parent: Some(self.clone()),
++            owner_uid,
++            level: self.level + 1,
++            uid_map: Once::new(),
++            gid_map: Once::new(),
++            setgroups_denied: AtomicBool::new(false),
++            config_lock: Mutex::new(()),
++            stashed_dentry: StashedDentry::new(),
++        }))
++    }
++
++    /// Returns whether this is the initial user namespace.
++    pub(crate) fn is_init(&self) -> bool {
++        self.parent.is_none()
++    }
++
++    /// Returns the namespace in which this namespace was created.
++    pub(crate) fn parent_ns(&self) -> Option<&Arc<UserNamespace>> {
++        self.parent.as_ref()
++    }
++
++    /// Returns the nesting depth of the namespace.
++    pub(crate) fn level(&self) -> u32 {
++        self.level
++    }
++
+     /// Returns the owner UID of the user namespace.
+     pub(crate) fn owner_uid(&self) -> Result<Uid> {
+-        // FIXME: The owner of the user namespace is not yet tracked.
+-        // Return the correct user ID once ownership tracking is implemented.
+-        Ok(Uid::new_root())
++        Ok(self.owner_uid)
++    }
++
++    /// Returns whether the UID has a mapping in this namespace.
++    pub(crate) fn maps_uid(&self, uid: Uid) -> bool {
++        self.maps_id(IdKind::User, uid.into())
++    }
++
++    /// Returns whether the GID has a mapping in this namespace.
++    pub(crate) fn maps_gid(&self, gid: Gid) -> bool {
++        self.maps_id(IdKind::Group, gid.into())
++    }
++
++    fn maps_id(&self, kind: IdKind, id: u32) -> bool {
++        if id == u32::MAX {
++            return false;
++        }
++        if self.is_init() {
++            return true;
++        }
++        self.map(kind).get().is_some_and(|range| range.contains(id))
++    }
++
++    fn map(&self, kind: IdKind) -> &Once<IdRange> {
++        match kind {
++            IdKind::User => &self.uid_map,
++            IdKind::Group => &self.gid_map,
++        }
++    }
++
++    /// Returns the ID map as `(first ID inside, first ID outside, count)`.
++    pub(crate) fn id_map(&self, kind: IdKind) -> Option<(u32, u32, u32)> {
++        if self.is_init() {
++            return Some((0, 0, u32::MAX));
++        }
++        self.map(kind)
++            .get()
++            .map(|range| (range.first, range.first, range.count))
++    }
++
++    /// Writes an ID map of this namespace.
++    ///
++    /// The writer is the current thread, which must be in this namespace or in its
++    /// parent. Without privileges in the parent namespace, the writer can only map
++    /// its own effective ID, and it must have denied `setgroups` before it maps a
++    /// group ID.
++    pub(crate) fn write_id_map(
++        &self,
++        kind: IdKind,
++        text: &str,
++        writer: &PosixThread,
++    ) -> Result<()> {
++        let Some(parent) = self.parent.as_ref() else {
++            return_errno_with_message!(
++                Errno::EPERM,
++                "the ID maps of the initial user namespace cannot be changed"
++            );
++        };
++
++        let writer_ns = writer.user_ns();
++        if !core::ptr::eq(writer_ns.as_ref(), self) && !Arc::ptr_eq(&writer_ns, parent) {
++            return_errno_with_message!(
++                Errno::EPERM,
++                "the writer is neither in the user namespace nor in its parent"
++            );
++        }
++        // A thread in the namespace needs `CAP_SETUID` or `CAP_SETGID` there, and a
++        // thread in the parent holds it if it owns the namespace.
++        let required_cap = match kind {
++            IdKind::User => CapSet::SETUID,
++            IdKind::Group => CapSet::SETGID,
++        };
++        lsm_hooks::on_capable(lsm_hooks::CapableContext::new(self, writer, required_cap))?;
++
++        let range = parse_id_map(text)?;
++        let credentials = writer.credentials();
++        let (own_id, parent_maps_range) = match kind {
++            IdKind::User => (
++                u32::from(credentials.euid()),
++                parent.maps_uid(Uid::new(range.first))
++                    && parent.maps_uid(Uid::new(range.first + (range.count - 1))),
++            ),
++            IdKind::Group => (
++                u32::from(credentials.egid()),
++                parent.maps_gid(Gid::new(range.first))
++                    && parent.maps_gid(Gid::new(range.first + (range.count - 1))),
++            ),
++        };
++        if !parent_maps_range {
++            return_errno_with_message!(
++                Errno::EPERM,
++                "the IDs are not mapped in the parent user namespace"
++            );
++        }
++
++        let _guard = self.config_lock.lock();
++
++        let maps_only_own_id = range.count == 1
++            && range.first == own_id
++            && credentials.euid() == self.owner_uid
++            && (kind == IdKind::User || self.setgroups_denied.load(Ordering::Relaxed));
++        if !maps_only_own_id {
++            // Mapping other IDs lets the namespace act as those users.
++            lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
++                parent.as_ref(),
++                writer,
++                required_cap,
++            ))?;
++        }
++
++        let map = self.map(kind);
++        if map.is_completed() {
++            return_errno_with_message!(Errno::EPERM, "the ID map has already been written");
++        }
++        map.call_once(|| range);
++        Ok(())
++    }
++
++    /// Returns whether `setgroups` is denied in this namespace.
++    pub(crate) fn is_setgroups_denied(&self) -> bool {
++        self.setgroups_denied.load(Ordering::Relaxed)
++    }
++
++    /// Returns whether threads in this namespace may call `setgroups`.
++    ///
++    /// Dropping groups can grant access that a group was denied, so it needs a
++    /// group map that a privileged thread has set up.
++    pub(crate) fn may_setgroups(&self) -> bool {
++        self.is_init() || (self.gid_map.is_completed() && !self.is_setgroups_denied())
++    }
++
++    /// Changes the `setgroups` setting of this namespace.
++    pub(crate) fn write_setgroups(&self, text: &str, writer: &PosixThread) -> Result<()> {
++        let deny = match text.trim_end_matches('\n') {
++            "deny" => true,
++            "allow" => false,
++            _ => return_errno_with_message!(Errno::EINVAL, "invalid setgroups setting"),
++        };
++        if self.is_init() {
++            return_errno_with_message!(
++                Errno::EPERM,
++                "the setting of the initial user namespace cannot be changed"
++            );
++        }
++        lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
++            self,
++            writer,
++            CapSet::SYS_ADMIN,
++        ))?;
++
++        let _guard = self.config_lock.lock();
++        let is_denied = self.setgroups_denied.load(Ordering::Relaxed);
++        if deny == is_denied {
++            return Ok(());
++        }
++        // The setting is fixed once the group map exists, and a denial is permanent.
++        if is_denied || self.gid_map.is_completed() {
++            return_errno_with_message!(Errno::EPERM, "the setgroups setting is fixed");
++        }
++        self.setgroups_denied.store(true, Ordering::Relaxed);
++        Ok(())
+     }
+ 
+     /// Returns whether this namespace is the same as, or an ancestor of, the other namespace.
+     pub(crate) fn is_same_or_ancestor_of(self: &Arc<Self>, other: &Arc<Self>) -> bool {
+-        // FIXME: Creating new user namespaces is not yet supported,
+-        // so we simply check pointer equality.
+-        // Once user namespace creation is implemented,
+-        // this should walk up the ancestor chain to verify
+-        // whether `self` is an ancestor of `other`.
+-        Arc::ptr_eq(self, other)
++        let mut current = other;
++        loop {
++            if Arc::ptr_eq(self, current) {
++                return true;
++            }
++            match current.parent.as_ref() {
++                Some(parent) if current.level > self.level => current = parent,
++                _ => return false,
++            }
++        }
++    }
++}
++
++/// Parses the single line of an identity ID map: `<inside> <outside> <count>`.
++fn parse_id_map(text: &str) -> Result<IdRange> {
++    let invalid = || Error::with_message(Errno::EINVAL, "invalid ID map");
++
++    let mut lines = text.lines();
++    let line = lines.next().ok_or_else(invalid)?;
++    if lines.next().is_some() {
++        // Maps with several extents are not supported.
++        return Err(invalid());
++    }
++
++    let mut fields = line.split_ascii_whitespace();
++    let mut next_field = || -> Result<u32> {
++        fields
++            .next()
++            .and_then(|field| field.parse::<u32>().ok())
++            .ok_or_else(invalid)
++    };
++    let inside = next_field()?;
++    let outside = next_field()?;
++    let count = next_field()?;
++    if fields.next().is_some() || count == 0 {
++        return Err(invalid());
+     }
++    // The range must not wrap or include the invalid ID.
++    if inside.checked_add(count).is_none() {
++        return Err(invalid());
++    }
++    if inside != outside {
++        return_errno_with_message!(
++            Errno::EINVAL,
++            "only identity ID maps are supported"
++        );
++    }
++
++    Ok(IdRange {
++        first: inside,
++        count,
++    })
+ }
+ 
+ impl NsCommonOps for UserNamespace {
+@@ -50,7 +353,7 @@ impl NsCommonOps for UserNamespace {
+         // For user namespaces, `NS_GET_USERNS` returns the parent user namespace
+         // rather than an "owner". The initial user namespace has no parent.
+         // Reference: <https://elixir.bootlin.com/linux/v6.19/source/kernel/user_namespace.c#L1406>
+-        None
++        self.parent.as_ref()
+     }
+ 
+     fn parent(&self) -> Result<&Arc<Self>> {
+diff --git a/kernel/core/src/process/posix_thread/builder.rs b/kernel/core/src/process/posix_thread/builder.rs
+--- a/kernel/core/src/process/posix_thread/builder.rs
++++ b/kernel/core/src/process/posix_thread/builder.rs
+@@ -215,6 +215,7 @@ impl PosixThreadBuilder {
+                     tracees: Once::new(),
+                     exit_code: AtomicU32::new(0),
+                     personality: AtomicU32::new(0),
++                    user_ns: SpinLock::new(user_ns.clone()),
+                     seccomp,
+                 }
+             };
+diff --git a/kernel/core/src/process/posix_thread/mod.rs b/kernel/core/src/process/posix_thread/mod.rs
+--- a/kernel/core/src/process/posix_thread/mod.rs
++++ b/kernel/core/src/process/posix_thread/mod.rs
+@@ -11,7 +11,7 @@ use ostd::{
+ use spin::Once;
+ 
+ use super::{
+-    Credentials, Process,
++    Credentials, Process, UserNamespace,
+     signal::{sig_mask::AtomicSigMask, sig_num::SigNum, sig_queues::SigQueues, signals::Signal},
+ };
+ use crate::{
+@@ -108,6 +108,12 @@ pub struct PosixThread {
+     /// The personality value for this thread.
+     personality: AtomicU32,
+ 
++    /// The user namespace of this thread.
++    ///
++    /// Capability checks read it for threads other than the current one, so it is
++    /// kept here in addition to the copy in `ThreadLocal`.
++    user_ns: SpinLock<Arc<UserNamespace>>,
++
+     /// The secure computing state of this thread.
+     seccomp: seccomp::SeccompState,
+ }
+@@ -311,6 +317,17 @@ impl PosixThread {
+         self.credentials.dup().restrict()
+     }
+ 
++    /// Returns the user namespace of the thread.
++    pub(crate) fn user_ns(&self) -> Arc<UserNamespace> {
++        self.user_ns.lock().clone()
++    }
++
++    /// Moves the thread into a user namespace.
++    pub(in crate::process) fn set_user_ns(&self, user_ns: Arc<UserNamespace>) {
++        let old = core::mem::replace(&mut *self.user_ns.lock(), user_ns);
++        drop(old);
++    }
++
+     /// Returns the secure computing state of the thread.
+     pub(crate) fn seccomp(&self) -> &seccomp::SeccompState {
+         &self.seccomp
+diff --git a/kernel/core/src/process/posix_thread/thread_local.rs b/kernel/core/src/process/posix_thread/thread_local.rs
+--- a/kernel/core/src/process/posix_thread/thread_local.rs
++++ b/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -192,6 +192,11 @@ impl ThreadLocal {
+         self.user_ns.borrow()
+     }
+ 
++    /// Moves the thread into a user namespace.
++    pub(in crate::process) fn set_user_ns(&self, user_ns: Arc<UserNamespace>) {
++        *self.user_ns.borrow_mut() = user_ns;
++    }
++
+     pub(crate) fn borrow_ns_proxy(&self) -> NsProxyRef<'_> {
+         ThreadLocalOptionRef(self.ns_proxy.borrow())
+     }
+diff --git a/kernel/core/src/security/lsm/hooks/capability.rs b/kernel/core/src/security/lsm/hooks/capability.rs
+--- a/kernel/core/src/security/lsm/hooks/capability.rs
++++ b/kernel/core/src/security/lsm/hooks/capability.rs
+@@ -37,10 +37,6 @@ impl<'a> CapableContext<'a> {
+     }
+ 
+     /// Returns the user namespace against which the capability is checked.
+-    #[expect(
+-        dead_code,
+-        reason = "Asterinas currently has only the initial user namespace"
+-    )]
+     pub(crate) const fn target_user_ns(&self) -> &UserNamespace {
+         self.target_user_ns
+     }
+diff --git a/kernel/core/src/security/lsm/modules/capability.rs b/kernel/core/src/security/lsm/modules/capability.rs
+--- a/kernel/core/src/security/lsm/modules/capability.rs
++++ b/kernel/core/src/security/lsm/modules/capability.rs
+@@ -26,18 +26,43 @@ impl LsmModule for CapabilityLsm {
+ 
+ impl LsmCapabilityHook for CapabilityLsm {
+     fn on_capable(&self, context: &CapableContext) -> Result<()> {
+-        // Since creating new user namespaces is not supported at the moment,
+-        // there is effectively only one user namespace in the entire system.
+-        // Therefore, the thread has a single set of capabilities used for permission checks.
+-        // FIXME: Once support for creating new user namespaces is added,
+-        // we should verify the thread's capabilities within the relevant user namespace.
+-        if context
+-            .posix_thread()
+-            .credentials()
+-            .effective_capset()
+-            .contains(context.required_cap())
+-        {
+-            return Ok(());
++        let posix_thread = context.posix_thread();
++        let thread_ns = posix_thread.user_ns();
++        let mut target_ns = context.target_user_ns();
++
++        // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/security/commoncap.c#L68>
++        loop {
++            // In its own user namespace, a thread holds its effective capabilities.
++            if core::ptr::eq(target_ns, thread_ns.as_ref()) {
++                if posix_thread
++                    .credentials()
++                    .effective_capset()
++                    .contains(context.required_cap())
++                {
++                    return Ok(());
++                }
++                break;
++            }
++
++            // A thread has no capabilities in a namespace that is not a descendant
++            // of its own namespace.
++            if target_ns.level() <= thread_ns.level() {
++                break;
++            }
++            let Some(parent_ns) = target_ns.parent_ns() else {
++                break;
++            };
++
++            // The owner of a user namespace holds all capabilities in it, as long as
++            // the owner is in the parent namespace.
++            if Arc::ptr_eq(parent_ns, &thread_ns)
++                && target_ns.owner_uid()? == posix_thread.credentials().euid()
++            {
++                return Ok(());
++            }
++
++            // Capabilities in a namespace extend to its descendants.
++            target_ns = parent_ns.as_ref();
+         }
+ 
+         return_errno_with_message!(
+diff --git a/kernel/core/src/syscall/fsopen.rs b/kernel/core/src/syscall/fsopen.rs
+--- a/kernel/core/src/syscall/fsopen.rs
++++ b/kernel/core/src/syscall/fsopen.rs
+@@ -37,10 +37,15 @@ pub(super) fn sys_fsopen(fs_name_addr: Vaddr, flags: u32, ctx: &Context) -> Resu
+ }
+ 
+ pub(super) fn check_mount_api_capability(ctx: &Context) -> Result<()> {
+-    use crate::{process::credentials::capabilities::CapSet, security::lsm::hooks as lsm_hooks};
++    use crate::{
++        process::{UserNamespace, credentials::capabilities::CapSet},
++        security::lsm::hooks as lsm_hooks,
++    };
+ 
++    // Creating a filesystem instance is not yet restricted to the filesystem types
++    // that are safe for a user namespace, so it requires the initial namespace.
+     lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+-        ctx.thread_local.borrow_user_ns().as_ref(),
++        UserNamespace::get_init_singleton().as_ref(),
+         ctx.posix_thread,
+         CapSet::SYS_ADMIN,
+     ))
+diff --git a/kernel/core/src/syscall/setfsgid.rs b/kernel/core/src/syscall/setfsgid.rs
+--- a/kernel/core/src/syscall/setfsgid.rs
++++ b/kernel/core/src/syscall/setfsgid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_gids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Gid, posix_thread::ContextPthreadAdminApi},
+@@ -13,6 +13,7 @@ pub(super) fn sys_setfsgid(gid: i32, ctx: &Context) -> Result<SyscallReturn> {
+         None
+     };
+ 
++    let fsgid = fsgid.filter(|_| check_gids_mapped(&[fsgid], ctx).is_ok());
+     debug!("fsgid = {:?}", fsgid);
+ 
+     let old_fsgid = {
+diff --git a/kernel/core/src/syscall/setfsuid.rs b/kernel/core/src/syscall/setfsuid.rs
+--- a/kernel/core/src/syscall/setfsuid.rs
++++ b/kernel/core/src/syscall/setfsuid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_uids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Uid, posix_thread::ContextPthreadAdminApi},
+@@ -13,6 +13,7 @@ pub(super) fn sys_setfsuid(uid: i32, ctx: &Context) -> Result<SyscallReturn> {
+         None
+     };
+ 
++    let fsuid = fsuid.filter(|_| check_uids_mapped(&[fsuid], ctx).is_ok());
+     debug!("fsuid = {:?}", fsuid);
+ 
+     let old_fsuid = {
+diff --git a/kernel/core/src/syscall/setgid.rs b/kernel/core/src/syscall/setgid.rs
+--- a/kernel/core/src/syscall/setgid.rs
++++ b/kernel/core/src/syscall/setgid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_gids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Gid, posix_thread::ContextPthreadAdminApi},
+@@ -12,6 +12,7 @@ pub(super) fn sys_setgid(gid: i32, ctx: &Context) -> Result<SyscallReturn> {
+     }
+ 
+     let gid = Gid::new(gid.cast_unsigned());
++    check_gids_mapped(&[Some(gid)], ctx)?;
+     debug!("gid = {:?}", gid);
+ 
+     let credentials = ctx.credentials_mut();
+diff --git a/kernel/core/src/syscall/setgroups.rs b/kernel/core/src/syscall/setgroups.rs
+--- a/kernel/core/src/syscall/setgroups.rs
++++ b/kernel/core/src/syscall/setgroups.rs
+@@ -2,7 +2,7 @@
+ 
+ use ostd::mm::VmIo;
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_gids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Gid, credentials::capabilities::CapSet, posix_thread::ContextPthreadAdminApi},
+@@ -22,6 +22,13 @@ pub(super) fn sys_setgroups(
+         CapSet::SETGID,
+     ))?;
+ 
++    if !ctx.thread_local.borrow_user_ns().may_setgroups() {
++        return_errno_with_message!(
++            Errno::EPERM,
++            "setgroups is not permitted in the user namespace"
++        );
++    }
++
+     if size > NGROUPS_MAX {
+         return_errno_with_message!(Errno::EINVAL, "size cannot be greater than NGROUPS_MAX");
+     }
+@@ -29,7 +36,8 @@ pub(super) fn sys_setgroups(
+     let mut new_groups = BTreeSet::new();
+     for idx in 0..size {
+         let addr = group_list_addr + idx * size_of::<Gid>();
+-        let gid = ctx.user_space().read_val(addr)?;
++        let gid: Gid = ctx.user_space().read_val(addr)?;
++        check_gids_mapped(&[Some(gid)], ctx)?;
+         new_groups.insert(gid);
+     }
+ 
+diff --git a/kernel/core/src/syscall/setregid.rs b/kernel/core/src/syscall/setregid.rs
+--- a/kernel/core/src/syscall/setregid.rs
++++ b/kernel/core/src/syscall/setregid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_gids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Gid, posix_thread::ContextPthreadAdminApi},
+@@ -19,6 +19,7 @@ pub(super) fn sys_setregid(rgid: i32, egid: i32, ctx: &Context) -> Result<Syscal
+         None
+     };
+ 
++    check_gids_mapped(&[rgid, egid], ctx)?;
+     debug!("rgid = {:?}, egid = {:?}", rgid, egid);
+ 
+     let credentials = ctx.credentials_mut();
+diff --git a/kernel/core/src/syscall/setresgid.rs b/kernel/core/src/syscall/setresgid.rs
+--- a/kernel/core/src/syscall/setresgid.rs
++++ b/kernel/core/src/syscall/setresgid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_gids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Gid, posix_thread::ContextPthreadAdminApi},
+@@ -30,6 +30,7 @@ pub(super) fn sys_setresgid(
+         None
+     };
+ 
++    check_gids_mapped(&[rgid, egid, sgid], ctx)?;
+     debug!("rgid = {:?}, egid = {:?}, sgid = {:?}", rgid, egid, sgid);
+ 
+     let credentials = ctx.credentials_mut();
+diff --git a/kernel/core/src/syscall/setresuid.rs b/kernel/core/src/syscall/setresuid.rs
+--- a/kernel/core/src/syscall/setresuid.rs
++++ b/kernel/core/src/syscall/setresuid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_uids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Uid, posix_thread::ContextPthreadAdminApi},
+@@ -30,6 +30,7 @@ pub(super) fn sys_setresuid(
+         None
+     };
+ 
++    check_uids_mapped(&[ruid, euid, suid], ctx)?;
+     debug!("ruid = {:?}, euid = {:?}, suid = {:?}", ruid, euid, suid);
+ 
+     let credentials = ctx.credentials_mut();
+diff --git a/kernel/core/src/syscall/setreuid.rs b/kernel/core/src/syscall/setreuid.rs
+--- a/kernel/core/src/syscall/setreuid.rs
++++ b/kernel/core/src/syscall/setreuid.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, setuid::check_uids_mapped};
+ use crate::{
+     prelude::*,
+     process::{Uid, posix_thread::ContextPthreadAdminApi},
+@@ -19,6 +19,7 @@ pub(super) fn sys_setreuid(ruid: i32, euid: i32, ctx: &Context) -> Result<Syscal
+         None
+     };
+ 
++    check_uids_mapped(&[ruid, euid], ctx)?;
+     debug!("ruid = {:?}, euid = {:?}", ruid, euid);
+ 
+     let credentials = ctx.credentials_mut();
+diff --git a/kernel/core/src/syscall/setuid.rs b/kernel/core/src/syscall/setuid.rs
+--- a/kernel/core/src/syscall/setuid.rs
++++ b/kernel/core/src/syscall/setuid.rs
+@@ -3,7 +3,7 @@
+ use super::SyscallReturn;
+ use crate::{
+     prelude::*,
+-    process::{Uid, posix_thread::ContextPthreadAdminApi},
++    process::{Gid, Uid, posix_thread::ContextPthreadAdminApi},
+ };
+ 
+ pub(super) fn sys_setuid(uid: i32, ctx: &Context) -> Result<SyscallReturn> {
+@@ -12,6 +12,7 @@ pub(super) fn sys_setuid(uid: i32, ctx: &Context) -> Result<SyscallReturn> {
+     }
+ 
+     let uid = Uid::new(uid.cast_unsigned());
++    check_uids_mapped(&[Some(uid)], ctx)?;
+     debug!("uid = {:?}", uid);
+ 
+     let credentials = ctx.credentials_mut();
+@@ -19,3 +20,29 @@ pub(super) fn sys_setuid(uid: i32, ctx: &Context) -> Result<SyscallReturn> {
+ 
+     Ok(SyscallReturn::Return(0))
+ }
++
++/// Checks that the user IDs are mapped in the user namespace of the current thread.
++///
++/// A thread can only take an identity that exists in its user namespace.
++pub(super) fn check_uids_mapped(uids: &[Option<Uid>], ctx: &Context) -> Result<()> {
++    let user_ns = ctx.thread_local.borrow_user_ns();
++    if uids.iter().flatten().any(|uid| !user_ns.maps_uid(*uid)) {
++        return_errno_with_message!(
++            Errno::EINVAL,
++            "the UID is not mapped in the user namespace"
++        );
++    }
++    Ok(())
++}
++
++/// Checks that the group IDs are mapped in the user namespace of the current thread.
++pub(super) fn check_gids_mapped(gids: &[Option<Gid>], ctx: &Context) -> Result<()> {
++    let user_ns = ctx.thread_local.borrow_user_ns();
++    if gids.iter().flatten().any(|gid| !user_ns.maps_gid(*gid)) {
++        return_errno_with_message!(
++            Errno::EINVAL,
++            "the GID is not mapped in the user namespace"
++        );
++    }
++    Ok(())
++}

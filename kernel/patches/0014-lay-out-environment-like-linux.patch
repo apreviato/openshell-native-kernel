@@ -1,0 +1,59 @@
+diff --git a/kernel/core/src/process/process_vm/init_stack/mod.rs b/kernel/core/src/process/process_vm/init_stack/mod.rs
+--- a/kernel/core/src/process/process_vm/init_stack/mod.rs
++++ b/kernel/core/src/process/process_vm/init_stack/mod.rs
+@@ -296,11 +296,16 @@ impl InitStackWriter<'_> {
+     }
+ 
+     fn write_envp_strings(&self) -> Result<Vec<u64>> {
++        // The stack grows down, so the strings are written from the last one. As on Linux,
++        // `envp[0]` then directly follows the last argument string, and the strings are in
++        // increasing order. Programs such as Chromium rely on this layout to rewrite their
++        // process title.
+         let mut envp_pointers = Vec::with_capacity(self.envp.len());
+-        for envp in self.envp.iter() {
++        for envp in self.envp.iter().rev() {
+             let pointer = self.write_cstring(envp)?;
+             envp_pointers.push(pointer);
+         }
++        envp_pointers.reverse();
+         Ok(envp_pointers)
+     }
+ 
+@@ -437,7 +442,36 @@ impl InitStackReader<'_> {
+ 
+     /// Reads argv at the `offset` from the process init stack.
+     pub(crate) fn argv(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+-        self.read_range(offset, writer, &self.argv_range)
++        // A process may rewrite its title over the argument strings. If the last byte of
++        // that area is no longer NUL, the title continues into the environment strings
++        // and ends at the first NUL.
++        // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/fs/proc/base.c#L258>
++        let argv_range = &self.argv_range;
++        if argv_range.is_empty() {
++            return Ok(0);
++        }
++        let mut last = [0u8; 1];
++        self.vmar
++            .read_alien(argv_range.end - 1, &mut VmWriter::from(&mut last[..]).to_fallible())?;
++        if last[0] == 0 || self.envp_range.start != argv_range.end {
++            return self.read_range(offset, writer, argv_range);
++        }
++
++        const MAX_TITLE_LEN: usize = 4096;
++        let end = self.envp_range.end.min(argv_range.start + MAX_TITLE_LEN);
++        let mut title = vec![0u8; end - argv_range.start];
++        let read = self.vmar.read_alien(
++            argv_range.start,
++            &mut VmWriter::from(title.as_mut_slice()).to_fallible(),
++        )?;
++        title.truncate(read);
++        let len = title.iter().position(|byte| *byte == 0).unwrap_or(title.len());
++        if offset >= len {
++            return Ok(0);
++        }
++        let bytes = &title[offset..len];
++        let mut reader = VmReader::from(bytes).to_fallible();
++        Ok(writer.write_fallible(&mut reader).unwrap_or(0))
+     }
+ 
+     /// Reads envp at the `offset` from the process init stack.

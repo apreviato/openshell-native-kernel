@@ -1,0 +1,1090 @@
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/status.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/status.rs
+--- a/kernel/core/src/fs/fs_impls/procfs/pid/task/status.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/status.rs
+@@ -52,6 +52,9 @@ use crate::{
+ /// - CapInh: Inheritable capabilities.
+ /// - CapPrm: Permitted capabilities.
+ /// - CapEff: Effective capabilities.
++/// - NoNewPrivs: Whether the no-new-privileges flag is set.
++/// - Seccomp: Seccomp mode of the thread.
++/// - Seccomp_filters: Number of seccomp filters attached to the thread.
+ /// - CapBnd: Bounding set.
+ /// - CapAmb: Ambient capabilities.
+ /// - Seccomp: Seccomp mode.
+@@ -198,6 +201,15 @@ impl ProcFileOps for StatusFileOps {
+             credentials.ambient_capset().bits()
+         )?;
+ 
++        let seccomp = posix_thread.seccomp();
++        writeln!(
++            printer,
++            "NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}",
++            credentials.no_new_privs() as u32,
++            seccomp.mode(),
++            seccomp.filter().map_or(0, |filter| filter.chain_len())
++        )?;
++
+         Ok(printer.bytes_written())
+     }
+ }
+diff --git a/kernel/core/src/process/clone.rs b/kernel/core/src/process/clone.rs
+--- a/kernel/core/src/process/clone.rs
++++ b/kernel/core/src/process/clone.rs
+@@ -457,7 +457,8 @@ fn clone_child_task(
+         .fpu_context(child_fpu_context)
+         .user_ns(child_user_ns)
+         .ns_proxy(child_ns_proxy)
+-        .default_timer_slack_ns(default_timer_slack_ns);
++        .default_timer_slack_ns(default_timer_slack_ns)
++        .inherit_seccomp(posix_thread.seccomp());
+         #[cfg(target_arch = "x86_64")]
+         {
+             thread_builder = thread_builder.fs_base(child_fs_base).gs_base(child_gs_base);
+@@ -471,16 +472,23 @@ fn clone_child_task(
+         thread_builder.build()
+     };
+ 
+-    process
+-        .tasks()
+-        .lock()
+-        .insert(child_task.clone())
+-        .map_err(|_| {
++    {
++        let mut tasks = process.tasks().lock();
++        // A sibling thread may have synchronized a new seccomp filter to the
++        // process after the builder copied the state. Copy it again while the
++        // task set is locked so that the new thread cannot miss the filter.
++        child_task
++            .as_posix_thread()
++            .unwrap()
++            .seccomp()
++            .inherit_from(posix_thread.seccomp());
++        tasks.insert(child_task.clone()).map_err(|_| {
+             Error::with_message(
+                 Errno::EINTR,
+                 "the process has exited or has already executed a new program",
+             )
+         })?;
++    }
+ 
+     let child_thread = child_task.as_thread().unwrap();
+     pid_table::pid_table_mut().insert_thread(child_tid, child_thread);
+@@ -593,6 +601,7 @@ fn clone_child_process(
+             .user_ns(child_user_ns.clone())
+             .ns_proxy(child_ns_proxy)
+             .default_timer_slack_ns(default_timer_slack_ns)
++            .inherit_seccomp(ctx.posix_thread.seccomp())
+         };
+         #[cfg(target_arch = "x86_64")]
+         {
+diff --git a/kernel/core/src/process/posix_thread/builder.rs b/kernel/core/src/process/posix_thread/builder.rs
+--- a/kernel/core/src/process/posix_thread/builder.rs
++++ b/kernel/core/src/process/posix_thread/builder.rs
+@@ -18,7 +18,7 @@ use crate::{
+     prelude::*,
+     process::{
+         Credentials, NsProxy, Process, UserNamespace,
+-        posix_thread::{ThreadName, thread_local::SuppUserContext},
++        posix_thread::{ThreadName, seccomp::SeccompState, thread_local::SuppUserContext},
+         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
+     },
+     sched::{Nice, SchedPolicy},
+@@ -49,6 +49,7 @@ pub(crate) struct PosixThreadBuilder {
+     user_ns: Option<Arc<UserNamespace>>,
+     ns_proxy: Option<Arc<NsProxy>>,
+     default_timer_slack_ns: u64,
++    seccomp: SeccompState,
+ }
+ 
+ impl PosixThreadBuilder {
+@@ -77,6 +78,7 @@ impl PosixThreadBuilder {
+             user_ns: None,
+             ns_proxy: None,
+             default_timer_slack_ns: 50_000, // 50 usec default slack
++            seccomp: SeccompState::new(),
+         }
+     }
+ 
+@@ -148,6 +150,12 @@ impl PosixThreadBuilder {
+         self
+     }
+ 
++    /// Starts the thread with the seccomp state of its creator.
++    pub(crate) fn inherit_seccomp(self, parent: &SeccompState) -> Self {
++        self.seccomp.inherit_from(parent);
++        self
++    }
++
+     pub(crate) fn build(self) -> Arc<Task> {
+         let Self {
+             tid,
+@@ -167,6 +175,7 @@ impl PosixThreadBuilder {
+             user_ns,
+             ns_proxy,
+             default_timer_slack_ns,
++            seccomp,
+         } = self;
+ 
+         let file_table = file_table.unwrap_or_else(FileTable::new);
+@@ -206,6 +215,7 @@ impl PosixThreadBuilder {
+                     tracees: Once::new(),
+                     exit_code: AtomicU32::new(0),
+                     personality: AtomicU32::new(0),
++                    seccomp,
+                 }
+             };
+ 
+diff --git a/kernel/core/src/process/posix_thread/mod.rs b/kernel/core/src/process/posix_thread/mod.rs
+--- a/kernel/core/src/process/posix_thread/mod.rs
++++ b/kernel/core/src/process/posix_thread/mod.rs
+@@ -37,6 +37,7 @@ mod personality;
+ mod posix_thread_ext;
+ pub(crate) mod ptrace;
+ mod robust_list;
++pub(crate) mod seccomp;
+ mod thread_local;
+ 
+ pub(crate) use builder::PosixThreadBuilder;
+@@ -106,6 +107,9 @@ pub struct PosixThread {
+ 
+     /// The personality value for this thread.
+     personality: AtomicU32,
++
++    /// The secure computing state of this thread.
++    seccomp: seccomp::SeccompState,
+ }
+ 
+ impl PosixThread {
+@@ -307,6 +311,19 @@ impl PosixThread {
+         self.credentials.dup().restrict()
+     }
+ 
++    /// Returns the secure computing state of the thread.
++    pub(crate) fn seccomp(&self) -> &seccomp::SeccompState {
++        &self.seccomp
++    }
++
++    /// Sets the no-new-privileges flag of the thread.
++    ///
++    /// The flag can only be set, so a thread may set it for its sibling threads
++    /// when it synchronizes a seccomp filter to them.
++    pub(crate) fn set_no_new_privs(&self) {
++        self.credentials.set_no_new_privs();
++    }
++
+     /// Returns the I/O priority value of the thread.
+     pub(crate) fn io_priority(&self) -> &AtomicU32 {
+         &self.io_priority
+diff --git a/kernel/core/src/process/posix_thread/seccomp.rs b/kernel/core/src/process/posix_thread/seccomp.rs
+new file mode 100755
+--- /dev/null
++++ b/kernel/core/src/process/posix_thread/seccomp.rs
+@@ -0,0 +1,438 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Secure computing mode (seccomp).
++//!
++//! This module keeps the per-thread seccomp state and evaluates classic BPF
++//! filters against system calls. The filter semantics follow Linux:
++//! every installed filter runs for every system call and the most
++//! restrictive action wins.
++//!
++//! Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/kernel/seccomp.c>
++
++use core::sync::atomic::{AtomicU32, Ordering};
++
++use crate::prelude::*;
++
++pub(crate) const SECCOMP_MODE_DISABLED: u32 = 0;
++pub(crate) const SECCOMP_MODE_STRICT: u32 = 1;
++pub(crate) const SECCOMP_MODE_FILTER: u32 = 2;
++
++pub(crate) const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
++pub(crate) const SECCOMP_RET_KILL_THREAD: u32 = 0x0000_0000;
++pub(crate) const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
++pub(crate) const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
++pub(crate) const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
++pub(crate) const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
++pub(crate) const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
++pub(crate) const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
++
++pub(crate) const SECCOMP_RET_ACTION_FULL: u32 = 0xffff_0000;
++pub(crate) const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
++
++/// The maximum number of instructions in one classic BPF program.
++const BPF_MAXINSNS: usize = 4096;
++/// The maximum total size of all filters attached to one thread, in instructions.
++///
++/// Each filter additionally costs four instructions.
++const MAX_INSNS_PER_PATH: usize = (1 << 18) / size_of::<SockFilter>();
++/// The number of scratch memory slots of the classic BPF machine.
++const BPF_MEMWORDS: usize = 16;
++
++/// The size of `struct seccomp_data`.
++pub(crate) const SECCOMP_DATA_SIZE: usize = 64;
++
++/// A classic BPF instruction (`struct sock_filter`).
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Pod)]
++pub(crate) struct SockFilter {
++    code: u16,
++    jt: u8,
++    jf: u8,
++    k: u32,
++}
++
++/// The system call description that filters inspect (`struct seccomp_data`).
++pub(crate) struct SeccompData([u8; SECCOMP_DATA_SIZE]);
++
++impl SeccompData {
++    pub(crate) fn new(nr: i32, arch: u32, instruction_pointer: u64, args: &[u64; 6]) -> Self {
++        let mut bytes = [0u8; SECCOMP_DATA_SIZE];
++        bytes[0..4].copy_from_slice(&nr.to_ne_bytes());
++        bytes[4..8].copy_from_slice(&arch.to_ne_bytes());
++        bytes[8..16].copy_from_slice(&instruction_pointer.to_ne_bytes());
++        for (index, arg) in args.iter().enumerate() {
++            let start = 16 + index * 8;
++            bytes[start..start + 8].copy_from_slice(&arg.to_ne_bytes());
++        }
++        Self(bytes)
++    }
++
++    fn load_word(&self, offset: u32) -> u32 {
++        // The offset has been validated by `SeccompFilter::new`.
++        let offset = offset as usize;
++        u32::from_ne_bytes(self.0[offset..offset + 4].try_into().unwrap())
++    }
++}
++
++/// An installed seccomp filter, linked to the filters installed before it.
++pub(crate) struct SeccompFilter {
++    prev: Option<Arc<SeccompFilter>>,
++    program: Box<[SockFilter]>,
++    /// The cost of this filter and all of its ancestors.
++    total_cost: usize,
++}
++
++impl Drop for SeccompFilter {
++    fn drop(&mut self) {
++        // Unlink a long chain iteratively to keep the kernel stack usage bounded.
++        let mut prev = self.prev.take();
++        while let Some(filter) = prev {
++            match Arc::try_unwrap(filter) {
++                Ok(mut filter) => prev = filter.prev.take(),
++                Err(_) => break,
++            }
++        }
++    }
++}
++
++// Classic BPF instruction classes and fields.
++const BPF_LD: u16 = 0x00;
++const BPF_LDX: u16 = 0x01;
++const BPF_ST: u16 = 0x02;
++const BPF_STX: u16 = 0x03;
++const BPF_ALU: u16 = 0x04;
++const BPF_JMP: u16 = 0x05;
++const BPF_RET: u16 = 0x06;
++const BPF_MISC: u16 = 0x07;
++
++const BPF_W: u16 = 0x00;
++const BPF_IMM: u16 = 0x00;
++const BPF_ABS: u16 = 0x20;
++const BPF_MEM: u16 = 0x60;
++const BPF_LEN: u16 = 0x80;
++
++const BPF_ADD: u16 = 0x00;
++const BPF_SUB: u16 = 0x10;
++const BPF_MUL: u16 = 0x20;
++const BPF_DIV: u16 = 0x30;
++const BPF_OR: u16 = 0x40;
++const BPF_AND: u16 = 0x50;
++const BPF_LSH: u16 = 0x60;
++const BPF_RSH: u16 = 0x70;
++const BPF_NEG: u16 = 0x80;
++const BPF_XOR: u16 = 0xa0;
++
++const BPF_JA: u16 = 0x00;
++const BPF_JEQ: u16 = 0x10;
++const BPF_JGT: u16 = 0x20;
++const BPF_JGE: u16 = 0x30;
++const BPF_JSET: u16 = 0x40;
++
++const BPF_K: u16 = 0x00;
++const BPF_X: u16 = 0x08;
++const BPF_A: u16 = 0x10;
++
++const BPF_TAX: u16 = 0x00;
++const BPF_TXA: u16 = 0x80;
++
++const LD_W_ABS: u16 = BPF_LD | BPF_W | BPF_ABS;
++const LD_W_LEN: u16 = BPF_LD | BPF_W | BPF_LEN;
++const LDX_W_LEN: u16 = BPF_LDX | BPF_W | BPF_LEN;
++const LD_IMM: u16 = BPF_LD | BPF_IMM;
++const LDX_IMM: u16 = BPF_LDX | BPF_IMM;
++const LD_MEM: u16 = BPF_LD | BPF_MEM;
++const LDX_MEM: u16 = BPF_LDX | BPF_MEM;
++const RET_K: u16 = BPF_RET | BPF_K;
++const RET_A: u16 = BPF_RET | BPF_A;
++const MISC_TAX: u16 = BPF_MISC | BPF_TAX;
++const MISC_TXA: u16 = BPF_MISC | BPF_TXA;
++const ALU_NEG: u16 = BPF_ALU | BPF_NEG;
++const JMP_JA: u16 = BPF_JMP | BPF_JA;
++
++fn is_binary_alu(code: u16) -> bool {
++    code & 0x07 == BPF_ALU
++        && code & !(0x07 | 0x08 | 0xf0) == 0
++        && matches!(
++            code & 0xf0,
++            BPF_ADD | BPF_SUB | BPF_MUL | BPF_DIV | BPF_OR | BPF_AND | BPF_LSH | BPF_RSH | BPF_XOR
++        )
++}
++
++fn is_conditional_jump(code: u16) -> bool {
++    code & 0x07 == BPF_JMP
++        && code & !(0x07 | 0x08 | 0xf0) == 0
++        && matches!(code & 0xf0, BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET)
++}
++
++impl SeccompFilter {
++    /// Checks the number of instructions of a new filter.
++    pub(crate) fn check_len(len: usize) -> Result<()> {
++        if len == 0 || len > BPF_MAXINSNS {
++            return_errno_with_message!(Errno::EINVAL, "invalid seccomp filter length");
++        }
++        Ok(())
++    }
++
++    /// Validates a program and links it after `prev`.
++    pub(crate) fn new(
++        program: Vec<SockFilter>,
++        prev: Option<Arc<SeccompFilter>>,
++    ) -> Result<Arc<Self>> {
++        Self::check_len(program.len())?;
++        Self::check_program(&program)?;
++
++        let prev_cost = prev.as_ref().map_or(0, |filter| filter.total_cost);
++        let total_cost = prev_cost + program.len() + 4;
++        if total_cost > MAX_INSNS_PER_PATH {
++            return_errno_with_message!(Errno::ENOMEM, "too many seccomp filter instructions");
++        }
++
++        Ok(Arc::new(Self {
++            prev,
++            program: program.into_boxed_slice(),
++            total_cost,
++        }))
++    }
++
++    fn check_program(program: &[SockFilter]) -> Result<()> {
++        let invalid = || Error::with_message(Errno::EINVAL, "invalid seccomp filter program");
++        let len = program.len();
++
++        // The scratch memory slots that are known to be initialized when reaching
++        // each instruction.
++        let mut masks = vec![u16::MAX; len];
++        let mut mem_valid = 0u16;
++
++        for (pc, insn) in program.iter().enumerate() {
++            mem_valid &= masks[pc];
++            let code = insn.code;
++            match code {
++                LD_W_ABS => {
++                    if insn.k as usize >= SECCOMP_DATA_SIZE || insn.k & 3 != 0 {
++                        return Err(invalid());
++                    }
++                }
++                LD_W_LEN | LDX_W_LEN | LD_IMM | LDX_IMM | RET_K | RET_A | MISC_TAX | MISC_TXA
++                | ALU_NEG => {}
++                LD_MEM | LDX_MEM => {
++                    if insn.k as usize >= BPF_MEMWORDS || mem_valid & (1 << insn.k) == 0 {
++                        return Err(invalid());
++                    }
++                }
++                BPF_ST | BPF_STX => {
++                    if insn.k as usize >= BPF_MEMWORDS {
++                        return Err(invalid());
++                    }
++                    mem_valid |= 1 << insn.k;
++                }
++                JMP_JA => {
++                    // The target must be a later instruction within the program.
++                    if insn.k as usize >= len - pc - 1 {
++                        return Err(invalid());
++                    }
++                    masks[pc + 1 + insn.k as usize] &= mem_valid;
++                    mem_valid = u16::MAX;
++                }
++                _ if is_conditional_jump(code) => {
++                    let jt = pc + 1 + insn.jt as usize;
++                    let jf = pc + 1 + insn.jf as usize;
++                    if jt >= len || jf >= len {
++                        return Err(invalid());
++                    }
++                    masks[jt] &= mem_valid;
++                    masks[jf] &= mem_valid;
++                    mem_valid = u16::MAX;
++                }
++                _ if is_binary_alu(code) => {
++                    if code & BPF_X == 0 {
++                        let op = code & 0xf0;
++                        if op == BPF_DIV && insn.k == 0 {
++                            return Err(invalid());
++                        }
++                        if (op == BPF_LSH || op == BPF_RSH) && insn.k >= 32 {
++                            return Err(invalid());
++                        }
++                    }
++                }
++                _ => return Err(invalid()),
++            }
++        }
++
++        // A program must end with a return so that it cannot fall off its end.
++        if !matches!(program[len - 1].code, RET_K | RET_A) {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++
++    /// Runs this single program and returns the filter return value.
++    fn run_one(&self, data: &SeccompData) -> u32 {
++        let mut a = 0u32;
++        let mut x = 0u32;
++        let mut mem = [0u32; BPF_MEMWORDS];
++        let mut pc = 0usize;
++
++        // `check_program` guarantees that jumps only move forward and stay in
++        // bounds and that the last instruction returns, so the loop terminates.
++        loop {
++            let insn = &self.program[pc];
++            pc += 1;
++            let code = insn.code;
++            let k = insn.k;
++            match code {
++                LD_W_ABS => a = data.load_word(k),
++                LD_W_LEN => a = SECCOMP_DATA_SIZE as u32,
++                LDX_W_LEN => x = SECCOMP_DATA_SIZE as u32,
++                LD_IMM => a = k,
++                LDX_IMM => x = k,
++                LD_MEM => a = mem[k as usize],
++                LDX_MEM => x = mem[k as usize],
++                BPF_ST => mem[k as usize] = a,
++                BPF_STX => mem[k as usize] = x,
++                RET_K => return k,
++                RET_A => return a,
++                MISC_TAX => x = a,
++                MISC_TXA => a = x,
++                ALU_NEG => a = a.wrapping_neg(),
++                JMP_JA => pc += k as usize,
++                _ if code & 0x07 == BPF_JMP => {
++                    let operand = if code & BPF_X != 0 { x } else { k };
++                    let taken = match code & 0xf0 {
++                        BPF_JEQ => a == operand,
++                        BPF_JGT => a > operand,
++                        BPF_JGE => a >= operand,
++                        _ => a & operand != 0,
++                    };
++                    pc += if taken { insn.jt } else { insn.jf } as usize;
++                }
++                _ => {
++                    let operand = if code & BPF_X != 0 { x } else { k };
++                    a = match code & 0xf0 {
++                        BPF_ADD => a.wrapping_add(operand),
++                        BPF_SUB => a.wrapping_sub(operand),
++                        BPF_MUL => a.wrapping_mul(operand),
++                        BPF_DIV => {
++                            if operand == 0 {
++                                // Dividing by zero terminates the program with zero,
++                                // which is the most restrictive action.
++                                return SECCOMP_RET_KILL_THREAD;
++                            }
++                            a / operand
++                        }
++                        BPF_OR => a | operand,
++                        BPF_AND => a & operand,
++                        BPF_LSH => a.checked_shl(operand).unwrap_or(0),
++                        BPF_RSH => a.checked_shr(operand).unwrap_or(0),
++                        _ => a ^ operand,
++                    };
++                }
++            }
++        }
++    }
++
++    /// Runs this filter and all of its ancestors.
++    ///
++    /// Returns the return value with the most restrictive action.
++    pub(crate) fn run(&self, data: &SeccompData) -> u32 {
++        fn action_of(ret: u32) -> i32 {
++            (ret & SECCOMP_RET_ACTION_FULL) as i32
++        }
++
++        let mut result = SECCOMP_RET_ALLOW;
++        let mut current = Some(self);
++        while let Some(filter) = current {
++            let ret = filter.run_one(data);
++            if action_of(ret) < action_of(result) {
++                result = ret;
++            }
++            current = filter.prev.as_deref();
++        }
++        result
++    }
++
++    /// Returns the number of filters in the chain that ends with this filter.
++    pub(crate) fn chain_len(&self) -> usize {
++        let mut count = 1;
++        let mut current = self.prev.as_deref();
++        while let Some(filter) = current {
++            count += 1;
++            current = filter.prev.as_deref();
++        }
++        count
++    }
++
++    /// Returns whether `ancestor` is this filter or one of the filters before it.
++    fn has_ancestor(self: &Arc<Self>, ancestor: &Arc<SeccompFilter>) -> bool {
++        let mut current = Some(self);
++        while let Some(filter) = current {
++            if Arc::ptr_eq(filter, ancestor) {
++                return true;
++            }
++            current = filter.prev.as_ref();
++        }
++        false
++    }
++}
++
++/// The per-thread seccomp state.
++pub(crate) struct SeccompState {
++    mode: AtomicU32,
++    filter: SpinLock<Option<Arc<SeccompFilter>>>,
++}
++
++impl SeccompState {
++    pub(crate) fn new() -> Self {
++        Self {
++            mode: AtomicU32::new(SECCOMP_MODE_DISABLED),
++            filter: SpinLock::new(None),
++        }
++    }
++
++    /// Returns the current seccomp mode.
++    pub(crate) fn mode(&self) -> u32 {
++        self.mode.load(Ordering::Acquire)
++    }
++
++    /// Returns the most recently installed filter.
++    pub(crate) fn filter(&self) -> Option<Arc<SeccompFilter>> {
++        self.filter.lock().clone()
++    }
++
++    /// Enters the strict mode.
++    pub(crate) fn set_strict(&self) {
++        self.mode.store(SECCOMP_MODE_STRICT, Ordering::Release);
++    }
++
++    /// Replaces the filter chain and enters the filter mode.
++    pub(crate) fn set_filter(&self, filter: Arc<SeccompFilter>) {
++        let old = self.filter.lock().replace(filter);
++        self.mode.store(SECCOMP_MODE_FILTER, Ordering::Release);
++        // Drop the old chain outside the spin lock.
++        drop(old);
++    }
++
++    /// Copies the state of `parent` into this state.
++    ///
++    /// A new thread or process starts with the seccomp state of its creator.
++    pub(crate) fn inherit_from(&self, parent: &SeccompState) {
++        let filter = parent.filter();
++        let mode = parent.mode();
++        let old = core::mem::replace(&mut *self.filter.lock(), filter);
++        self.mode.store(mode, Ordering::Release);
++        drop(old);
++    }
++
++    /// Returns whether this state can be replaced by a filter chain that
++    /// extends `caller_filter` without lifting any restriction.
++    pub(crate) fn can_sync_to(&self, caller_filter: Option<&Arc<SeccompFilter>>) -> bool {
++        match self.mode() {
++            SECCOMP_MODE_DISABLED => true,
++            SECCOMP_MODE_FILTER => match (self.filter(), caller_filter) {
++                (None, _) => true,
++                (Some(own), Some(caller)) => caller.has_ancestor(&own),
++                (Some(_), None) => false,
++            },
++            _ => false,
++        }
++    }
++}
+diff --git a/kernel/core/src/process/signal/c_types.rs b/kernel/core/src/process/signal/c_types.rs
+--- a/kernel/core/src/process/signal/c_types.rs
++++ b/kernel/core/src/process/signal/c_types.rs
+@@ -77,6 +77,15 @@ impl siginfo_t {
+             .status_mut() = status;
+     }
+ 
++    /// Sets the fields that describe a system call trapped by seccomp.
++    pub(crate) fn set_sigsys(&mut self, call_addr: Vaddr, syscall: i32, arch: u32) {
++        *self.siginfo_fields.sigsys_mut() = siginfo_sigsys_t {
++            call_addr,
++            syscall,
++            arch,
++        };
++    }
++
+     pub(crate) fn si_addr(&self) -> Vaddr {
+         self.siginfo_fields.sigfault().addr
+     }
+@@ -89,6 +98,7 @@ union siginfo_fields_t {
+     bytes: [u8; 128 - size_of::<i32>() * 4],
+     common: siginfo_common_t,
+     sigfault: siginfo_sigfault_t,
++    sigsys: siginfo_sigsys_t,
+ }
+ 
+ impl Default for siginfo_fields_t {
+@@ -167,6 +177,14 @@ union siginfo_sigchild_t {
+     stime: clock_t,
+ }
+ 
++#[repr(C)]
++#[derive(Clone, Copy, Pod)]
++struct siginfo_sigsys_t {
++    call_addr: Vaddr, //*const c_void
++    syscall: i32,
++    arch: u32,
++}
++
+ #[padding_struct]
+ #[repr(C)]
+ #[derive(Clone, Copy, Pod)]
+diff --git a/kernel/core/src/syscall/arch/generic.rs b/kernel/core/src/syscall/arch/generic.rs
+--- a/kernel/core/src/syscall/arch/generic.rs
++++ b/kernel/core/src/syscall/arch/generic.rs
+@@ -123,6 +123,7 @@ macro_rules! import_generic_syscall_entries {
+             sched_setparam::sys_sched_setparam,
+             sched_setscheduler::sys_sched_setscheduler,
+             sched_yield::sys_sched_yield,
++            seccomp::sys_seccomp,
+             semctl::sys_semctl,
+             semget::sys_semget,
+             semop::{sys_semop, sys_semtimedop},
+@@ -397,6 +398,7 @@ macro_rules! define_syscalls_with_generic_syscall_table {
+             SYS_SCHED_SETATTR = 274          => sys_sched_setattr(args[..3]);
+             SYS_SCHED_GETATTR = 275          => sys_sched_getattr(args[..4]);
+             SYS_RENAMEAT2 = 276              => sys_renameat2(args[..5]);
++            SYS_SECCOMP = 277                => sys_seccomp(args[..3]);
+             SYS_GETRANDOM = 278              => sys_getrandom(args[..3]);
+             SYS_MEMFD_CREATE = 279           => sys_memfd_create(args[..2]);
+             SYS_EXECVEAT = 281               => sys_execveat(args[..5], &mut user_ctx);
+diff --git a/kernel/core/src/syscall/arch/x86.rs b/kernel/core/src/syscall/arch/x86.rs
+--- a/kernel/core/src/syscall/arch/x86.rs
++++ b/kernel/core/src/syscall/arch/x86.rs
+@@ -126,6 +126,7 @@ use super::{
+     sched_setparam::sys_sched_setparam,
+     sched_setscheduler::sys_sched_setscheduler,
+     sched_yield::sys_sched_yield,
++    seccomp::sys_seccomp,
+     select::sys_select,
+     semctl::sys_semctl,
+     semget::sys_semget,
+@@ -412,6 +413,7 @@ impl_syscall_nums_and_dispatch_fn! {
+     SYS_SCHED_SETATTR = 314    => sys_sched_setattr(args[..3]);
+     SYS_SCHED_GETATTR = 315    => sys_sched_getattr(args[..4]);
+     SYS_RENAMEAT2 = 316        => sys_renameat2(args[..5]);
++    SYS_SECCOMP = 317          => sys_seccomp(args[..3]);
+     SYS_GETRANDOM = 318        => sys_getrandom(args[..3]);
+     SYS_MEMFD_CREATE = 319     => sys_memfd_create(args[..2]);
+     SYS_EXECVEAT = 322         => sys_execveat(args[..5], &mut user_ctx);
+diff --git a/kernel/core/src/syscall/mod.rs b/kernel/core/src/syscall/mod.rs
+--- a/kernel/core/src/syscall/mod.rs
++++ b/kernel/core/src/syscall/mod.rs
+@@ -144,6 +144,7 @@ mod sched_setattr;
+ mod sched_setparam;
+ mod sched_setscheduler;
+ mod sched_yield;
++mod seccomp;
+ mod select;
+ mod semctl;
+ mod semget;
+@@ -383,6 +384,16 @@ impl SyscallArgument {
+ 
+ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
+     let syscall_frame = SyscallArgument::new_from_context(user_ctx);
++
++    match seccomp::check_syscall(&syscall_frame, ctx, user_ctx) {
++        seccomp::SeccompVerdict::Allow => {}
++        seccomp::SeccompVerdict::Errno(errno) => {
++            user_ctx.set_syscall_ret((-errno) as usize);
++            return;
++        }
++        seccomp::SeccompVerdict::Skip => return,
++    }
++
+     let syscall_return = arch::syscall_dispatch(
+         syscall_frame.syscall_number,
+         syscall_frame.args,
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -2,7 +2,7 @@
+ 
+ use ostd::mm::VmIo;
+ 
+-use super::SyscallReturn;
++use super::{SyscallReturn, seccomp};
+ use crate::{
+     prelude::*,
+     process::{
+@@ -120,6 +120,12 @@ pub(super) fn sys_prctl(
+             ctx.user_space()
+                 .write_val(write_addr, &(process.is_child_subreaper() as u32))?;
+         }
++        PrctlCmd::PR_GET_SECCOMP => {
++            return Ok(SyscallReturn::Return(seccomp::get_seccomp_mode(ctx) as _));
++        }
++        PrctlCmd::PR_SET_SECCOMP(mode, filter) => {
++            seccomp::set_seccomp_mode(mode, filter, ctx)?;
++        }
+         PrctlCmd::PR_SET_NO_NEW_PRIVS => {
+             let credentials = ctx.credentials_mut();
+             credentials.set_no_new_privs();
+@@ -160,6 +166,8 @@ const PR_GET_KEEPCAPS: i32 = 7;
+ const PR_SET_KEEPCAPS: i32 = 8;
+ const PR_SET_NAME: i32 = 15;
+ const PR_GET_NAME: i32 = 16;
++const PR_GET_SECCOMP: i32 = 21;
++const PR_SET_SECCOMP: i32 = 22;
+ const PR_CAPBSET_READ: i32 = 23;
+ const PR_CAPBSET_DROP: i32 = 24;
+ const PR_GET_SECUREBITS: i32 = 27;
+@@ -183,6 +191,8 @@ enum PrctlCmd {
+     PR_SET_KEEPCAPS(u32),
+     PR_SET_NAME(Vaddr),
+     PR_GET_NAME(Vaddr),
++    PR_GET_SECCOMP,
++    PR_SET_SECCOMP(u64, Vaddr),
+     PR_CAPBSET_READ(CapSet),
+     PR_CAPBSET_DROP(CapSet),
+     PR_GET_SECUREBITS,
+@@ -226,6 +236,8 @@ impl PrctlCmd {
+             PR_SET_KEEPCAPS => Ok(PrctlCmd::PR_SET_KEEPCAPS(arg2 as _)),
+             PR_SET_NAME => Ok(PrctlCmd::PR_SET_NAME(arg2 as _)),
+             PR_GET_NAME => Ok(PrctlCmd::PR_GET_NAME(arg2 as _)),
++            PR_GET_SECCOMP => Ok(PrctlCmd::PR_GET_SECCOMP),
++            PR_SET_SECCOMP => Ok(PrctlCmd::PR_SET_SECCOMP(arg2, arg3 as _)),
+             PR_CAPBSET_READ => Ok(PrctlCmd::PR_CAPBSET_READ(parse_capability(arg2)?)),
+             PR_CAPBSET_DROP => Ok(PrctlCmd::PR_CAPBSET_DROP(parse_capability(arg2)?)),
+             PR_GET_SECUREBITS => Ok(PrctlCmd::PR_GET_SECUREBITS),
+diff --git a/kernel/core/src/syscall/seccomp.rs b/kernel/core/src/syscall/seccomp.rs
+new file mode 100755
+--- /dev/null
++++ b/kernel/core/src/syscall/seccomp.rs
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use ostd::{arch::cpu::context::UserContext, mm::VmIo, user::UserContextApi};
++
++use super::{SyscallArgument, SyscallReturn, arch};
++use crate::{
++    prelude::*,
++    security::lsm::hooks as lsm_hooks,
++    process::{
++        TermStatus,
++        credentials::capabilities::CapSet,
++        posix_thread::{
++            AsPosixThread, do_exit, do_exit_group,
++            seccomp::{
++                SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
++                SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ALLOW, SECCOMP_RET_DATA, SECCOMP_RET_ERRNO,
++                SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG,
++                SECCOMP_RET_TRACE, SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF, SeccompData,
++                SeccompFilter, SockFilter,
++            },
++        },
++        signal::{
++            c_types::siginfo_t,
++            constants::{SIGKILL, SIGSYS},
++            sig_action::SigAction,
++            sig_num::SigNum,
++            signals::Signal,
++        },
++    },
++};
++
++const SECCOMP_SET_MODE_STRICT: u32 = 0;
++const SECCOMP_SET_MODE_FILTER: u32 = 1;
++const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
++
++bitflags! {
++    struct SeccompFilterFlags: u32 {
++        const TSYNC = 1 << 0;
++        const LOG = 1 << 1;
++        const SPEC_ALLOW = 1 << 2;
++        const TSYNC_ESRCH = 1 << 4;
++    }
++}
++
++/// The `si_code` of a `SIGSYS` that is raised by a seccomp filter.
++const SYS_SECCOMP: i32 = 1;
++
++/// The largest errno value that `SECCOMP_RET_ERRNO` can report.
++const MAX_ERRNO: u32 = 4095;
++
++#[cfg(target_arch = "x86_64")]
++const AUDIT_ARCH: u32 = 0xc000_003e;
++#[cfg(target_arch = "riscv64")]
++const AUDIT_ARCH: u32 = 0xc000_00f3;
++#[cfg(target_arch = "aarch64")]
++const AUDIT_ARCH: u32 = 0xc000_00b7;
++#[cfg(target_arch = "loongarch64")]
++const AUDIT_ARCH: u32 = 0xc000_0102;
++
++pub(super) fn sys_seccomp(
++    operation: u32,
++    flags: u32,
++    uargs: Vaddr,
++    ctx: &Context,
++) -> Result<SyscallReturn> {
++    debug!(
++        "operation = {}, flags = {:#x}, uargs = {:#x}",
++        operation, flags, uargs
++    );
++
++    match operation {
++        SECCOMP_SET_MODE_STRICT => {
++            if flags != 0 || uargs != 0 {
++                return_errno_with_message!(Errno::EINVAL, "invalid strict seccomp arguments");
++            }
++            set_mode_strict(ctx)?;
++            Ok(SyscallReturn::Return(0))
++        }
++        SECCOMP_SET_MODE_FILTER => set_mode_filter(flags, uargs, ctx),
++        SECCOMP_GET_ACTION_AVAIL => {
++            if flags != 0 {
++                return_errno_with_message!(Errno::EINVAL, "invalid seccomp flags");
++            }
++            let action = ctx.user_space().read_val::<u32>(uargs)?;
++            match action {
++                SECCOMP_RET_KILL_PROCESS
++                | SECCOMP_RET_KILL_THREAD
++                | SECCOMP_RET_TRAP
++                | SECCOMP_RET_ERRNO
++                | SECCOMP_RET_LOG
++                | SECCOMP_RET_ALLOW => Ok(SyscallReturn::Return(0)),
++                _ => return_errno_with_message!(
++                    Errno::EOPNOTSUPP,
++                    "the seccomp action is not supported"
++                ),
++            }
++        }
++        _ => return_errno_with_message!(Errno::EINVAL, "unsupported seccomp operation"),
++    }
++}
++
++/// Handles `prctl(PR_GET_SECCOMP)`.
++pub(super) fn get_seccomp_mode(ctx: &Context) -> u32 {
++    ctx.posix_thread.seccomp().mode()
++}
++
++/// Handles `prctl(PR_SET_SECCOMP)`.
++pub(super) fn set_seccomp_mode(mode: u64, filter: Vaddr, ctx: &Context) -> Result<()> {
++    match mode {
++        mode if mode == SECCOMP_MODE_STRICT as u64 => set_mode_strict(ctx),
++        mode if mode == SECCOMP_MODE_FILTER as u64 => set_mode_filter(0, filter, ctx).map(|_| ()),
++        _ => return_errno_with_message!(Errno::EINVAL, "invalid seccomp mode"),
++    }
++}
++
++fn set_mode_strict(ctx: &Context) -> Result<()> {
++    let seccomp = ctx.posix_thread.seccomp();
++    match seccomp.mode() {
++        SECCOMP_MODE_DISABLED | SECCOMP_MODE_STRICT => {
++            seccomp.set_strict();
++            Ok(())
++        }
++        _ => return_errno_with_message!(Errno::EINVAL, "the seccomp mode cannot be changed"),
++    }
++}
++
++fn set_mode_filter(flags: u32, uargs: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
++    let Some(flags) = SeccompFilterFlags::from_bits(flags) else {
++        return_errno_with_message!(Errno::EINVAL, "unsupported seccomp filter flags");
++    };
++    if flags.contains(SeccompFilterFlags::TSYNC_ESRCH) && !flags.contains(SeccompFilterFlags::TSYNC)
++    {
++        return_errno_with_message!(Errno::EINVAL, "TSYNC_ESRCH requires TSYNC");
++    }
++
++    // Read `struct sock_fprog`: a 16-bit length followed by an aligned pointer.
++    let user_space = ctx.user_space();
++    let len = user_space.read_val::<u16>(uargs)? as usize;
++    let insns_addr = user_space.read_val::<u64>(uargs + size_of::<u64>())? as Vaddr;
++    SeccompFilter::check_len(len)?;
++
++    // Installing a filter must not allow a process to confuse a more privileged
++    // program that it executes later.
++    let credentials = ctx.posix_thread.credentials();
++    if !credentials.no_new_privs() {
++        let has_sys_admin = lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
++            ctx.thread_local.borrow_user_ns().as_ref(),
++            ctx.posix_thread,
++            CapSet::SYS_ADMIN,
++        ))
++        .is_ok();
++        if !has_sys_admin {
++            return_errno_with_message!(
++                Errno::EACCES,
++                "installing a seccomp filter requires no_new_privs or CAP_SYS_ADMIN"
++            );
++        }
++    }
++
++    let mut program = vec![SockFilter::new_zeroed(); len];
++    user_space.read_bytes(insns_addr, program.as_mut_slice().as_mut_bytes())?;
++
++    let seccomp = ctx.posix_thread.seccomp();
++    if seccomp.mode() == SECCOMP_MODE_STRICT {
++        return_errno_with_message!(Errno::EINVAL, "the seccomp mode cannot be changed");
++    }
++
++    if !flags.contains(SeccompFilterFlags::TSYNC) {
++        let filter = SeccompFilter::new(program, seccomp.filter())?;
++        seccomp.set_filter(filter);
++        return Ok(SyscallReturn::Return(0));
++    }
++
++    // Synchronize the new filter chain to all threads of the process. Holding the
++    // task set lock keeps new threads out until every thread has been updated.
++    let tasks = ctx.process.tasks().lock();
++    let caller_filter = seccomp.filter();
++    for task in tasks.as_slice() {
++        let posix_thread = task.as_posix_thread().unwrap();
++        if core::ptr::eq(posix_thread, ctx.posix_thread) {
++            continue;
++        }
++        if !posix_thread.seccomp().can_sync_to(caller_filter.as_ref()) {
++            if flags.contains(SeccompFilterFlags::TSYNC_ESRCH) {
++                return_errno_with_message!(Errno::ESRCH, "a thread has a diverging seccomp state");
++            }
++            return Ok(SyscallReturn::Return(posix_thread.tid() as isize));
++        }
++    }
++
++    let filter = SeccompFilter::new(program, caller_filter)?;
++    let no_new_privs = credentials.no_new_privs();
++    for task in tasks.as_slice() {
++        let posix_thread = task.as_posix_thread().unwrap();
++        if no_new_privs {
++            posix_thread.set_no_new_privs();
++        }
++        posix_thread.seccomp().set_filter(filter.clone());
++    }
++
++    Ok(SyscallReturn::Return(0))
++}
++
++/// The decision of seccomp for a system call.
++pub(super) enum SeccompVerdict {
++    /// The system call runs.
++    Allow,
++    /// The system call is skipped and fails with the error number.
++    Errno(i32),
++    /// The system call is skipped and the user registers stay untouched.
++    Skip,
++}
++
++/// Applies the seccomp state of the current thread to a system call.
++pub(super) fn check_syscall(
++    syscall: &SyscallArgument,
++    ctx: &Context,
++    user_ctx: &mut UserContext,
++) -> SeccompVerdict {
++    let seccomp = ctx.posix_thread.seccomp();
++    match seccomp.mode() {
++        SECCOMP_MODE_DISABLED => SeccompVerdict::Allow,
++        SECCOMP_MODE_STRICT => {
++            if matches!(
++                syscall.syscall_number,
++                arch::SYS_READ | arch::SYS_WRITE | arch::SYS_EXIT | arch::SYS_RT_SIGRETURN
++            ) {
++                return SeccompVerdict::Allow;
++            }
++            do_exit(TermStatus::Killed(SIGKILL), ctx, user_ctx);
++            SeccompVerdict::Skip
++        }
++        _ => {
++            let Some(filter) = seccomp.filter() else {
++                return SeccompVerdict::Allow;
++            };
++            let nr = syscall.syscall_number as i32;
++            let instruction_pointer = user_ctx.instruction_pointer();
++            let data = SeccompData::new(nr, AUDIT_ARCH, instruction_pointer as u64, &syscall.args);
++            let ret = filter.run(&data);
++            let data = ret & SECCOMP_RET_DATA;
++
++            match ret & SECCOMP_RET_ACTION_FULL {
++                SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => SeccompVerdict::Allow,
++                SECCOMP_RET_ERRNO => SeccompVerdict::Errno(data.min(MAX_ERRNO) as i32),
++                // There is neither a tracer that handles seccomp events nor a
++                // user-space notification listener.
++                SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => {
++                    SeccompVerdict::Errno(Errno::ENOSYS as i32)
++                }
++                SECCOMP_RET_TRAP => {
++                    // The system call does not happen, so the registers must stay as
++                    // they were at the system call entry for the signal handler.
++                    let is_blocked = ctx.posix_thread.sig_mask().contains(SIGSYS);
++                    let is_ignored = matches!(
++                        ctx.process.sig_dispositions().lock().lock().get(SIGSYS),
++                        SigAction::Ign
++                    );
++                    if is_blocked || is_ignored {
++                        // The signal is forced: a thread cannot continue past a
++                        // trapped system call by blocking or ignoring `SIGSYS`.
++                        do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
++                    } else {
++                        ctx.posix_thread.enqueue_signal(Box::new(SeccompSignal {
++                            call_addr: instruction_pointer,
++                            syscall: nr,
++                            errno: data as i32,
++                        }));
++                    }
++                    SeccompVerdict::Skip
++                }
++                SECCOMP_RET_KILL_THREAD => {
++                    do_exit(TermStatus::Killed(SIGSYS), ctx, user_ctx);
++                    SeccompVerdict::Skip
++                }
++                // `SECCOMP_RET_KILL_PROCESS` and unknown actions.
++                _ => {
++                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
++                    SeccompVerdict::Skip
++                }
++            }
++        }
++    }
++}
++
++/// The `SIGSYS` signal that reports a system call trapped by a seccomp filter.
++#[derive(Clone, Copy, Debug)]
++struct SeccompSignal {
++    call_addr: Vaddr,
++    syscall: i32,
++    errno: i32,
++}
++
++impl Signal for SeccompSignal {
++    fn num(&self) -> SigNum {
++        SIGSYS
++    }
++
++    fn to_info(&self) -> siginfo_t {
++        let mut info = siginfo_t::new(SIGSYS, SYS_SECCOMP);
++        info.si_errno = self.errno;
++        info.set_sigsys(self.call_addr, self.syscall, AUDIT_ARCH);
++        info
++    }
++}

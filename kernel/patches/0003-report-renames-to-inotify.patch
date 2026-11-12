@@ -1,0 +1,253 @@
+diff --git a/kernel/core/src/fs/vfs/notify/inotify.rs b/kernel/core/src/fs/vfs/notify/inotify.rs
+--- a/kernel/core/src/fs/vfs/notify/inotify.rs
++++ b/kernel/core/src/fs/vfs/notify/inotify.rs
+@@ -227,8 +227,8 @@ impl InotifyFile {
+     /// The event will be queued and can be read by users.
+     /// If the event can be merged with the last event in the queue, it will be merged.
+     /// The event is only queued if it matches one of the subscriber's interesting events.
+-    fn receive_event(&self, wd: u32, event: FsEvents, name: Option<String>) {
+-        let new_event = InotifyEvent::new(wd, event, 0, name);
++    fn receive_event(&self, wd: u32, event: FsEvents, name: Option<String>, cookie: u32) {
++        let new_event = InotifyEvent::new(wd, event, cookie, name);
+ 
+         'notify: {
+             let mut event_queue = self.event_queue.lock();
+@@ -515,7 +515,7 @@ impl InotifySubscriber {
+ 
+ impl FsEventSubscriber for InotifySubscriber {
+     /// Sends FS events to the inotify file.
+-    fn deliver_event(&self, event: FsEvents, name: Option<String>) -> bool {
++    fn deliver_event(&self, event: FsEvents, name: Option<String>, cookie: u32) -> bool {
+         let (interesting, options) = self.interesting_and_controls();
+ 
+         if !event.contains(FsEvents::IN_IGNORED) && !is_interesting(interesting, event) {
+@@ -534,10 +534,10 @@ impl FsEventSubscriber for InotifySubscriber {
+         let inotify_file = self.inotify_file();
+         let wd = self.wd();
+ 
+-        inotify_file.receive_event(wd, event, name);
++        inotify_file.receive_event(wd, event, name, cookie);
+ 
+         if !event.contains(FsEvents::IN_IGNORED) && is_oneshot {
+-            inotify_file.receive_event(wd, FsEvents::IN_IGNORED, None);
++            inotify_file.receive_event(wd, FsEvents::IN_IGNORED, None, 0);
+         }
+ 
+         is_oneshot
+diff --git a/kernel/core/src/fs/vfs/notify/mod.rs b/kernel/core/src/fs/vfs/notify/mod.rs
+--- a/kernel/core/src/fs/vfs/notify/mod.rs
++++ b/kernel/core/src/fs/vfs/notify/mod.rs
+@@ -82,7 +82,7 @@ impl FsEventPublisher {
+ 
+         let removed = subscribers.len() != orig_len;
+         if removed {
+-            subscriber.deliver_event(FsEvents::IN_IGNORED, None);
++            subscriber.deliver_event(FsEvents::IN_IGNORED, None, 0);
+         }
+ 
+         removed
+@@ -93,7 +93,7 @@ impl FsEventPublisher {
+         let mut subscribers = self.subscribers.write();
+ 
+         for subscriber in subscribers.iter() {
+-            subscriber.deliver_event(FsEvents::IN_IGNORED, None);
++            subscriber.deliver_event(FsEvents::IN_IGNORED, None, 0);
+         }
+ 
+         let num_subscribers = subscribers.len();
+@@ -116,7 +116,9 @@ impl FsEventPublisher {
+     }
+ 
+     /// Broadcasts an event to all the subscribers of this publisher.
+-    pub(crate) fn publish_event(&self, events: FsEvents, name: Option<String>) {
++    ///
++    /// The cookie connects the two events of a move and is zero for all other events.
++    pub(crate) fn publish_event(&self, events: FsEvents, name: Option<String>, cookie: u32) {
+         let interesting = self.all_interesting_events.load(Ordering::Relaxed);
+         if !interesting.intersects(events) {
+             return;
+@@ -125,7 +127,7 @@ impl FsEventPublisher {
+         let subscribers = self.subscribers.read();
+         let mut has_oneshot = false;
+         for subscriber in subscribers.iter() {
+-            has_oneshot |= subscriber.deliver_event(events, name.clone());
++            has_oneshot |= subscriber.deliver_event(events, name.clone(), cookie);
+         }
+         drop(subscribers);
+ 
+@@ -203,7 +205,7 @@ pub(crate) trait FsEventSubscriber: Any + Send + Sync {
+     ///
+     /// Invariant: This method must not sleep or perform blocking operations. The publisher
+     /// may hold a spin lock when calling this method.
+-    fn deliver_event(&self, events: FsEvents, name: Option<String>) -> bool;
++    fn deliver_event(&self, events: FsEvents, name: Option<String>, cookie: u32) -> bool;
+ 
+     /// Returns the events that this subscriber is interested in.
+     fn interesting_events(&self) -> FsEvents;
+@@ -350,6 +352,70 @@ pub(crate) fn on_link(
+     notify_inode_with_name(dir_inode, FsEvents::CREATE, name);
+ }
+ 
++/// The cookie of the next move.
++static NEXT_MOVE_COOKIE: AtomicU32 = AtomicU32::new(1);
++
++/// Notifies that an entry was moved between two names.
++///
++/// The old and the new directory receive `MOVED_FROM` and `MOVED_TO` events that
++/// share a nonzero cookie. If the move replaced an existing inode, the caller
++/// passes it as `replaced_inode`.
++pub(crate) fn on_move(
++    old_dir_inode: &Arc<dyn Inode>,
++    old_name: &str,
++    new_dir_inode: &Arc<dyn Inode>,
++    new_name: &str,
++    moved_inode: &Arc<dyn Inode>,
++    replaced_inode: Option<&Arc<dyn Inode>>,
++) {
++    if !old_dir_inode
++        .fs()
++        .fs_event_subscriber_stats()
++        .has_any_subscribers()
++    {
++        return;
++    }
++
++    let cookie = loop {
++        let cookie = NEXT_MOVE_COOKIE.fetch_add(1, Ordering::Relaxed);
++        if cookie != 0 {
++            break cookie;
++        }
++    };
++    let is_dir = if moved_inode.type_() == InodeType::Dir {
++        FsEvents::ISDIR
++    } else {
++        FsEvents::empty()
++    };
++
++    if let Some(publisher) = old_dir_inode.fs_event_publisher() {
++        publisher.publish_event(
++            FsEvents::MOVED_FROM | is_dir,
++            Some(old_name.to_string()),
++            cookie,
++        );
++    }
++    if let Some(publisher) = new_dir_inode.fs_event_publisher() {
++        publisher.publish_event(
++            FsEvents::MOVED_TO | is_dir,
++            Some(new_name.to_string()),
++            cookie,
++        );
++    }
++    notify_inode(moved_inode, FsEvents::MOVE_SELF);
++
++    if let Some(replaced_inode) = replaced_inode {
++        notify_inode(replaced_inode, FsEvents::ATTRIB);
++        if replaced_inode
++            .metadata()
++            .is_ok_and(|metadata| metadata.nr_hard_links == 0)
++        {
++            // FIXME: `DELETE_SELF` should be generated after closing the last FD.
++            notify_inode(replaced_inode, FsEvents::DELETE_SELF);
++        }
++    }
++}
++
+ /// Notifies that a directory was created.
+ pub(crate) fn on_mkdir(dir_path: &Path, name: impl FnOnce() -> String) {
+     if !dir_path
+@@ -446,7 +512,7 @@ fn notify_parent(path: &Path, mut events: FsEvents) {
+ /// to all registered subscribers through the inode's publisher.
+ fn notify_inode(inode: &Arc<dyn Inode>, events: FsEvents) {
+     if let Some(publisher) = inode.fs_event_publisher() {
+-        publisher.publish_event(events, None);
++        publisher.publish_event(events, None, 0);
+     }
+ }
+ 
+@@ -456,6 +522,6 @@ fn notify_inode(inode: &Arc<dyn Inode>, events: FsEvents) {
+ /// child name information (e.g., CREATE, DELETE).
+ fn notify_inode_with_name(inode: &Arc<dyn Inode>, events: FsEvents, name: impl FnOnce() -> String) {
+     if let Some(publisher) = inode.fs_event_publisher() {
+-        publisher.publish_event(events, Some(name()));
++        publisher.publish_event(events, Some(name()), 0);
+     }
+ }
+diff --git a/kernel/core/src/fs/vfs/path/dentry.rs b/kernel/core/src/fs/vfs/path/dentry.rs
+--- a/kernel/core/src/fs/vfs/path/dentry.rs
++++ b/kernel/core/src/fs/vfs/path/dentry.rs
+@@ -825,6 +825,13 @@ impl DirDentry<'_> {
+             }
+ 
+             old_dir_inode.rename(&old_dentry, self, new_name, replaced_inode, mode)?;
++            Self::notify_rename(
++                mode,
++                (old_dir_inode, old_name),
++                (old_dir_inode, new_name),
++                old_inode,
++                replaced_inode,
++            );
+ 
+             match mode {
+                 RenameMode::Replace | RenameMode::NoReplace => {
+@@ -882,6 +889,13 @@ impl DirDentry<'_> {
+             }
+ 
+             old_dir_inode.rename(&old_dentry, new_dir, new_name, replaced_inode, mode)?;
++            Self::notify_rename(
++                mode,
++                (old_dir_inode, old_name),
++                (new_dir.inode(), new_name),
++                old_inode,
++                replaced_inode,
++            );
+ 
+             match mode {
+                 RenameMode::Replace | RenameMode::NoReplace => {
+@@ -910,6 +924,47 @@ impl DirDentry<'_> {
+         Ok(())
+     }
+ 
++    /// Publishes the filesystem events of a completed rename.
++    fn notify_rename(
++        mode: RenameMode,
++        (old_dir_inode, old_name): (&Arc<dyn Inode>, &str),
++        (new_dir_inode, new_name): (&Arc<dyn Inode>, &str),
++        old_inode: &Arc<dyn Inode>,
++        new_inode: Option<&Arc<dyn Inode>>,
++    ) {
++        use fs::vfs::notify::on_move;
++
++        match (mode, new_inode) {
++            (RenameMode::Exchange, Some(new_inode)) => {
++                // An exchange moves both entries, so it reports two moves.
++                on_move(
++                    old_dir_inode,
++                    old_name,
++                    new_dir_inode,
++                    new_name,
++                    old_inode,
++                    None,
++                );
++                on_move(
++                    new_dir_inode,
++                    new_name,
++                    old_dir_inode,
++                    old_name,
++                    new_inode,
++                    None,
++                );
++            }
++            _ => on_move(
++                old_dir_inode,
++                old_name,
++                new_dir_inode,
++                new_name,
++                old_inode,
++                new_inode,
++            ),
++        }
++    }
++
+     fn check_rename_cycle(
+         mode: RenameMode,
+         old_dir: &DirDentry<'_>,

@@ -1,0 +1,160 @@
+diff --git a/kernel/core/src/fs/fs_impls/procfs/pid/task/ns.rs b/kernel/core/src/fs/fs_impls/procfs/pid/task/ns.rs
+--- a/kernel/core/src/fs/fs_impls/procfs/pid/task/ns.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/pid/task/ns.rs
+@@ -20,9 +20,9 @@ use crate::{
+         },
+     },
+     ipc::IpcNamespace,
+-    net::uts_ns::UtsNamespace,
++    net::{net_ns::NetNamespace, uts_ns::UtsNamespace},
+     prelude::*,
+-    process::{NsProxy, UserNamespace, posix_thread::AsPosixThread},
++    process::{NsProxy, PidNamespace, UserNamespace, posix_thread::AsPosixThread},
+     thread::Thread,
+ };
+ 
+@@ -52,13 +52,24 @@ enum NsProxyEntry {
+     Ipc,
+     /// The mount namespace.
+     Mnt,
++    /// The network namespace.
++    Net,
++    /// The PID namespace of the children that the thread creates.
++    PidForChildren,
+     /// The UTS namespace.
+     Uts,
+ }
+ 
+ impl NsProxyEntry {
+     /// All supported `NsProxy`-backed namespace entries.
+-    const ALL: &[Self] = &[Self::Cgroup, Self::Ipc, Self::Mnt, Self::Uts];
++    const ALL: &[Self] = &[
++        Self::Cgroup,
++        Self::Ipc,
++        Self::Mnt,
++        Self::Net,
++        Self::PidForChildren,
++        Self::Uts,
++    ];
+ 
+     /// Returns the filename of this namespace entry under `/proc/[pid]/ns/`.
+     fn as_str(self) -> &'static str {
+@@ -66,6 +77,8 @@ impl NsProxyEntry {
+             Self::Cgroup => "cgroup",
+             Self::Ipc => "ipc",
+             Self::Mnt => "mnt",
++            Self::Net => "net",
++            Self::PidForChildren => "pid_for_children",
+             Self::Uts => "uts",
+         }
+     }
+@@ -76,6 +89,8 @@ impl NsProxyEntry {
+             "cgroup" => Some(Self::Cgroup),
+             "ipc" => Some(Self::Ipc),
+             "mnt" => Some(Self::Mnt),
++            "net" => Some(Self::Net),
++            "pid_for_children" => Some(Self::PidForChildren),
+             "uts" => Some(Self::Uts),
+             _ => None,
+         }
+@@ -104,6 +119,16 @@ impl NsProxyEntry {
+                 ns_proxy.mnt_ns().get_path(),
+                 parent,
+             ),
++            Self::Net => NsSymOps::<NetNamespace>::new_inode(
++                dir.clone(),
++                ns_proxy.net_ns().get_path(),
++                parent,
++            ),
++            Self::PidForChildren => NsSymOps::<PidNamespace>::new_inode(
++                dir.clone(),
++                ns_proxy.pid_ns_for_children().get_path(),
++                parent,
++            ),
+             Self::Uts => NsSymOps::<UtsNamespace>::new_inode(
+                 dir.clone(),
+                 ns_proxy.uts_ns().get_path(),
+@@ -132,6 +157,12 @@ fn cached_ns_path(inode: &dyn Inode) -> Option<&Path> {
+     if let Some(sym) = inode.downcast_ref::<NsSymlink<UtsNamespace>>() {
+         return Some(&sym.inner().ns_path);
+     }
++    if let Some(sym) = inode.downcast_ref::<NsSymlink<NetNamespace>>() {
++        return Some(&sym.inner().ns_path);
++    }
++    if let Some(sym) = inode.downcast_ref::<NsSymlink<PidNamespace>>() {
++        return Some(&sym.inner().ns_path);
++    }
+     // TODO: Support additional namespace types.
+     None
+ }
+@@ -155,6 +186,19 @@ impl ProcDirOps for NsDirOps {
+             ));
+         }
+ 
++        // A process never leaves its PID namespace. Chromium checks that this entry
++        // exists before it creates PID namespaces for its sandbox.
++        if name == "pid" {
++            let Some(process) = self.dir.process() else {
++                return_errno_with_message!(Errno::ESRCH, "the process does not exist");
++            };
++            return Ok(NsSymOps::<PidNamespace>::new_inode(
++                self.dir.clone(),
++                process.pid_ns().get_path(),
++                this_dir.this_weak().clone(),
++            ));
++        }
++
+         // Validate the name and get the current namespace path.
+         let entry = NsProxyEntry::from_str(name)
+             .ok_or_else(|| Error::with_message(Errno::ENOENT, "the file does not exist"))?;
+@@ -194,9 +238,13 @@ impl ProcDirOps for NsDirOps {
+                     .map(|entry| ListedEntry::new(entry.as_str(), InodeType::SymLink))
+             });
+ 
+-        let user_entry = Some(ListedEntry::new("user", InodeType::SymLink)).into_iter();
++        let process_entries = [
++            ListedEntry::new("pid", InodeType::SymLink),
++            ListedEntry::new("user", InodeType::SymLink),
++        ]
++        .into_iter();
+ 
+-        visit_listed_entries(offset, ns_proxy_entries.chain(user_entry), visit_fn)
++        visit_listed_entries(offset, ns_proxy_entries.chain(process_entries), visit_fn)
+     }
+ 
+     fn revalidation_policy(&self) -> RevalidationPolicy {
+@@ -205,11 +253,18 @@ impl ProcDirOps for NsDirOps {
+         RevalidationPolicy::REVALIDATE_EXISTS
+     }
+ 
+-    fn revalidate_exists(&self, _name: &str, child: &dyn Inode) -> bool {
++    fn revalidate_exists(&self, name: &str, child: &dyn Inode) -> bool {
+         let Some(cached_path) = cached_ns_path(child) else {
+             return false;
+         };
+ 
++        if name == "pid" && child.downcast_ref::<NsSymlink<PidNamespace>>().is_some() {
++            return self
++                .dir
++                .process()
++                .is_some_and(|process| cached_path == &process.pid_ns().get_path());
++        }
++
+         if child.downcast_ref::<NsSymlink<UserNamespace>>().is_some() {
+             let Some(process) = self.dir.process() else {
+                 return false;
+@@ -242,6 +297,14 @@ impl ProcDirOps for NsDirOps {
+             return cached_path == &ns_proxy.ipc_ns().get_path();
+         }
+ 
++        if child.downcast_ref::<NsSymlink<NetNamespace>>().is_some() {
++            return cached_path == &ns_proxy.net_ns().get_path();
++        }
++
++        if child.downcast_ref::<NsSymlink<PidNamespace>>().is_some() {
++            return cached_path == &ns_proxy.pid_ns_for_children().get_path();
++        }
++
+         // TODO: Support additional namespace types.
+         false
+     }
