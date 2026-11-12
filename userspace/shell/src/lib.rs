@@ -1,4 +1,5 @@
 mod cef;
+pub mod session;
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -80,7 +81,20 @@ pub fn write_cef_startup(mut pipe: impl Write, url: &str, profile: &str) -> io::
             "Invalid CEF startup configuration",
         ));
     }
-    writeln!(pipe, "desktop\n{url}\n{profile}")
+    writeln!(pipe, "desktop\n{url}\n{profile}")?;
+    pipe.flush()
+}
+
+/// Tells a running Desktop host to start over with a restarted hostd.
+pub fn write_cef_bootstrap(mut pipe: impl Write, url: &str) -> io::Result<()> {
+    if bootstrap_origin(url, None).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid hostd bootstrap URL",
+        ));
+    }
+    writeln!(pipe, "{}{url}", cef::BOOTSTRAP)?;
+    pipe.flush()
 }
 
 #[cfg(test)]

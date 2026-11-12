@@ -37,6 +37,7 @@ let
       runHook preInstall
       install -Dm0644 target/release/libopenshell_shell.a "$out/lib/libopenshell_shell.a"
       install -Dm0755 target/release/openshell-shell "$out/bin/openshell-shell"
+      install -Dm0755 target/release/openshell-session "$out/bin/openshell-session"
       runHook postInstall
     '';
   };

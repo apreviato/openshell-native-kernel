@@ -114,6 +114,34 @@ def loopback_udp():
         require(receiver.recv(len(FIXTURE)) == FIXTURE, "UDP loopback returned unexpected data")
 
 
+def server_restart():
+    # A restarted server binds its port again while the connections of the
+    # previous one are still closing, as hostd does after a crash.
+    first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    first.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    first.bind(("127.0.0.1", 0))
+    first.listen()
+    address = first.getsockname()
+    client = socket.create_connection(address, timeout=TIMEOUT)
+    accepted, _ = first.accept()
+    # The server closes first, so its side of the connection lingers.
+    accepted.close()
+    first.close()
+    second = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        second.bind(address)
+        second.listen()
+        with socket.create_connection(address, timeout=TIMEOUT) as again:
+            served, _ = second.accept()
+            with served:
+                again.sendall(FIXTURE)
+                require(served.recv(len(FIXTURE)) == FIXTURE, "The restarted server got unexpected data")
+    finally:
+        second.close()
+        client.close()
+
+
 def clock_and_entropy():
     before = time.monotonic_ns()
     require(len(os.urandom(32)) == 32, "Entropy unavailable")
@@ -122,7 +150,7 @@ def clock_and_entropy():
 
 print(json.dumps({"runtime": "python", "version": sys.version.split()[0], "platform": sys.platform}), flush=True)
 failed = False
-for probe in (processes, terminal, mapped_memory, descriptor_passing, filesystem, loopback_udp, clock_and_entropy):
+for probe in (processes, terminal, mapped_memory, descriptor_passing, filesystem, loopback_udp, server_restart, clock_and_entropy):
     try:
         probe()
         print(json.dumps({"probe": probe.__name__, "status": "passed"}), flush=True)

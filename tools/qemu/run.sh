@@ -37,20 +37,85 @@ boot_timeout=10m
 
 bundle=/tmp/openshell-native-bundle
 shell_sources=/tmp/openshell-native-shell
+ab_sources=/tmp/openshell-native-ab
 
 prepare_compat() {
     install -m 0644 "$compat/initramfs.nix" test/initramfs/nix/openshell-compat.nix
     rm -rf test/initramfs/nix/openshell-probes test/initramfs/nix/openshell-bundle \
-        test/initramfs/nix/openshell-shell
+        test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab
     cp -R "$probes" test/initramfs/nix/openshell-probes
-    # The Desktop profile adds the OpenShell bundle to the initramfs.
-    if [[ "$action" == desktop ]]; then
+    cp -R "$ab_sources" test/initramfs/nix/openshell-ab
+    # The Desktop and kiosk profiles add the OpenShell bundle to the initramfs.
+    if [[ "$action" == desktop || "$action" == kiosk ]]; then
         cp -R "$bundle" test/initramfs/nix/openshell-bundle
     fi
-    # The graphics profile builds the CEF host and adds an X server.
-    if [[ "$action" == graphics ]]; then
+    # The graphics and kiosk profiles build the shell and add an X server.
+    if [[ "$action" == graphics || "$action" == kiosk ]]; then
         cp -R "$shell_sources" test/initramfs/nix/openshell-shell
     fi
+}
+
+# Runs the CEF smokes, and the Desktop shell smoke for the kiosk, on the
+# builder's Linux with the packages of the guest, as an unprivileged user in
+# Xvfb and Openbox. The container must allow unprivileged user namespaces.
+run_control_graphics() {
+    local scratch="$work/control-graphics" status=0 attribute
+    for attribute in cefHost launcher mesa fonts graphicsTools node python; do
+        if ! timeout --kill-after=15s 60m nix-build test/initramfs/nix/openshell-compat.nix \
+            -A "$attribute" -o "$work/control-$attribute" >> "$artifacts/control-graphics-build.log" 2>&1; then
+            record_check control-cef failed
+            return 1
+        fi
+    done
+    # Xvfb and libglvnd find Mesa where NixOS installs it.
+    mkdir -p /run /tmp/.X11-unix
+    ln -sfn "$(readlink -f "$work/control-mesa")" /run/opengl-driver
+    chmod 1777 /tmp /tmp/.X11-unix
+    install -d -m 0755 -o 65534 -g 65534 "$scratch"
+    local tools="$work/control-graphicsTools/bin"
+    local path="$tools:$work/control-node/bin:$work/control-python/bin:$PATH"
+    "$tools/Xvfb" :7 -screen 0 1280x800x24 -nolisten tcp -ac > "$artifacts/control-xvfb.log" 2>&1 &
+    local xserver=$!
+    sleep 3
+    DISPLAY=:7 HOME="$scratch" XDG_CONFIG_DIRS="$work/control-graphicsTools/etc/xdg" \
+        "$work/control-python/bin/python3" -I "$probes/unprivileged.py" "$tools/openbox" \
+        > "$artifacts/control-openbox.log" 2>&1 &
+    local wm=$!
+    sleep 2
+    control_smoke() {
+        local name=$1
+        shift
+        if DISPLAY=:7 HOME="$scratch" PATH="$path" FONTCONFIG_FILE="$work/control-fonts" \
+            OPENSHELL_CEF_SMOKE_TIMEOUT_MS=90000 timeout --kill-after=10s 15m \
+            "$work/control-python/bin/python3" -I "$probes/unprivileged.py" \
+            "$work/control-node/bin/node" "$@" "$scratch/$name" 2>&1 | tee "$artifacts/$name.log"; then
+            record_check "$name" passed
+        else
+            record_check "$name" failed
+            status=1
+        fi
+        cp -R "$scratch/$name" "$artifacts/$name" 2>/dev/null || true
+    }
+    local host="$work/control-cefHost/runtime/openshell-cef-host"
+    control_smoke control-cef "$probes/cef-smoke.mjs" host "$host"
+    control_smoke control-cef-isolation "$probes/cef-smoke.mjs" isolation "$host"
+    if [[ "$action" == kiosk ]]; then
+        control_smoke control-shell "$probes/shell-smoke.mjs" \
+            "$work/control-launcher/bin/openshell-shell" "$bundle" "$host"
+        # The supervisor runs as root and starts the session as the user.
+        if PATH="$path" FONTCONFIG_FILE="$work/control-fonts" XDG_CONFIG_DIRS="$work/control-graphicsTools/etc/xdg" \
+            OPENSHELL_CEF_SMOKE_TIMEOUT_MS=90000 timeout --kill-after=10s 15m "$work/control-node/bin/node" \
+            "$probes/session-smoke.mjs" "$work/control-launcher/bin/openshell-session" \
+            "$work/control-launcher/bin/openshell-shell" "$bundle" "$host" "$tools/Xvfb" "$tools/openbox" \
+            "$scratch/control-session" 2>&1 | tee "$artifacts/control-session.log"; then
+            record_check control-session passed
+        else
+            record_check control-session failed
+            status=1
+        fi
+    fi
+    kill "$wm" "$xserver" 2>/dev/null || true
+    return "$status"
 }
 
 # Runs the hostd smoke of the bundle on the builder's Linux as an unprivileged user.
@@ -111,11 +176,26 @@ if [[ "$action" == control || "$action" == baseline ]]; then
         record_check control-rust-shell failed
         control_status=1
     fi
+    # The A/B transaction: unit tests, including power cuts, then the CLI on disk.
+    if CARGO_TARGET_DIR="$work/ab-target" timeout --kill-after=15s 5m cargo test --locked \
+        --manifest-path "$ab_sources/Cargo.toml" 2>&1 | tee "$artifacts/control-ab.log" &&
+        CARGO_TARGET_DIR="$work/ab-target" timeout --kill-after=15s 5m cargo build --locked --release \
+        --manifest-path "$ab_sources/Cargo.toml" 2>&1 | tee -a "$artifacts/control-ab.log" &&
+        sh "$ab_sources/smoke.sh" "$work/ab-target/release/openshell-ab" 2>&1 | tee -a "$artifacts/control-ab.log"; then
+        record_check control-ab passed
+    else
+        record_check control-ab failed
+        control_status=1
+    fi
 fi
 
-if [[ "$action" == desktop ]]; then
+if [[ "$action" == desktop || "$action" == kiosk ]]; then
     prepare_compat
     run_control_hostd || control_status=1
+fi
+if [[ "$action" == graphics || "$action" == kiosk ]]; then
+    prepare_compat
+    run_control_graphics || control_status=1
 fi
 
 # The series applies in file name order to the pinned upstream revision.
@@ -224,22 +304,30 @@ run_compat() {
     record_check compat-initramfs passed
     # The graphics closure (GTK, Mesa and Chromium) makes a large initramfs.
     # Chromium runs several processes at once, and TCG gives each vCPU a host thread.
+    # Mesa adds LLVM to it, and the kiosk drives the whole Desktop.
     local memory=4G cpus=1
     boot_timeout=10m
     if [[ "$action" == graphics ]]; then
-        memory=8G
+        memory=12G
         cpus=4
-        boot_timeout=30m
+        boot_timeout=40m
+    elif [[ "$action" == kiosk ]]; then
+        memory=12G
+        cpus=4
+        boot_timeout=90m
     fi
     boot_args=("MEM=$memory" "SMP=$cpus" "CARGO_OSDK_INITRAMFS_OPTION=--initramfs=$work/compat-initramfs")
     local status=0 sandbox_status=0 console="$artifacts/native-compat-console.txt"
-    local markers=(OPENSHELL_NATIVE_PYTHON_OK OPENSHELL_NATIVE_NODE_OK)
-    local workloads=()
-    if [[ "$action" == desktop ]]; then
+    local markers=(OPENSHELL_NATIVE_PYTHON_OK OPENSHELL_NATIVE_NODE_OK OPENSHELL_NATIVE_AB_OK)
+    local workloads=(ab)
+    if [[ "$action" == desktop || "$action" == kiosk ]]; then
         workloads+=(hostd)
     fi
-    if [[ "$action" == graphics ]]; then
-        workloads+=(x11 cef)
+    if [[ "$action" == graphics || "$action" == kiosk ]]; then
+        workloads+=(x11 cef cef_isolation)
+    fi
+    if [[ "$action" == kiosk ]]; then
+        workloads+=(shell session)
     fi
     local workload
     for workload in "${workloads[@]}"; do
@@ -248,9 +336,9 @@ run_compat() {
     run_boot native-compat "${markers[@]}" || status=$?
     for workload in "${workloads[@]}"; do
         if [[ -f "$console" ]] && grep -Fxq "OPENSHELL_NATIVE_${workload^^}_OK" "$console"; then
-            record_check "native-$workload" passed
+            record_check "native-${workload//_/-}" passed
         else
-            record_check "native-$workload" failed
+            record_check "native-${workload//_/-}" failed
             status=1
         fi
     done
@@ -274,7 +362,7 @@ run_compat() {
     return "$status"
 }
 
-if [[ "$action" == compat || "$action" == sandbox || "$action" == desktop || "$action" == graphics ]]; then
+if [[ "$action" == compat || "$action" == sandbox || "$action" == desktop || "$action" == graphics || "$action" == kiosk ]]; then
     prepare_compat
     compat_status=0
     run_compat || compat_status=1

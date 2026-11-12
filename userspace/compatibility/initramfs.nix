@@ -13,7 +13,8 @@ let
     $CC -O2 -Wall -Wextra -Werror -pthread -o "$out/bin/chromium-userns" ${probes}/chromium-userns.c
   '';
   # The graphics profile: an X server, a window manager, the X11 tools that the CEF
-  # smoke drives and the CEF host, when the build provides the shell sources.
+  # smoke drives, Mesa for OpenGL in software and the Rust launcher with the CEF
+  # host, when the build provides the shell sources.
   graphics =
     if builtins.pathExists ./openshell-shell then
       let
@@ -21,13 +22,29 @@ let
       in
       {
         inherit (shell) cefHost;
+        launcher = shell.shell;
         tools = [
           pkgs.xvfb
           pkgs.openbox
           pkgs.xdotool
           pkgs.xwd
         ];
+        # Xvfb and libglvnd find the drivers where NixOS installs them.
+        mesa = pkgs.mesa;
         fonts = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+      }
+    else
+      null;
+  # The Desktop Terminal integrates with bash, as on OpenShell Live.
+  shell = if bundle != null then pkgs.bashInteractive else null;
+  # The A/B release transaction, exercised on the guest's VirtIO disk.
+  ab =
+    if builtins.pathExists ./openshell-ab then
+      pkgs.rustPlatform.buildRustPackage {
+        pname = "openshell-ab";
+        version = "0.1.0";
+        src = ./openshell-ab;
+        cargoLock.lockFile = ./openshell-ab/Cargo.lock;
       }
     else
       null;
@@ -45,7 +62,17 @@ let
       seccomp
       tls
     ]
-    ++ lib.optionals (graphics != null) ([ graphics.cefHost graphics.fonts ] ++ graphics.tools)
+    ++ lib.optionals (graphics != null) (
+      [
+        graphics.cefHost
+        graphics.launcher
+        graphics.mesa
+        graphics.fonts
+      ]
+      ++ graphics.tools
+    )
+    ++ lib.optional (shell != null) shell
+    ++ lib.optional (ab != null) ab
   );
   extended = pkgs.runCommand "openshell-native-compat-root" { } ''
     mkdir -p "$out"
@@ -66,10 +93,16 @@ let
     ln -s ${seccomp}/bin/seccomp-probe "$out/opt/openshell-compat/seccomp-probe"
     ln -s ${seccomp}/bin/chromium-userns "$out/opt/openshell-compat/chromium-userns"
     ln -s ${tls} "$out/opt/openshell-compat/tls"
+    ${lib.optionalString (ab != null) ''
+      ln -s ${ab}/bin/openshell-ab "$out/opt/openshell-compat/openshell-ab"
+      install -m 0644 ${./openshell-ab/smoke.sh} "$out/opt/openshell-compat/ab-smoke.sh"
+    ''}
     install -m 0644 ${probes}/hostd-smoke.mjs ${probes}/unprivileged.py ${probes}/node.mjs ${probes}/python.py ${probes}/inotify.py ${probes}/namespaces.py "$out/opt/openshell-compat/"
     ${lib.optionalString (bundle != null) ''
       mkdir -p "$out/opt/openshell"
       cp -R ${bundle}/. "$out/opt/openshell/"
+      chmod u+w "$out/bin"
+      ln -s ${shell}/bin/bash "$out/bin/bash"
     ''}
     ${lib.optionalString (graphics != null) ''
       for tool in ${lib.concatMapStringsSep " " (tool: "${tool}/bin") graphics.tools}; do
@@ -80,17 +113,29 @@ let
         done
       done
       ln -s ${graphics.cefHost}/runtime "$out/opt/openshell-cef"
+      ln -s ${graphics.launcher}/bin/openshell-shell "$out/opt/openshell-compat/bin/openshell-shell"
+      ln -s ${graphics.launcher}/bin/openshell-session "$out/opt/openshell-compat/bin/openshell-session"
+      mkdir -p "$out/run"
+      ln -s ${graphics.mesa} "$out/run/opengl-driver"
       ln -s ${graphics.fonts} "$out/opt/openshell-compat/fonts.conf"
       ln -s ${pkgs.openbox}/etc/xdg "$out/opt/openshell-compat/xdg"
-      install -m 0644 ${probes}/cef-smoke.mjs ${probes}/linux-sandbox.mjs "$out/opt/openshell-compat/"
+      install -m 0644 ${probes}/cef-smoke.mjs ${probes}/shell-smoke.mjs ${probes}/session-smoke.mjs ${probes}/linux-sandbox.mjs "$out/opt/openshell-compat/"
     ''}
     rm "$out/test/boot_hello.sh"
     install -m 0755 ${probes}/compat-boot.sh "$out/test/boot_hello.sh"
   '';
 in
 {
-  inherit node python seccomp tls;
+  inherit node python seccomp tls ab;
+  # The graphics profile, for the Linux control of the builder.
   cefHost = graphics.cefHost or null;
+  launcher = graphics.launcher or null;
+  mesa = graphics.mesa or null;
+  fonts = graphics.fonts or null;
+  graphicsTools = if graphics != null then pkgs.symlinkJoin {
+    name = "openshell-graphics-tools";
+    paths = graphics.tools;
+  } else null;
   image = pkgs.callPackage ./initramfs-image.nix {
     initramfs = extended;
     compressed = true;

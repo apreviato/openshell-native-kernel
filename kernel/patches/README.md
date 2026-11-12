@@ -18,6 +18,7 @@ Os patches aplicam em ordem de nome sobre a revisão do Asterinas fixada em [ups
 | `0012-limit-unix-sockets-in-flight` | O Mojo, IPC do Chromium, passa sockets Unix por `SCM_RIGHTS`. A v0.19.0 só permitia isso com `CAP_SYS_ADMIN` no namespace inicial, e os renderers sem privilégios nunca recebiam seu canal. | `chromium-userns.c`, verificação `socket_passing`, que também comprova o limite. | Não enviado. Substitui a exigência de privilégio por um limite por usuário. |
 | `0013-honor-msg-dontwait` | O serviço de rede do Chromium lê o dump de endereços e interfaces do netlink com `recv(MSG_DONTWAIT)` até `EAGAIN`. A v0.19.0 ignorava a flag, o recebimento bloqueava, e o browser esperava para sempre antes de criar a janela. | `chromium-userns.c`, verificação `address_tracker`. | Não enviado. A v0.19.0 só emitia um aviso para a flag. |
 | `0014-lay-out-environment-like-linux` | Os filhos do zygote reescrevem o título sobre as strings de argumento e ambiente, que precisam estar contíguas e em ordem. A v0.19.0 gravava o ambiente em ordem inversa, e `/proc/[pid]/cmdline` não identificava os renderers. | `chromium-userns.c`, verificação `process_title`, e o `cef-smoke`, que encontra os renderers por esse título. | Não enviado. |
+| `0015-inherit-address-reuse-in-accepted-connections` | O launcher reinicia o hostd na mesma porta, que o perfil do Desktop exige. As conexões aceitas pelo hostd anterior não herdavam `SO_REUSEADDR` e, enquanto fechavam, o novo `listen` falhava com `EADDRINUSE`. | [python.py](../../userspace/compatibility/probes/python.py), sonda `server_restart`, e o [smoke do shell](../../tools/desktop/shell-smoke.mjs), verificação `hostd-restart`. | Não enviado. Correção de bug. |
 
 ## 0002 · seccomp
 
@@ -100,6 +101,10 @@ O risco que continua aberto: um ciclo deliberado mantém até `RLIMIT_NOFILE` so
 
 - `MSG_DONTWAIT` torna uma única chamada de envio ou recebimento não bloqueante em sockets IP, Unix, netlink e vsock, independentemente do modo do arquivo. `MSG_NOSIGNAL` passa a constar como suportada: o kernel nunca envia `SIGPIPE` em sockets.
 - As strings de ambiente ficam logo depois das de argumento e em ordem crescente, como no Linux. `/proc/[pid]/cmdline` segue `get_mm_cmdline`: se o último byte da área de argumentos não é NUL, o título continua na área de ambiente até o primeiro NUL.
+
+## 0015 · reinício de servidores
+
+Como no Linux, uma conexão aceita herda de quem escuta o `SO_REUSEADDR` no momento do `accept`. Um servidor reiniciado com `SO_REUSEADDR` volta a fazer `bind` na porta enquanto as conexões do anterior terminam de fechar. A série não altera o caso de dois sockets em `listen` na mesma porta: como já era na v0.19.0, ele continua permitido quando todos os sockets da porta usam `SO_REUSEADDR`. O Linux recusa esse caso.
 
 ## Diagnóstico de falhas do Chromium
 

@@ -26,7 +26,7 @@ async function startFixture({ cookie, setCookie = false, forbiddenUrl, key = "k"
   const id = randomBytes(8).toString("hex");
   const entry = `/${id}/`;
   const title = `OpenShell CEF Probe ${id}`;
-  const evidence = { ready: false, interactions: 0, viewport: null };
+  const evidence = { ready: false, interactions: 0, viewport: null, webgl: null };
   if (cookie) evidence.cookieObserved = false;
   if (setCookie) evidence.crossOriginRequests = 0;
   if (forbiddenUrl) evidence.blocked = { direct: false, redirect: false, worker: false };
@@ -60,6 +60,24 @@ worker.postMessage("openshell-cef");
 function reportSize() { void fetch("size?" + new URLSearchParams({ width: innerWidth, height: innerHeight }), { method: "POST" }); }
 window.addEventListener("resize", reportSize);
 reportSize();
+// The effective WebGL backend, and whether a cleared pixel reads back.
+const webgl = { available: false, renderer: null, pixel: false };
+try {
+  const gl = document.createElement("canvas").getContext("webgl");
+  if (gl) {
+    webgl.available = true;
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    webgl.renderer = String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+    gl.clearColor(0, 1, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const pixel = new Uint8Array(4);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    webgl.pixel = pixel[0] === 0 && pixel[1] === 255 && pixel[2] === 0;
+  }
+} catch {
+  // Reported as unavailable.
+}
+void fetch("webgl", { method: "POST", body: JSON.stringify(webgl) });
 void fetch("ready", { method: "POST" });
 ${forbidden}`;
   const worker = `self.onmessage = async ({ data }) => {
@@ -89,6 +107,21 @@ ${forbidden}`;
     }
     if (request.method === "POST" && request.headers.origin === `http://127.0.0.1:${server.address().port}`) {
       const target = new URL(request.url, "http://127.0.0.1");
+      if (target.pathname === entry + "webgl") {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => { body = (body + chunk).slice(0, 4096); });
+        request.on("end", () => {
+          try {
+            const { available, renderer, pixel } = JSON.parse(body);
+            evidence.webgl = { available: available === true, renderer: typeof renderer === "string" ? renderer.slice(0, 200) : null, pixel: pixel === true };
+          } catch {
+            evidence.webgl = { available: false, renderer: null, pixel: false };
+          }
+          response.writeHead(204).end();
+        });
+        return;
+      }
       if (target.pathname === entry + "ready") evidence.ready = true;
       else if (target.pathname === entry + "result") evidence.interactions++;
       else if (target.pathname === entry + "size") {
@@ -174,7 +207,10 @@ async function smoke(mode, executable, outputArg) {
     for (const [index, fixture] of fixtures.entries()) {
       const x = Math.floor(width * (index + 0.5) / fixtures.length);
       const y = Math.floor(height / 2);
-      tool("xdotool", ["windowactivate", "--sync", window, "mousemove", "--window", window, String(x), String(y), "click", "1", "key", fixture.key]);
+      tool("xdotool", ["windowactivate", "--sync", window, "mousemove", "--window", window, String(x), String(y), "click", "1"]);
+      // The click moves the keyboard focus to this view, which takes a while in an emulated guest.
+      await sleep(500 * timeoutScale);
+      tool("xdotool", ["key", fixture.key]);
       await waitFor("mouse, keyboard, and Web Worker", () => fixture.evidence.interactions === round);
     }
   }
@@ -237,6 +273,7 @@ async function smoke(mode, executable, outputArg) {
       await waitFor("both viewports to resize", () => fixtures.every(({ evidence }, index) => Math.abs(evidence.viewport[0] - widths[index]) >= 32));
       await verifyInput(window, fixtures, 2);
     }
+    report.webgl = await waitFor("the WebGL report", () => primary.evidence.webgl);
     report.screenshot = tool("xwd", ["-silent", "-id", window, "-out", join(output, "cef.xwd")], { optional: true }) !== null;
     await waitFor("renderer sandbox evidence", () => {
       report.sandbox = sandboxSample(child.pid);

@@ -1,0 +1,77 @@
+diff --git a/kernel/libs/aster-bigtcp/src/iface/common.rs b/kernel/libs/aster-bigtcp/src/iface/common.rs
+--- a/kernel/libs/aster-bigtcp/src/iface/common.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/common.rs
+@@ -314,6 +314,11 @@ impl<E: Ext> BoundPort<E> {
+         IpEndpoint::new(self.addr, self.port)
+     }
+ 
++    /// Returns whether the port can be reused.
++    pub fn can_reuse(&self) -> bool {
++        self.can_reuse.load(Ordering::Relaxed)
++    }
++
+     /// Sets whether the port can be reused.
+     pub fn set_can_reuse(&self, can_reuse: bool) {
+         let iface_common = self.iface.common();
+diff --git a/kernel/libs/aster-bigtcp/src/iface/port.rs b/kernel/libs/aster-bigtcp/src/iface/port.rs
+--- a/kernel/libs/aster-bigtcp/src/iface/port.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/port.rs
+@@ -15,8 +15,8 @@ enum PortKind {
+     Specified(u16),
+     /// Allocates an ephemeral port to bind.
+     Ephemeral(bool),
+-    /// Reuses the port of the listening socket.
+-    Backlog(u16),
++    /// Reuses the port of the listening socket, with its address reuse flag.
++    Backlog(u16, bool),
+ }
+ 
+ impl BindPortConfig {
+@@ -35,10 +35,14 @@ impl BindPortConfig {
+     }
+ 
+     /// Creates a new configuration for reusing the port of a listening socket.
+-    pub fn new_backlog(endpoint: IpEndpoint) -> Self {
++    ///
++    /// Like Linux, an accepted connection inherits `SO_REUSEADDR` from the
++    /// listening socket, so that a restarted server can bind the port again
++    /// while the connections of the previous one are still closing.
++    pub fn new_backlog(endpoint: IpEndpoint, can_reuse: bool) -> Self {
+         Self {
+             addr: endpoint.addr,
+-            kind: PortKind::Backlog(endpoint.port),
++            kind: PortKind::Backlog(endpoint.port, can_reuse),
+         }
+     }
+ 
+@@ -49,13 +53,13 @@ impl BindPortConfig {
+     pub(super) fn can_reuse(&self) -> bool {
+         matches!(
+             self.kind,
+-            PortKind::CanReuse(..) | PortKind::Ephemeral(true)
++            PortKind::CanReuse(..) | PortKind::Ephemeral(true) | PortKind::Backlog(_, true)
+         )
+     }
+ 
+     pub(super) fn port(&self) -> Option<u16> {
+         match &self.kind {
+-            PortKind::CanReuse(port) | PortKind::Specified(port) | PortKind::Backlog(port) => {
++            PortKind::CanReuse(port) | PortKind::Specified(port) | PortKind::Backlog(port, _) => {
+                 Some(*port)
+             }
+             PortKind::Ephemeral(_) => None,
+diff --git a/kernel/libs/aster-bigtcp/src/socket/bound/tcp_listen.rs b/kernel/libs/aster-bigtcp/src/socket/bound/tcp_listen.rs
+--- a/kernel/libs/aster-bigtcp/src/socket/bound/tcp_listen.rs
++++ b/kernel/libs/aster-bigtcp/src/socket/bound/tcp_listen.rs
+@@ -239,7 +239,10 @@ impl<E: Ext> TcpListenerBg<E> {
+         let conn = TcpConnection::new_cyclic(
+             self.bound
+                 .iface()
+-                .bind_tcp(BindPortConfig::new_backlog(self.bound.endpoint()))
++                .bind_tcp(BindPortConfig::new_backlog(
++                    self.bound.endpoint(),
++                    self.bound.can_reuse(),
++                ))
+                 .unwrap(),
+             |weak| {
+                 TcpConnectionInner::new(

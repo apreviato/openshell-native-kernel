@@ -158,12 +158,89 @@ Para comparar desempenho, registrar boot até o primeiro frame utilizável, temp
 | Decisão | Evidência necessária |
 | --- | --- |
 | Versão e distribuição do CEF | Compatibilidade do SDK no Linux de controle e no Asterinas, manutenção de segurança e requisitos de empacotamento. |
-| View nativa ou off-screen | Correção de empilhamento e recortes, entrada e desempenho no Browser incorporado. |
+| View nativa ou off-screen | Correção de empilhamento e recortes, entrada e desempenho no Browser incorporado. A primeira composição usa views nativas sobrepostas (seção 10). |
 | Origem interna do Desktop | Preservação de armazenamento, CSP, workers e transporte do `hostd`, com política testada para origens externas. |
 | Lacunas de kernel | Diferença reproduzível entre Linux e Asterinas, com caso mínimo e impacto no sandbox ou na operação da UI. |
 | Migração de perfil | Lista de dados suportados, exportação ou migração testada e retorno para a última release funcional. |
 
-O launcher Rust já inicia o `hostd`. A configuração de bootstrap e a política de navegação e recursos ficam numa biblioteca Rust, chamada pelo adaptador C++ a partir dos callbacks do SDK. O teste `isolation` usa dois contextos CEF e duas views lado a lado na mesma janela. Ele exige entrada antes e depois de redimensionar e mede isolamento de cookies e requisições, incluindo um Web Worker.
+## 10. Estado da implementação
 
-A fase 1 está comprovada no Asterinas com o host do shell no lugar do `cefsimple`, que o CEF do nixpkgs não inclui: a ação `graphics` abre a fixture numa janela X11, verifica mouse, teclado e Web Worker e exige renderers com o sandbox do Chromium efetivo. O próximo marco é executar o shell com a fixture de isolamento e o bundle Desktop real em Linux de controle e no Asterinas. Depois, posicionar uma view a partir da janela lógica do Browser e verificar foco, recorte e sobreposição de modais. Esses resultados orientam a escolha entre views nativas e composição off-screen.
+As provas abaixo passam no Linux de controle, com o sandbox do Chromium efetivo, e no guest Asterinas com a [série de patches](kernel/patches/README.md). O [README](README.md) lista os comandos e os relatórios.
 
+**Fase 1.** O host do shell substitui o `cefsimple`, que o CEF do nixpkgs não inclui. A ação `graphics` abre a fixture numa janela X11 e verifica mouse, teclado e Web Worker. O modo `isolation` usa dois contextos lado a lado e exige o isolamento de cookies e requisições antes e depois de redimensionar a janela. Nas duas provas, os renderers rodam com o sandbox do Chromium.
+
+**Fase 2.** O launcher Rust inicia o `hostd`, valida a prontidão e abre o bundle Desktop real no contexto do Desktop, cujo perfil fica em `cef/desktop`. O [smoke do shell](tools/desktop/shell-smoke.mjs) usa apenas entrada X11 e o que o `hostd` grava em disco:
+
+- Desktop: a UI grava os documentos padrão pelo `hostd`.
+- Files: Ctrl+A, Enter e F2 renomeiam um arquivo de prova.
+- Terminal: um comando digitado roda no PTY do `hostd`.
+- Recuperação do renderer e do `hostd`, com o Terminal funcionando de novo depois de cada uma.
+- Encerramento limpo e segunda sessão no mesmo perfil.
+- Nenhum log contém a URL de bootstrap.
+
+O launcher reinicia o `hostd` até 5 vezes por minuto, com espera crescente, na mesma porta e com a mesma origem. O stdin do host CEF continua aberto como canal de controle. Por ele, o launcher envia o novo bootstrap, e o host só aceita uma URL de bootstrap na origem original. Quando o launcher fecha o canal, a sessão termina. O host recarrega o Desktop até 3 vezes por minuto quando o renderer morre e reativa a janela: a view mantém o foco do Views, mas o renderer novo não o recebe. Os erros do `hostd` ficam em `hostd.log`, no estado da sessão. O segredo de bootstrap trafega só por pipes.
+
+**Fase 3, primeira composição.** As abas do Browser são views do host sobrepostas à janela (`CefWindow::AddOverlayView`, modo custom), no retângulo do elemento da aba. A UI é a fonte do layout: publica o retângulo sempre que ele muda, com um número de geração por aba, e o host descarta posicionamentos mais antigos que o último aplicado, porque as requisições podem chegar fora de ordem.
+
+- **Ponte.** A página do Desktop envia `POST /_shell/<comando>`. O host responde no processo principal e nunca repassa a requisição ao `hostd`. Só o frame principal do browser do Desktop é aceito; frames, abas e navegações recebem 403. Os eventos das abas chegam à página como `openshell-native-browser`. O adaptador fica em `apps/desktop/src/host/nativeBrowser.tsx`, no repositório `openshell`. O Browser usa o mesmo componente de aba do Electron, com um elemento que implementa a interface do `<webview>`.
+- **Contextos.** Uma aba normal usa o perfil `cef/browser`, separado do Desktop. Uma aba privada usa um contexto em memória, descartado quando termina a sessão privada.
+- **Política.** As abas abrem http(s), `about:blank` e os serviços locais do usuário. Nenhum alias de loopback alcança a porta do `hostd`: `localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`, `[::1]` e o IPv4 mapeado. Outros esquemas, como `file:` e `chrome:`, são recusados. Pop-ups e links para uma janela nova abrem uma aba, criada pelo Desktop.
+- **Visibilidade.** A view só aparece com a janela do Browser em primeiro plano, sem menu de contexto nem diálogo do Desktop e sem nenhum elemento do Desktop sobre a área da aba. A UI confere esta última condição numa grade de pontos com `elementFromPoint`, a 16 px das bordas, onde ficam as alças de redimensionamento da janela. Assim, sugestões da barra de endereço, menus e outra janela por cima aparecem: a view se oculta enquanto estão abertos.
+
+O smoke abre um site pelo `xdg-open` do Terminal e comprova:
+
+- a página e um Web Worker;
+- WebGL;
+- clique e tecla confiáveis;
+- um pop-up aberto como aba;
+- renderers filtrados;
+- que a página não alcança o `hostd`.
+
+Limites conhecidos desta composição:
+
+- **WebSocket.** A API de recursos do CEF não intercepta o handshake de WebSocket. O `hostd` recusa a origem estrangeira sem cookie e fecha o socket antes da primeira mensagem, e o smoke exige esse resultado.
+- **DNS rebinding.** O bloqueio do host compara o endereço literal da URL. Um domínio que resolve para o loopback na porta do `hostd` passa pelo CEF. Quando escuta em loopback, o `hostd` responde 421 a qualquer `Host` que não seja `127.0.0.1`, `localhost` ou `[::1]` na sua porta, e recusa o upgrade de WebSocket nesse caso.
+- **Sobreposição.** Enquanto um elemento do Desktop cobre a aba, a área da página fica vazia, sem o último quadro da página, e um elemento menor que o espaçamento da grade pode escapar da detecção.
+- **Atalhos.** Os atalhos do Desktop não chegam enquanto a aba tem o foco do teclado.
+- **Recursos de Electron.** O Browser ainda não tem localizar, zoom, downloads, senhas e DevTools.
+
+A composição off-screen continua sendo a alternativa se a sobreposição de elementos se mostrar insuficiente.
+
+**Gráficos.** O image inclui o Mesa do nixpkgs fixado em `/run/opengl-driver`, como no NixOS. O Xvfb oferece GLX, e o ANGLE renderiza com llvmpipe. O host passa `ignore-gpu-blocklist`, porque o blocklist do Chromium, feito para drivers desconhecidos, recusa WebGL no llvmpipe e o image fixa o driver. Os smokes registram o renderer efetivo e conferem um pixel lido de volta.
+
+**Supervisão (etapa 5 do plano original).** O `openshell-session` roda como serviço do init, como root:
+
+- depois de criar o home e o diretório de logs, mantém só `CAP_SETUID`, `CAP_SETGID`, `CAP_KILL` e `CAP_FOWNER`;
+- inicia o X, o Openbox e o launcher como o usuário da sessão, cada um no seu grupo de processos;
+- espera o socket do X antes de iniciar o resto;
+- reinicia o shell até 5 vezes por minuto e o gerenciador de janelas até 5 vezes por minuto;
+- quando o X morre, reinicia a sessão inteira, até 3 vezes em 5 minutos;
+- como subreaper, recolhe os órfãos da sessão;
+- encerra shell, gerenciador de janelas e X nessa ordem;
+- guarda os logs de cada boot num diretório próprio e mantém os 5 mais recentes.
+
+O [smoke da sessão](tools/desktop/session-smoke.mjs) confere as capabilities do supervisor, mata o host CEF e exige uma sessão nova, sem processos da anterior. Depois, exige que o SIGTERM encerre todos os processos da sessão. O smoke do shell registra memória (soma de RSS e PSS, quando o kernel informa) e tempo de CPU do CEF e do `hostd` com o Desktop pronto, com o Browser aberto e em repouso.
+
+## 11. Decisões e próximos passos
+
+A proposta de evolução de 12/11/2026 (*OpenShell Native — Arquitetura final proposta e oportunidades de otimização*) foi avaliada contra a implementação. As decisões abaixo valem até que uma medição as reabra.
+
+| Decisão | Situação |
+| --- | --- |
+| A UI define o layout, e o shell valida e apresenta as superfícies | Adotada. Retângulo, visibilidade e geração já seguem esse modelo. Recorte, escala, z-order e foco entram no mesmo contrato quando houver um segundo tipo de superfície. |
+| Views sobrepostas como composição de base, com off-screen só se a sobreposição não bastar | Adotada. Composição off-screen e compositor próprio dependem de medição de cópias, CPU, latência e quadros descartados. |
+| X11 e Xpra mantidos até uma alternativa ter paridade | Adotada. Openbox e Xorg só saem do caminho quando os apps Linux tiverem outro caminho validado. |
+| Proteção do `hostd` independente do bloqueio no CEF | Adotada: Origin, cookie e validação de `Host`. |
+| `hostd` em Rust | Condicionada a testes de contrato do `@openshell/host-api`, portados método a método com as duas implementações sob os mesmos testes. O `hostd-smoke` é a semente desses testes. |
+| IPC nativo do CEF no lugar de `/_shell/` | Condicionada. Exige um handler no processo renderer. A ponte HTTP atual aceita só o frame principal do Desktop e só `POST`. |
+| Assets servidos por um esquema interno do CEF | Experimento. Muda a origem do perfil do Desktop e exige plano de migração do armazenamento e dos cookies. |
+| Rootfs A/B separado da camada de compatibilidade Debian | Adotada no desenho de `distro/ab`: os slots guardam a base, e apps e pacotes Debian ficam numa área atualizável com rollback próprio. |
+
+Próximos passos, em ordem:
+
+1. Apps Linux no guest: Xpra, um app GTK e um app Qt reais abertos pelo launcher e pelo Terminal como janelas do OpenShell. A prova inclui foco, resize, encerramento sem órfãos e a recuperação de Xpra e do app.
+2. Contrato de superfícies comum às abas do Browser e às janelas Xpra: recorte, escala, z-order, foco e região de entrada, com a matriz de foco e menus da proposta (drag and drop, clipboard, IME, fullscreen e dois monitores).
+3. Recursos do Browser: localizar, zoom, downloads, permissões e atalhos do Desktop com a aba em foco.
+4. Testes de contrato do `host-api` e baseline de desempenho do Electron no mesmo Linux de controle, antes de portar serviços do `hostd`.
+5. Autenticação nativa antes da sessão e Xorg sobre DRM.
+6. Imagem com partições `system_a`, `system_b`, `recovery` e `data`, seleção de slot no boot, manifesto assinado e confirmação do slot pelo supervisor.

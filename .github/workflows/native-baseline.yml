@@ -8,7 +8,7 @@ on:
       mode:
         description: Linux validation to run
         type: choice
-        options: [smoke, compat, sandbox, control, baseline]
+        options: [smoke, compat, sandbox, control, baseline, graphics]
         default: smoke
 
 permissions:
@@ -32,6 +32,8 @@ jobs:
           node --check tools/desktop/smoke.mjs
           node --check tools/desktop/cef-smoke.mjs
           node --check tools/desktop/hostd-smoke.mjs
+          node --check tools/desktop/shell-smoke.mjs
+          node --check tools/desktop/session-smoke.mjs
           node --test tools/desktop/linux-sandbox.test.mjs
           bash -n tools/desktop/build-cef.sh
           bash -n tools/desktop/cef-baseline.sh
@@ -40,6 +42,11 @@ jobs:
           sh -n userspace/compatibility/probes/compat-boot.sh
       - name: Check the Rust shell
         run: cargo test --locked --manifest-path userspace/shell/Cargo.toml
+      - name: Check the A/B release transaction
+        run: |
+          cargo test --locked --manifest-path distro/ab/Cargo.toml
+          cargo build --locked --release --manifest-path distro/ab/Cargo.toml
+          sh distro/ab/smoke.sh distro/ab/target/release/openshell-ab
       - name: Check the static ELF probe
         run: |
           as --64 -o "$RUNNER_TEMP/static-exit.o" userspace/compatibility/probes/static-exit.S
@@ -83,6 +90,10 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+      - name: Allow unprivileged user namespaces
+        if: inputs.mode == 'graphics'
+        # The Linux control of the graphics mode runs the Chromium sandbox.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run Linux validation
         env:
           MODE: ${{ inputs.mode }}

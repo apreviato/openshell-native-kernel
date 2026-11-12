@@ -23,6 +23,12 @@ fi
 if ! ./python -I ./unprivileged.py ./chromium-userns; then
     echo OPENSHELL_NATIVE_CHROMIUM_USERNS_UNAVAILABLE
 fi
+# The A/B transaction writes and syncs its selector and slots on the VirtIO disk.
+if [ -x ./openshell-ab ]; then
+    if ! TMPDIR=/ext2 sh ./ab-smoke.sh ./openshell-ab; then
+        echo OPENSHELL_NATIVE_AB_UNAVAILABLE
+    fi
+fi
 hostd_status=0
 if [ -d /opt/openshell ]; then
     # The real hostd of the bundle runs as an unprivileged user with a disposable profile.
@@ -70,16 +76,64 @@ if [ -e /opt/openshell-cef ]; then
             tail -n 20 "$scratch/openbox.log"
         fi
         # Chromium starts slowly in an emulated guest.
-        DISPLAY=:0 HOME="$scratch" PATH="$graphics_path" OPENSHELL_CEF_DIAGNOSTICS=1 \
-            OPENSHELL_CEF_SMOKE_TIMEOUT_MS=300000 ./python -I ./unprivileged.py \
-            ./node ./cef-smoke.mjs host /opt/openshell-cef/openshell-cef-host "$scratch/out" || cef_status=$?
-        cat "$scratch"/out/cef-*/cef-smoke.json 2>/dev/null || true
+        cef_smoke() {
+            mode=$1
+            shift
+            DISPLAY=:0 HOME="$scratch" PATH="$graphics_path" OPENSHELL_CEF_DIAGNOSTICS=1 \
+                OPENSHELL_CEF_SMOKE_TIMEOUT_MS=300000 ./python -I ./unprivileged.py \
+                ./node "$@" "$scratch/out-$mode"
+        }
+        cef_smoke host ./cef-smoke.mjs host /opt/openshell-cef/openshell-cef-host || cef_status=$?
+        cat "$scratch"/out-host/cef-*/cef-smoke.json 2>/dev/null || true
         if [ "$cef_status" -eq 0 ]; then
             echo OPENSHELL_NATIVE_CEF_OK
         else
-            grep -v file_path_watcher "$scratch"/out/cef-*/cef.log 2>/dev/null | tail -n 200 || true
+            grep -v file_path_watcher "$scratch"/out-host/cef-*/cef.log 2>/dev/null | tail -n 200 || true
+        fi
+        # Two browsing contexts side by side, with the trusted context's cookie
+        # and endpoint out of the guest's reach.
+        isolation_status=0
+        cef_smoke isolation ./cef-smoke.mjs isolation /opt/openshell-cef/openshell-cef-host || isolation_status=$?
+        cat "$scratch"/out-isolation/cef-*/cef-smoke.json 2>/dev/null || true
+        if [ "$isolation_status" -eq 0 ]; then
+            echo OPENSHELL_NATIVE_CEF_ISOLATION_OK
+        else
+            grep -v file_path_watcher "$scratch"/out-isolation/cef-*/cef.log 2>/dev/null | tail -n 100 || true
+            cef_status=$isolation_status
+        fi
+        # The kiosk: the Rust launcher with hostd and the real Desktop bundle.
+        if [ -d /opt/openshell ] && [ -x /opt/openshell-compat/bin/openshell-shell ]; then
+            shell_status=0
+            cef_smoke shell ./shell-smoke.mjs /opt/openshell-compat/bin/openshell-shell /opt/openshell \
+                /opt/openshell-cef/openshell-cef-host || shell_status=$?
+            cat "$scratch"/out-shell/shell-*/shell-smoke.json 2>/dev/null || true
+            if [ "$shell_status" -eq 0 ]; then
+                echo OPENSHELL_NATIVE_SHELL_OK
+            else
+                for log in "$scratch"/out-shell/shell-*/*.log; do
+                    echo "== $log"
+                    grep -v 'GLX\|file_path_watcher' "$log" | tail -n 60
+                done
+                cef_status=$shell_status
+            fi
         fi
         kill "$wm" 2>/dev/null || true
+        # The session as init starts it: the supervisor runs as root on its own
+        # display and starts X, Openbox and the shell as the session user.
+        if [ -d /opt/openshell ] && [ -x /opt/openshell-compat/bin/openshell-session ]; then
+            session_status=0
+            PATH="$graphics_path" XDG_CONFIG_DIRS=/opt/openshell-compat/xdg OPENSHELL_CEF_SMOKE_TIMEOUT_MS=300000 \
+                ./node ./session-smoke.mjs /opt/openshell-compat/bin/openshell-session \
+                /opt/openshell-compat/bin/openshell-shell /opt/openshell /opt/openshell-cef/openshell-cef-host \
+                /opt/openshell-compat/bin/Xvfb /opt/openshell-compat/bin/openbox "$scratch/out-session" || session_status=$?
+            cat "$scratch"/out-session/session-*/session-smoke.json 2>/dev/null || true
+            if [ "$session_status" -eq 0 ]; then
+                echo OPENSHELL_NATIVE_SESSION_OK
+            else
+                tail -n 40 "$scratch"/out-session/session-*/*.log 2>/dev/null || true
+                cef_status=$session_status
+            fi
+        fi
     else
         cef_status=1
         tail -n 40 "$scratch/xvfb.log"

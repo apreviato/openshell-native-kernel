@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const lock = JSON.parse(readFileSync(join(root, "kernel", "config", "upstream.lock.json"), "utf8"));
-const actions = ["doctor", "build", "smoke", "compat", "control", "sandbox", "baseline", "graphics", "desktop"];
-const usage = `Usage: node tools/build/native.mjs <${actions.filter((name) => name !== "desktop").join("|")}>
-       node tools/build/native.mjs desktop <openshell-desktop-bundle>`;
+const bundleActions = ["desktop", "kiosk"];
+const shellActions = ["graphics", "kiosk"];
+const actions = ["doctor", "build", "smoke", "compat", "control", "sandbox", "baseline", "graphics", ...bundleActions];
+const usage = `Usage: node tools/build/native.mjs <${actions.filter((name) => !bundleActions.includes(name)).join("|")}>
+       node tools/build/native.mjs <${bundleActions.join("|")}> <openshell-desktop-bundle>`;
 
 function docker(args, { optional = false, inherit = false } = {}) {
   const result = spawnSync("docker", args, {
@@ -113,7 +115,7 @@ async function run(action, bundlePath) {
   const output = mkdtempSync(join(outputRoot, "native-"));
   const reportPath = join(output, "run.json");
   const report = { action, upstream: lock.commit, image: null, status: "running", checks: {} };
-  const bundle = action === "desktop" ? readBundle(bundlePath) : null;
+  const bundle = bundleActions.includes(action) ? readBundle(bundlePath) : null;
   if (bundle) report.bundle = { version: bundle.version, builtAt: bundle.builtAt, electron: bundle.electron, hostdSha256: bundle.hostdSha256 };
   const saveReport = () => writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   saveReport();
@@ -128,15 +130,19 @@ async function run(action, bundlePath) {
     console.log(`Builder: ${image}`);
     container = docker([
       "create", "--init", "--platform", "linux/amd64", "--entrypoint", "/bin/bash",
+      // The Linux control of the graphics actions runs the Chromium sandbox,
+      // which needs unprivileged user namespaces in the container.
+      ...(shellActions.includes(action) ? ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"] : []),
       image, "/tmp/openshell-native-run.sh", action,
       lock.repository, lock.tag, lock.commit, lock.rust,
     ]);
     docker(["cp", join(root, "tools", "qemu", "run.sh"), `${container}:/tmp/openshell-native-run.sh`]);
     docker(["cp", join(root, "userspace", "compatibility"), `${container}:/tmp/openshell-native-compat`]);
-    for (const name of ["hostd-smoke.mjs", "cef-smoke.mjs", "linux-sandbox.mjs"]) {
+    docker(["cp", join(root, "distro", "ab"), `${container}:/tmp/openshell-native-ab`]);
+    for (const name of ["hostd-smoke.mjs", "cef-smoke.mjs", "shell-smoke.mjs", "session-smoke.mjs", "linux-sandbox.mjs"]) {
       docker(["cp", join(root, "tools", "desktop", name), `${container}:/tmp/openshell-native-compat/probes/${name}`]);
     }
-    if (action === "graphics") {
+    if (shellActions.includes(action)) {
       // The guest builds the Rust shell and the CEF host from these sources.
       // The recipe ignores a local Cargo target directory.
       docker(["cp", join(root, "userspace", "shell"), `${container}:/tmp/openshell-native-shell`]);
@@ -178,7 +184,7 @@ async function run(action, bundlePath) {
 }
 
 const [action, ...extra] = process.argv.slice(2);
-const expected = action === "desktop" ? 1 : 0;
+const expected = bundleActions.includes(action) ? 1 : 0;
 if ((action === "--help" || action === "-h") && extra.length === 0) {
   console.log(usage);
 } else if (extra.length !== expected || !actions.includes(action)) {

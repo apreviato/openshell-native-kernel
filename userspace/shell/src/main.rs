@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, BufReader};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -13,13 +13,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use openshell_shell::{read_hostd_readiness, write_cef_startup};
+use openshell_shell::{read_hostd_readiness, write_cef_bootstrap, write_cef_startup};
 
 const USAGE: &str = "Usage: openshell-shell <desktop-bundle> <cef-host> <state-dir> [node]";
 const SIGINT: i32 = 2;
 const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// hostd may restart this many times within RESTART_WINDOW before the session fails.
+const MAX_RESTARTS: usize = 5;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+const ESRCH: i32 = 3;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
@@ -37,21 +41,38 @@ struct SessionProcess(Child);
 
 impl Drop for SessionProcess {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(Some(_))) {
+        // Both children lead process groups created by session_command. The
+        // group can outlive its leader, for example with hostd's terminals.
+        let group = -(self.0.id() as i32);
+        let leader_exited = matches!(self.0.try_wait(), Ok(Some(_)));
+        if unsafe { kill(group, SIGTERM) } != 0 && leader_exited {
             return;
         }
-        let pid = self.0.id() as i32;
-        // Both children lead process groups created by session_command.
-        unsafe { kill(-pid, SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(4);
         while Instant::now() < deadline {
-            if matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.try_wait();
+            if unsafe { kill(group, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
                 return;
             }
             thread::sleep(POLL_INTERVAL);
         }
-        unsafe { kill(-pid, SIGKILL) };
+        unsafe { kill(group, SIGKILL) };
         let _ = self.0.wait();
+    }
+}
+
+/// Restarts within RESTART_WINDOW, with an exponential delay between them.
+struct RestartBudget(Vec<Instant>);
+
+impl RestartBudget {
+    fn next_delay(&mut self) -> Option<Duration> {
+        let now = Instant::now();
+        self.0.retain(|time| now.duration_since(*time) < RESTART_WINDOW);
+        if self.0.len() >= MAX_RESTARTS {
+            return None;
+        }
+        self.0.push(now);
+        Some(Duration::from_millis(250 << (self.0.len() - 1)))
     }
 }
 
@@ -96,7 +117,8 @@ fn hostd_url(child: &mut Child, port: u16) -> Result<Option<String>, Box<dyn Err
 fn session_command(executable: &OsStr) -> Command {
     let mut command = Command::new(executable);
     command.env_clear().process_group(0);
-    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY"] {
+    // A system without /etc/fonts, such as NixOS, names its font configuration.
+    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE"] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
         }
@@ -145,18 +167,25 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let profile_path = profile.to_str().filter(|path| !path.contains(['\r', '\n']))
         .ok_or("CEF profile path must be UTF-8 without line breaks")?;
 
-    let mut daemon = SessionProcess(session_command(&node)
-        .arg(&hostd)
-        .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--offline"])
-        .arg("--ui").arg(&ui)
-        .arg("--home").arg(&home)
-        .arg("--data-dir").arg(&data)
-        .env("HOME", &home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?);
-    let Some(url) = hostd_url(&mut daemon.0, port)? else { return Ok(()) };
+    // hostd's errors, kept per session. Its stdout carries the bootstrap
+    // secret and is never logged.
+    let log = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(state.join("hostd.log"))?;
+    let start_hostd = || -> Result<(SessionProcess, Option<String>), Box<dyn Error>> {
+        let mut daemon = SessionProcess(session_command(&node)
+            .arg(&hostd)
+            .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--offline"])
+            .arg("--ui").arg(&ui)
+            .arg("--home").arg(&home)
+            .arg("--data-dir").arg(&data)
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(log.try_clone()?)
+            .spawn()?);
+        let url = hostd_url(&mut daemon.0, port)?;
+        Ok((daemon, url))
+    };
+    let (mut daemon, Some(url)) = start_hostd()? else { return Ok(()) };
 
     let mut browser = session_command(cef.as_os_str());
     if env::var_os("XAUTHORITY").is_none() {
@@ -169,15 +198,26 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
         .env("XDG_RUNTIME_DIR", &runtime)
         .stdin(Stdio::piped())
         .spawn()?);
-    let pipe = browser.0.stdin.take().ok_or("CEF startup pipe is unavailable")?;
-    write_cef_startup(pipe, &url, profile_path)?;
+    // The pipe stays open for the session: the host ends the session when it closes.
+    let mut pipe = browser.0.stdin.take().ok_or("CEF startup pipe is unavailable")?;
+    write_cef_startup(&mut pipe, &url, profile_path)?;
 
+    let mut budget = RestartBudget(Vec::new());
     while !STOP_REQUESTED.load(Ordering::Relaxed) {
         if let Some(status) = browser.0.try_wait()? {
             return if status.success() { Ok(()) } else { Err(format!("CEF host exited with {status}").into()) };
         }
         if let Some(status) = daemon.0.try_wait()? {
-            return Err(format!("hostd exited with {status}").into());
+            let Some(delay) = budget.next_delay() else {
+                return Err(format!("hostd exited with {status} too often").into());
+            };
+            eprintln!("openshell-shell: hostd exited with {status}; restarting");
+            drop(daemon);
+            thread::sleep(delay);
+            let (restarted, url) = start_hostd()?;
+            daemon = restarted;
+            let Some(url) = url else { break };
+            write_cef_bootstrap(&mut pipe, &url)?;
         }
         thread::sleep(POLL_INTERVAL);
     }
