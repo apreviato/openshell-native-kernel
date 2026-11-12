@@ -1,0 +1,72 @@
+diff --git a/kernel/core/src/sched/sched_class/mod.rs b/kernel/core/src/sched/sched_class/mod.rs
+--- a/kernel/core/src/sched/sched_class/mod.rs
++++ b/kernel/core/src/sched/sched_class/mod.rs
+@@ -238,6 +238,15 @@ impl Scheduler for ClassScheduler {
+             return None;
+         }
+ 
++        // A wake-up can race with the end of the task: the waker marks the task as woken, the
++        // task runs to its end anyway, and `exit_current` dequeues it and clears its CPU. Put
++        // back in a run queue, the task would return from `exit_current` when picked again.
++        // Holding the CPU of the task now, the waker sees that it finished.
++        if task.is_finished() {
++            task.cpu().set_to_none();
++            return None;
++        }
++
+         // Preempt if the new task has a higher priority.
+         let should_preempt = rq
+             .current
+diff --git a/ostd/src/task/mod.rs b/ostd/src/task/mod.rs
+--- a/ostd/src/task/mod.rs
++++ b/ostd/src/task/mod.rs
+@@ -15,7 +15,7 @@ use core::{
+     cell::{Cell, SyncUnsafeCell},
+     ops::Deref,
+     ptr::NonNull,
+-    sync::atomic::AtomicBool,
++    sync::atomic::{AtomicBool, Ordering},
+ };
+ 
+ use kernel_stack::KernelStack;
+@@ -70,6 +70,9 @@ pub struct Task {
+     /// See [`processor::switch_to_task`] for more details.
+     switched_to_cpu: AtomicBool,
+ 
++    /// If the task function has returned: only `scheduler::exit_current` is left.
++    finished: AtomicBool,
++
+     schedule_info: TaskScheduleInfo,
+ }
+ 
+@@ -124,6 +127,14 @@ impl Task {
+     pub fn schedule_info(&self) -> &TaskScheduleInfo {
+         &self.schedule_info
+     }
++
++    /// Returns whether the task function has returned.
++    ///
++    /// A finished task never runs again once it switches away, so a scheduler
++    /// must not enqueue it, even for a wake-up that raced with its end.
++    pub fn is_finished(&self) -> bool {
++        self.finished.load(Ordering::Acquire)
++    }
+ }
+ 
+ /// Options to create or spawn a new task.
+@@ -207,6 +218,7 @@ impl TaskOptions {
+             // However, `current_task` _borrows_ the current task without holding
+             // an extra reference count. So we do nothing here.
+ 
++            current_task.finished.store(true, Ordering::Release);
+             scheduler::exit_current();
+         }
+ 
+@@ -234,6 +246,7 @@ impl TaskOptions {
+             ctx: SyncUnsafeCell::new(ctx),
+             kstack,
+             switched_to_cpu: AtomicBool::new(false),
++            finished: AtomicBool::new(false),
+             schedule_info: TaskScheduleInfo {
+                 cpu: AtomicCpuId::default(),
+             },

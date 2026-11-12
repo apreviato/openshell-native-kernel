@@ -14,6 +14,7 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
 find_package(CEF REQUIRED)
 find_package(Threads REQUIRED)
+find_package(X11 REQUIRED)
 if(NOT USE_SANDBOX)
   message(FATAL_ERROR "OpenShell requires the Chromium sandbox")
 endif()
@@ -27,11 +28,11 @@ set_target_properties(openshell_cef_policy PROPERTIES
 )
 
 set(output "${CMAKE_BINARY_DIR}/runtime")
-add_executable(openshell-cef-host main.cc)
+add_executable(openshell-cef-host main.cc session.cc browser_features.cc clipboard.cc input_state.cc)
 SET_EXECUTABLE_TARGET_PROPERTIES(openshell-cef-host)
 target_compile_features(openshell-cef-host PRIVATE cxx_std_17)
 target_link_libraries(openshell-cef-host PRIVATE
-  openshell_libcef libcef_dll_wrapper openshell_cef_policy ${CEF_STANDARD_LIBS}
+  openshell_libcef libcef_dll_wrapper openshell_cef_policy ${CEF_STANDARD_LIBS} X11::X11 X11::Xfixes X11::Xss
 )
 set_target_properties(openshell-cef-host PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${output}"

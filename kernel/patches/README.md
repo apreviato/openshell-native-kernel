@@ -19,6 +19,7 @@ Os patches aplicam em ordem de nome sobre a revisão do Asterinas fixada em [ups
 | `0013-honor-msg-dontwait` | O serviço de rede do Chromium lê o dump de endereços e interfaces do netlink com `recv(MSG_DONTWAIT)` até `EAGAIN`. A v0.19.0 ignorava a flag, o recebimento bloqueava, e o browser esperava para sempre antes de criar a janela. | `chromium-userns.c`, verificação `address_tracker`. | Não enviado. A v0.19.0 só emitia um aviso para a flag. |
 | `0014-lay-out-environment-like-linux` | Os filhos do zygote reescrevem o título sobre as strings de argumento e ambiente, que precisam estar contíguas e em ordem. A v0.19.0 gravava o ambiente em ordem inversa, e `/proc/[pid]/cmdline` não identificava os renderers. | `chromium-userns.c`, verificação `process_title`, e o `cef-smoke`, que encontra os renderers por esse título. | Não enviado. |
 | `0015-inherit-address-reuse-in-accepted-connections` | O launcher reinicia o hostd na mesma porta, que o perfil do Desktop exige. As conexões aceitas pelo hostd anterior não herdavam `SO_REUSEADDR` e, enquanto fechavam, o novo `listen` falhava com `EADDRINUSE`. | [python.py](../../userspace/compatibility/probes/python.py), sonda `server_restart`, e o [smoke do shell](../../tools/desktop/shell-smoke.mjs), verificação `hostd-restart`. | Não enviado. Correção de bug. |
+| `0016-ignore-wake-ups-of-finished-tasks` | Os processos do CEF criam e encerram muitas threads. Uma thread acordada enquanto terminava voltava a uma fila de execução depois de `exit_current` e, escolhida de novo, saía de `exit_current`: o kernel entrava em pânico com `unreachable!()` no meio da prova de isolamento do CEF. | Check `native-cef-isolation` e as fases seguintes da ação `apps`. A corrida é rara e não tem sonda própria. | Não enviado. Correção de bug, ligada ao problema 2 de [asterinas#1633](https://github.com/asterinas/asterinas/issues/1633). |
 
 ## 0002 · seccomp
 
@@ -105,6 +106,10 @@ O risco que continua aberto: um ciclo deliberado mantém até `RLIMIT_NOFILE` so
 ## 0015 · reinício de servidores
 
 Como no Linux, uma conexão aceita herda de quem escuta o `SO_REUSEADDR` no momento do `accept`. Um servidor reiniciado com `SO_REUSEADDR` volta a fazer `bind` na porta enquanto as conexões do anterior terminam de fechar. A série não altera o caso de dois sockets em `listen` na mesma porta: como já era na v0.19.0, ele continua permitido quando todos os sockets da porta usam `SO_REUSEADDR`. O Linux recusa esse caso.
+
+## 0016 · fim de tarefa
+
+`Waker::wake_up` marca a tarefa como acordada e só depois a põe numa fila. Nesse intervalo, a tarefa pode seguir sem dormir até o fim da sua função, e `exit_current` a tira da fila e limpa a CPU dela. A fila recebia então uma tarefa terminada, e o escalonador voltava a ela. O patch marca a tarefa como terminada quando a função dela retorna, em `kernel_task_entry`, e o `enqueue` do escalonador recusa a tarefa marcada depois de obter a CPU dela. A marca não usa `Thread::is_exited`, porque a saída POSIX ainda pode dormir depois de marcar a thread, ao fechar arquivos e encerrar o processo.
 
 ## Diagnóstico de falhas do Chromium
 

@@ -47,7 +47,7 @@ let
     inherit (cef) version;
     src = "${src}/cef";
     nativeBuildInputs = [ pkgs.cmake ];
-    buildInputs = [ pkgs.libx11 ];
+    buildInputs = [ pkgs.libx11 pkgs.libxext pkgs.libxfixes pkgs.libxscrnsaver ];
     cmakeFlags = [
       "-DCEF_ROOT=${cef}"
       "-DCMAKE_BUILD_TYPE=Release"

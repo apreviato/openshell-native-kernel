@@ -187,6 +187,19 @@ O launcher reinicia o `hostd` até 5 vezes por minuto, com espera crescente, na 
 - **Política.** As abas abrem http(s), `about:blank` e os serviços locais do usuário. Nenhum alias de loopback alcança a porta do `hostd`: `localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`, `[::1]` e o IPv4 mapeado. Outros esquemas, como `file:` e `chrome:`, são recusados. Pop-ups e links para uma janela nova abrem uma aba, criada pelo Desktop.
 - **Visibilidade.** Uma aba pode permanecer visível atrás de outra janela quando as áreas não se cruzam. A UI verifica os retângulos de janelas acima e de elementos como sugestões da barra de endereço, menus e o seletor de janelas. Para os demais elementos, consulta `elementFromPoint` numa grade com margem para as alças de redimensionamento. Um diálogo do Desktop pode suspender a apresentação. A UI adia a reexibição de uma aba oculta enquanto um campo editável ou iframe do Desktop mantém o teclado, pois mostrar o overlay CEF pode tomar o foco. Clicar numa view visível ativa sua janela lógica.
 - **Teclado.** O Desktop registra os atalhos que compartilha com as abas e indica quais precisam transferir o foco antes de executar. O host encaminha pressionamento e soltura aos bundles que anunciam suporte na inscrição. Ctrl+L transfere o foco para o Desktop, que seleciona o endereço. O Openbox empacotado libera Alt+Tab, Alt+F4 e as combinações com Super para o OpenShell. O seletor usa a soltura real de Alt. Quando uma aba focada se oculta, o Desktop recebe o foco. Uma aba focada antes de ter renderer, como um pop-up, recebe o teclado quando a página termina de carregar. Depois que o overlay de uma aba teve o teclado, o Chromium pode deixar as teclas sem destino, embora o Views conte um navegador como focado: elas chegam à janela sem passar por nenhum navegador. A janela entrega essas teclas ao navegador focado, com o caractere que digitam, e deixa em paz as que uma página recebeu e não tratou.
+- **DevTools.** O frontend usa uma janela CEF Chrome sem moldura, vinculada à janela Alloy do Desktop. A UI posiciona a janela no painel inferior ou lateral da aba ativa e a oculta quando o painel está coberto. O frontend tem seu próprio cliente CEF, e o fechamento da aba encerra o DevTools associado.
+- **Fontes.** O perfil gráfico inclui Cascadia Code e JetBrains Mono, usadas pelo Desktop, além de Liberation, DejaVu e Noto para os fallbacks. O initramfs instala a configuração do Fontconfig em `/etc/fonts/fonts.conf` para disponibilizar as famílias offline.
+
+**Fase 4, paridade com o processo principal do Electron.** No OpenShell Live, o processo principal do Electron (`electron/main.ts`) oferece à UI a interface `OpenShellElectronApi`. No Native, `apps/desktop/src/host/nativeShell.ts`, no repositório `openshell`, implementa a mesma interface sobre a ponte `/_shell/`, com `isElectron: false`. Assim, os componentes do Desktop não precisam distinguir os dois runtimes, exceto nos pontos que dependem do Electron (o encaminhamento de teclas pelo processo principal), que testam `isElectron`, e não a presença da ponte. Os ids numéricos de `webContents` viram ids de convidado, que o adaptador associa às abas. No host, [browser_features.cc](userspace/shell/cef/browser_features.cc) reúne os recursos, [session.h](userspace/shell/cef/session.h) o estado compartilhado com `main.cc`, e a ponte aceita respostas assíncronas para os comandos que dependem do Chromium ou de uma resposta da pessoa.
+
+- **Downloads.** Vão para `~/Downloads`, com nome saneado e sem sobrescrever arquivos. O Desktop recebe o progresso, com no máximo um evento a cada 400 ms, e pode pausar, retomar e cancelar o download.
+- **Perguntas.** O Desktop responde aos pedidos de câmera e microfone e à seleção de arquivos, pelo seletor do OpenShell, tanto para as abas quanto para a própria página do Desktop. As respostas de câmera e microfone valem por site durante a sessão, separadas na janela privada. Os demais pedidos de permissão são recusados, como no Live.
+- **Certificados.** Um certificado não confiável é recusado, a menos que a pessoa abra uma exceção para aquele host e aquela impressão digital.
+- **Protocolo DevTools.** As ferramentas do agente usam `ExecuteDevToolsMethod`, limitado a uma lista de métodos: avaliação, captura, PDF, entrada sintética e limpeza de cache nas abas, e só captura e entrada na página do Desktop.
+- **Impressão.** Ctrl+P exporta a aba para PDF, em `openshell-print` na pasta temporária, e o Desktop abre o arquivo.
+- **Capturas.** A captura do shell combina a imagem da página do Desktop com a captura de cada aba visível, no retângulo do último layout aplicado. Assim, Print e Shift+Print incluem as abas, que são views nativas fora da página.
+- **Clipboard.** Um observador XFixes, com thread e conexão X próprias, recebe cada cópia do sistema, em texto UTF-8 ou PNG, inclusive por transferência INCR, até 1 MB de texto e 16 MB de imagem. O Desktop guarda a cópia no histórico, exceto quando o programa a marca como secreta. Super+V, numa aba ou no Desktop, abre o histórico, e colar devolve o item à aba ou ao campo onde a tecla foi pressionada.
+- **Teclas de hardware.** Volume, mudo e brilho seguem `shared/hardwareKeys.ts`, mesmo quando uma aba tem o teclado. A tabela de teclas do host inclui seus códigos, e o OSD do Desktop aparece por cima. Enquanto o OSD cobre a aba, ela fica oculta e, quando reaparece, recebe o teclado de volta, a menos que a pessoa tenha usado o Desktop nesse intervalo.
 
 O smoke abre um site pelo `xdg-open` do Terminal e comprova:
 
@@ -195,6 +208,11 @@ O smoke abre um site pelo `xdg-open` do Terminal e comprova:
 - clique e tecla confiáveis, navegação digitada após Ctrl+L, prioridade do seletor sobre a aba com Alt mantido e retorno do clique após dispensar o seletor;
 - Alt+S pressionado num pop-up abre a busca do Desktop, e o texto digitado em seguida chega a ela;
 - zoom e download para a pasta `Downloads` do perfil descartável;
+- abertura do DevTools com F12, execução de um comando no console da aba e fechamento com F12 a partir do próprio painel;
+- seleção de arquivos de um `<input type=file>` da aba pelo seletor do OpenShell, sem janela nova no X;
+- Ctrl+P gera o PDF da aba;
+- Shift+Print grava uma captura em que o pixel da aba tem a cor da página;
+- texto copiado na aba volta ao histórico do clipboard e é colado com Super+V;
 - um pop-up aberto como aba;
 - renderers filtrados;
 - que a página não alcança o `hostd`.
@@ -205,7 +223,10 @@ Limites conhecidos desta composição:
 - **DNS rebinding.** O bloqueio do host compara o endereço literal da URL. Um domínio que resolve para o loopback na porta do `hostd` passa pelo CEF. Quando escuta em loopback, o `hostd` responde 421 a qualquer `Host` que não seja `127.0.0.1`, `localhost` ou `[::1]` na sua porta, e recusa o upgrade de WebSocket nesse caso.
 - **Sobreposição.** Quando há interseção, a view CEF é ocultada inteira. Falta recorte parcial, e elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
 - **Atalhos.** A entrega depende das teclas que chegam ao CEF pelo X11. Sessões com outro gerenciador de janelas podem capturar teclas antes do CEF. Outros layouts de teclado e IME ainda precisam de validação.
-- **Recursos de Browser.** A ponte oferece localizar, zoom e downloads básicos. Permissões por origem, gestão de downloads, senhas e DevTools ainda estão pendentes.
+- **Recursos de Browser.** Ainda faltam o cofre de senhas, que exige script no renderer das abas e um cofre no `hostd`, e a persistência das decisões de permissão entre sessões. O indicador de áudio da aba também falta, porque o CEF 147 não expõe se uma aba toca som. O mute funciona. A pergunta de câmera e microfone não tem prova no smoke, porque a VM não tem dispositivos.
+- **Miniaturas do dock.** Não há miniaturas das janelas no dock (`captureRect`). Capturar a página do Desktop a cada poucos segundos deixava a tela preta durante a captura.
+- **OSD e camadas do Desktop.** O OSD de volume e brilho, como qualquer camada do Desktop, oculta a aba que cobre, em vez de aparecer por cima dela como no Live (`setHardwareOsd`).
+- **Uma tela, sem bloqueio e sem gravação.** O Native mostra uma única tela, e sem `screens` o Desktop mantém esse comportamento. O bloqueio de tela do Live (`onScreenLocked`) depende da autenticação nativa. A gravação de tela (`recordSource`) depende de uma fonte de captura do X para `getUserMedia`.
 
 A composição off-screen continua sendo a alternativa se a sobreposição de elementos se mostrar insuficiente.
 
@@ -256,7 +277,7 @@ Próximos passos, em ordem:
 
 1. Apps Linux: completar a prova com a abertura pelo Terminal e pelo Files, a recuperação depois que o Xpra ou o app morrem, apps com várias janelas e diálogos, clipboard e o cursor do app, que hoje usa o padrão porque o script de tema não encontra a libX11 fora do Debian.
 2. Contrato de superfícies comum às abas do Browser e às janelas Xpra: recorte, escala, z-order, foco e região de entrada, com a matriz de foco e menus da proposta (drag and drop, clipboard, IME, fullscreen e dois monitores).
-3. Paridade do Browser: permissões por origem, downloads concorrentes e cancelamento, mais a matriz de atalhos, layouts de teclado e IME.
+3. Paridade do Browser: cofre de senhas (detecção de campos no renderer das abas e cofre no `hostd`), permissões persistidas por origem, gravação de tela, OSD sobre as abas, mais a matriz de atalhos, layouts de teclado e IME.
 4. Testes de contrato do `host-api` e baseline de desempenho do Electron no mesmo Linux de controle, antes de portar serviços do `hostd`.
 5. Autenticação nativa antes da sessão e Xorg sobre DRM.
 6. Imagem com partições `system_a`, `system_b`, `recovery` e `data`, seleção de slot no boot, manifesto assinado e confirmação do slot pelo supervisor.

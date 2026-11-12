@@ -26,12 +26,14 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
+#include "include/cef_dialog_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_find_handler.h"
 #include "include/cef_focus_handler.h"
 #include "include/cef_keyboard_handler.h"
 #include "include/cef_frame.h"
 #include "include/cef_parser.h"
+#include "include/cef_permission_handler.h"
 #include "include/cef_request.h"
 #include "include/cef_request_context.h"
 #include "include/cef_request_context_handler.h"
@@ -45,6 +47,8 @@
 #include "include/views/cef_overlay_controller.h"
 #include "include/views/cef_window.h"
 #include "include/wrapper/cef_closure_task.h"
+#include "browser_features.h"
+#include "session.h"
 #include "startup.h"
 
 #ifndef CEF_USE_SANDBOX
@@ -53,23 +57,17 @@
 
 namespace {
 
+using namespace openshell;
+
 constexpr char kTitle[] = "OpenShell Native";
 // Requests of the Desktop page that the host answers itself. They never reach hostd.
 constexpr char kShellPath[] = "/_shell/";
-constexpr char kBrowserEvent[] = "openshell-native-browser";
 constexpr int kBridgeVersion = 1;
 constexpr std::size_t kMaxCommandBytes = 64 * 1024;
 constexpr std::size_t kMaxTabs = 64;
 constexpr int kMaxViewSize = 16384;
 constexpr std::size_t kMaxRendererRestarts = 3;
 constexpr auto kRendererRestartWindow = std::chrono::minutes(1);
-
-using Startup = std::shared_ptr<OpenshellCefStartup>;
-
-// The browsing contexts of the host: the trusted page (the Desktop, or the
-// fixture of a probe), the second fixture of the isolation test and the tabs
-// of the Desktop's Browser.
-enum class Kind { kPrimary, kGuest, kBrowser };
 
 std::uint32_t ContextOf(Kind kind) {
   switch (kind) {
@@ -102,74 +100,15 @@ bool Allows(const Startup& startup, Kind kind, OpenshellCefOperation operation,
                               value.data(), value.size());
 }
 
-// A tab of the Desktop's Browser: a browser view over the Desktop page, at
-// the place of its Browser window.
-struct Tab {
-  bool incognito = false;
-  bool closing = false;
-  bool visible = false;
-  bool focus_on_show = false;
-  // The page numbers its placements; requests may arrive out of order.
-  int generation = -1;
-  CefRect bounds;
-  std::string url;
-  CefRefPtr<CefBrowserView> view;
-  CefRefPtr<CefOverlayController> overlay;
-  CefRefPtr<CefBrowser> browser;
-};
-
-// A key press that a focused tab hands to the Desktop page, which derives the
-// list from its own shortcut definitions: the DOM key (lowercase) and the
-// exact modifiers.
-struct Shortcut {
-  std::string key;
-  int modifiers = 0;
-  bool focus_desktop = false;
-};
-
 constexpr int kShortcutModifiers =
     EVENTFLAG_ALT_DOWN | EVENTFLAG_SHIFT_DOWN | EVENTFLAG_CONTROL_DOWN | EVENTFLAG_COMMAND_DOWN;
-
-// Session state belongs to the browser UI thread, except desktop_id.
-// A key event that a page left unhandled, to tell it from a lost key.
-struct SeenKey {
-  int type;
-  int code;
-  std::chrono::steady_clock::time_point at;
-};
-
-struct Session : std::enable_shared_from_this<Session> {
-  Startup startup;
-  std::string profile;
-  int browsers = 0;
-  bool failed = false;
-  bool closing = false;
-  CefRefPtr<CefBrowser> desktop;
-  // The latest key events that pages left unhandled.
-  std::deque<SeenKey> seen_keys;
-  // Read on the IO thread to recognize requests of the Desktop page.
-  std::atomic<int> desktop_id{0};
-  CefRefPtr<CefWindow> window;
-  std::string pending_bootstrap;
-  std::deque<std::chrono::steady_clock::time_point> renderer_restarts;
-  std::map<std::string, Tab> tabs;
-  int layout_generation = -1;
-  // The key presses that go to the Desktop page even from a tab.
-  std::vector<Shortcut> shortcuts;
-  bool shortcut_phases = false;
-  // The Browser's contexts are created with its first tab. The private one
-  // lasts until the private session ends.
-  CefRefPtr<CefRequestContext> browser_context;
-  CefRefPtr<CefRequestContext> private_context;
-  bool browser_ready = false;
-  bool private_ready = false;
-};
 
 void CloseTab(Session& session, const std::string& id);
 void CloseTabs(Session& session);
 
 void CloseSession(std::shared_ptr<Session> session) {
   session->closing = true;
+  session->clipboard.reset();
   CloseTabs(*session);
   if (session->desktop) {
     session->desktop->GetHost()->CloseBrowser(true);
@@ -208,27 +147,6 @@ void ReadControl(OpenshellCefControl* control, std::shared_ptr<Session> session)
   }
   openshell_cef_control_free(control);
   CefPostTask(TID_UI, base::BindOnce(&CloseSession, session));
-}
-
-// Tells the Desktop page about one of its tabs.
-void Emit(Session& session, CefRefPtr<CefDictionaryValue> event) {
-  if (!session.desktop || session.closing) {
-    return;
-  }
-  auto value = CefValue::Create();
-  value->SetDictionary(event);
-  const auto json = CefWriteJSON(value, JSON_WRITER_DEFAULT).ToString();
-  session.desktop->GetMainFrame()->ExecuteJavaScript(
-      std::string("window.dispatchEvent(new CustomEvent('") + kBrowserEvent +
-          "',{detail:" + json + "}));",
-      "", 0);
-}
-
-CefRefPtr<CefDictionaryValue> TabEvent(const std::string& id, const char* type) {
-  auto event = CefDictionaryValue::Create();
-  event->SetString("id", id);
-  event->SetString("type", type);
-  return event;
 }
 
 // The DOM `key` and `code` of a key press, for the keys that shortcuts use.
@@ -270,6 +188,12 @@ bool DomKey(const CefKeyEvent& event, std::string& key, std::string& code) {
       {0xbf, "/", "Slash"},             {0xc0, "`", "Backquote"},
       {0xdb, "[", "BracketLeft"},       {0xdc, "\\", "Backslash"},
       {0xdd, "]", "BracketRight"},      {0xde, "'", "Quote"},
+      // The computer's keys (shared/hardwareKeys.ts in the Desktop).
+      {0xad, "AudioVolumeMute", "AudioVolumeMute"},
+      {0xae, "AudioVolumeDown", "AudioVolumeDown"},
+      {0xaf, "AudioVolumeUp", "AudioVolumeUp"},
+      {0xd8, "BrightnessDown", "BrightnessDown"},
+      {0xd9, "BrightnessUp", "BrightnessUp"},
   };
   for (const auto& entry : kKeys) {
     if (entry.vk == vk) {
@@ -285,36 +209,6 @@ std::string Lowercase(std::string text) {
   std::transform(text.begin(), text.end(), text.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return text;
-}
-
-// A file name for a download: the last path element, without leading dots,
-// control characters or separators, and short enough for any filesystem.
-std::string DownloadName(std::string name) {
-  name = std::filesystem::path(name).filename().string();
-  std::string clean;
-  for (unsigned char c : name) {
-    if (c >= 0x20 && c != 0x7f && c != '/' && c != '\\') {
-      clean += static_cast<char>(c);
-    }
-  }
-  while (!clean.empty() && (clean.front() == '.' || clean.front() == ' ')) {
-    clean.erase(clean.begin());
-  }
-  if (clean.size() > 200) {
-    clean.resize(200);
-  }
-  return clean.empty() ? "download" : clean;
-}
-
-// The first free name in the Downloads folder: "name", "name (1)", ...
-std::filesystem::path FreeDownloadPath(const std::filesystem::path& folder, const std::string& name) {
-  const auto stem = std::filesystem::path(name).stem().string();
-  const auto extension = std::filesystem::path(name).extension().string();
-  auto candidate = folder / name;
-  for (int copy = 1; std::filesystem::exists(candidate) && copy < 1000; ++copy) {
-    candidate = folder / (stem + " (" + std::to_string(copy) + ")" + extension);
-  }
-  return candidate;
 }
 
 void FocusDesktop(Session& session) {
@@ -348,6 +242,10 @@ void ApplyBounds(Session& session, Tab& tab) {
     const bool return_focus = !shown && tab.view->HasFocus();
     tab.overlay->SetVisible(shown);
     if (return_focus && session.desktop) {
+      // Covered for a moment (the volume display), the tab takes the keyboard
+      // back when shown, unless the person uses the Desktop meanwhile
+      // (FocusDesktop forgets it).
+      tab.focus_on_show = !tab.closing;
       if (auto desktop = CefBrowserView::GetForBrowser(session.desktop)) {
         desktop->RequestFocus();
         session.desktop->GetHost()->SetFocus(true);
@@ -357,20 +255,46 @@ void ApplyBounds(Session& session, Tab& tab) {
   if (shown && tab.focus_on_show && session.window->IsActive()) {
     tab.focus_on_show = false;
     tab.view->RequestFocus();
+    if (tab.browser) {
+      tab.browser->GetHost()->SetFocus(true);
+    }
   }
 }
 
 class ViewDelegate final : public CefBrowserViewDelegate {
  public:
+  ViewDelegate() = default;
+  // A tab's view: its DevTools are docked in the Desktop's window.
+  ViewDelegate(std::weak_ptr<Session> session, std::string tab)
+      : session_(std::move(session)), tab_(std::move(tab)) {}
+  explicit ViewDelegate(cef_runtime_style_t style) : style_(style) {}
+
   cef_runtime_style_t GetBrowserRuntimeStyle() override {
-    return CEF_RUNTIME_STYLE_ALLOY;
+    return style_;
+  }
+
+  CefRefPtr<CefBrowserViewDelegate> GetDelegateForPopupBrowserView(
+      CefRefPtr<CefBrowserView>, const CefBrowserSettings&, CefRefPtr<CefClient>,
+      bool is_devtools) override {
+    return is_devtools ? new ViewDelegate(CEF_RUNTIME_STYLE_CHROME) : nullptr;
+  }
+
+  bool OnPopupBrowserViewCreated(CefRefPtr<CefBrowserView>, CefRefPtr<CefBrowserView> popup,
+                                 bool is_devtools) override {
+    auto session = session_.lock();
+    return is_devtools && session && !tab_.empty() &&
+           features::DevToolsCreated(*session, tab_, popup);
   }
 
  private:
+  const std::weak_ptr<Session> session_;
+  const std::string tab_;
+  const cef_runtime_style_t style_ = CEF_RUNTIME_STYLE_ALLOY;
   IMPLEMENT_REFCOUNTING(ViewDelegate);
 };
 
 class BrowserClient final : public CefClient,
+                            public CefDialogHandler,
                             public CefDisplayHandler,
                             public CefDownloadHandler,
                             public CefFindHandler,
@@ -378,6 +302,7 @@ class BrowserClient final : public CefClient,
                             public CefKeyboardHandler,
                             public CefLifeSpanHandler,
                             public CefLoadHandler,
+                            public CefPermissionHandler,
                             public CefRequestHandler {
  public:
   BrowserClient(Startup startup, Kind kind, bool desktop,
@@ -385,6 +310,7 @@ class BrowserClient final : public CefClient,
       : startup_(std::move(startup)), kind_(kind), desktop_(desktop),
         session_(std::move(session)), tab_(std::move(tab)) {}
 
+  CefRefPtr<CefDialogHandler> GetDialogHandler() override { return this; }
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
@@ -392,6 +318,7 @@ class BrowserClient final : public CefClient,
   CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override { return this; }
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+  CefRefPtr<CefPermissionHandler> GetPermissionHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
 
   bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
@@ -536,18 +463,9 @@ class BrowserClient final : public CefClient,
   bool OnBeforeDownload(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDownloadItem> item,
                         const CefString& suggested_name,
                         CefRefPtr<CefBeforeDownloadCallback> callback) override {
-    const char* home = std::getenv("HOME");
-    if (!IsTab() || !home || *home != '/') {
+    if (!IsTab() || !features::BeforeDownload(*session_, tab_, item, suggested_name, callback)) {
       return false;
     }
-    std::error_code error;
-    const auto folder = std::filesystem::path(home) / "Downloads";
-    std::filesystem::create_directories(folder, error);
-    if (error) {
-      return false;
-    }
-    auto path = FreeDownloadPath(folder, DownloadName(suggested_name.ToString()));
-    callback->Continue(path.string(), false);
     // Starting a download takes the keyboard from the page; it goes back.
     CefPostTask(TID_UI, base::BindOnce(
                             [](CefRefPtr<CefBrowser> page) {
@@ -557,27 +475,43 @@ class BrowserClient final : public CefClient,
                               page->GetHost()->SetFocus(true);
                             },
                             browser));
-    auto event = TabEvent(tab_, "download");
-    event->SetInt("download", static_cast<int>(item->GetId()));
-    event->SetString("name", path.filename().string());
-    event->SetString("url", item->GetURL());
-    event->SetString("state", "started");
-    Emit(*session_, event);
     return true;
   }
 
   void OnDownloadUpdated(CefRefPtr<CefBrowser>, CefRefPtr<CefDownloadItem> item,
-                         CefRefPtr<CefDownloadItemCallback>) override {
-    if (!IsTab() || !(item->IsComplete() || item->IsCanceled() || item->IsInterrupted())) {
-      return;
+                         CefRefPtr<CefDownloadItemCallback> callback) override {
+    if (IsTab()) {
+      features::DownloadUpdated(*session_, item, callback);
     }
-    auto event = TabEvent(tab_, "download");
-    event->SetInt("download", static_cast<int>(item->GetId()));
-    event->SetString("name", std::filesystem::path(item->GetFullPath().ToString()).filename().string());
-    event->SetString("url", item->GetURL());
-    event->SetString("state", item->IsComplete() ? "complete" : "failed");
-    event->SetDouble("bytes", static_cast<double>(item->GetReceivedBytes()));
-    Emit(*session_, event);
+  }
+
+  bool OnRequestMediaAccessPermission(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                                      const CefString& origin, uint32_t permissions,
+                                      CefRefPtr<CefMediaAccessCallback> callback) override {
+    return IsTab() && features::MediaAccess(*session_, tab_, origin, permissions, callback);
+  }
+
+  bool OnShowPermissionPrompt(CefRefPtr<CefBrowser>, uint64_t, const CefString&,
+                              uint32_t permissions,
+                              CefRefPtr<CefPermissionPromptCallback> callback) override {
+    return IsTab() && features::PermissionPrompt(*session_, tab_, permissions, callback);
+  }
+
+  // Uploads and the Desktop's own "choose a file" open the Desktop's picker.
+  bool OnFileDialog(CefRefPtr<CefBrowser> browser, FileDialogMode mode, const CefString&,
+                    const CefString&, const std::vector<CefString>& accept,
+                    const std::vector<CefString>&, const std::vector<CefString>&,
+                    CefRefPtr<CefFileDialogCallback> callback) override {
+    if (!IsTab() && !IsDesktop()) {
+      return false;
+    }
+    const CefString page = IsTab() ? browser->GetMainFrame()->GetURL() : CefString();
+    return features::FileDialog(*session_, page, mode, accept, callback);
+  }
+
+  bool OnCertificateError(CefRefPtr<CefBrowser>, cef_errorcode_t, const CefString& url,
+                          CefRefPtr<CefSSLInfo> ssl, CefRefPtr<CefCallback> callback) override {
+    return IsTab() && features::CertificateError(*session_, url, ssl, callback);
   }
 
   void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
@@ -697,6 +631,7 @@ class BrowserClient final : public CefClient,
         browser->GetHost()->CloseBrowser(true);
       } else {
         tab->second.browser = browser;
+        features::TabCreated(*session_, tab_);
       }
       return;
     }
@@ -704,6 +639,19 @@ class BrowserClient final : public CefClient,
       return;
     }
     session_->desktop = browser;
+    if (desktop_ && !session_->clipboard) {
+      // Copies of any program, for the Desktop's clipboard history.
+      session_->clipboard = ClipboardWatcher::Start(
+          [weak = std::weak_ptr<Session>(session_)](ClipboardCopy copy) {
+            CefPostTask(TID_UI, base::BindOnce(
+                                    [](std::weak_ptr<Session> weak, ClipboardCopy copy) {
+                                      if (auto session = weak.lock(); session && !session->closing) {
+                                        features::ClipboardCopied(*session, copy);
+                                      }
+                                    },
+                                    weak, std::move(copy)));
+          });
+    }
     session_->desktop_id = browser->GetIdentifier();
     if (session_->closing) {
       CloseSession(session_);
@@ -718,6 +666,7 @@ class BrowserClient final : public CefClient,
       auto tab = session_->tabs.find(tab_);
       if (tab != session_->tabs.end() && tab->second.browser &&
           tab->second.browser->IsSame(browser)) {
+        features::TabClosing(*session_, tab_);
         if (tab->second.overlay) {
           tab->second.overlay->Destroy();
         }
@@ -764,7 +713,8 @@ void CreateTabView(Session& session, const std::string& id) {
   tab.view = CefBrowserView::CreateBrowserView(
       new BrowserClient(session.startup, Kind::kBrowser, true,
                         session.shared_from_this(), id),
-      tab.url, CefBrowserSettings(), nullptr, context, new ViewDelegate);
+      tab.url, CefBrowserSettings(), nullptr, context,
+      new ViewDelegate(session.weak_from_this(), id));
   if (tab.view && session.window) {
     tab.overlay = session.window->AddOverlayView(tab.view, CEF_DOCKING_MODE_CUSTOM, true);
   }
@@ -801,20 +751,6 @@ void CloseTab(Session& session, const std::string& id) {
   }
   session.tabs.erase(entry);
   Emit(session, TabEvent(id, "closed"));
-}
-
-// The commands of the Desktop page, from the requests to /_shell/.
-struct Reply {
-  int status = 200;
-  std::string body = "{}";
-};
-
-Reply Error(int status, const char* message) {
-  auto value = CefValue::Create();
-  auto error = CefDictionaryValue::Create();
-  error->SetString("error", message);
-  value->SetDictionary(error);
-  return {status, CefWriteJSON(value, JSON_WRITER_DEFAULT).ToString()};
 }
 
 bool ValidTabId(const std::string& id) {
@@ -914,6 +850,7 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
   if (command == "hello") {
     // A new Desktop page: the tabs of the previous one have no window anymore.
     CloseTabs(session);
+    features::DesktopReset(session);
     session.layout_generation = -1;
     session.shortcuts.clear();
     session.shortcut_phases = false;
@@ -923,6 +860,7 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
     hello->SetBool("browser", true);
     hello->SetBool("surfaceLayout", true);
     hello->SetBool("shortcutPhases", true);
+    hello->SetBool("overlays", true);
     hello->SetString("event", kBrowserEvent);
     value->SetDictionary(hello);
     return {200, CefWriteJSON(value, JSON_WRITER_DEFAULT).ToString()};
@@ -1157,11 +1095,21 @@ class ShellRequest final : public CefResourceHandler {
   // request back to the IO thread.
   static void Run(CefRefPtr<ShellRequest> self, std::string body,
                   CefRefPtr<CefCallback> callback) {
+    Respond respond = [self, callback](Reply reply) {
+      self->reply_ = std::move(reply);
+      callback->Continue();
+    };
     auto session = self->session_.lock();
-    self->reply_ = session && !session->closing
-                       ? RunCommand(*session, self->command_, body)
-                       : Error(503, "The session is ending");
-    callback->Continue();
+    if (!session || session->closing) {
+      respond(Error(503, "The session is ending"));
+      return;
+    }
+    auto parsed = CefParseJSON(body.data(), body.size(), JSON_PARSER_RFC);
+    auto args = parsed && parsed->GetType() == VTYPE_DICTIONARY ? parsed->GetDictionary()
+                                                                 : CefDictionaryValue::Create();
+    if (!features::Run(*session, self->command_, args, respond)) {
+      respond(RunCommand(*session, self->command_, body));
+    }
   }
 
   const std::weak_ptr<Session> session_;
@@ -1256,6 +1204,7 @@ void BrowserContextReady(std::weak_ptr<Session> weak, bool incognito,
     return;
   }
   (incognito ? session->private_ready : session->browser_ready) = true;
+  features::BrowserContextReady(context);
   std::vector<std::string> waiting;
   for (const auto& [id, tab] : session->tabs) {
     if (tab.incognito == incognito && !tab.view) {
@@ -1520,7 +1469,11 @@ class DesktopApp final : public CefApp, public CefBrowserProcessHandler {
 
   const Startup startup_;
   const OpenshellCefStartupView config_;
-  const std::shared_ptr<Session> session_ = std::make_shared<Session>();
+  const std::shared_ptr<Session> session_ = [] {
+    auto session = std::make_shared<Session>();
+    session->features = features::CreateState();
+    return session;
+  }();
   std::string shell_prefix_;
   // Used on the UI thread only.
   CefRefPtr<CefRequestContext> context_;

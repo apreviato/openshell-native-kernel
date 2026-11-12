@@ -4,18 +4,71 @@
 // and hostd recovery, the shutdown and a second session on the same profile.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
-import { arch, release } from "node:os";
+import { arch, release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
 import { sandboxSample } from "./linux-sandbox.mjs";
 
 const usage = "Usage: node tools/desktop/shell-smoke.mjs <openshell-shell> <desktop-bundle> <cef-host> [output-dir]";
 // Emulated guests run the Desktop much slower than a host.
 const scale = Math.max(1, Number(process.env.OPENSHELL_CEF_SMOKE_TIMEOUT_MS ?? 45_000) / 45_000);
 const WINDOW_TITLE = "^OpenShell Native$";
+// The default Xvfb keymap maps F12 to keycode 96. Asking xdotool for
+// the keysym F12 on that map also injects an unwanted Alt press.
+const X11_F12_KEYCODE = "96";
+// Print has the same kind of map (Alt gives Sys_Req): its keycode, 107, too.
+const X11_PRINT_KEYCODE = "107";
+
+// The color of a pixel of a PNG that a canvas wrote (8-bit RGB or RGBA,
+// not interlaced), as 0xRRGGBB.
+function pngPixel(path, x, y) {
+  const data = readFileSync(path);
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const chunks = [];
+  while (offset < data.length) {
+    const length = data.readUInt32BE(offset);
+    const type = data.toString("latin1", offset + 4, offset + 8);
+    const body = data.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") {
+      width = body.readUInt32BE(0);
+      height = body.readUInt32BE(4);
+      assert.equal(body[8], 8, "The PNG is not 8-bit");
+      channels = { 2: 3, 6: 4 }[body[9]];
+      assert.ok(channels && body[12] === 0, "The PNG is not plain RGB(A)");
+    } else if (type === "IDAT") {
+      chunks.push(body);
+    }
+    offset += 12 + length;
+  }
+  assert.ok(x < width && y < height, "The point is outside the PNG");
+  const raw = inflateSync(Buffer.concat(chunks));
+  const stride = width * channels;
+  let previous = Buffer.alloc(stride);
+  for (let row = 0; row <= y; row++) {
+    const filter = raw[row * (stride + 1)];
+    const line = Buffer.from(raw.subarray(row * (stride + 1) + 1, (row + 1) * (stride + 1)));
+    for (let index = 0; index < stride; index++) {
+      const left = index >= channels ? line[index - channels] : 0;
+      const up = previous[index];
+      const corner = index >= channels ? previous[index - channels] : 0;
+      const base = left + up - corner;
+      const nearest = Math.abs(base - left) <= Math.abs(base - up) && Math.abs(base - left) <= Math.abs(base - corner)
+        ? left : Math.abs(base - up) <= Math.abs(base - corner) ? up : corner;
+      const add = [0, left, up, (left + up) >> 1, nearest][filter];
+      line[index] = (line[index] + add) & 0xff;
+    }
+    previous = line;
+  }
+  const pixel = previous.subarray(x * channels, x * channels + 3);
+  return (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
+}
 
 function tool(command, args, { optional = false } = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", timeout: 10_000 });
@@ -113,7 +166,7 @@ async function freePort() {
 // A site for the Desktop's Browser: it reports what the page saw and did,
 // and tries to reach hostd, which the shell must prevent.
 async function startSite(hostdPort) {
-  const evidence = { page: false, worker: false, webgl: null, clicks: 0, addressNavigation: false, key: false, popup: false, widths: [], downloaded: false, reachedHostd: false, blocked: { fetch: false, socket: false } };
+  const evidence = { page: false, worker: false, webgl: null, clicks: 0, addressNavigation: false, addressReady: false, key: false, popup: false, widths: [], heights: [], devtools: false, chooser: null, pasted: null, generated: null, downloaded: false, reachedHostd: false, blocked: { fetch: false, socket: false } };
   const page = `<!doctype html><meta charset="utf-8"><title>OpenShell Browser Probe</title>
 <style>html, body { margin: 0; height: 100%; background: #284; color: #fff; font: 24px sans-serif; }</style>
 <body><h1>OpenShell Browser Probe</h1><script src="probe.js"></script></body>`;
@@ -139,18 +192,51 @@ try {
 fetch("webgl", { method: "POST", body: webgl.slice(0, 200) }).catch(() => undefined);
 document.addEventListener("click", (event) => { if (event.isTrusted) post("click"); });
 // The page's CSS width shrinks when the Browser zooms in.
-const reportWidth = () => post("width?value=" + innerWidth);
-addEventListener("resize", reportWidth);
-reportWidth();
+const reportSize = () => post("size?width=" + innerWidth + "&height=" + innerHeight);
+addEventListener("resize", reportSize);
+reportSize();
 // z downloads a file.
 addEventListener("keydown", (event) => { if (event.isTrusted && event.key === "z") location.href = "download"; });
+// u chooses a file to upload: the Desktop's picker answers for the page.
+const upload = Object.assign(document.createElement("input"), { type: "file", hidden: true });
+document.body.append(upload);
+upload.addEventListener("cancel", () => post("chooser?result=cancel"));
+upload.addEventListener("change", () => post("chooser?result=" + encodeURIComponent(upload.files[0]?.name ?? "")));
+addEventListener("keydown", (event) => { if (event.isTrusted && event.key === "u") upload.click(); });
+// x selects a text for Ctrl+C; once copied, the other field waits for the paste.
+const copied = Object.assign(document.createElement("input"), { value: "openshell-clipboard-probe" });
+const pasted = document.createElement("input");
+document.body.append(copied, pasted);
+addEventListener("keydown", (event) => {
+  if (event.isTrusted && event.key === "x" && document.activeElement !== copied && document.activeElement !== pasted) {
+    event.preventDefault();
+    copied.focus();
+    copied.select();
+  }
+});
+copied.addEventListener("copy", () => setTimeout(() => pasted.focus(), 100));
+pasted.addEventListener("input", () => post("pasted?value=" + encodeURIComponent(pasted.value)));
+// n gives the keyboard to a new password field: the password manager offers a strong password.
+const signup = document.createElement("form");
+const account = Object.assign(document.createElement("input"), { name: "username", autocomplete: "username", value: "openshell" });
+const secret = Object.assign(document.createElement("input"), { type: "password", name: "password", autocomplete: "new-password" });
+signup.append(account, secret);
+document.body.append(signup);
+addEventListener("keydown", (event) => {
+  if (event.isTrusted && event.key === "n" && document.activeElement !== secret) {
+    event.preventDefault();
+    secret.focus();
+  }
+});
+secret.addEventListener("input", () => post("generated?length=" + secret.value.length));
 let opened = false;
 window.addEventListener("keydown", (event) => {
   if (!event.isTrusted || event.key !== "k" || opened) return;
   opened = true;
   post("key");
   window.open("popup", "_blank");
-});`;
+});
+if (location.pathname === "/address-focus") post("addressReady");`;
   const worker = `self.onmessage = ({ data }) => { if (data === "ping") self.postMessage("pong"); };`;
   const files = new Map([
     ["/", ["text/html; charset=utf-8", page]],
@@ -168,11 +254,17 @@ window.addEventListener("keydown", (event) => {
       request.on("end", () => {
         const name = url.pathname.slice(1);
         if (name === "blocked" && Object.hasOwn(evidence.blocked, url.searchParams.get("kind"))) evidence.blocked[url.searchParams.get("kind")] = true;
-        else if (name === "width") evidence.widths.push(Number(url.searchParams.get("value")));
+        else if (name === "size") {
+          evidence.widths.push(Number(url.searchParams.get("width")));
+          evidence.heights.push(Number(url.searchParams.get("height")));
+        }
         else if (name === "reached") evidence.reachedHostd = true;
+        else if (name === "chooser") evidence.chooser = url.searchParams.get("result");
+        else if (name === "pasted") evidence.pasted = url.searchParams.get("value");
+        else if (name === "generated") evidence.generated = Number(url.searchParams.get("length"));
         else if (name === "webgl") evidence.webgl = body;
         else if (name === "click") evidence.clicks++;
-        else if (["page", "worker", "key"].includes(name)) evidence[name] = true;
+        else if (["page", "worker", "key", "devtools", "addressReady"].includes(name)) evidence[name] = true;
         response.writeHead(204).end();
       });
       return;
@@ -220,6 +312,37 @@ async function smoke(launcher, bundle, host, outputArg) {
   function screenshot(name) {
     const path = join(output, `${name}.xwd`);
     return tool("xwd", ["-root", "-silent", "-out", path], { optional: true }) === null ? null : path;
+  }
+
+  /** The screen at a quarter of its size, as a PNG: printed when a run fails where its artifacts stay behind (the guest). */
+  function screenPng(path, step = 4) {
+    const data = readFileSync(path);
+    const field = index => data.readUInt32BE(index * 4);
+    if (field(2) !== 2 || field(11) !== 32) return null;
+    const width = Math.floor(field(4) / step);
+    const height = Math.floor(field(5) / step);
+    const rows = Buffer.alloc((width * 3 + 1) * height);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const pixel = data.readUInt32LE(field(0) + field(19) * 12 + y * step * field(12) + x * step * 4);
+        const at = y * (width * 3 + 1) + 1 + x * 3;
+        rows[at] = (pixel >> 16) & 255;
+        rows[at + 1] = (pixel >> 8) & 255;
+        rows[at + 2] = pixel & 255;
+      }
+    }
+    const chunk = (type, body) => {
+      const head = Buffer.alloc(4);
+      head.writeUInt32BE(body.length);
+      const tail = Buffer.alloc(4);
+      tail.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type), body])));
+      return Buffer.concat([head, Buffer.from(type), body, tail]);
+    };
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(width, 0);
+    header.writeUInt32BE(height, 4);
+    header.set([8, 2, 0, 0, 0], 8);
+    return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", header), chunk("IDAT", deflateSync(rows)), chunk("IEND", Buffer.alloc(0))]);
   }
 
   function screenPixel(path, x, y) {
@@ -403,8 +526,17 @@ async function smoke(launcher, bundle, host, outputArg) {
         await type(`${site.url}address-focus`);
         screenshot("browser-address");
         tool("xdotool", ["key", "Return"]);
-        await waitFor("navigation typed into the Desktop address bar from the page", () => evidence.addressNavigation, 30_000);
-        await pause(2);
+        await waitFor("the page opened from the Desktop address bar to accept input", () => evidence.addressNavigation && evidence.addressReady, 30_000);
+        // The renderer may have installed its listeners before the native view
+        // is visible again. Wait for the fixture's green background at the click.
+        let nextCapture = 0;
+        await waitFor("the navigated page to be visible", () => {
+          const now = performance.now();
+          if (now < nextCapture) return false;
+          nextCapture = now + 1000;
+          const pixel = screenPixel(screenshot("browser-address-loaded"), pageX, pageY);
+          return pixel === null || (pixel & 0xffffff) === 0x228844;
+        }, 30_000);
         clickPage();
         await waitFor("a click after address navigation", () => evidence.clicks === 2, 30_000);
         // The Desktop switcher stays above the tab until the held Alt key is released.
@@ -432,12 +564,93 @@ async function smoke(launcher, bundle, host, outputArg) {
         await waitFor("the page to zoom in", () => evidence.widths.at(-1) < before, 30_000);
         tool("xdotool", ["key", "ctrl+0"]);
         await waitFor("the zoom to reset", () => evidence.widths.at(-1) === before, 30_000);
+        // Drive the real DevTools frontend. A viewport resize alone would also
+        // pass if the Desktop reserved space for a frontend that never drew.
+        const height = evidence.heights.at(-1);
+        tool("xdotool", ["key", X11_F12_KEYCODE]);
+        await waitFor("F12 to open docked DevTools", () => evidence.heights.at(-1) < height, 30_000);
+        tool("xdotool", ["mousemove", String(pageX), String(Math.floor(display[1] / 4)), "click", "1"]);
+        tool("xdotool", ["key", "ctrl+shift+j"]);
+        await pause(2);
+        screenshot("browser-devtools");
+        await type(`fetch('/devtools', {method:'POST'})`);
+        tool("xdotool", ["key", "Return"]);
+        await waitFor("console input to reach the inspected page", () => evidence.devtools, 30_000);
+        tool("xdotool", ["key", X11_F12_KEYCODE]);
+        await waitFor("F12 to close DevTools from its frontend", () => evidence.heights.at(-1) === height, 30_000);
         // A download goes to Home > Downloads.
         tool("xdotool", ["key", "z"]);
         const download = join(home, "Downloads", "openshell-probe.txt");
         await waitFor("the download", () => existsSync(download) && readFileSync(download, "utf8") === "OpenShell Native download\n", 30_000);
         // The download's notification covers the page for a moment; the page keeps the keyboard.
         await pause(1);
+        // An upload opens the Desktop's file picker, not a dialog of its own.
+        const windowsBefore = tool("xdotool", ["search", "--onlyvisible", "--name", ".+"], { optional: true }).split("\n").length;
+        tool("xdotool", ["key", "u"]);
+        await pause(3);
+        screenshot("browser-file-chooser");
+        const windowsAfter = tool("xdotool", ["search", "--onlyvisible", "--name", ".+"], { optional: true }).split("\n").length;
+        assert.equal(windowsAfter, windowsBefore, "The page opened a file dialog outside the Desktop");
+        tool("xdotool", ["key", "Escape"]);
+        await waitFor("the page to learn that the choice was cancelled", () => evidence.chooser === "cancel", 30_000);
+        // Ctrl+P prints the page: the tab as a PDF, in the Desktop's print dialog.
+        clickPage();
+        const printed = Date.now();
+        tool("xdotool", ["key", "ctrl+p"]);
+        await waitFor("the page as a PDF for printing", () => {
+          const folder = join(tmpdir(), "openshell-print");
+          return existsSync(folder) && readdirSync(folder).some((name) => name.endsWith(".pdf") && statSync(join(folder, name)).mtimeMs >= printed - 1000);
+        }, 60_000);
+        await pause(2);
+        screenshot("browser-print");
+        tool("xdotool", ["key", "Escape"]);
+        await pause(1);
+        // Shift+Print saves the whole screen, the Browser tab's own view included.
+        tool("xdotool", ["mousemove", "4", String(display[1] - 4), "click", "1"]);
+        await pause(1);
+        tool("xdotool", ["key", `shift+${X11_PRINT_KEYCODE}`]);
+        const pictures = join(home, "Pictures", "Screenshots");
+        const picture = await waitFor("the screenshot in Pictures", () => {
+          const name = existsSync(pictures) && readdirSync(pictures).find((entry) => entry.endsWith(".png"));
+          return name ? join(pictures, name) : null;
+        }, 60_000);
+        await pause(1);
+        assert.equal(pngPixel(picture, pageX, pageY), 0x228844, "The screenshot lacks the Browser tab");
+        clickPage();
+        // A copy in the page reaches the clipboard history; Super+V pastes it back.
+        tool("xdotool", ["key", "x"]);
+        await pause(1);
+        tool("xdotool", ["key", "ctrl+c"]);
+        await pause(2);
+        tool("xdotool", ["key", "super+v"]);
+        await pause(2);
+        screenshot("browser-clipboard-history");
+        tool("xdotool", ["key", "Return"]);
+        await waitFor("the clipboard history to paste into the page", () => evidence.pasted === "openshell-clipboard-probe", 30_000);
+        clickPage();
+        // The brightness key from the page: the display shows above the tab, which
+        // stays visible and keeps the keyboard. The display sits above the dock.
+        const osdX = Math.floor(display[0] / 2);
+        const osdY = display[1] - 100;
+        const underOsd = screenPixel(screenshot("browser-before-osd"), osdX, osdY);
+        tool("xdotool", ["key", "XF86MonBrightnessUp"]);
+        await pause(1);
+        const overTab = screenPixel(screenshot("browser-osd"), osdX, osdY);
+        if (underOsd !== null && overTab !== null && (underOsd & 0xffffff) === 0x228844) {
+          assert.notEqual(overTab & 0xffffff, 0x228844, "The volume and brightness display is hidden under the Browser tab");
+          assert.equal(screenPixel(screenshot("browser-osd-page"), pageX, pageY) & 0xffffff, 0x228844, "The tab was hidden under the volume and brightness display");
+        }
+        await pause(3);
+        // Saved passwords: a new password field gets a strong one from the list above the tab,
+        // picked with the keys pressed in the field.
+        clickPage();
+        tool("xdotool", ["key", "n"]);
+        await pause(2);
+        screenshot("browser-password-list");
+        tool("xdotool", ["key", "Down"]);
+        await pause(1);
+        tool("xdotool", ["key", "Return"]);
+        await waitFor("the suggested password in the page", () => evidence.generated >= 16, 30_000);
         tool("xdotool", ["key", "k"]);
         await waitFor("a key in the page", () => evidence.key, 30_000);
         await waitFor("the page's popup in a new tab", () => evidence.popup, 30_000);
@@ -573,6 +786,13 @@ async function smoke(launcher, bundle, host, outputArg) {
     report.ok = true;
   } catch (error) {
     report.error = error.message;
+    try {
+      const shot = screenshot("failure");
+      const png = shot && screenPng(shot);
+      if (png) console.log(`OPENSHELL_SMOKE_SCREEN ${png.toString("base64")}`);
+    } catch {
+      // No display to show.
+    }
     throw error;
   } finally {
     if (session) await stop().catch(() => undefined);

@@ -44,7 +44,18 @@ let
         ];
         # Xvfb and libglvnd find the drivers where NixOS installs them.
         mesa = pkgs.mesa;
-        fonts = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+        # Match the Desktop's CSS and the font families shipped by OpenShell Live.
+        fonts = pkgs.makeFontsConf {
+          fontDirectories = with pkgs; [
+            cascadia-code
+            jetbrains-mono
+            liberation_ttf
+            dejavu_fonts
+            noto-fonts
+            noto-fonts-color-emoji
+          ];
+          includes = [ "${pkgs.fontconfig.out}/etc/fonts/conf.d" "/etc/fonts/conf.d" ];
+        };
       }
     else
       null;
@@ -206,7 +217,11 @@ let
       ln -s ${graphics.launcher}/bin/openshell-session "$out/opt/openshell-compat/bin/openshell-session"
       mkdir -p "$out/run"
       ln -s ${graphics.mesa} "$out/run/opengl-driver"
-      ln -s ${graphics.fonts} "$out/opt/openshell-compat/fonts.conf"
+      chmod u+w "$out/etc"
+      mkdir -p "$out/etc/fonts"
+      chmod u+w "$out/etc/fonts"
+      ln -sfn ${graphics.fonts} "$out/etc/fonts/fonts.conf"
+      ln -s /etc/fonts/fonts.conf "$out/opt/openshell-compat/fonts.conf"
       ln -s ${pkgs.openbox}/etc/xdg "$out/opt/openshell-compat/xdg"
       install -m 0644 ${probes}/cef-smoke.mjs ${probes}/shell-smoke.mjs ${probes}/session-smoke.mjs ${probes}/linux-sandbox.mjs "$out/opt/openshell-compat/"
     ''}
@@ -217,7 +232,11 @@ let
           ${apps.gtkProbe}/bin/openshell-gtk-probe ${apps.qtProbe}/bin/openshell-qt-probe; do
         ln -s "$program" "$out/opt/openshell-compat/bin/"
       done
+      # The upstream root comes from the store, read-only.
       chmod u+w "$out" "$out/etc"
+      mkdir -p "$out/usr"
+      chmod u+w "$out/usr"
+      if [ -d "$out/usr/share" ]; then chmod u+w "$out/usr/share"; fi
       mkdir -p "$out/etc/dbus-1" "$out/usr/share/xpra"
       ln -s ${apps.dbusSession}/etc/dbus-1/session.conf "$out/etc/dbus-1/session.conf"
       ln -s ${apps.html5}/share/xpra/www "$out/usr/share/xpra/www"
