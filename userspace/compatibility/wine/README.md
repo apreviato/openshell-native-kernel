@@ -11,7 +11,7 @@ Estado das fases do [plano de Wine](../../../OPENSHELL_WINE.md). A ação `wine`
 | CEF | 147.0.10 | nixpkgs fixado |
 | Xpra e cliente HTML5 | 6.4 e 17.1 | nixpkgs fixado |
 
-Wine Mono e Gecko não fazem parte do perfil: o prefixo é criado sem eles (`WINEDLLOVERRIDES=mscoree,mshtml=`), e programas .NET ou que embutem o motor HTML do Windows ficam fora até a fase W5.
+Wine Mono e Gecko não fazem parte do prefixo padrão: ele é criado sem eles (`WINEDLLOVERRIDES=mscoree,mshtml=`). Um programa .NET recebe o Wine Mono no próprio prefixo (W5); programas que embutem o motor HTML do Windows (Gecko) seguem fora.
 
 ## Execução
 
@@ -43,4 +43,4 @@ Wine Mono e Gecko não fazem parte do perfil: o prefixo é criado sem eles (`WIN
 | W2 · abrir `.exe` | Associação de `.exe` e `.msi`, runner em primeiro plano, limpeza pelo `hostd` ao fechar (a sessão Xpra inteira). |
 | W3 · janelas no Desktop | Pelo caminho Xpra dos apps Linux: a janela do programa é uma janela do OpenShell, com dock, foco, teclado e clipboard dos apps Linux. |
 | W4 · prefixos por app, instalação | Runner e painel de Configurações oferecem prefixos por instalação, logs, backup e restauração. O gate W4 do `wine-smoke` passa no Linux de controle. No Asterinas, roda na ação `wine` e segue pendente. Os prefixos ficam nos dados da pessoa (`XDG_DATA_HOME`), fora dos slots que uma atualização ou um rollback substitui. |
-| W5 · compatibilidade avançada | Pendente: Wine Mono, Gecko, VC runtimes sob demanda e medições. |
+| W5 · compatibilidade avançada | Em andamento. Programas .NET: o runner reconhece o cabeçalho CLR do PE (PE32 e PE32+) e instala o Wine Mono do pacote do Wine só no prefixo desse programa, na primeira execução; os outros prefixos seguem sem ele. Faltam as provas no `wine-smoke` (Win32 por WoW64, .NET), o Gecko e os VC runtimes sob demanda e as medições de lançamento e RAM. |

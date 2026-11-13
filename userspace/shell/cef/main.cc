@@ -1489,6 +1489,13 @@ class DesktopApp final : public CefApp, public CefBrowserProcessHandler {
       // The image ships its own pinned Mesa. Chromium's blocklist, meant for
       // unknown drivers, otherwise refuses WebGL on its llvmpipe renderer.
       command_line->AppendSwitch("ignore-gpu-blocklist");
+      // There is no GPU driver (the firmware's framebuffer, through simpledrm):
+      // a GPU compositor would run on llvmpipe or SwiftShader, emulating a GPU
+      // on the processor for every frame of the Desktop. Chromium's software
+      // compositor draws the same frames with far less work, as Live's
+      // Electron does on machines without a GPU (the Desktop then also leaves
+      // out its backdrop blurs: nativeShell.ts softwareRendering).
+      command_line->AppendSwitch("disable-gpu-compositing");
       // The media leave Mesa out (they run from memory): WebGL then runs on
       // the SwiftShader that CEF ships, which Chromium no longer picks by itself.
       if (access("/run/opengl-driver/lib", F_OK) != 0) {

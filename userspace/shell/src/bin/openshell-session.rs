@@ -25,6 +25,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use openshell_shell::install::{Installer, INSTALL_PREFIX, SYSTEM_SOCKET_ENV};
 use openshell_shell::login::{parse_request, Phase, Request, GREETER_SOCKET_ENV, MAX_REQUEST};
 use openshell_shell::power::PowerAction;
+use openshell_shell::settings::{Saved, Setting, SystemFiles};
+use openshell_shell::update::{self, Updates};
 use openshell_shell::session::{
     boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig,
     DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET, DESKTOP_HEALTHY,
@@ -375,6 +377,36 @@ impl Supervisor {
                     }
                     None => "unavailable".to_owned(),
                 }
+            } else if Setting::is_request(line) {
+                match Setting::from_request(line) {
+                    Some(setting) => {
+                        let applied = SystemFiles::default().apply(&setting, self.config.uid).and_then(|()| {
+                            self.config.settings_dir.as_ref().map_or(Ok(()), |folder| Saved(folder.clone()).save(&setting))
+                        });
+                        match applied {
+                            Ok(()) => {
+                                self.journal.note(&format!("set {setting:?}"));
+                                "ok".to_owned()
+                            }
+                            Err(error) => {
+                                self.journal.note(&format!("could not set {setting:?}: {error}"));
+                                "failed".to_owned()
+                            }
+                        }
+                    }
+                    None => "invalid".to_owned(),
+                }
+            } else if update::is_request(line) {
+                match &self.config.updates_dir {
+                    Some(folder) => {
+                        let answer = Updates(folder.clone()).answer(line).unwrap_or_else(|error| format!("failed {error}"));
+                        if answer == "ok" && line != update::UPDATE_STATUS {
+                            self.journal.note(&format!("updates: {line}"));
+                        }
+                        answer
+                    }
+                    None => "unavailable".to_owned(),
+                }
             } else if PowerAction::is_request(line) {
                 match PowerAction::from_request(line) {
                     Some(action) => {
@@ -619,6 +651,14 @@ fn main() -> ExitCode {
         let journal = Journal(OpenOptions::new().create(true).append(true).mode(0o640).open(logs.join("session.log"))?);
         let mut supervisor = Supervisor { config, logs, journal, members: Vec::new(), signed_in: false, greeter_socket: None, system: None, power: None };
         supervisor.open_system_socket()?;
+        // The time zone and the account's name chosen in Settings, before the session.
+        if let Some(folder) = supervisor.config.settings_dir.clone() {
+            for setting in Saved(folder).load() {
+                if let Err(error) = SystemFiles::default().apply(&setting, supervisor.config.uid) {
+                    supervisor.journal.note(&format!("could not set {setting:?}: {error}"));
+                }
+            }
+        }
         supervisor.journal.note(&format!("session logs in {}", supervisor.logs.display()));
         // Root keeps only what the supervision needs.
         drop_capabilities()?;

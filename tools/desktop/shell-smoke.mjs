@@ -12,6 +12,7 @@ import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { crc32, deflateSync, inflateSync } from "node:zlib";
 import { sandboxSample } from "./linux-sandbox.mjs";
+import { childOf, processes, resourceUse } from "./processes.mjs";
 
 const usage = "Usage: node tools/desktop/shell-smoke.mjs <openshell-shell> <desktop-bundle> <cef-host> [output-dir]";
 // Emulated guests run the Desktop much slower than a host.
@@ -82,73 +83,6 @@ function tool(command, args, { optional = false } = {}) {
     throw new Error(`${command} ${args[0]} failed: ${result.error?.message ?? result.stderr?.trim() ?? result.status}`);
   }
   return result.stdout.trim();
-}
-
-function processes() {
-  const table = new Map();
-  for (const entry of readdirSync("/proc")) {
-    if (!/^\d+$/.test(entry)) continue;
-    try {
-      const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
-      const parent = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-      const cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").filter(Boolean);
-      table.set(Number(entry), { parent, cmdline });
-    } catch {
-      // The process exited while the table was read.
-    }
-  }
-  return table;
-}
-
-function childOf(parent, predicate) {
-  for (const [pid, info] of processes()) {
-    if (info.parent === parent && predicate(info.cmdline)) return pid;
-  }
-  return null;
-}
-
-/** Memory and processor time of `root` and its descendants. */
-function resourceUse(root) {
-  const table = processes();
-  const members = new Set([root]);
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const [pid, info] of table) {
-      if (!members.has(pid) && members.has(info.parent)) {
-        members.add(pid);
-        grew = true;
-      }
-    }
-  }
-  let rssKiB = 0;
-  let pssKiB = 0;
-  let pssAvailable = true;
-  let cpuTicks = 0;
-  for (const pid of members) {
-    try {
-      rssKiB += Number(readFileSync(`/proc/${pid}/status`, "utf8").match(/^VmRSS:\s+(\d+)/m)?.[1] ?? 0);
-      // PSS divides shared pages, such as libcef.so, among the processes.
-      try {
-        const pss = readFileSync(`/proc/${pid}/smaps_rollup`, "utf8").match(/^Pss:\s+(\d+)/m)?.[1];
-        if (pss === undefined) pssAvailable = false;
-        else pssKiB += Number(pss);
-      } catch {
-        pssAvailable = false;
-      }
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      cpuTicks += Number(fields[11]) + Number(fields[12]);
-    } catch {
-      // Exited meanwhile.
-    }
-  }
-  return {
-    processes: members.size,
-    // The sum of RSS counts shared pages once per process.
-    rssMiB: Math.round(rssKiB / 1024),
-    pssMiB: pssAvailable ? Math.round(pssKiB / 1024) : null,
-    cpuSeconds: Math.round(cpuTicks) / 100,
-  };
 }
 
 function alive(pid) {

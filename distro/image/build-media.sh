@@ -7,7 +7,10 @@
 # media boot as OpenShell Live's do, Secure Boot included: Debian's shim and
 # GRUB, and the kernel signed with OpenShell Native's key (secureboot.sh),
 # whose certificate the computer enrolls once in MokManager. SB_KEYS names
-# the folder of that key.
+# the folder of that key, which also holds the release key: with RELEASE_AB
+# (openshell-ab) set, the live ISO comes with its release channel
+# (channel.sh) in <output>/native-channel, for installed systems to update to.
+# OPENSHELL_BUILT_AT is the Desktop bundle's build time.
 set -euo pipefail
 
 action=$1 version=$2 kernel=$3 desktop=$4 recovery=$5 output=$6
@@ -18,6 +21,7 @@ fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/release.sh"
+source "$here/channel.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -92,5 +96,13 @@ esac
 
 mv "$work/$name" "$output/$name"
 (cd "$output" && sha256sum "$name" > "$name.sha256")
+if [[ "$action" == live-iso && -n "${RELEASE_AB:-}" ]]; then
+    # What an installed system boots: the session without "live".
+    release_boot_cfg "$version" "${RELEASE_SESSION[@]}" > "$work/boot.cfg"
+    sb_sign "$SB_KEYS" "$kernel" "$work/kernel.signed"
+    channel_release "$output/native-channel" "$RELEASE_AB" "$SB_KEYS" "$version" \
+        "${OPENSHELL_BUILT_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "$work/kernel.signed" "$desktop" "$work/boot.cfg" "$output/$name"
+    echo "OpenShell Native release channel: $output/native-channel"
+fi
 cp "$SB_KEYS/openshell-native.cer" "$output/ENROLL_THIS_KEY_IN_MOKMANAGER.cer"
 echo "OpenShell Native media: $output/$name"

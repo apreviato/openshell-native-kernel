@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use openshell_shell::{read_hostd_readiness, write_cef_bootstrap, write_cef_startup};
 use openshell_shell::install::SYSTEM_SOCKET_ENV;
+use openshell_shell::session::MODE_ENV;
+use openshell_shell::update::{INBOX_ENV, RELEASE_KEYS_ENV};
 use openshell_shell::login::GREETER_SOCKET_ENV;
 use openshell_shell::session::{DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET};
 
@@ -123,8 +125,14 @@ fn session_command(executable: &OsStr) -> Command {
     // A system without /etc/fonts, such as NixOS, names its font configuration,
     // and XDG_DATA_DIRS says where the installed applications' entries are.
     // As a greeter, hostd answers the sign-in page through the supervisor's socket;
-    // on the live medium, it installs the system through the supervisor's other one.
-    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE", "XDG_DATA_DIRS", GREETER_SOCKET_ENV, SYSTEM_SOCKET_ENV] {
+    // in the session, it asks the supervisor's other one (power, the lock
+    // screen, settings, updates and the live medium's installer). The session
+    // says which it is, live or installed, as OpenShell Live's files do
+    // (MODE_ENV), and where updates go (update.rs).
+    for name in [
+        "PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE", "XDG_DATA_DIRS",
+        GREETER_SOCKET_ENV, SYSTEM_SOCKET_ENV, MODE_ENV, INBOX_ENV, RELEASE_KEYS_ENV,
+    ] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
         }

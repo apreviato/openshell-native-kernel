@@ -205,14 +205,21 @@ async function run(action, bundlePath) {
   }
 }
 
-/** The key a build made goes to .secureboot (git-ignored) the first time, and never stays in out/. */
+/**
+ * The keys a build made go to .secureboot (git-ignored) the first time, and
+ * never stay in out/: the Secure Boot key (distro/image/secureboot.sh) and the
+ * release key of the update channel (distro/image/channel.sh).
+ */
 function keepSecureBootKey(output) {
   const made = join(output, "secureboot-key");
   if (!existsSync(made)) return;
-  if (!existsSync(join(secureBootKeys, "openshell-native.key"))) {
-    mkdirSync(secureBootKeys, { recursive: true });
-    cpSync(made, secureBootKeys, { recursive: true });
-    console.log(`Secure Boot key kept in ${secureBootKeys}: back it up; media signed with another key need enrolling again.`);
+  mkdirSync(secureBootKeys, { recursive: true });
+  for (const name of readdirSync(made)) {
+    if (existsSync(join(secureBootKeys, name))) continue;
+    cpSync(join(made, name), join(secureBootKeys, name));
+    if (name.endsWith(".key")) {
+      console.log(`Key ${name} kept in ${secureBootKeys}: back it up. Media signed with another Secure Boot key need enrolling again, and installed systems take updates only from their release key.`);
+    }
   }
   rmSync(made, { recursive: true, force: true });
 }

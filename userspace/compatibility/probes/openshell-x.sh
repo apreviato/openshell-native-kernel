@@ -65,10 +65,15 @@ EndSection
 EOF
     inputs=
     index=0
+    # Scrolling: the kernel drives touchpads only as PS/2 mice, which send no
+    # wheel. Holding the right button while moving scrolls (evdev's wheel
+    # emulation, both ways); a press without moving is still a right click.
+    # A mouse with a wheel scrolls with it as well. Keyboards ignore these options.
+    scrolling='    Option "EmulateWheel" "true"\n    Option "EmulateWheelButton" "3"\n    Option "EmulateWheelTimeout" "250"\n    Option "XAxisMapping" "6 7"\n    Option "YAxisMapping" "4 5"\n'
     for device in /dev/input/event*; do
         [ -r "$device" ] || continue
         index=$((index + 1))
-        printf 'Section "InputDevice"\n    Identifier "input%s"\n    Driver "evdev"\n    Option "Device" "%s"\nEndSection\n\n' "$index" "$device"
+        printf 'Section "InputDevice"\n    Identifier "input%s"\n    Driver "evdev"\n    Option "Device" "%s"\n%bEndSection\n\n' "$index" "$device" "$scrolling"
         inputs="$inputs    InputDevice \"input$index\"\n"
     done
     printf 'Section "ServerLayout"\n    Identifier "openshell"\n    Screen "screen"\n%b    Option "AllowEmptyInput" "true"\nEndSection\n' "$inputs"

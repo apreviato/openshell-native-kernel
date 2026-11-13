@@ -5,6 +5,19 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { sandboxSample } from "./linux-sandbox.mjs";
+import { childOf, processes, processTree, resourceUseOf } from "./processes.mjs";
+
+/** How often the memory of Electron and hostd is sampled. */
+const MEMORY_SAMPLE_MS = 500;
+
+/** Electron's processes and hostd's, apart, as shell-smoke.mjs reports the CEF host and hostd. */
+function desktopResources(root) {
+  const table = processes();
+  const isHostd = (cmdline) => cmdline.some((arg) => arg.endsWith("openshell-hostd.mjs"));
+  const hostd = childOf(root, isHostd, table);
+  const electron = resourceUseOf(processTree(root, table, new Set(hostd ? [hostd] : [])));
+  return { electron, ...(hostd ? { hostd: resourceUseOf(processTree(hostd, table)) } : {}) };
+}
 
 const usage = "Usage: node tools/desktop/smoke.mjs <desktop-bundle> <linux-electron> [output-dir]";
 const guestTitle = "OpenShell Native Browser Probe OK";
@@ -40,7 +53,7 @@ async function smoke(bundleArg, electronArg, outputArg) {
   mkdirSync(outputRoot, { recursive: true });
   const output = mkdtempSync(join(outputRoot, "desktop-"));
   const scratch = mkdtempSync("/tmp/openshell-native-desktop-");
-  const report = { ok: false, output, sandbox: [] };
+  const report = { ok: false, output, sandbox: [], resources: {} };
   console.log(`Artifacts: ${output}`);
   const server = createServer((request, response) => {
     const resource = fixture[request.url];
@@ -57,6 +70,7 @@ async function smoke(bundleArg, electronArg, outputArg) {
   let log;
   let child;
   let poll;
+  let sampler;
   let timeout;
   let timedOut = false;
   const stop = () => {
@@ -102,6 +116,15 @@ async function smoke(bundleArg, electronArg, outputArg) {
       },
     });
     if (child.pid) {
+      // The peak, and the last sample before the smoke ends with the Browser's guest open.
+      const started = Date.now();
+      sampler = setInterval(() => {
+        const sample = { atMs: Date.now() - started, ...desktopResources(child.pid) };
+        if (!report.resources.peak || (sample.electron.pssMiB ?? sample.electron.rssMiB) > (report.resources.peak.electron.pssMiB ?? report.resources.peak.electron.rssMiB)) {
+          report.resources.peak = sample;
+        }
+        if (sample.electron.processes > 1) report.resources.last = sample;
+      }, MEMORY_SAMPLE_MS);
       poll = setInterval(() => {
         try {
           const sample = sandboxSample(child.pid);
@@ -133,6 +156,7 @@ async function smoke(bundleArg, electronArg, outputArg) {
     throw error;
   } finally {
     clearInterval(poll);
+    clearInterval(sampler);
     clearTimeout(timeout);
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);

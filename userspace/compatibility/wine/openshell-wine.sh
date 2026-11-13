@@ -18,7 +18,8 @@
 #   before it updates it, so a rollback of the system can restore it.
 # - Temporary files go to the cache ($XDG_CACHE_HOME/openshell/wine/<id>).
 # - Prefixes are set up without Wine Mono and Gecko, which Wine would offer to
-#   download (they come on demand, phase W5).
+#   download. A .NET program (its PE header names a CLR runtime) gets Wine
+#   Mono in its prefix, from the Wine package (phase W5), on first use.
 # - Drive Z:, which Wine maps to the whole filesystem, is removed: programs
 #   see C: only (OPENSHELL_WINE.md, section 6). The program or installer the
 #   person opened reaches its own folder only, as drive P:.
@@ -38,6 +39,24 @@ fail() { echo "openshell-wine: $*" >&2; exit 2; }
 valid_id() { printf '%s' "$1" | grep -Eq '^[a-z0-9][a-z0-9-]{0,63}$'; }
 version() { wine --version 2>/dev/null || echo unknown; }
 setting() { sed -n "s/^$1=//p" "$WINEPREFIX/openshell-prefix.conf" 2>/dev/null | head -n 1; }
+
+# Reads an unsigned little-endian number of $2 bytes at offset $1 of file $3.
+number_at() { od -An -tu"$2" -j "$1" -N "$2" "$3" 2>/dev/null | tr -d ' \n'; }
+
+# Whether $1 is a .NET program or installer: a PE file whose CLR runtime
+# header (data directory 14) is set.
+dotnet_program() {
+    pe=$(number_at 60 4 "$1")
+    [ -n "$pe" ] && [ "$(od -An -c -j "$pe" -N 2 "$1" 2>/dev/null | tr -d ' \n')" = PE ] || return 1
+    optional=$((pe + 24))
+    case $(number_at "$optional" 2 "$1") in
+    267) directories=$((optional + 96)) ;;  # PE32
+    523) directories=$((optional + 112)) ;; # PE32+
+    *) return 1 ;;
+    esac
+    clr=$(number_at $((directories + 14 * 8)) 4 "$1")
+    [ -n "$clr" ] && [ "$clr" -ne 0 ]
+}
 
 # Records a setting of the prefix (key=value lines).
 record() {
@@ -65,6 +84,12 @@ backup() (
     echo "$file"
 )
 
+# What Wine leaves out of the prefix: Gecko always, Wine Mono unless a .NET
+# program needs it.
+overrides() {
+    if [ "$(setting mono)" = yes ]; then echo "mshtml="; else echo "mscoree,mshtml="; fi
+}
+
 # The prefix, created on first use and brought to this Wine.
 prepare() {
     current=$(version)
@@ -85,9 +110,15 @@ prepare() {
     elif [ "$(setting wine)" != "$current" ]; then
         # Another Wine ran it last: a backup first, then the update.
         backup "$id" "$(setting wine | tr -c 'a-z0-9.\n' '-')" > /dev/null
-        env -u DISPLAY WINEDLLOVERRIDES="mscoree,mshtml=" wineboot -u
+        env -u DISPLAY WINEDLLOVERRIDES="$(overrides)" wineboot -u
         wineserver -w
         record wine "$current"
+    fi
+    # A .NET program: Wine Mono in this prefix, once, from the Wine package.
+    if [ -n "${file:-}" ] && [ "$(setting mono)" != yes ] && dotnet_program "$file"; then
+        record mono yes
+        env -u DISPLAY WINEDLLOVERRIDES="$(overrides)" wineboot -u
+        wineserver -w
     fi
     rm -f "$WINEPREFIX/dosdevices/z:"
     # Temporary files out of the prefix, which backups keep.

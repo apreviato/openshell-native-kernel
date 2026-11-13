@@ -104,6 +104,10 @@ prepare_media_payload() {
     ) >> "$artifacts/media-payload.log" 2>&1
     install -m 0644 "$image_sources/grub.cfg" "$payload/grub.cfg"
     install -m 0755 "$image_sources/install.sh" "$payload/install.sh"
+    # The release channel's public key (channel.sh), which updates are checked against.
+    prepare_release_key >> "$artifacts/media-payload.log" 2>&1
+    mkdir -p "$payload/release-keys"
+    install -m 0644 "$SB_KEYS/openshell-native-release.pem" "$payload/release-keys/"
     printf '%s\n' "$1" > "$payload/release"
 }
 
@@ -480,6 +484,22 @@ prepare_secure_boot() {
     # Handed back to the host (native.mjs keeps it in .secureboot), never published.
     mkdir -p "$artifacts/secureboot-key"
     cp "$SB_KEYS"/openshell-native.* "$artifacts/secureboot-key/"
+}
+
+# OpenShell Native's release key (distro/image/channel.sh), made once with
+# openshell-ab and kept with the Secure Boot key; RELEASE_AB names the tool
+# for build-media.sh. Needs prepare_compat's openshell-ab sources.
+prepare_release_key() {
+    [[ -n "${RELEASE_AB:-}" ]] && return 0
+    nix-build test/initramfs/nix/openshell-compat.nix -A ab -o "$work/release-ab" || return 1
+    export RELEASE_AB="$work/release-ab/bin/openshell-ab"
+    (source "$image_sources/channel.sh" && channel_key "$SB_KEYS" "$RELEASE_AB")
+    # Handed back to the host with the Secure Boot key, never published.
+    mkdir -p "$artifacts/secureboot-key"
+    cp "$SB_KEYS"/openshell-native-release.* "$artifacts/secureboot-key/"
+    # The Desktop bundle's build time, for the channel's manifest.
+    OPENSHELL_BUILT_AT=$(sed -n 's/.*"builtAt": *"\([^"]*\)".*/\1/p' "$bundle/BUILD.json" 2>/dev/null | head -n1)
+    export OPENSHELL_BUILT_AT
 }
 
 # The disk image (distro/image): GPT with the system slots, recovery and

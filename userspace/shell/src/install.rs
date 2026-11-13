@@ -13,7 +13,8 @@
 //!
 //! The same socket checks the lock screen's password (login.rs, Phase::Unlock):
 //! `state` → "unlock" and `login <password>` → "ok" or "wrong", or
-//! "unavailable" without a sign-in, and `power` (power.rs). The socket is
+//! "unavailable" without a sign-in, `power` (power.rs), `timezone` and
+//! `name` (settings.rs), and the update-* requests (update.rs). The socket is
 //! always there; without an installer, the install requests answer
 //! "unavailable".
 

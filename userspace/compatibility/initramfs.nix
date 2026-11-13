@@ -51,7 +51,8 @@ let
         inherit (shell) cefHost;
         launcher = shell.shell;
         # setxkbmap: hostd's keyboard service sets the session's layout with it
-        # (Settings ▸ Keyboard); xset: its lock service, when the screen turns off.
+        # (Settings ▸ Keyboard); xset: its lock service, when the screen turns
+        # off; xrandr: its display service (Settings ▸ Display).
         tools = [
           pkgs.xvfb
           openbox
@@ -59,6 +60,7 @@ let
           pkgs.xwd
           pkgs.setxkbmap
           pkgs.xset
+          pkgs.xrandr
         ];
         # Xvfb and libglvnd find the drivers where NixOS installs them.
         mesa = pkgs.mesa;
@@ -180,7 +182,8 @@ let
         # cursorTheme.py draws the applications' OpenShell cursor from Adwaita's
         # (share/icons, in XDG_DATA_DIRS) and tells the toolkits through xsettingsd and xrdb.
         probeApps = lib.optionals (!media) [ gtkProbe qtProbe entries ];
-        packages = [ xpra html5 python dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb ] ++ probeApps;
+        # tzdata: the time zones of Settings ▸ Date & time (/usr/share/zoneinfo).
+        packages = [ xpra html5 python dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb pkgs.tzdata ] ++ probeApps;
       }
     else
       null;
@@ -366,7 +369,7 @@ let
     ''}
     ${lib.optionalString (graphics != null) ''
       for tool in ${lib.concatMapStringsSep " " (tool: "${tool}/bin") graphics.tools}; do
-        for program in Xvfb openbox xdotool xwd setxkbmap xset; do
+        for program in Xvfb openbox xdotool xwd setxkbmap xset xrandr; do
           if [ -e "$tool/$program" ]; then
             ln -s "$tool/$program" "$out/opt/openshell-compat/bin/$program"
           fi
@@ -407,6 +410,8 @@ let
       ln -s ${applications}/share/applications "$out/usr/share/applications"
       # The cursor theme of the applications draws from Adwaita, where Debian has it.
       ln -s ${pkgs.adwaita-icon-theme}/share/icons "$out/usr/share/icons"
+      # The time zones, where /etc/localtime points (the supervisor's settings.rs).
+      ln -s ${pkgs.tzdata}/share/zoneinfo "$out/usr/share/zoneinfo"
       install -m 0644 ${probes}/apps-smoke.mjs "$out/opt/openshell-compat/"
     ''}
     ${lib.optionalString (wine != null) ''

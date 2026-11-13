@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 pub const DESKTOP_HEALTHY: &str = "OPENSHELL_DESKTOP_HEALTHY";
 pub const DESKTOP_HEALTH_RESET: &str = "OPENSHELL_DESKTOP_HEALTH_RESET";
 pub const DESKTOP_HEALTH_ENV: &str = "OPENSHELL_NATIVE_HEALTH";
+/// Whether the session is a live medium's or an installed system's ("live" or
+/// "installed"): hostd's OPENSHELL_MODE, which OpenShell Live tells from its files.
+pub const MODE_ENV: &str = "OPENSHELL_MODE";
 const HEALTH_EXPIRY: Duration = Duration::from_secs(15);
 
 /// A command line of the configuration: words separated by spaces, without
@@ -37,6 +40,11 @@ pub struct SessionConfig {
     pub login: Option<crate::login::LoginConfig>,
     /// The live session's installer (install.rs), which the supervisor runs as root.
     pub installer: Option<CommandLine>,
+    /// Where the time zone and the account's name are kept across boots
+    /// (settings.rs); without it, they last until the computer stops.
+    pub settings_dir: Option<PathBuf>,
+    /// The updates folder of an installed system (update.rs).
+    pub updates_dir: Option<PathBuf>,
 }
 
 /// By default the Desktop must report health continuously for a minute.
@@ -67,7 +75,7 @@ impl SessionConfig {
         let (mut x_server, mut window_manager, mut shell) = (None, None, None);
         let (mut confirm, mut confirm_after) = (None, DEFAULT_CONFIRM_AFTER);
         let (mut greeter, mut password_file, mut password_tool) = (None, None, None);
-        let mut installer = None;
+        let (mut installer, mut settings_dir, mut updates_dir) = (None, None, None);
         let mut env = Vec::new();
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -101,6 +109,8 @@ impl SessionConfig {
                 "password_file" => password_file = Some(absolute(value, key)?),
                 "password_tool" => password_tool = Some(command(value, key)?),
                 "installer" => installer = Some(command(value, key)?),
+                "settings_dir" => settings_dir = Some(absolute(value, key)?),
+                "updates_dir" => updates_dir = Some(absolute(value, key)?),
                 "confirm_after" => {
                     let seconds = value.parse::<u64>().map_err(|_| "confirm_after is a number of seconds")?;
                     confirm_after = Duration::from_secs(seconds.max(1));
@@ -146,6 +156,8 @@ impl SessionConfig {
             confirm_after,
             login,
             installer,
+            settings_dir,
+            updates_dir,
         })
     }
 

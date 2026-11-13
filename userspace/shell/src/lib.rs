@@ -3,6 +3,8 @@ mod cef;
 pub mod install;
 pub mod login;
 pub mod power;
+pub mod settings;
+pub mod update;
 pub mod session;
 
 use std::io::{self, BufRead, Read, Write};

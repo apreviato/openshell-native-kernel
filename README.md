@@ -31,7 +31,7 @@ As mídias iniciam como as do OpenShell Live: o firmware carrega o shim do Debia
 1. No menu do pendrive, escolha **Enroll the OpenShell Native key**. O MokManager do Debian abre.
 2. Escolha **Enroll key from disk**, o volume do pendrive, `ENROLL_THIS_KEY_IN_MOKMANAGER.cer`, **Continue** e **Yes**, e reinicie.
 
-Sem o certificado, o GRUB recusa o kernel ("bad shim signature"). Nesse caso, **Try OpenShell Native** mostra os passos acima e abre o MokManager sozinho, e o disco instalado, quando não inicia nenhum slot, faz o mesmo. A inscrição é inevitável com Secure Boot ligado: só um kernel assinado pela Microsoft ou por uma distribuição que ela assina dispensaria esse passo. Com Secure Boot desligado, nada é pedido. O GRUB assinado do Debian não tem `multiboot2` sob Secure Boot. Por isso, o kernel é construído com `BOOT_PROTOCOL=linux-efi-handover64` e entra pelo `linux`/`initrd` do GRUB, inclusive nas validações em QEMU.
+Sem o certificado, o GRUB recusa o kernel ("bad shim signature"). Nesse caso, **Try OpenShell Native** mostra os passos acima e abre o MokManager sozinho, e o disco instalado, quando não inicia nenhum slot, faz o mesmo. O Live não pede isso porque inicia o kernel Linux do próprio Debian, assinado com a chave do Debian que o shim já traz. O shim só aceita, além dessa chave, as do MOK, e o Debian não assina outros kernels. Dispensar a inscrição exigiria um shim do OpenShell com a sua chave embutida e assinado pela Microsoft (o processo de revisão do shim, feito por quem publica a distribuição), ou desligar o Secure Boot. Com Secure Boot desligado, nada é pedido. O GRUB assinado do Debian não tem `multiboot2` sob Secure Boot. Por isso, o kernel é construído com `BOOT_PROTOCOL=linux-efi-handover64` e entra pelo `linux`/`initrd` do GRUB, inclusive nas validações em QEMU.
 
 A chave nasce no primeiro build e fica em `.secureboot/` (fora do Git); os builds seguintes a reutilizam, para que o certificado inscrito continue valendo. Guarde uma cópia: mídias assinadas com outra chave pedem nova inscrição. `OPENSHELL_SECURE_BOOT_KEYS` aponta outra pasta. O teste do disco ([boot-test.sh](distro/image/boot-test.sh)) inicia o slot com o OVMF em Secure Boot e as chaves da Microsoft: primeiro sem o certificado, com o kernel recusado, e depois com ele.
 
@@ -39,9 +39,18 @@ A chave nasce no primeiro build e fica em `.secureboot/` (fora do Git); os build
 
 O boot mostra a mesma tela de carregamento do OpenShell Live: o wordmark OPENSHELL e a barra sobre o quase-preto do Desktop. O GRUB desenha [splash.png](distro/image/splash.png) (feito por [make-splash.py](distro/image/make-splash.py) com as imagens do tema Plymouth do Live, na mesma geometria) enquanto carrega o kernel e o initramfs, e o [splash.cfg](distro/image/splash.cfg) da ESP serve ao menu do pendrive e ao disco instalado. O GRUB entrega a tela como está (`gfxpayload=keep`), o stub EFI não escreve nela (patch [0022](kernel/patches/README.md)) e o kernel não a apaga (patch 0023). A tela de carregamento do próprio Desktop, com o mesmo desenho, assume em seguida, e depois vem a entrada. As mensagens do GRUB continuam na porta serial, que os testes leem.
 
+#### Desempenho da tela
+
+O Native não tem driver de GPU: a tela é o framebuffer do firmware, pelo simpledrm. Tudo é desenhado no processador, e cada camada evita trabalho que só faria sentido com GPU:
+
+- O Chromium compõe em software (`--disable-gpu-compositing`), em vez de emular uma GPU com o SwiftShader ou o llvmpipe a cada quadro. O WebGL continua no SwiftShader.
+- O Desktop se declara sem GPU, como o Live faz nessas máquinas, e deixa de fora os desfoques de fundo, que seriam recalculados a cada quadro sob o dock e os menus.
+- O kernel copia para a tela só as áreas que o X informa como alteradas (patch [0025](kernel/patches/README.md)). Antes, cada movimento do ponteiro copiava a tela inteira.
+- O X recebe as imagens dos apps por memória compartilhada (MIT-SHM), que o kernel passou a oferecer com a memória compartilhada SysV (patch 0026). Antes, o Chromium, o Xpra e os apps GTK mandavam cada imagem pelo socket do X.
+
 #### Tela, teclado e mouse
 
-A sessão das mídias mostra o Desktop na tela do computador. O [openshell-x](userspace/compatibility/probes/openshell-x.sh) inicia o Xorg com o driver `modesetting` sobre o `/dev/dri/card0` do kernel (simpledrm sobre o framebuffer do UEFI, na resolução que o firmware entregou), com o driver `evdev` em cada `/dev/input/event*`. Sem udev nem logind, o script entrega a tela, as entradas e o console ao usuário da sessão antes de iniciá-la, como o logind faz com o seat ativo, e o X roda sem privilégios. Sem DRM, ele inicia o Xvfb, como nos smokes em QEMU. No QEMU com framebuffer UEFI, o X desenha na tela do firmware (captura por `screendump`), e teclas e o mouse PS/2 chegam ao X. O teclado depende do patch [0019](kernel/patches/README.md). O kernel ainda não tem pilha USB: teclado e mouse USB não funcionam, enquanto teclados e touchpads PS/2 (i8042) funcionam. Não há aceleração 3D; a tela usa o framebuffer do firmware, sem troca de resolução nem segundo monitor.
+A sessão das mídias mostra o Desktop na tela do computador. O [openshell-x](userspace/compatibility/probes/openshell-x.sh) inicia o Xorg com o driver `modesetting` sobre o `/dev/dri/card0` do kernel (simpledrm sobre o framebuffer do UEFI, na resolução que o firmware entregou), com o driver `evdev` em cada `/dev/input/event*`. Sem udev nem logind, o script entrega a tela, as entradas e o console ao usuário da sessão antes de iniciá-la, como o logind faz com o seat ativo, e o X roda sem privilégios. Sem DRM, ele inicia o Xvfb, como nos smokes em QEMU. No QEMU com framebuffer UEFI, o X desenha na tela do firmware (captura por `screendump`), e teclas e o mouse PS/2 chegam ao X. O teclado depende do patch [0019](kernel/patches/README.md). O kernel ainda não tem pilha USB: teclado e mouse USB não funcionam, enquanto teclados e touchpads PS/2 (i8042) funcionam. O touchpad funciona como mouse PS/2, sem gestos: para rolar, segure o botão direito e mova (um toque rápido continua sendo o clique direito). Um mouse PS/2 com roda rola com ela. Não há aceleração 3D; a tela usa o framebuffer do firmware, sem troca de resolução nem segundo monitor.
 
 #### Entrada
 
@@ -58,6 +67,23 @@ Desligar e reiniciar, no Desktop e na tela de bloqueio, também passam pelo supe
 O pendrive live instala o sistema, como o Calamares no Live: **Install OpenShell** no Desktop live lista os discos internos (NVMe e VirtIO, de 16 GiB ou mais), pede confirmação (**Erase and install**), mostra o progresso e oferece reiniciar no fim. O supervisor roda o [instalador](distro/image/install.sh) como root. Ele cria a tabela GPT do disco de referência (ESP, `system_a`, `system_b`, recovery e dados), grava a cadeia assinada e o splash na ESP, a versão no slot A, já confirmada, e a mesma versão como recovery. O primeiro boot do disco pede a criação da senha. O kernel não lê o pendrive depois do boot (não há pilha USB), então o sistema live roda inteiro da memória, e o instalador copia o initramfs que o computador carregou, exposto em `/dev/initrd` (patch [0021](kernel/patches/README.md)). O computador precisa de memória para o sistema descompactado além do uso normal. Por isso, a mídia deixa de fora o Mesa (o CEF usa o SwiftShader dele para WebGL) e as aplicações de teste. O [teste do instalador](distro/image/install-test.sh) instala em um NVMe do QEMU e inicia o disco sozinho pela cadeia assinada.
 
 A revisão atual do kernel oferece VirtIO e NVMe. Boot de um sistema instalado em SATA/AHCI, armazenamento USB e outros controladores depende de suporte no kernel.
+
+#### Configurações do sistema
+
+O Live muda o fuso horário com `timedatectl` e o nome da conta com `sudo chfn`. O Native não tem nenhum dos dois, e sua raiz vive na memória. Em Configurações, o Desktop pede essas mudanças ao supervisor pelo socket do sistema (`timezone <Área/Cidade>`, `name <nome>`, [settings.rs](userspace/shell/src/settings.rs)). O supervisor aponta `/etc/localtime` para a zona do `tzdata` e troca o nome da conta no `/etc/passwd`. No sistema instalado, ele guarda os dois em `/data/openshell/system` e os aplica de novo a cada boot, antes da sessão. O relógio é o do firmware: não há hora pela rede nem ajuste manual do horário. Configurações ▸ Tela usa o `xrandr` e mostra a única saída do simpledrm.
+
+#### Paridade com o OpenShell Live
+
+| Recurso do Live | No Native |
+| --- | --- |
+| Boot pelo shim/GRUB do Debian com Secure Boot | Igual; o certificado do kernel é inscrito uma vez no MokManager (ver [Secure Boot](#secure-boot)). |
+| Tela de carregamento (Plymouth) | Igual, desenhada pelo GRUB e mantida até o Desktop ([Carregamento](#carregamento)). |
+| Entrada com senha, bloqueio de tela, desligar e reiniciar | Iguais ([Entrada](#entrada), [Bloqueio de tela e energia](#bloqueio-de-tela-e-energia)); sem suspensão. |
+| Instalação pelo Calamares | Instalador do Desktop live, com o disco A/B ([Instalação](#instalação)). |
+| Desktop, Terminal, Files, Browser, apps Linux (Xpra) e Windows (Wine) | Os mesmos, sobre o CEF ([Shell com CEF](#shell-com-cef)). |
+| Fuso horário, nome da conta, teclado, tela | Pelo supervisor e pelas ferramentas X ([Configurações do sistema](#configurações-do-sistema)). |
+| Rede cabeada e Wi-Fi, som, Bluetooth, pendrives e discos USB, impressoras, brilho | Dependem de drivers que o kernel ainda não tem (rede só VirtIO, sem USB, sem áudio). As páginas mostram o recurso como indisponível. |
+| Atualizações do sistema | Configurações ▸ Atualizações, pelo canal de releases do Native, gravadas no outro slot A/B ao reiniciar ([Canal de releases](#canal-de-releases)). Não há "restaurar": uma versão que não inicia volta sozinha à anterior. |
 
 ### Sondas e builds de desenvolvimento
 
@@ -167,6 +193,17 @@ O smoke usa um perfil descartável e testa a troca do token por cookie, o carreg
 - **Atualização pelo guest.** `openshell-ab <data>/openshell/ab update-mounted <origem> <manifesto> <schema> <chaves> <slot-montado>` valida a release assinada e agenda o próximo boot em teste. O comando exige que o slot em execução coincida com a release confirmada e que o destino seja a partição inativa ext2 do mesmo disco GPT da partição `data`. O GRUB identifica as partições da imagem por UUID. Use o diretório das chaves públicas confiáveis da instalação.
 - **Boot.** O GRUB lê `grubenv` na partição `data` e grava o desconto antes de entregar o controle a um slot em teste. Após três tentativas sem confirmação, volta ao slot confirmado. O serviço de boot sincroniza esse resultado com o seletor. A imagem também prova o boot do recovery com o ambiente ausente ou sem um `boot.cfg` utilizável nos slots.
 - **Confirmação.** A sessão instalada mantém o perfil em `data`. O renderer envia relatórios periódicos depois que o Desktop monta a interface e conclui uma leitura e escrita autenticadas pelo hostd. O supervisor exige 60 segundos de relatórios contínuos por padrão e reinicia a contagem quando perde os relatórios ou quando a sessão reinicia. O comando de confirmação verifica se o identificador da release em execução coincide com o registrado no slot.
+
+### Canal de releases
+
+O sistema instalado se atualiza por Configurações ▸ Atualizações, como o Live, mas a versão nova é o sistema inteiro. O build da ISO live também gera o canal em `out/native-*/native-channel/` ([channel.sh](distro/image/channel.sh)): `latest.json` com `.sig`, no formato do Desktop (`product: "openshell-native"`), e `openshell-native-<versão>-amd64.tar`, com kernel assinado, initramfs, `boot.cfg` e o `MANIFEST` do `openshell-ab` com sua assinatura. Publique a pasta em `<portal>/downloads/native/`. Uma chave Ed25519 do OpenShell Native assina os dois manifestos. Ela nasce no primeiro build, fica em `.secureboot/` com a chave do Secure Boot, e a imagem leva a parte pública em `/opt/openshell-media/release-keys`. Sem ela, os sistemas instalados não aceitam versões novas: guarde uma cópia.
+
+1. O hostd confere a assinatura de `latest.json` e baixa o arquivo, com retomada e SHA-256, na caixa de entrada do sistema (`/data/openshell/updates/inbox`, do usuário da sessão).
+2. **Instalar** pede ao supervisor `update-stage <arquivo>` ([update.rs](userspace/shell/src/update.rs)). Ele só registra o nome, num arquivo de root.
+3. Ao reiniciar ou desligar pelo Desktop, e no boot seguinte se o computador parou antes, o init ([installed-session.sh](userspace/compatibility/probes/installed-session.sh)) desempacota o arquivo, monta o slot inativo e roda `openshell-ab update-mounted` com as chaves da imagem. Isso confere a assinatura do `MANIFEST` e cada arquivo, grava o slot e agenda o boot em teste. O resultado aparece em Atualizações (`update-status`).
+4. O GRUB inicia a versão nova em teste, e a sessão a confirma depois de 60 s saudável. Se ela não iniciar três vezes, o GRUB volta à anterior.
+
+O pendrive live não se atualiza: o Desktop mostra o link da ISO nova.
 
 Os testes unitários simulam um corte de energia em cada gravação de uma atualização inteira. Em todos os casos, o boot seguinte escolhe um slot `good` ou em teste, nunca um slot incompleto. Também conferem a assinatura com o vetor 1 da RFC 8032. O [smoke](distro/ab/smoke.sh) repete o fluxo com o CLI sobre um diretório: recusa um manifesto alterado depois de assinado, um assinado por chave não confiável e um sem assinatura. Roda no Linux, na CI e no guest, em `/ext2`. O [smoke da sessão](tools/desktop/session-smoke.mjs) exige a confirmação do boot, uma única vez.
 

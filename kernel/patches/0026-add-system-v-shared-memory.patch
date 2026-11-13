@@ -1,0 +1,780 @@
+diff --git a/kernel/core/src/ipc/ipc_ids.rs b/kernel/core/src/ipc/ipc_ids.rs
+index c8c365f..16e1182 100644
+--- a/kernel/core/src/ipc/ipc_ids.rs
++++ b/kernel/core/src/ipc/ipc_ids.rs
+@@ -44,6 +44,17 @@ impl<T> IpcIds<T> {
+         Ok(op(object))
+     }
+ 
++    /// Returns the first `Some` that `op` gives for an object.
++    pub(super) fn find_map<R, F>(&self, mut op: F) -> Option<R>
++    where
++        F: FnMut(IpcId, &T) -> Option<R>,
++    {
++        self.objects
++            .read()
++            .iter()
++            .find_map(|(id, object)| op(*id, object))
++    }
++
+     /// Removes the object identified by `id`.
+     pub(super) fn remove<F>(&self, id: IpcId, may_remove: F) -> Result<()>
+     where
+diff --git a/kernel/core/src/ipc/ipc_ns.rs b/kernel/core/src/ipc/ipc_ns.rs
+index 7be6176..7dd8138 100644
+--- a/kernel/core/src/ipc/ipc_ns.rs
++++ b/kernel/core/src/ipc/ipc_ns.rs
+@@ -19,6 +19,7 @@ use super::{
+         PermissionMode,
+         sem_set::{SEMMNI, SemaphoreSet},
+     },
++    shared_memory::{SHMMNI, SharedMemory},
+ };
+ use crate::{
+     fs::pseudofs::{NsCommonOps, NsType, StashedDentry},
+@@ -41,6 +42,10 @@ use crate::{
+ pub(crate) struct IpcNamespace {
+     /// Semaphore sets within this namespace.
+     sem_ids: IpcIds<SemaphoreSet>,
++    /// Shared memory segments within this namespace.
++    shm_ids: IpcIds<SharedMemory>,
++    /// Destroyed segments that were still attached, removed once nothing maps them.
++    destroyed_shm: SpinLock<Vec<IpcId>>,
+     /// Owner user namespace.
+     owner: Arc<UserNamespace>,
+     /// Stashed dentry for nsfs.
+@@ -64,11 +69,18 @@ impl IpcNamespace {
+             IpcId::new(SEMMNI as u32)
+         };
+ 
++        const MAX_SHM_ID: IpcId = {
++            assert!(SHMMNI <= u32::MAX as usize);
++            IpcId::new(SHMMNI as u32)
++        };
++
+         let sem_ids = IpcIds::new(MAX_SEM_ID);
+         let stashed_dentry = StashedDentry::new();
+ 
+         Arc::new(Self {
+             sem_ids,
++            shm_ids: IpcIds::new(MAX_SHM_ID),
++            destroyed_shm: SpinLock::new(Vec::new()),
+             owner,
+             stashed_dentry,
+         })
+@@ -174,6 +186,122 @@ impl IpcNamespace {
+         }
+     }
+ 
++    /// Calls `op` with the shared memory segment identified by `shmid`.
++    pub(crate) fn with_shm<T, F>(&self, shmid: IpcId, op: F) -> Result<T>
++    where
++        F: FnOnce(&SharedMemory) -> Result<T>,
++    {
++        self.shm_ids.with(shmid, op)?
++    }
++
++    /// Finds the segment whose memory is `vmo`.
++    pub(crate) fn find_shm<T, F>(&self, mut op: F) -> Option<T>
++    where
++        F: FnMut(IpcId, &SharedMemory) -> Option<T>,
++    {
++        self.shm_ids.find_map(|shmid, shm| op(shmid, shm))
++    }
++
++    /// Destroys the segment identified by `shmid` (`IPC_RMID`), once `may_remove` agrees. A
++    /// segment that is still attached stays, without its key, until its last mapping goes.
++    pub(crate) fn remove_shm<F>(&self, shmid: IpcId, may_remove: F) -> Result<()>
++    where
++        F: FnOnce(&SharedMemory) -> Result<()>,
++    {
++        let attached = self.shm_ids.with(shmid, |shm| -> Result<bool> {
++            may_remove(shm)?;
++            Ok(shm.destroy())
++        })??;
++        if attached {
++            self.destroyed_shm.lock().push(shmid);
++        } else {
++            self.shm_ids.remove(shmid, |_| Ok(()))?;
++        }
++        self.reap_shm();
++        Ok(())
++    }
++
++    /// Removes the destroyed segments that nothing maps anymore.
++    pub(crate) fn reap_shm(&self) {
++        let destroyed = core::mem::take(&mut *self.destroyed_shm.lock());
++        let mut remaining = Vec::new();
++        for shmid in destroyed {
++            let gone = self
++                .shm_ids
++                .with(shmid, |shm| shm.memory().is_none())
++                .unwrap_or(true);
++            if gone {
++                let _ = self.shm_ids.remove(shmid, |_| Ok(()));
++            } else {
++                remaining.push(shmid);
++            }
++        }
++        self.destroyed_shm.lock().extend(remaining);
++    }
++
++    /// Returns the existing segment of `key`, or creates one (`shmget`).
++    pub(crate) fn get_or_create_shm(
++        &self,
++        key: IpcKey,
++        size: usize,
++        flags: IpcFlags,
++        mode: u16,
++        credentials: Credentials<ReadOp>,
++        pid: crate::process::Pid,
++    ) -> Result<IpcId> {
++        self.reap_shm();
++        if key == IPC_PRIVATE {
++            return self
++                .shm_ids
++                .insert_auto(|_| SharedMemory::new(IPC_PRIVATE, size, mode, &credentials, pid));
++        }
++
++        // As for semaphores, the ID is the key's hash; a conflict is an error.
++        const { assert!(SHMMNI <= u32::MAX as usize) };
++        let shmid = IpcId::new(key.cast_unsigned() % SHMMNI as u32 + 1);
++        loop {
++            match self.shm_ids.with(shmid, |shm| {
++                if shm.permission().key() != key || shm.is_destroyed() {
++                    if flags.contains(IpcFlags::IPC_CREAT) {
++                        return_errno_with_message!(Errno::ENOSPC, "key hashes conflict");
++                    }
++                    return_errno_with_message!(Errno::ENOENT, "the key does not exist");
++                }
++                if flags.contains(IpcFlags::IPC_CREAT | IpcFlags::IPC_EXCL) {
++                    return_errno_with_message!(
++                        Errno::EEXIST,
++                        "the shared memory segment already exists with IPC_EXCL"
++                    );
++                }
++                if !shm
++                    .permission()
++                    .allows(credentials.euid(), credentials.egid(), false)
++                {
++                    return_errno_with_message!(Errno::EACCES, "no access to the segment");
++                }
++                if size > shm.size() {
++                    return_errno_with_message!(Errno::EINVAL, "the segment is too small");
++                }
++                Ok(shmid)
++            }) {
++                Err(_id_not_exist) if flags.contains(IpcFlags::IPC_CREAT) => {}
++                Err(_id_not_exist) => {
++                    return_errno_with_message!(Errno::ENOENT, "the key does not exist");
++                }
++                Ok(result) => return result,
++            }
++
++            match self
++                .shm_ids
++                .insert_at(shmid, |_| SharedMemory::new(key, size, mode, &credentials, pid))
++            {
++                Ok(()) => return Ok(shmid),
++                Err(err) if err.error() == Errno::EEXIST => continue,
++                Err(err) => return Err(err),
++            }
++        }
++    }
++
+     fn validate_sem_set(_sem_set: &SemaphoreSet, required_perm: PermissionMode) -> Result<()> {
+         if !required_perm.is_empty() {
+             // TODO: Support permission check
+diff --git a/kernel/core/src/ipc/mod.rs b/kernel/core/src/ipc/mod.rs
+index a171f22..715b5d7 100644
+--- a/kernel/core/src/ipc/mod.rs
++++ b/kernel/core/src/ipc/mod.rs
+@@ -8,6 +8,7 @@ use crate::{
+ mod ipc_ids;
+ mod ipc_ns;
+ pub(crate) mod semaphore;
++pub(crate) mod shared_memory;
+ 
+ pub(crate) use ipc_ids::IpcId;
+ pub(crate) use ipc_ns::IpcNamespace;
+@@ -54,6 +55,24 @@ pub(crate) enum IpcControlCmd {
+     // SEM_SETALL = 17,
+ }
+ 
++// Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/asm-generic/ipcbuf.h#L22>.
++#[padding_struct]
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, Pod)]
++pub(crate) struct IpcPerm {
++    key: u32,
++    uid: u32,
++    gid: u32,
++    cuid: u32,
++    cgid: u32,
++    mode: u16,
++    _pad1: u16,
++    seq: u16,
++    _pad2: u16,
++    _unused1: u64,
++    _unused2: u64,
++}
++
+ #[derive(Debug)]
+ pub(crate) struct IpcPermission {
+     key: IpcKey,
+@@ -99,6 +118,39 @@ impl IpcPermission {
+         self.mode
+     }
+ 
++    /// The C layout of the permission (`struct ipc64_perm`), as `*ctl(IPC_STAT)` reports it.
++    pub(crate) fn to_c(&self) -> IpcPerm {
++        IpcPerm {
++            key: self.key.cast_unsigned(),
++            uid: self.uid().into(),
++            gid: self.gid().into(),
++            cuid: self.cuid().into(),
++            cgid: self.cguid().into(),
++            mode: self.mode(),
++            ..IpcPerm::default()
++        }
++    }
++
++    /// Whether a process with `euid` and `egid` may read and, if `write`, also write.
++    ///
++    /// The owner's or creator's bits apply to their user, the group's to their group and the
++    /// others' to everyone else. Root may do anything.
++    // TODO: Consider `CAP_IPC_OWNER` and supplementary groups instead of the root user only.
++    pub(crate) fn allows(&self, euid: Uid, egid: Gid, write: bool) -> bool {
++        if euid.is_root() {
++            return true;
++        }
++        let bits = if euid == self.uid || euid == self.cuid {
++            self.mode >> 6
++        } else if egid == self.gid || egid == self.cguid {
++            self.mode >> 3
++        } else {
++            self.mode
++        };
++        let required = if write { 0o6 } else { 0o4 };
++        bits & required == required
++    }
++
+     pub(self) fn new_sem_perm(key: IpcKey, uid: Uid, gid: Gid, mode: u16) -> Self {
+         Self {
+             key,
+diff --git a/kernel/core/src/ipc/semaphore/system_v/sem_set.rs b/kernel/core/src/ipc/semaphore/system_v/sem_set.rs
+index ba7f354..191c7eb 100644
+--- a/kernel/core/src/ipc/semaphore/system_v/sem_set.rs
++++ b/kernel/core/src/ipc/semaphore/system_v/sem_set.rs
+@@ -8,7 +8,7 @@ use super::sem::{
+     PendingBlocker, PendingOp, Semaphore, Status, update_pending_alter, wake_const_ops,
+ };
+ use crate::{
+-    ipc::{IpcKey, IpcPermission},
++    ipc::{IpcKey, IpcPerm, IpcPermission},
+     prelude::*,
+     process::{Credentials, Pid},
+     time::clocks::RealTimeCoarseClock,
+@@ -45,24 +45,6 @@ pub(crate) struct SemaphoreSet {
+     sem_otime: AtomicU64,
+ }
+ 
+-// Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/asm-generic/ipcbuf.h#L22>.
+-#[padding_struct]
+-#[repr(C)]
+-#[derive(Clone, Copy, Debug, Default, Pod)]
+-struct IpcPerm {
+-    key: u32,
+-    uid: u32,
+-    gid: u32,
+-    cuid: u32,
+-    cgid: u32,
+-    mode: u16,
+-    _pad1: u16,
+-    seq: u16,
+-    _pad2: u16,
+-    _unused1: u64,
+-    _unused2: u64,
+-}
+-
+ // In Linux, most popular 64-bit architectures except x86_64 adopt the same
+ // layout of `semid_ds`.
+ // Reference: <https://elixir.bootlin.com/linux/v6.16.9/A/ident/semid64_ds>.
+@@ -265,15 +247,7 @@ impl SemaphoreSet {
+     }
+ 
+     pub(crate) fn semid_ds(&self) -> SemidDs {
+-        let ipc_perm = IpcPerm {
+-            key: self.permission.key().cast_unsigned(),
+-            uid: self.permission.uid().into(),
+-            gid: self.permission.gid().into(),
+-            cuid: self.permission.cuid().into(),
+-            cgid: self.permission.cguid().into(),
+-            mode: self.permission.mode(),
+-            ..IpcPerm::default()
+-        };
++        let ipc_perm = self.permission.to_c();
+ 
+         SemidDs {
+             sem_perm: ipc_perm,
+diff --git a/kernel/core/src/ipc/shared_memory.rs b/kernel/core/src/ipc/shared_memory.rs
+new file mode 100644
+index 0000000..54b53b0
+--- /dev/null
++++ b/kernel/core/src/ipc/shared_memory.rs
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! System V shared memory.
++//!
++//! A segment is a [`Vmo`] that every `shmat` maps shared into its caller. The X server's MIT-SHM
++//! extension relies on it: a client (Chromium, Xpra, GTK) draws into a segment that the server
++//! attaches too, instead of sending every image through the socket.
++//!
++//! As in Linux, `IPC_RMID` does not end a segment that is still attached: it is marked destroyed,
++//! loses its key, and lives until its last mapping goes. The namespace then keeps only a weak
++//! reference to the memory, which the mappings hold.
++
++use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
++
++use align_ext::AlignExt;
++
++use aster_rights::ReadOp;
++
++use super::{IpcKey, IpcPerm, IpcPermission};
++use crate::{
++    prelude::*,
++    process::{Credentials, Pid},
++    time::clocks::RealTimeCoarseClock,
++    vm::page_cache::{Vmo, VmoOptions},
++};
++
++/// The most segments in a namespace.
++pub(crate) const SHMMNI: usize = 4096;
++/// The smallest segment.
++pub(crate) const SHMMIN: usize = 1;
++/// The largest segment (Linux's default `SHMMAX`).
++pub(crate) const SHMMAX: usize = usize::MAX - (1 << 24);
++/// `shm_perm.mode` of a destroyed segment.
++const SHM_DEST: u16 = 0o1000;
++
++// Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/asm-generic/shmbuf.h>.
++#[padding_struct]
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, Pod)]
++pub(crate) struct ShmidDs {
++    shm_perm: IpcPerm,
++    shm_segsz: u64,
++    shm_atime: u64,
++    shm_dtime: u64,
++    shm_ctime: u64,
++    shm_cpid: i32,
++    shm_lpid: i32,
++    shm_nattch: u64,
++    _unused4: u64,
++    _unused5: u64,
++}
++
++pub(crate) struct SharedMemory {
++    permission: IpcPermission,
++    size: usize,
++    /// The memory while the segment is not destroyed.
++    memory: Mutex<Option<Arc<Vmo>>>,
++    /// The memory, as long as anything maps it.
++    weak_memory: Weak<Vmo>,
++    destroyed: AtomicBool,
++    creator_pid: Pid,
++    last_pid: AtomicI32,
++    attach_time: AtomicU64,
++    detach_time: AtomicU64,
++    change_time: AtomicU64,
++}
++
++fn now() -> u64 {
++    RealTimeCoarseClock::get().read_time().as_secs()
++}
++
++impl SharedMemory {
++    pub(super) fn new(
++        key: IpcKey,
++        size: usize,
++        mode: u16,
++        credentials: &Credentials<ReadOp>,
++        creator_pid: Pid,
++    ) -> Result<Self> {
++        if !(SHMMIN..=SHMMAX).contains(&size) {
++            return_errno_with_message!(Errno::EINVAL, "the shared memory size is out of range");
++        }
++        let vmo = VmoOptions::new(size.align_up(PAGE_SIZE)).alloc()?;
++        Ok(Self {
++            permission: IpcPermission::new_sem_perm(
++                key,
++                credentials.euid(),
++                credentials.egid(),
++                mode,
++            ),
++            size,
++            weak_memory: Arc::downgrade(&vmo),
++            memory: Mutex::new(Some(vmo)),
++            destroyed: AtomicBool::new(false),
++            creator_pid,
++            last_pid: AtomicI32::new(0),
++            attach_time: AtomicU64::new(0),
++            detach_time: AtomicU64::new(0),
++            change_time: AtomicU64::new(now()),
++        })
++    }
++
++    pub(crate) fn permission(&self) -> &IpcPermission {
++        &self.permission
++    }
++
++    pub(crate) fn size(&self) -> usize {
++        self.size
++    }
++
++    pub(crate) fn is_destroyed(&self) -> bool {
++        self.destroyed.load(Ordering::Relaxed)
++    }
++
++    /// The memory to map, while anything can still map it.
++    pub(crate) fn memory(&self) -> Option<Arc<Vmo>> {
++        self.weak_memory.upgrade()
++    }
++
++    /// Whether `vmo` is this segment's memory.
++    pub(crate) fn is_memory(&self, vmo: &Arc<Vmo>) -> bool {
++        Weak::ptr_eq(&self.weak_memory, &Arc::downgrade(vmo))
++    }
++
++    /// The mappings of the segment (each holds the memory, as the namespace does until `IPC_RMID`).
++    pub(crate) fn attach_count(&self) -> usize {
++        let held = usize::from(!self.is_destroyed());
++        self.weak_memory.strong_count().saturating_sub(held)
++    }
++
++    /// Marks the segment destroyed; returns whether it is still attached.
++    pub(super) fn destroy(&self) -> bool {
++        self.destroyed.store(true, Ordering::Relaxed);
++        self.memory.lock().take();
++        self.change_time.store(now(), Ordering::Relaxed);
++        self.weak_memory.strong_count() > 0
++    }
++
++    pub(crate) fn note_attach(&self, pid: Pid) {
++        self.last_pid.store(pid as i32, Ordering::Relaxed);
++        self.attach_time.store(now(), Ordering::Relaxed);
++    }
++
++    pub(crate) fn note_detach(&self, pid: Pid) {
++        self.last_pid.store(pid as i32, Ordering::Relaxed);
++        self.detach_time.store(now(), Ordering::Relaxed);
++    }
++
++    pub(crate) fn shmid_ds(&self) -> ShmidDs {
++        let mut perm = self.permission.to_c();
++        // A destroyed segment has lost its key, as in Linux.
++        if self.is_destroyed() {
++            perm.key = super::IPC_PRIVATE.cast_unsigned();
++            perm.mode |= SHM_DEST;
++        }
++        ShmidDs {
++            shm_perm: perm,
++            shm_segsz: self.size as u64,
++            shm_atime: self.attach_time.load(Ordering::Relaxed),
++            shm_dtime: self.detach_time.load(Ordering::Relaxed),
++            shm_ctime: self.change_time.load(Ordering::Relaxed),
++            shm_cpid: self.creator_pid as i32,
++            shm_lpid: self.last_pid.load(Ordering::Relaxed),
++            shm_nattch: self.attach_count() as u64,
++            ..ShmidDs::default()
++        }
++    }
++}
+diff --git a/kernel/core/src/syscall/arch/generic.rs b/kernel/core/src/syscall/arch/generic.rs
+index fb44a1b..d9572ca 100644
+--- a/kernel/core/src/syscall/arch/generic.rs
++++ b/kernel/core/src/syscall/arch/generic.rs
+@@ -127,6 +127,7 @@ macro_rules! import_generic_syscall_entries {
+             seccomp::sys_seccomp,
+             semctl::sys_semctl,
+             semget::sys_semget,
++            shm::{sys_shmat, sys_shmctl, sys_shmdt, sys_shmget},
+             semop::{sys_semop, sys_semtimedop},
+             sendfile::sys_sendfile,
+             sendmmsg::sys_sendmmsg,
+@@ -363,6 +364,10 @@ macro_rules! define_syscalls_with_generic_syscall_table {
+             SYS_SYSINFO = 179                => sys_sysinfo(args[..1]);
+             SYS_SEMGET = 190                 => sys_semget(args[..3]);
+             SYS_SEMCTL = 191                 => sys_semctl(args[..4]);
++            SYS_SHMGET = 194                 => sys_shmget(args[..3]);
++            SYS_SHMCTL = 195                 => sys_shmctl(args[..3]);
++            SYS_SHMAT = 196                  => sys_shmat(args[..3]);
++            SYS_SHMDT = 197                  => sys_shmdt(args[..1]);
+             SYS_SEMTIMEDOP = 192             => sys_semtimedop(args[..4]);
+             SYS_SEMOP = 193                  => sys_semop(args[..3]);
+             SYS_SOCKET = 198                 => sys_socket(args[..3]);
+diff --git a/kernel/core/src/syscall/arch/x86.rs b/kernel/core/src/syscall/arch/x86.rs
+index 08d723f..fdeba9e 100644
+--- a/kernel/core/src/syscall/arch/x86.rs
++++ b/kernel/core/src/syscall/arch/x86.rs
+@@ -131,6 +131,7 @@ use super::{
+     select::sys_select,
+     semctl::sys_semctl,
+     semget::sys_semget,
++    shm::{sys_shmat, sys_shmctl, sys_shmdt, sys_shmget},
+     semop::{sys_semop, sys_semtimedop},
+     sendfile::sys_sendfile,
+     sendmmsg::sys_sendmmsg,
+@@ -248,9 +249,13 @@ impl_syscall_nums_and_dispatch_fn! {
+     SYS_WAIT4 = 61             => sys_wait4(args[..4]);
+     SYS_KILL = 62              => sys_kill(args[..2]);
+     SYS_UNAME = 63             => sys_uname(args[..1]);
++    SYS_SHMGET = 29            => sys_shmget(args[..3]);
++    SYS_SHMAT = 30             => sys_shmat(args[..3]);
++    SYS_SHMCTL = 31            => sys_shmctl(args[..3]);
+     SYS_SEMGET = 64            => sys_semget(args[..3]);
+     SYS_SEMOP = 65             => sys_semop(args[..3]);
+     SYS_SEMCTL = 66            => sys_semctl(args[..4]);
++    SYS_SHMDT = 67             => sys_shmdt(args[..1]);
+     SYS_FCNTL = 72             => sys_fcntl(args[..3]);
+     SYS_FLOCK = 73             => sys_flock(args[..2]);
+     SYS_FSYNC = 74             => sys_fsync(args[..1]);
+diff --git a/kernel/core/src/syscall/mod.rs b/kernel/core/src/syscall/mod.rs
+index 5236770..442764d 100644
+--- a/kernel/core/src/syscall/mod.rs
++++ b/kernel/core/src/syscall/mod.rs
+@@ -150,6 +150,7 @@ mod select;
+ mod semctl;
+ mod semget;
+ mod semop;
++mod shm;
+ mod sendfile;
+ mod sendmmsg;
+ mod sendmsg;
+diff --git a/kernel/core/src/syscall/shm.rs b/kernel/core/src/syscall/shm.rs
+new file mode 100644
+index 0000000..fe8e37b
+--- /dev/null
++++ b/kernel/core/src/syscall/shm.rs
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `shmget`, `shmat`, `shmdt` and `shmctl` (ipc/shared_memory.rs).
++
++use align_ext::AlignExt;
++use ostd::mm::VmIo;
++
++use super::SyscallReturn;
++use crate::{
++    ipc::{IpcFlags, IpcId},
++    prelude::*,
++    vm::{
++        perms::VmPerms,
++        vmar::{MmapMode, VMAR_CAP_ADDR, VmarMapOffset},
++    },
++};
++
++const SHM_RDONLY: i32 = 0o10000;
++const SHM_RND: i32 = 0o20000;
++const SHM_REMAP: i32 = 0o40000;
++const SHM_EXEC: i32 = 0o100000;
++/// Attach addresses are aligned to this (`SHMLBA`).
++const SHMLBA: usize = PAGE_SIZE;
++
++const IPC_RMID: i32 = 0;
++const IPC_STAT: i32 = 2;
++const SHM_LOCK: i32 = 11;
++const SHM_UNLOCK: i32 = 12;
++/// Some C libraries add this to the command for the 64-bit layout, which is the only one here.
++const IPC_64: i32 = 0x100;
++
++fn shm_id(shmid: i32) -> Result<IpcId> {
++    IpcId::try_from(shmid.cast_unsigned())
++        .map_err(|_| Error::with_message(Errno::EINVAL, "non-positive shared memory IDs are invalid"))
++}
++
++pub(super) fn sys_shmget(key: i32, size: usize, shmflg: i32, ctx: &Context) -> Result<SyscallReturn> {
++    let flags = IpcFlags::from_bits_truncate(shmflg.cast_unsigned());
++    let mode = (shmflg.cast_unsigned() & 0o777) as u16;
++    debug!("shmget: key = {}, size = {}, flags = {:?}, mode = {:03o}", key, size, flags, mode);
++
++    let ns_proxy = ctx.thread_local.borrow_ns_proxy();
++    let ipc_ns = ns_proxy.unwrap().ipc_ns();
++    let shmid = ipc_ns.get_or_create_shm(
++        key,
++        size,
++        flags,
++        mode,
++        ctx.posix_thread.credentials(),
++        ctx.process.pid(),
++    )?;
++    Ok(SyscallReturn::Return(shmid.get() as isize))
++}
++
++pub(super) fn sys_shmat(shmid: i32, shmaddr: Vaddr, shmflg: i32, ctx: &Context) -> Result<SyscallReturn> {
++    let shmid = shm_id(shmid)?;
++    debug!("shmat: shmid = {:?}, addr = {:#x}, flags = {:#o}", shmid, shmaddr, shmflg);
++
++    let read_only = shmflg & SHM_RDONLY != 0;
++    let addr = if shmflg & SHM_RND != 0 {
++        shmaddr.align_down(SHMLBA)
++    } else if !shmaddr.is_multiple_of(SHMLBA) {
++        return_errno_with_message!(Errno::EINVAL, "the attach address is not aligned");
++    } else {
++        shmaddr
++    };
++
++    let ns_proxy = ctx.thread_local.borrow_ns_proxy();
++    let ipc_ns = ns_proxy.unwrap().ipc_ns();
++    let credentials = ctx.posix_thread.credentials();
++    let (memory, len) = ipc_ns.with_shm(shmid, |shm| {
++        if !shm
++            .permission()
++            .allows(credentials.euid(), credentials.egid(), !read_only)
++        {
++            return_errno_with_message!(Errno::EACCES, "no access to the shared memory segment");
++        }
++        let memory = shm
++            .memory()
++            .ok_or_else(|| Error::with_message(Errno::EIDRM, "the segment was removed"))?;
++        Ok((memory, shm.size().align_up(PAGE_SIZE)))
++    })?;
++
++    let mut perms = VmPerms::READ;
++    let mut may_perms = VmPerms::ALL_MAY_PERMS;
++    if read_only {
++        may_perms.remove(VmPerms::MAY_WRITE);
++    } else {
++        perms |= VmPerms::WRITE;
++    }
++    if shmflg & SHM_EXEC != 0 {
++        perms |= VmPerms::EXEC;
++    }
++
++    let user_space = ctx.user_space();
++    let mut options = user_space
++        .vmar()
++        .new_map(len, perms)
++        .may_perms(may_perms)
++        .map_mode(MmapMode::Shared)
++        .vmo(memory);
++    if addr != 0 {
++        if VMAR_CAP_ADDR.checked_sub(addr).is_none_or(|gap| gap < len) {
++            return_errno_with_message!(Errno::EINVAL, "the attach address is not in userspace");
++        }
++        options = options.offset(if shmflg & SHM_REMAP != 0 {
++            VmarMapOffset::FixedReplace(addr)
++        } else {
++            VmarMapOffset::FixedNoReplace(addr)
++        });
++    } else if shmflg & SHM_REMAP != 0 {
++        return_errno_with_message!(Errno::EINVAL, "SHM_REMAP needs an address");
++    }
++    let mapped = options.build()?;
++
++    let _ = ipc_ns.with_shm(shmid, |shm| {
++        shm.note_attach(ctx.process.pid());
++        Ok(())
++    });
++    Ok(SyscallReturn::Return(mapped as isize))
++}
++
++pub(super) fn sys_shmdt(shmaddr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
++    debug!("shmdt: addr = {:#x}", shmaddr);
++    if !shmaddr.is_multiple_of(PAGE_SIZE) {
++        return_errno_with_message!(Errno::EINVAL, "the address is not aligned");
++    }
++
++    let user_space = ctx.user_space();
++    let vmar = user_space.vmar();
++    // The segment mapped at the address: its memory names it.
++    let memory = {
++        let query = vmar.query(shmaddr..shmaddr + 1);
++        let found = query
++            .iter()
++            .find(|mapping| mapping.map_to_addr() == shmaddr)
++            .and_then(|mapping| mapping.shared_vmo().cloned());
++        found
++    }
++    .ok_or_else(|| Error::with_message(Errno::EINVAL, "no shared memory segment is attached there"))?;
++
++    let ns_proxy = ctx.thread_local.borrow_ns_proxy();
++    let ipc_ns = ns_proxy.unwrap().ipc_ns();
++    let len = ipc_ns
++        .find_shm(|_, shm| {
++            shm.is_memory(&memory).then(|| {
++                shm.note_detach(ctx.process.pid());
++                shm.size().align_up(PAGE_SIZE)
++            })
++        })
++        .ok_or_else(|| Error::with_message(Errno::EINVAL, "no shared memory segment is attached there"))?;
++    drop(memory);
++
++    vmar.remove_mapping(shmaddr..shmaddr + len);
++    ipc_ns.reap_shm();
++    Ok(SyscallReturn::Return(0))
++}
++
++pub(super) fn sys_shmctl(shmid: i32, cmd: i32, buf: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
++    let shmid = shm_id(shmid)?;
++    let cmd = cmd & !IPC_64;
++    debug!("shmctl: shmid = {:?}, cmd = {}, buf = {:#x}", shmid, cmd, buf);
++
++    let ns_proxy = ctx.thread_local.borrow_ns_proxy();
++    let ipc_ns = ns_proxy.unwrap().ipc_ns();
++    let credentials = ctx.posix_thread.credentials();
++
++    match cmd {
++        IPC_STAT => {
++            let shmid_ds = ipc_ns.with_shm(shmid, |shm| {
++                if !shm
++                    .permission()
++                    .allows(credentials.euid(), credentials.egid(), false)
++                {
++                    return_errno_with_message!(Errno::EACCES, "no access to the shared memory segment");
++                }
++                Ok(shm.shmid_ds())
++            })?;
++            ctx.user_space().write_val(buf, &shmid_ds)?;
++        }
++        IPC_RMID => {
++            let euid = credentials.euid();
++            ipc_ns.remove_shm(shmid, |shm| {
++                let permission = shm.permission();
++                if !(euid.is_root() || euid == permission.uid() || euid == permission.cuid()) {
++                    return_errno_with_message!(
++                        Errno::EPERM,
++                        "the process does not have permission to remove the segment"
++                    );
++                }
++                Ok(())
++            })?;
++        }
++        // Memory is never swapped out: locking it changes nothing.
++        SHM_LOCK | SHM_UNLOCK => {
++            ipc_ns.with_shm(shmid, |_| Ok(()))?;
++        }
++        _ => return_errno_with_message!(Errno::EINVAL, "unsupported shmctl command"),
++    }
++    Ok(SyscallReturn::Return(0))
++}
+diff --git a/kernel/core/src/vm/vmar/vm_mapping.rs b/kernel/core/src/vm/vmar/vm_mapping.rs
+index fe7ed78..7f2f1a9 100644
+--- a/kernel/core/src/vm/vmar/vm_mapping.rs
++++ b/kernel/core/src/vm/vmar/vm_mapping.rs
+@@ -221,6 +221,14 @@ impl VmMapping {
+         }
+     }
+ 
++    /// Returns the VMO of a shared mapping of one (System V shared memory, `shmdt`).
++    pub(crate) fn shared_vmo(&self) -> Option<&Arc<Vmo>> {
++        match &self.mapped_mem {
++            MappedMemory::Vmo(mapped_vmo) if self.map_mode.is_shared() => Some(mapped_vmo.vmo()),
++            _ => None,
++        }
++    }
++
+     /// Returns the shared futex backing identity for the address if available.
+     pub(crate) fn futex_backing(&self, addr: Vaddr) -> Result<Option<(Weak<Vmo>, usize)>> {
+         if !self.map_mode.is_shared() {

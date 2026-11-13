@@ -1,0 +1,197 @@
+diff --git a/kernel/comps/drm/src/ioctl/kms.rs b/kernel/comps/drm/src/ioctl/kms.rs
+index 6053321..711d658 100644
+--- a/kernel/comps/drm/src/ioctl/kms.rs
++++ b/kernel/comps/drm/src/ioctl/kms.rs
+@@ -694,8 +694,9 @@ impl DrmFile {
+     }
+ 
+     pub(super) fn drm_mode_dirty_fb(&self, cmd: ioctl_defs::ModeDirtyFb) -> Result<i32> {
+-        // TODO: Honor dirtyfb flags, color, and clip rectangles. For now,
+-        // treat every dirtyfb request as a whole-framebuffer refresh.
++        // The clip rectangles are the damage: only they are refreshed. Without any, the whole
++        // framebuffer is. A copy annotation's pairs are refreshed as damage too (both the source and
++        // the destination of each copy), which covers what changed. The fill color is ignored.
+         let args: DrmModeFbDirtyCmd = cmd.read()?;
+ 
+         let framebuffer = self.lookup_framebuffer(args.fb_id).ok_or(Errno::ENOENT)?;
+@@ -718,11 +719,25 @@ impl DrmFile {
+             return_errno_with_message!(Errno::EINVAL, "too many DRM clip rectangles");
+         }
+ 
+-        // Validate userspace access even though the refresh covers the whole framebuffer.
+-        cmd.with_data_ptr(|args_ptr| {
++        let clips = cmd.with_data_ptr(|args_ptr| {
+             copy_array_from_user::<DrmClipRect>(args_ptr.vm(), args.clips_ptr, args.num_clips)
+-                .map(drop)
+         })?;
++        let damage = clips
++            .iter()
++            .filter(|clip| clip.x2 > clip.x1 && clip.y2 > clip.y1)
++            .map(|clip| {
++                DrmRect::new(
++                    clip.x1.into(),
++                    clip.y1.into(),
++                    (clip.x2 - clip.x1).into(),
++                    (clip.y2 - clip.y1).into(),
++                )
++            })
++            .collect::<Vec<_>>();
++        // Clips that are all empty change nothing.
++        if !clips.is_empty() && damage.is_empty() {
++            return Ok(0);
++        }
+ 
+         let kms_ops = self.device().as_kms_ops().unwrap();
+         let object_store = kms_ops.mode_config().object_store().lock();
+@@ -737,7 +752,7 @@ impl DrmFile {
+             })
+             .collect::<Vec<_>>();
+ 
+-        kms_ops.refresh_dirty_fb(&framebuffer, &source_rects)?;
++        kms_ops.refresh_dirty_fb(&framebuffer, &source_rects, &damage)?;
+ 
+         Ok(0)
+     }
+diff --git a/kernel/comps/drm/src/kms/mod.rs b/kernel/comps/drm/src/kms/mod.rs
+index 86177a4..fc8a988 100644
+--- a/kernel/comps/drm/src/kms/mod.rs
++++ b/kernel/comps/drm/src/kms/mod.rs
+@@ -61,6 +61,9 @@ pub trait DrmKmsOps: DrmDevice {
+ 
+     /// Refreshes the regions of a framebuffer currently scanned out by planes.
+     ///
++    /// `source_rects` are the planes' source rectangles. `damage` holds the regions that changed,
++    /// in framebuffer coordinates; when it is empty, the whole framebuffer changed.
++    ///
+     /// # Locking
+     ///
+     /// The DRM core holds the object-store lock across this call. Implementations must not access
+@@ -69,6 +72,7 @@ pub trait DrmKmsOps: DrmDevice {
+         &self,
+         framebuffer: &DrmFramebuffer,
+         source_rects: &[DrmRect],
++        damage: &[DrmRect],
+     ) -> Result<()>;
+ }
+ 
+diff --git a/kernel/comps/drm/src/utils.rs b/kernel/comps/drm/src/utils.rs
+index a94def9..5d18cb7 100644
+--- a/kernel/comps/drm/src/utils.rs
++++ b/kernel/comps/drm/src/utils.rs
+@@ -109,6 +109,15 @@ impl DrmRect {
+         (self.x..right).contains(&x) && (self.y..bottom).contains(&y)
+     }
+ 
++    /// The part of `self` that `other` covers, if any.
++    pub fn intersection(&self, other: &Self) -> Option<Self> {
++        let x = self.x.max(other.x);
++        let y = self.y.max(other.y);
++        let right = self.right()?.min(other.right()?);
++        let bottom = self.bottom()?.min(other.bottom()?);
++        (x < right && y < bottom).then(|| Self::new(x, y, right - x, bottom - y))
++    }
++
+     /// Returns whether `other` is fully contained within `self`.
+     pub fn contains_rect(&self, other: &Self) -> bool {
+         let Some(self_right) = self.right() else {
+diff --git a/kernel/comps/simpledrm/src/lib.rs b/kernel/comps/simpledrm/src/lib.rs
+index 7746be6..7f0ccbd 100644
+--- a/kernel/comps/simpledrm/src/lib.rs
++++ b/kernel/comps/simpledrm/src/lib.rs
+@@ -130,6 +130,17 @@ impl SimpleDrmDevice {
+     }
+ 
+     fn flush_framebuffer(&self, framebuffer: &DrmFramebuffer, source_rect: DrmRect) -> Result<()> {
++        self.flush_region(framebuffer, source_rect, source_rect)
++    }
++
++    /// Copies `region` (framebuffer coordinates, within `source_rect`) of the framebuffer that
++    /// `source_rect` scans out to the same place on the boot framebuffer.
++    fn flush_region(
++        &self,
++        framebuffer: &DrmFramebuffer,
++        source_rect: DrmRect,
++        region: DrmRect,
++    ) -> Result<()> {
+         if framebuffer.pixel_format() != self.pixel_format {
+             return_errno_with_message!(
+                 Errno::EINVAL,
+@@ -159,34 +170,45 @@ impl SimpleDrmDevice {
+         }
+ 
+         let bytes_per_pixel = framebuffer.pixel_format().bytes_per_pixel();
+-        let row_len = output_width
++        let output_row_len = output_width
+             .checked_mul(bytes_per_pixel)
+             .ok_or(Errno::EOVERFLOW)?;
+         let destination_pitch = self.boot_framebuffer.line_size();
+-        if row_len > destination_pitch {
++        if output_row_len > destination_pitch {
+             return_errno_with_message!(
+                 Errno::EINVAL,
+                 "the simpledrm scanout row exceeds the physical framebuffer pitch"
+             );
+         }
++        if !source_rect.contains_rect(&region) {
++            return_errno_with_message!(
++                Errno::EINVAL,
++                "the simpledrm damage lies outside the scanout rectangle"
++            );
++        }
+ 
+         let source_pitch = framebuffer.pitch() as usize;
+         let framebuffer_offset = framebuffer.offset() as usize;
+-        let source_x = source_rect.x() as usize;
+-        let source_y = source_rect.y() as usize;
+-
+-        let source_x_bytes = source_x
++        // Where the region is on the screen: the scanout starts at its top left corner.
++        let destination_x = (region.x() - source_rect.x()) as usize;
++        let destination_y = (region.y() - source_rect.y()) as usize;
++        let region_x_bytes = (region.x() as usize)
++            .checked_mul(bytes_per_pixel)
++            .ok_or(Errno::EOVERFLOW)?;
++        let row_len = (region.width() as usize)
+             .checked_mul(bytes_per_pixel)
+             .ok_or(Errno::EOVERFLOW)?;
+         let mut row = vec![0; row_len];
+ 
+-        for row_index in 0..output_height {
+-            let source_offset =
+-                framebuffer_offset + (source_y + row_index) * source_pitch + source_x_bytes;
++        for row_index in 0..region.height() as usize {
++            let source_offset = framebuffer_offset
++                + (region.y() as usize + row_index) * source_pitch
++                + region_x_bytes;
+             framebuffer
+                 .gem_object()
+                 .read_bytes(source_offset, row.as_mut_slice())?;
+-            let destination_offset = row_index * destination_pitch;
++            let destination_offset = (destination_y + row_index) * destination_pitch
++                + destination_x * bytes_per_pixel;
+             self.boot_framebuffer
+                 .write_bytes_at(destination_offset, row.as_slice())?;
+         }
+@@ -268,9 +290,21 @@ impl DrmKmsOps for SimpleDrmDevice {
+         &self,
+         framebuffer: &DrmFramebuffer,
+         source_rects: &[DrmRect],
++        damage: &[DrmRect],
+     ) -> Result<()> {
+         for source_rect in source_rects {
+-            self.flush_framebuffer(framebuffer, *source_rect)?;
++            if damage.is_empty() {
++                self.flush_framebuffer(framebuffer, *source_rect)?;
++                continue;
++            }
++            // Only what changed is copied: a moving pointer or a blinking caret is a few rows
++            // of a few dozen pixels, not the whole screen.
++            for region in damage
++                .iter()
++                .filter_map(|region| region.intersection(source_rect))
++            {
++                self.flush_region(framebuffer, *source_rect, region)?;
++            }
+         }
+ 
+         Ok(())
