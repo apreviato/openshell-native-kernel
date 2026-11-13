@@ -7,9 +7,9 @@
 #   openshell-x <display> [Xvfb arguments...]
 #
 # It runs as the session user: `openshell-x --seat <user>` (as root, before
-# the session) hands that user the screen, the input devices and the console,
-# as logind does for the active seat. No udev: the devices present at start
-# are the session's. OPENSHELL_X=xvfb keeps Xvfb.
+# the session) hands that user the screen, the input devices, the sound
+# devices and the console, as logind does for the active seat. No udev: the
+# devices present at start are the session's. OPENSHELL_X=xvfb keeps Xvfb.
 #
 # initramfs.nix sets OPENSHELL_XORG, OPENSHELL_XORG_MODULES, OPENSHELL_XORG_FONTS
 # and OPENSHELL_XVFB to the store paths. OPENSHELL_X_KEYBOARD, "<layout>" or
@@ -21,7 +21,7 @@ card=/dev/dri/card0
 
 if [ "${1:-}" = --seat ]; then
     user=$2
-    for device in "$card" /dev/dri/renderD* /dev/fb0 /dev/input/event* /dev/tty0 /dev/tty1; do
+    for device in "$card" /dev/dri/renderD* /dev/fb0 /dev/input/event* /dev/snd/* /dev/tty0 /dev/tty1; do
         if [ -e "$device" ]; then
             chown "$user" "$device"
             chmod 0600 "$device"

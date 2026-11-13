@@ -1,0 +1,1312 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a885234..150ba39 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -242,6 +242,19 @@ dependencies = [
+  "zerocopy",
+ ]
+ 
++[[package]]
++name = "aster-ethernet"
++version = "0.1.0"
++dependencies = [
++ "aster-bigtcp",
++ "aster-network",
++ "aster-pci",
++ "aster-softirq",
++ "component",
++ "ostd",
++ "spin",
++]
++
+ [[package]]
+ name = "aster-framebuffer"
+ version = "0.1.0"
+@@ -527,6 +540,7 @@ dependencies = [
+  "aster-backlight",
+  "aster-core",
+  "aster-drm",
++ "aster-ethernet",
+  "aster-i8042",
+  "aster-simpledrm",
+  "aster-uart",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6f68f73..450ef84 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,6 +29,7 @@ members = [
+     "kernel",
+     "kernel/comps/backlight",
+     "kernel/comps/drm",
++    "kernel/comps/ethernet",
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
+     "kernel/comps/sound",
+@@ -87,6 +88,7 @@ default-members = [
+     "kernel",
+     "kernel/comps/backlight",
+     "kernel/comps/drm",
++    "kernel/comps/ethernet",
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
+     "kernel/comps/sound",
+@@ -178,6 +180,7 @@ aster-drm = { path = "kernel/comps/drm" }
+ aster-backlight = { path = "kernel/comps/backlight" }
+ aster-i8042 = { path = "kernel/comps/i8042" }
+ aster-usb = { path = "kernel/comps/usb" }
++aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+ aster-uart = { path = "kernel/comps/uart" }
+diff --git a/Components.toml b/Components.toml
+index c353ee5..54139af 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -22,6 +22,7 @@ systree = { name = "aster-systree" }
+ time = { name = "aster-time" }
+ uart = { name = "aster-uart" }
+ usb = { name = "aster-usb" }
++ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+ 
+ [whitelist]
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 2186826..a0a7c79 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -14,6 +14,7 @@ aster-drm.workspace = true
+ aster-simpledrm.workspace = true
+ aster-uart.workspace = true
+ aster-usb.workspace = true
++aster-ethernet.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+ aster-backlight.workspace = true
+diff --git a/kernel/comps/ethernet/Cargo.toml b/kernel/comps/ethernet/Cargo.toml
+new file mode 100755
+index 0000000..238875a
+--- /dev/null
++++ b/kernel/comps/ethernet/Cargo.toml
+@@ -0,0 +1,16 @@
++[package]
++name = "aster-ethernet"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-bigtcp.workspace = true
++aster-network.workspace = true
++aster-pci.workspace = true
++aster-softirq.workspace = true
++component.workspace = true
++ostd.workspace = true
++spin.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/ethernet/src/e1000.rs b/kernel/comps/ethernet/src/e1000.rs
+new file mode 100755
+index 0000000..df73e51
+--- /dev/null
++++ b/kernel/comps/ethernet/src/e1000.rs
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Intel's gigabit controllers of the e1000 family, with their legacy
++//! descriptors: the 8254x (Linux's e1000), the 82571 to 82574 and 82583,
++//! and the ICH and PCH LAN controllers (82566 to I219) of Intel chipsets
++//! (Linux's e1000e).
++//!
++//! References: Intel's 8254x and 82574 software developer's manuals;
++//! Linux's `drivers/net/ethernet/intel/e1000e`.
++
++use alloc::{boxed::Box, sync::Arc, vec::Vec};
++use core::sync::atomic::Ordering;
++
++use aster_pci::{PciDeviceId, cfg_space::BarAccess, common_device::PciCommonDevice};
++
++use crate::{Nic, RxProbe, ring::Ring};
++
++mod reg {
++    pub(super) const CTRL: usize = 0x0000;
++    pub(super) const STATUS: usize = 0x0008;
++    pub(super) const EERD: usize = 0x0014;
++    pub(super) const CTRL_EXT: usize = 0x0018;
++    pub(super) const FWSM: usize = 0x5b54;
++    pub(super) const IMC: usize = 0x00d8;
++    pub(super) const RCTL: usize = 0x0100;
++    pub(super) const TCTL: usize = 0x0400;
++    pub(super) const TIPG: usize = 0x0410;
++    pub(super) const RDBAL: usize = 0x2800;
++    pub(super) const RDBAH: usize = 0x2804;
++    pub(super) const RDLEN: usize = 0x2808;
++    pub(super) const RDH: usize = 0x2810;
++    pub(super) const RDT: usize = 0x2818;
++    pub(super) const TDBAL: usize = 0x3800;
++    pub(super) const TDBAH: usize = 0x3804;
++    pub(super) const TDLEN: usize = 0x3808;
++    pub(super) const TDH: usize = 0x3810;
++    pub(super) const TDT: usize = 0x3818;
++    pub(super) const MTA: usize = 0x5200;
++    pub(super) const RAL: usize = 0x5400;
++    pub(super) const RAH: usize = 0x5404;
++}
++
++const CTRL_SLU: u32 = 1 << 6;
++const CTRL_ASDE: u32 = 1 << 5;
++const CTRL_LANPHYPC_OVERRIDE: u32 = 1 << 16;
++const CTRL_LANPHYPC_VALUE: u32 = 1 << 17;
++const CTRL_RST: u32 = 1 << 26;
++const CTRL_PHY_RST: u32 = 1 << 31;
++const CTRL_EXT_FORCE_SMBUS: u32 = 1 << 11;
++const FWSM_FW_VALID: u32 = 1 << 15;
++const STATUS_LU: u32 = 1 << 1;
++const RCTL_EN: u32 = 1 << 1;
++const RCTL_MPE: u32 = 1 << 4;
++const RCTL_BAM: u32 = 1 << 15;
++const RCTL_SECRC: u32 = 1 << 26;
++const TCTL_EN: u32 = 1 << 1;
++const TCTL_PSP: u32 = 1 << 3;
++const TCTL_CT: u32 = 0x0f << 4;
++const TCTL_COLD: u32 = 0x3f << 12;
++/// Inter-packet gap for copper (Linux's defaults: 8, 8, 6).
++const TIPG_COPPER: u32 = 6 << 20 | 8 << 10 | 8;
++/// Descriptor fields (legacy layout).
++const DESC_LENGTH: usize = 8;
++const DESC_CMD: usize = 11;
++const DESC_STATUS: usize = 12;
++const DESC_ERRORS: usize = 13;
++const STATUS_DD: u8 = 1 << 0;
++const STATUS_EOP: u8 = 1 << 1;
++const CMD_EOP: u8 = 1 << 0;
++const CMD_IFCS: u8 = 1 << 1;
++const CMD_RS: u8 = 1 << 3;
++const RX_COUNT: usize = 256;
++const TX_COUNT: usize = 256;
++
++/// The 8254x (Linux's e1000): their EEPROM read register is laid out apart.
++const E1000: &[u16] = &[
++    0x1000, 0x1001, 0x1004, 0x1008, 0x1009, 0x100c, 0x100d, 0x100e, 0x100f, 0x1010, 0x1011, 0x1012, 0x1013, 0x1014, 0x1015,
++    0x1016, 0x1017, 0x1018, 0x1019, 0x101a, 0x101d, 0x101e, 0x1026, 0x1027, 0x1028, 0x1075, 0x1076, 0x1077, 0x1078, 0x1079,
++    0x107a, 0x107b, 0x107c, 0x108a, 0x1099, 0x10b5,
++];
++
++/// 82571 to 82574, 82583, 80003ES2LAN (Linux's e1000e, without ICH/PCH).
++const E1000E: &[u16] = &[
++    0x105e, 0x105f, 0x1060, 0x107d, 0x107e, 0x107f, 0x108b, 0x108c, 0x1096, 0x1098, 0x109a, 0x10a4, 0x10a5, 0x10b9, 0x10ba,
++    0x10bb, 0x10bc, 0x10d3, 0x10d5, 0x10d9, 0x10da, 0x10f6, 0x150c,
++];
++
++/// The LAN controllers of Intel chipsets: ICH8 to ICH10, then PCH (82577
++/// to I219); the ones from I217 on are "LPT" and later.
++const ICH: &[u16] = &[
++    0x1049, 0x104a, 0x104b, 0x104c, 0x104d, 0x10bd, 0x10bf, 0x10c0, 0x10c2, 0x10c3, 0x10c4, 0x10c5, 0x10cb, 0x10cc, 0x10cd,
++    0x10ce, 0x10de, 0x10df, 0x10e5, 0x10ea, 0x10eb, 0x10ef, 0x10f0, 0x10f5, 0x1501, 0x1502, 0x1503, 0x294c,
++];
++const LPT: &[u16] = &[
++    0x153a, 0x153b, 0x1559, 0x155a, 0x15a0, 0x15a1, 0x15a2, 0x15a3, 0x156f, 0x1570, 0x15b7, 0x15b8, 0x15b9, 0x15bb, 0x15bc,
++    0x15bd, 0x15be, 0x15d6, 0x15d7, 0x15d8, 0x15e3, 0x15df, 0x15e0, 0x15e1, 0x15e2, 0x0d4c, 0x0d4d, 0x0d4e, 0x0d4f, 0x0d53,
++    0x0d55, 0x15f4, 0x15f5, 0x15f9, 0x15fa, 0x15fb, 0x15fc, 0x1a1c, 0x1a1d, 0x1a1e, 0x1a1f, 0x0dc5, 0x0dc6, 0x0dc7, 0x0dc8,
++    0x550a, 0x550b, 0x550c, 0x550d, 0x550e, 0x550f, 0x5510, 0x5511, 0x57a0, 0x57a1, 0x57b3, 0x57b4, 0x57b5, 0x57b6, 0x57b7,
++    0x57b8, 0x57b9, 0x57ba,
++];
++
++pub(crate) fn supports(id: &PciDeviceId) -> bool {
++    id.vendor_id == 0x8086 && [E1000, E1000E, ICH, LPT].iter().any(|list| list.contains(&id.device_id))
++}
++
++struct E1000Nic {
++    mmio: BarAccess,
++    rx: Ring,
++    tx: Ring,
++    /// The oldest transmit descriptor not yet seen done.
++    tx_clean: usize,
++    mac: [u8; 6],
++    _device: PciCommonDevice,
++}
++
++impl E1000Nic {
++    fn r(&self, at: usize) -> u32 {
++        self.mmio.read_once::<u32>(at).unwrap_or(u32::MAX)
++    }
++
++    fn w(&self, at: usize, value: u32) {
++        let _ = self.mmio.write_once::<u32>(at, value);
++    }
++}
++
++fn read32(mmio: &BarAccess, at: usize) -> u32 {
++    mmio.read_once::<u32>(at).unwrap_or(u32::MAX)
++}
++
++fn write32(mmio: &BarAccess, at: usize, value: u32) {
++    let _ = mmio.write_once::<u32>(at, value);
++}
++
++/// An EEPROM word through EERD: the 8254x put the address at bit 8 and
++/// say done at bit 4, the later ones at bit 2 and bit 1.
++fn eeprom_word(mmio: &BarAccess, word: u16, old_layout: bool) -> Option<u16> {
++    let (shift, done) = if old_layout { (8, 1 << 4) } else { (2, 1 << 1) };
++    write32(mmio, reg::EERD, u32::from(word) << shift | 1);
++    for _ in 0..100_000 {
++        let value = read32(mmio, reg::EERD);
++        if value & done != 0 {
++            return Some((value >> 16) as u16);
++        }
++        core::hint::spin_loop();
++    }
++    None
++}
++
++pub(crate) fn start(mut device: PciCommonDevice) -> bool {
++    let id = *device.device_id();
++    let location = *device.location();
++    // Memory decoding and bus mastering.
++    let command = location.read16(0x04);
++    location.write16(0x04, command | 0x06);
++    let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else { return false };
++    let lpt = LPT.contains(&id.device_id);
++    let old_layout = E1000.contains(&id.device_id);
++
++    write32(&mmio, reg::IMC, u32::MAX);
++    // The PHY of the PCH controllers from I217 on may sleep in its ultra
++    // low power mode: without the management firmware, wake it (Linux's
++    // LANPHYPC toggle).
++    if lpt && read32(&mmio, reg::FWSM) & FWSM_FW_VALID == 0 {
++        let ctrl = read32(&mmio, reg::CTRL);
++        write32(&mmio, reg::CTRL, (ctrl | CTRL_LANPHYPC_OVERRIDE) & !CTRL_LANPHYPC_VALUE);
++        crate::delay_ms(1);
++        write32(&mmio, reg::CTRL, ctrl & !(CTRL_LANPHYPC_OVERRIDE | CTRL_LANPHYPC_VALUE));
++        crate::delay_ms(50);
++    }
++    // Reset: the controller reloads its MAC address and defaults.
++    write32(&mmio, reg::CTRL, read32(&mmio, reg::CTRL) | CTRL_RST);
++    crate::delay_ms(20);
++    for _ in 0..1000 {
++        if read32(&mmio, reg::CTRL) & CTRL_RST == 0 {
++            break;
++        }
++        crate::delay_ms(1);
++    }
++    write32(&mmio, reg::IMC, u32::MAX);
++    if lpt {
++        let ext = read32(&mmio, reg::CTRL_EXT);
++        write32(&mmio, reg::CTRL_EXT, ext & !CTRL_EXT_FORCE_SMBUS);
++    }
++    // The link: up, speed found by the PHY.
++    let ctrl = read32(&mmio, reg::CTRL);
++    write32(&mmio, reg::CTRL, (ctrl | CTRL_SLU | CTRL_ASDE) & !CTRL_PHY_RST);
++
++    // The MAC address the reset loaded, or the EEPROM's.
++    let (low, high) = (read32(&mmio, reg::RAL), read32(&mmio, reg::RAH));
++    let mut mac = [low as u8, (low >> 8) as u8, (low >> 16) as u8, (low >> 24) as u8, high as u8, (high >> 8) as u8];
++    if mac == [0; 6] || mac == [0xff; 6] {
++        for word in 0..3u16 {
++            let Some(value) = eeprom_word(&mmio, word, old_layout) else { break };
++            mac[usize::from(word) * 2] = value as u8;
++            mac[usize::from(word) * 2 + 1] = (value >> 8) as u8;
++        }
++        let low = u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]);
++        write32(&mmio, reg::RAL, low);
++        write32(&mmio, reg::RAH, u32::from(mac[4]) | u32::from(mac[5]) << 8 | 1 << 31);
++    }
++    for index in 0..128 {
++        write32(&mmio, reg::MTA + index * 4, 0);
++    }
++
++    let (Some(rx), Some(tx)) = (Ring::new(RX_COUNT), Ring::new(TX_COUNT)) else { return false };
++    for index in 0..RX_COUNT {
++        rx.write64(index, 0, rx.buffer_address(index));
++        rx.write32(index, 8, 0);
++        rx.write32(index, 12, 0);
++    }
++    for index in 0..TX_COUNT {
++        tx.write64(index, 0, tx.buffer_address(index));
++        tx.write32(index, 8, 0);
++        // Free from the start: done.
++        tx.write32(index, 12, u32::from(STATUS_DD));
++    }
++    write32(&mmio, reg::RDBAL, rx.base() as u32);
++    write32(&mmio, reg::RDBAH, (rx.base() >> 32) as u32);
++    write32(&mmio, reg::RDLEN, rx.bytes() as u32);
++    write32(&mmio, reg::RDH, 0);
++    write32(&mmio, reg::RDT, (RX_COUNT - 1) as u32);
++    // Broadcast and every multicast (IPv6's neighbours), 2 KiB buffers,
++    // the CRC stripped.
++    write32(&mmio, reg::RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC);
++    write32(&mmio, reg::TDBAL, tx.base() as u32);
++    write32(&mmio, reg::TDBAH, (tx.base() >> 32) as u32);
++    write32(&mmio, reg::TDLEN, tx.bytes() as u32);
++    write32(&mmio, reg::TDH, 0);
++    write32(&mmio, reg::TDT, 0);
++    write32(&mmio, reg::TIPG, TIPG_COPPER);
++    write32(&mmio, reg::TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
++
++    let probe: Arc<dyn RxProbe> = Arc::new(Probe { descriptors: rx.descriptors.clone(), next: rx.next.clone() });
++    let nic = E1000Nic { mmio, rx, tx, tx_clean: 0, mac, _device: device };
++    let model = if old_layout { "Intel 8254x" } else if lpt || ICH.contains(&id.device_id) { "Intel PCH LAN" } else { "Intel 8257x" };
++    crate::register(Box::new(nic), probe, model);
++    true
++}
++
++struct Probe {
++    descriptors: Arc<ostd::mm::dma::DmaCoherent>,
++    next: Arc<core::sync::atomic::AtomicUsize>,
++}
++
++impl RxProbe for Probe {
++    fn has_frames(&self) -> bool {
++        use ostd::mm::VmIo;
++        let index = self.next.load(Ordering::Acquire);
++        let status: u8 = self.descriptors.read_val(index * crate::ring::DESCRIPTOR + DESC_STATUS).unwrap_or(0);
++        status & STATUS_DD != 0
++    }
++}
++
++impl Nic for E1000Nic {
++    fn mac(&self) -> [u8; 6] {
++        self.mac
++    }
++
++    fn receive(&mut self) -> Option<Vec<u8>> {
++        loop {
++            let index = self.rx.next();
++            let status = self.rx.read8(index, DESC_STATUS);
++            if status & STATUS_DD == 0 {
++                return None;
++            }
++            let length = usize::from(self.rx.read16(index, DESC_LENGTH));
++            let errors = self.rx.read8(index, DESC_ERRORS);
++            let frame = (status & STATUS_EOP != 0 && errors == 0 && length >= 14).then(|| self.rx.read_buffer(index, length));
++            // The descriptor goes back to the controller.
++            self.rx.write32(index, 8, 0);
++            self.rx.write32(index, 12, 0);
++            self.w(reg::RDT, index as u32);
++            self.rx.advance();
++            if frame.is_some() {
++                return frame;
++            }
++        }
++    }
++
++    fn can_send(&mut self) -> bool {
++        while self.tx_clean != self.tx.next() && self.tx.read8(self.tx_clean, DESC_STATUS) & STATUS_DD != 0 {
++            self.tx_clean = (self.tx_clean + 1) % TX_COUNT;
++        }
++        (self.tx.next() + 1) % TX_COUNT != self.tx_clean
++    }
++
++    fn send(&mut self, frame: &[u8]) -> bool {
++        if !self.can_send() || frame.len() > crate::ring::BUFFER {
++            return false;
++        }
++        let index = self.tx.next();
++        self.tx.write_buffer(index, frame);
++        self.tx.write64(index, 0, self.tx.buffer_address(index));
++        self.tx.write16(index, DESC_LENGTH, frame.len() as u16);
++        self.tx.write8(index, 10, 0);
++        self.tx.write8(index, DESC_CMD, CMD_EOP | CMD_IFCS | CMD_RS);
++        self.tx.write8(index, DESC_STATUS, 0);
++        self.tx.write8(index, 13, 0);
++        self.tx.write16(index, 14, 0);
++        self.tx.advance();
++        self.w(reg::TDT, self.tx.next() as u32);
++        true
++    }
++
++    fn link_up(&self) -> bool {
++        self.r(reg::STATUS) & STATUS_LU != 0
++    }
++}
+diff --git a/kernel/comps/ethernet/src/igb.rs b/kernel/comps/ethernet/src/igb.rs
+new file mode 100755
+index 0000000..6390bb9
+--- /dev/null
++++ b/kernel/comps/ethernet/src/igb.rs
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Intel's controllers with advanced descriptors and per-queue registers:
++//! the 82575/82576/82580, I350, I210 and I211 (Linux's igb: the I211 is on
++//! many desktop motherboards) and the 2.5-gigabit I225 and I226 (Linux's
++//! igc). One receive and one transmit queue, polled.
++//!
++//! References: Intel's 82576, I210 and I225 datasheets; Linux's
++//! `drivers/net/ethernet/intel/igb` and `igc`.
++
++use alloc::{boxed::Box, sync::Arc, vec::Vec};
++use core::sync::atomic::Ordering;
++
++use aster_pci::{PciDeviceId, cfg_space::BarAccess, common_device::PciCommonDevice};
++
++use crate::{Nic, RxProbe, ring::Ring};
++
++mod reg {
++    pub(super) const CTRL: usize = 0x0000;
++    pub(super) const STATUS: usize = 0x0008;
++    pub(super) const MDIC: usize = 0x0020;
++    pub(super) const IMC: usize = 0x150c;
++    pub(super) const IMC_IGC: usize = 0x00d8;
++    pub(super) const RCTL: usize = 0x0100;
++    pub(super) const TCTL: usize = 0x0400;
++    pub(super) const RDBAL: usize = 0xc000;
++    pub(super) const RDBAH: usize = 0xc004;
++    pub(super) const RDLEN: usize = 0xc008;
++    pub(super) const SRRCTL: usize = 0xc00c;
++    pub(super) const RDH: usize = 0xc010;
++    pub(super) const RDT: usize = 0xc018;
++    pub(super) const RXDCTL: usize = 0xc028;
++    pub(super) const TDBAL: usize = 0xe000;
++    pub(super) const TDBAH: usize = 0xe004;
++    pub(super) const TDLEN: usize = 0xe008;
++    pub(super) const TDH: usize = 0xe010;
++    pub(super) const TDT: usize = 0xe018;
++    pub(super) const TXDCTL: usize = 0xe028;
++    pub(super) const MTA: usize = 0x5200;
++    pub(super) const RAL: usize = 0x5400;
++    pub(super) const RAH: usize = 0x5404;
++}
++
++const CTRL_SLU: u32 = 1 << 6;
++const CTRL_RST: u32 = 1 << 26;
++const CTRL_DEV_RST: u32 = 1 << 29;
++const STATUS_LU: u32 = 1 << 1;
++/// MDIC: write, ready, error; the internal PHY's address.
++const MDIC_WRITE: u32 = 1 << 26;
++const MDIC_READY: u32 = 1 << 28;
++const MDIC_ERROR: u32 = 1 << 30;
++const PHY_ADDRESS: u32 = 1;
++/// The PHY's control register: auto-negotiation on and restarted, not
++/// powered down.
++const PHY_CONTROL: u32 = 0;
++const PHY_AUTONEG: u32 = 0x1000 | 0x0200;
++const RCTL_EN: u32 = 1 << 1;
++const RCTL_MPE: u32 = 1 << 4;
++const RCTL_BAM: u32 = 1 << 15;
++const RCTL_SECRC: u32 = 1 << 26;
++const TCTL_EN: u32 = 1 << 1;
++const TCTL_PSP: u32 = 1 << 3;
++const TCTL_CT: u32 = 0x0f << 4;
++const TCTL_COLD: u32 = 0x3f << 12;
++const QUEUE_ENABLE: u32 = 1 << 25;
++/// SRRCTL: 2 KiB buffers, advanced one-buffer descriptors.
++const SRRCTL_ADV_ONE_BUFFER: u32 = 1 << 25 | 2;
++/// Advanced descriptors' write-back: status at 8 (DD, EOP), length at 12.
++const RX_STATUS: usize = 8;
++const RX_LENGTH: usize = 12;
++const DD: u32 = 1 << 0;
++const EOP: u32 = 1 << 1;
++/// The error bits of the receive write-back (RXE and the checksum ones
++/// left out).
++const RX_ERRORS: u32 = 1 << 31;
++/// Advanced transmit data descriptor: type data, end of packet, insert the
++/// CRC, report status, extended.
++const TX_DTYP_DATA: u32 = 0x3 << 20;
++const TX_EOP: u32 = 1 << 24;
++const TX_IFCS: u32 = 1 << 25;
++const TX_RS: u32 = 1 << 27;
++const TX_DEXT: u32 = 1 << 29;
++const RX_COUNT: usize = 256;
++const TX_COUNT: usize = 256;
++
++const IGB: &[u16] = &[
++    0x10a7, 0x10a9, 0x10d6, 0x10c9, 0x10e6, 0x10e7, 0x10e8, 0x1526, 0x150a, 0x1518, 0x150d, 0x150e, 0x150f, 0x1510, 0x1511,
++    0x1516, 0x1527, 0x1521, 0x1522, 0x1523, 0x1524, 0x1f40, 0x1f41, 0x1f45, 0x1533, 0x1536, 0x1537, 0x1538, 0x157b, 0x157c,
++    0x15f6, 0x1539,
++];
++const IGC: &[u16] = &[0x15f2, 0x15f3, 0x15f7, 0x15f8, 0x15fd, 0x0d9f, 0x3100, 0x3101, 0x5502, 0x125b, 0x125c, 0x125d, 0x125f, 0x5503, 0x3102];
++
++pub(crate) fn supports(id: &PciDeviceId) -> bool {
++    id.vendor_id == 0x8086 && (IGB.contains(&id.device_id) || IGC.contains(&id.device_id))
++}
++
++/// Writes a PHY register through MDIC.
++fn phy_write(mmio: &BarAccess, register: u32, value: u32) -> bool {
++    write32(mmio, reg::MDIC, (value & 0xffff) | register << 16 | PHY_ADDRESS << 21 | MDIC_WRITE);
++    for _ in 0..10_000 {
++        let mdic = read32(mmio, reg::MDIC);
++        if mdic & MDIC_READY != 0 {
++            return mdic & MDIC_ERROR == 0;
++        }
++        core::hint::spin_loop();
++    }
++    false
++}
++
++fn read32(mmio: &BarAccess, at: usize) -> u32 {
++    mmio.read_once::<u32>(at).unwrap_or(u32::MAX)
++}
++
++fn write32(mmio: &BarAccess, at: usize, value: u32) {
++    let _ = mmio.write_once::<u32>(at, value);
++}
++
++struct IgbNic {
++    mmio: BarAccess,
++    rx: Ring,
++    tx: Ring,
++    tx_clean: usize,
++    mac: [u8; 6],
++    _device: PciCommonDevice,
++}
++
++impl IgbNic {
++    fn give_rx(&self, index: usize) {
++        // Read format: the packet buffer, no header buffer.
++        self.rx.write64(index, 0, self.rx.buffer_address(index));
++        self.rx.write64(index, 8, 0);
++    }
++}
++
++pub(crate) fn start(mut device: PciCommonDevice) -> bool {
++    let id = *device.device_id();
++    let location = *device.location();
++    let command = location.read16(0x04);
++    location.write16(0x04, command | 0x06);
++    let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else { return false };
++    let igc = IGC.contains(&id.device_id);
++
++    let imc = if igc { reg::IMC_IGC } else { reg::IMC };
++    write32(&mmio, imc, u32::MAX);
++    write32(&mmio, reg::RCTL, 0);
++    write32(&mmio, reg::TCTL, TCTL_PSP);
++    let reset = if igc { CTRL_DEV_RST } else { CTRL_RST };
++    write32(&mmio, reg::CTRL, read32(&mmio, reg::CTRL) | reset);
++    crate::delay_ms(20);
++    for _ in 0..1000 {
++        if read32(&mmio, reg::CTRL) & reset == 0 {
++            break;
++        }
++        crate::delay_ms(1);
++    }
++    write32(&mmio, imc, u32::MAX);
++    write32(&mmio, reg::CTRL, read32(&mmio, reg::CTRL) | CTRL_SLU);
++    // The PHY powered up and negotiating (Linux's igb_power_up_phy_copper
++    // and its copper link setup); the I225/I226 do it themselves.
++    if !igc && !phy_write(&mmio, PHY_CONTROL, PHY_AUTONEG) {
++        ostd::notice!("{:04x}:{:04x}: the PHY did not answer", id.vendor_id, id.device_id);
++    }
++
++    let (low, high) = (read32(&mmio, reg::RAL), read32(&mmio, reg::RAH));
++    let mac = [low as u8, (low >> 8) as u8, (low >> 16) as u8, (low >> 24) as u8, high as u8, (high >> 8) as u8];
++    for index in 0..128 {
++        write32(&mmio, reg::MTA + index * 4, 0);
++    }
++
++    let (Some(rx), Some(tx)) = (Ring::new(RX_COUNT), Ring::new(TX_COUNT)) else { return false };
++    write32(&mmio, reg::RXDCTL, 0);
++    write32(&mmio, reg::RDBAL, rx.base() as u32);
++    write32(&mmio, reg::RDBAH, (rx.base() >> 32) as u32);
++    write32(&mmio, reg::RDLEN, rx.bytes() as u32);
++    write32(&mmio, reg::SRRCTL, SRRCTL_ADV_ONE_BUFFER);
++    write32(&mmio, reg::RDH, 0);
++    write32(&mmio, reg::RDT, 0);
++    write32(&mmio, reg::RXDCTL, QUEUE_ENABLE);
++    for _ in 0..100 {
++        if read32(&mmio, reg::RXDCTL) & QUEUE_ENABLE != 0 {
++            break;
++        }
++        crate::delay_ms(1);
++    }
++    write32(&mmio, reg::TXDCTL, 0);
++    write32(&mmio, reg::TDBAL, tx.base() as u32);
++    write32(&mmio, reg::TDBAH, (tx.base() >> 32) as u32);
++    write32(&mmio, reg::TDLEN, tx.bytes() as u32);
++    write32(&mmio, reg::TDH, 0);
++    write32(&mmio, reg::TDT, 0);
++    write32(&mmio, reg::TXDCTL, QUEUE_ENABLE);
++    for _ in 0..100 {
++        if read32(&mmio, reg::TXDCTL) & QUEUE_ENABLE != 0 {
++            break;
++        }
++        crate::delay_ms(1);
++    }
++
++    let nic = IgbNic { mmio, rx, tx, tx_clean: 0, mac, _device: device };
++    for index in 0..RX_COUNT {
++        nic.give_rx(index);
++    }
++    for index in 0..TX_COUNT {
++        nic.tx.write64(index, 0, 0);
++        nic.tx.write32(index, 8, 0);
++        // Free from the start: done.
++        nic.tx.write32(index, 12, DD);
++    }
++    write32(&nic.mmio, reg::RDT, (RX_COUNT - 1) as u32);
++    write32(&nic.mmio, reg::RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC);
++    write32(&nic.mmio, reg::TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
++
++    let probe: Arc<dyn RxProbe> = Arc::new(Probe { descriptors: nic.rx.descriptors.clone(), next: nic.rx.next.clone() });
++    crate::register(Box::new(nic), probe, if igc { "Intel I225/I226" } else { "Intel 82576/I210/I211/I350" });
++    true
++}
++
++struct Probe {
++    descriptors: Arc<ostd::mm::dma::DmaCoherent>,
++    next: Arc<core::sync::atomic::AtomicUsize>,
++}
++
++impl RxProbe for Probe {
++    fn has_frames(&self) -> bool {
++        use ostd::mm::VmIo;
++        let index = self.next.load(Ordering::Acquire);
++        let status: u32 = self.descriptors.read_val(index * crate::ring::DESCRIPTOR + RX_STATUS).unwrap_or(0);
++        status & DD != 0
++    }
++}
++
++impl Nic for IgbNic {
++    fn mac(&self) -> [u8; 6] {
++        self.mac
++    }
++
++    fn receive(&mut self) -> Option<Vec<u8>> {
++        loop {
++            let index = self.rx.next();
++            let status = self.rx.read32(index, RX_STATUS);
++            if status & DD == 0 {
++                return None;
++            }
++            let length = usize::from(self.rx.read16(index, RX_LENGTH));
++            let frame = (status & EOP != 0 && status & RX_ERRORS == 0 && length >= 14).then(|| self.rx.read_buffer(index, length));
++            self.give_rx(index);
++            write32(&self.mmio, reg::RDT, index as u32);
++            self.rx.advance();
++            if frame.is_some() {
++                return frame;
++            }
++        }
++    }
++
++    fn can_send(&mut self) -> bool {
++        while self.tx_clean != self.tx.next() && self.tx.read32(self.tx_clean, 12) & DD != 0 {
++            self.tx_clean = (self.tx_clean + 1) % TX_COUNT;
++        }
++        (self.tx.next() + 1) % TX_COUNT != self.tx_clean
++    }
++
++    fn send(&mut self, frame: &[u8]) -> bool {
++        if !self.can_send() || frame.len() > crate::ring::BUFFER {
++            return false;
++        }
++        let index = self.tx.next();
++        self.tx.write_buffer(index, frame);
++        let length = frame.len() as u32;
++        self.tx.write64(index, 0, self.tx.buffer_address(index));
++        self.tx.write32(index, 8, TX_DTYP_DATA | TX_EOP | TX_IFCS | TX_RS | TX_DEXT | length);
++        self.tx.write32(index, 12, length << 14);
++        self.tx.advance();
++        write32(&self.mmio, reg::TDT, self.tx.next() as u32);
++        true
++    }
++
++    fn link_up(&self) -> bool {
++        read32(&self.mmio, reg::STATUS) & STATUS_LU != 0
++    }
++}
+diff --git a/kernel/comps/ethernet/src/lib.rs b/kernel/comps/ethernet/src/lib.rs
+new file mode 100755
+index 0000000..f220df3
+--- /dev/null
++++ b/kernel/comps/ethernet/src/lib.rs
+@@ -0,0 +1,213 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Wired Ethernet: Intel's e1000 family (the 8254x, the 82571 to 82574 and
++//! the PCH LAN controllers I217 to I219 of nearly every Intel desktop and
++//! laptop), its igb and igc ones (I210, I211, I225, I226 on desktop
++//! motherboards) and Realtek's RTL8169/8111/8168/8101/8125 family (most
++//! other PCs and motherboards). Each controller is a network device of the
++//! kernel's stack (`aster-network`), which gives it an interface that asks
++//! a DHCP server for its address. Received frames are polled each
++//! millisecond.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++// This crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "ethernet: "
++    };
++}
++
++mod e1000;
++mod igb;
++mod r8169;
++mod ring;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++
++use aster_bigtcp::{
++    device::{AnyNetworkDevice, ChecksumCapabilities, DeviceCapabilities, EthernetAddress, Medium, NetError},
++    packet::{FreshTxPacket, LinkLayer, RxPacket, TxPacket},
++};
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    common_device::PciCommonDevice,
++};
++use aster_softirq::BottomHalfDisabled;
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    mm::{VmReader, VmWriter},
++    sync::SpinLock,
++};
++
++/// What each controller does for the device below.
++pub(crate) trait Nic: Send + Sync {
++    fn mac(&self) -> [u8; 6];
++    /// The next received frame, if any.
++    fn receive(&mut self) -> Option<Vec<u8>>;
++    /// Queues a frame; false when the ring is full.
++    fn send(&mut self, frame: &[u8]) -> bool;
++    /// Room for another frame.
++    fn can_send(&mut self) -> bool;
++    fn link_up(&self) -> bool;
++}
++
++/// Whether a controller has received something: read from the timer,
++/// without its lock.
++pub(crate) trait RxProbe: Send + Sync {
++    fn has_frames(&self) -> bool;
++}
++
++struct EthDevice {
++    mac: EthernetAddress,
++    nic: alloc::boxed::Box<dyn Nic>,
++}
++
++impl core::fmt::Debug for EthDevice {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("EthDevice").field("mac", &self.mac).finish_non_exhaustive()
++    }
++}
++
++impl AnyNetworkDevice for EthDevice {
++    fn mac_addr(&self) -> EthernetAddress {
++        self.mac
++    }
++
++    fn capabilities(&self) -> DeviceCapabilities {
++        let mut capabilities = DeviceCapabilities::default();
++        capabilities.max_transmission_unit = 1514;
++        capabilities.medium = Medium::Ethernet;
++        capabilities.checksum = ChecksumCapabilities::default();
++        capabilities
++    }
++
++    fn can_receive(&self) -> bool {
++        true
++    }
++
++    fn can_send(&self) -> bool {
++        true
++    }
++
++    fn receive(&mut self) -> Result<RxPacket<LinkLayer>, NetError> {
++        let frame = self.nic.receive().ok_or(NetError::NotReady)?;
++        let fresh = FreshTxPacket::<LinkLayer>::alloc(frame.len()).map_err(|_| NetError::NoMemory)?;
++        let mut builder = fresh.to_builder();
++        let written = builder.append_writer().write(&mut VmReader::from(frame.as_slice()));
++        builder.commit(written);
++        builder.build().to_rx_packet().ok_or(NetError::NoMemory)
++    }
++
++    fn send(&mut self, packet: TxPacket<LinkLayer>) -> Result<(), NetError> {
++        let mut frame = alloc::vec![0u8; packet.len()];
++        let length = packet.reader().read(&mut VmWriter::from(frame.as_mut_slice()));
++        frame.truncate(length);
++        if self.nic.send(&frame) { Ok(()) } else { Err(NetError::Busy) }
++    }
++
++    fn alloc_tx_buffer(payload_len: usize) -> Result<FreshTxPacket, ostd::Error> {
++        FreshTxPacket::alloc(payload_len)
++    }
++
++    fn free_processed_tx_buffers(&mut self) {}
++
++    fn notify_poll_end(&mut self) {}
++}
++
++/// The controllers' receive rings, for the timer.
++static PROBES: SpinLock<Vec<Arc<dyn RxProbe>>> = SpinLock::new(Vec::new());
++static NAMES: AtomicU32 = AtomicU32::new(0);
++static TICKS: AtomicU64 = AtomicU64::new(0);
++
++/// Each millisecond: a controller with frames waiting has the stack read them.
++fn tick() {
++    TICKS.fetch_add(1, Ordering::Relaxed);
++    let Some(probes) = PROBES.try_lock() else { return };
++    if probes.iter().any(|probe| probe.has_frames()) {
++        aster_network::raise_receive_softirq();
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++#[derive(Debug)]
++struct Driver {
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if e1000::supports(&id) || igb::supports(&id) || r8169::supports(&id) {
++            self.found.lock().push(device);
++            return Ok(Arc::new(Claimed(id)));
++        }
++        Err((BusProbeError::DeviceNotMatch, device))
++    }
++}
++
++/// Offers a controller to the network stack as eth<n>.
++pub(crate) fn register(nic: alloc::boxed::Box<dyn Nic>, probe: Arc<dyn RxProbe>, model: &str) {
++    let name: String = format!("eth{}", NAMES.fetch_add(1, Ordering::Relaxed));
++    let mac = nic.mac();
++    ostd::notice!(
++        "{}: {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
++        name, model, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
++        if nic.link_up() { "up" } else { "down" }
++    );
++    PROBES.lock().push(probe);
++    let device: Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>> =
++        Arc::new(SpinLock::new(EthDevice { mac: EthernetAddress(mac), nic }));
++    aster_network::register_device(name, device);
++}
++
++pub(crate) fn now_ms() -> u64 {
++    ostd::timer::Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++/// Waits about `ms` milliseconds (controller resets), spinning.
++pub(crate) fn delay_ms(ms: u64) {
++    let deadline = now_ms() + ms + 1;
++    while now_ms() < deadline {
++        core::hint::spin_loop();
++    }
++}
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
++    PCI_BUS.lock().register_driver(driver.clone());
++    let devices = core::mem::take(&mut *driver.found.lock());
++    if devices.is_empty() {
++        return Ok(());
++    }
++    for device in devices {
++        let id = *device.device_id();
++        let started = if e1000::supports(&id) {
++            e1000::start(device)
++        } else if igb::supports(&id) {
++            igb::start(device)
++        } else {
++            r8169::start(device)
++        };
++        if !started {
++            ostd::warn!("{:04x}:{:04x}: the controller did not start", id.vendor_id, id.device_id);
++        }
++    }
++    ostd::timer::register_callback_on_cpu(tick);
++    Ok(())
++}
+diff --git a/kernel/comps/ethernet/src/r8169.rs b/kernel/comps/ethernet/src/r8169.rs
+new file mode 100755
+index 0000000..9cb2d83
+--- /dev/null
++++ b/kernel/comps/ethernet/src/r8169.rs
+@@ -0,0 +1,272 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Realtek's gigabit and 2.5-gigabit controllers: RTL8169, RTL8111/8168
++//! (and Killer E2x00, which are those), RTL8101/8102/8105 and RTL8125
++//! (Killer E3000), on most motherboards and laptops without an Intel one.
++//! Their descriptors carry an OWN bit; the RTL8125 moved some registers.
++//! The PHY keeps the setup the firmware gave it.
++//!
++//! References: Realtek's RTL8111 datasheet; Linux's
++//! `drivers/net/ethernet/realtek/r8169_main.c`.
++
++use alloc::{boxed::Box, sync::Arc, vec::Vec};
++use core::sync::atomic::Ordering;
++
++use aster_pci::{PciDeviceId, cfg_space::BarAccess, common_device::PciCommonDevice};
++
++use crate::{Nic, RxProbe, ring::Ring};
++
++mod reg {
++    pub(super) const MAC0: usize = 0x00;
++    pub(super) const MAR0: usize = 0x08;
++    pub(super) const TX_DESC_LOW: usize = 0x20;
++    pub(super) const TX_DESC_HIGH: usize = 0x24;
++    pub(super) const CHIP_CMD: usize = 0x37;
++    pub(super) const TX_POLL: usize = 0x38;
++    pub(super) const INTR_MASK: usize = 0x3c;
++    pub(super) const INTR_STATUS: usize = 0x3e;
++    pub(super) const TX_CONFIG: usize = 0x40;
++    pub(super) const RX_CONFIG: usize = 0x44;
++    pub(super) const CFG9346: usize = 0x50;
++    pub(super) const PHY_STATUS: usize = 0x6c;
++    pub(super) const RX_MAX_SIZE: usize = 0xda;
++    pub(super) const RX_DESC_LOW: usize = 0xe4;
++    pub(super) const RX_DESC_HIGH: usize = 0xe8;
++    pub(super) const MAX_TX_PACKET: usize = 0xec;
++    /// RTL8125: its transmit poll and interrupt registers.
++    pub(super) const TX_POLL_8125: usize = 0x90;
++    pub(super) const INTR_MASK_8125: usize = 0x38;
++    pub(super) const INTR_STATUS_8125: usize = 0x3c;
++}
++
++const CMD_RESET: u8 = 0x10;
++const CMD_RX_ENABLE: u8 = 0x08;
++const CMD_TX_ENABLE: u8 = 0x04;
++const CFG9346_UNLOCK: u8 = 0xc0;
++const CFG9346_LOCK: u8 = 0x00;
++const TX_POLL_NORMAL: u8 = 0x40;
++const LINK_STATUS: u8 = 0x02;
++/// Broadcast, multicast and frames to us.
++const ACCEPT: u32 = 0x08 | 0x04 | 0x02;
++const DMA_BURST: u32 = 7 << 8;
++/// No receive FIFO threshold (older chips); on the RTL8168E and later the
++/// same bits ask early-off, multiple and 128-byte interrupts (as Linux).
++const RX_FIFO: u32 = 7 << 13;
++/// RTL8125's receive fetch default.
++const RX_FETCH_8125: u32 = 8 << 27;
++const TX_IFG: u32 = 3 << 24;
++/// Descriptor bits (first word).
++const OWN: u32 = 1 << 31;
++const EOR: u32 = 1 << 30;
++const FS: u32 = 1 << 29;
++const LS: u32 = 1 << 28;
++const RX_ERROR: u32 = 1 << 21;
++const RX_BUFFER: u32 = 1536;
++const RX_COUNT: usize = 256;
++const TX_COUNT: usize = 256;
++
++/// Realtek's IDs, and the boards that rebrand them.
++const IDS: &[(u16, u16)] = &[
++    (0x10ec, 0x8136),
++    (0x10ec, 0x8161),
++    (0x10ec, 0x8162),
++    (0x10ec, 0x8167),
++    (0x10ec, 0x8168),
++    (0x10ec, 0x8169),
++    (0x10ec, 0x2502),
++    (0x10ec, 0x2600),
++    (0x10ec, 0x8125),
++    (0x10ec, 0x3000),
++    (0x1186, 0x4300),
++    (0x1186, 0x4302),
++    (0x1259, 0xc107),
++    (0x16ec, 0x0116),
++    (0x1737, 0x1032),
++    (0x0001, 0x8168),
++];
++
++pub(crate) fn supports(id: &PciDeviceId) -> bool {
++    IDS.contains(&(id.vendor_id, id.device_id))
++}
++
++struct RealtekNic {
++    mmio: BarAccess,
++    rx: Ring,
++    tx: Ring,
++    tx_clean: usize,
++    mac: [u8; 6],
++    tx_poll: usize,
++    _device: PciCommonDevice,
++}
++
++impl RealtekNic {
++    fn w8(&self, at: usize, value: u8) {
++        let _ = self.mmio.write_once::<u8>(at, value);
++    }
++
++    fn r8(&self, at: usize) -> u8 {
++        self.mmio.read_once::<u8>(at).unwrap_or(u8::MAX)
++    }
++}
++
++fn r8(mmio: &BarAccess, at: usize) -> u8 {
++    mmio.read_once::<u8>(at).unwrap_or(u8::MAX)
++}
++
++fn w8(mmio: &BarAccess, at: usize, value: u8) {
++    let _ = mmio.write_once::<u8>(at, value);
++}
++
++fn w16(mmio: &BarAccess, at: usize, value: u16) {
++    let _ = mmio.write_once::<u16>(at, value);
++}
++
++fn w32(mmio: &BarAccess, at: usize, value: u32) {
++    let _ = mmio.write_once::<u32>(at, value);
++}
++
++pub(crate) fn start(mut device: PciCommonDevice) -> bool {
++    let id = *device.device_id();
++    let location = *device.location();
++    let command = location.read16(0x04);
++    location.write16(0x04, command | 0x06);
++    let is_8125 = matches!(id.device_id, 0x8125 | 0x3000);
++    // Their registers are in the first memory BAR (BAR 2 on the PCIe
++    // chips, BAR 1 on the RTL8169), BAR 0 being I/O ports.
++    let mmio = [2u8, 1, 0, 4]
++        .into_iter()
++        .find_map(|index| device.bar_manager_mut().bar_mut(index).and_then(|bar| bar.acquire().ok()).filter(|bar| matches!(bar, BarAccess::Memory(_))));
++    let Some(mmio) = mmio else { return false };
++
++    let mac: [u8; 6] = core::array::from_fn(|index| r8(&mmio, reg::MAC0 + index));
++    w8(&mmio, reg::CHIP_CMD, CMD_RESET);
++    for _ in 0..1000 {
++        if r8(&mmio, reg::CHIP_CMD) & CMD_RESET == 0 {
++            break;
++        }
++        crate::delay_ms(1);
++    }
++    let (Some(rx), Some(tx)) = (Ring::new(RX_COUNT), Ring::new(TX_COUNT)) else { return false };
++    for index in 0..RX_COUNT {
++        let end = if index == RX_COUNT - 1 { EOR } else { 0 };
++        rx.write32(index, 4, 0);
++        rx.write64(index, 8, rx.buffer_address(index));
++        rx.write32(index, 0, OWN | end | RX_BUFFER);
++    }
++    for index in 0..TX_COUNT {
++        let end = if index == TX_COUNT - 1 { EOR } else { 0 };
++        tx.write32(index, 0, end);
++        tx.write32(index, 4, 0);
++        tx.write64(index, 8, tx.buffer_address(index));
++    }
++
++    w8(&mmio, reg::CFG9346, CFG9346_UNLOCK);
++    if is_8125 {
++        w32(&mmio, reg::INTR_MASK_8125, 0);
++        w32(&mmio, reg::INTR_STATUS_8125, u32::MAX);
++    } else {
++        w16(&mmio, reg::INTR_MASK, 0);
++        w16(&mmio, reg::INTR_STATUS, u16::MAX);
++    }
++    w16(&mmio, reg::RX_MAX_SIZE, RX_BUFFER as u16);
++    w8(&mmio, reg::MAX_TX_PACKET, 0x3f);
++    w32(&mmio, reg::TX_DESC_LOW, tx.base() as u32);
++    w32(&mmio, reg::TX_DESC_HIGH, (tx.base() >> 32) as u32);
++    w32(&mmio, reg::RX_DESC_LOW, rx.base() as u32);
++    w32(&mmio, reg::RX_DESC_HIGH, (rx.base() >> 32) as u32);
++    // Every multicast (IPv6's neighbours).
++    for index in 0..8 {
++        w8(&mmio, reg::MAR0 + index, 0xff);
++    }
++    w8(&mmio, reg::CHIP_CMD, CMD_RX_ENABLE | CMD_TX_ENABLE);
++    w32(&mmio, reg::TX_CONFIG, TX_IFG | DMA_BURST);
++    let rx_config = if is_8125 { RX_FETCH_8125 | DMA_BURST | ACCEPT } else { RX_FIFO | DMA_BURST | ACCEPT };
++    w32(&mmio, reg::RX_CONFIG, rx_config);
++    w8(&mmio, reg::CFG9346, CFG9346_LOCK);
++
++    let probe: Arc<dyn RxProbe> = Arc::new(Probe { descriptors: rx.descriptors.clone(), next: rx.next.clone() });
++    let model = if is_8125 { "Realtek RTL8125" } else if id.device_id == 0x8136 { "Realtek RTL810x" } else { "Realtek RTL8111/8168" };
++    let nic = RealtekNic {
++        mmio,
++        rx,
++        tx,
++        tx_clean: 0,
++        mac,
++        tx_poll: if is_8125 { reg::TX_POLL_8125 } else { reg::TX_POLL },
++        _device: device,
++    };
++    crate::register(Box::new(nic), probe, model);
++    true
++}
++
++struct Probe {
++    descriptors: Arc<ostd::mm::dma::DmaCoherent>,
++    next: Arc<core::sync::atomic::AtomicUsize>,
++}
++
++impl RxProbe for Probe {
++    fn has_frames(&self) -> bool {
++        use ostd::mm::VmIo;
++        let index = self.next.load(Ordering::Acquire);
++        let opts: u32 = self.descriptors.read_val(index * crate::ring::DESCRIPTOR).unwrap_or(OWN);
++        opts & OWN == 0
++    }
++}
++
++impl Nic for RealtekNic {
++    fn mac(&self) -> [u8; 6] {
++        self.mac
++    }
++
++    fn receive(&mut self) -> Option<Vec<u8>> {
++        loop {
++            let index = self.rx.next();
++            let opts = self.rx.read32(index, 0);
++            if opts & OWN != 0 {
++                return None;
++            }
++            // The length counts the CRC.
++            let length = (opts & 0x3fff) as usize;
++            let whole = opts & (FS | LS) == FS | LS && opts & RX_ERROR == 0 && length > 18;
++            let frame = whole.then(|| self.rx.read_buffer(index, length - 4));
++            let end = if index == RX_COUNT - 1 { EOR } else { 0 };
++            self.rx.write64(index, 8, self.rx.buffer_address(index));
++            self.rx.write32(index, 4, 0);
++            self.rx.write32(index, 0, OWN | end | RX_BUFFER);
++            self.rx.advance();
++            if frame.is_some() {
++                return frame;
++            }
++        }
++    }
++
++    fn can_send(&mut self) -> bool {
++        while self.tx_clean != self.tx.next() && self.tx.read32(self.tx_clean, 0) & OWN == 0 {
++            self.tx_clean = (self.tx_clean + 1) % TX_COUNT;
++        }
++        (self.tx.next() + 1) % TX_COUNT != self.tx_clean
++    }
++
++    fn send(&mut self, frame: &[u8]) -> bool {
++        if !self.can_send() || frame.len() > crate::ring::BUFFER {
++            return false;
++        }
++        let index = self.tx.next();
++        // Short frames are padded (the chips do not always do it).
++        let length = frame.len().max(60);
++        let mut padded = frame.to_vec();
++        padded.resize(length, 0);
++        self.tx.write_buffer(index, &padded);
++        let end = if index == TX_COUNT - 1 { EOR } else { 0 };
++        self.tx.write64(index, 8, self.tx.buffer_address(index));
++        self.tx.write32(index, 4, 0);
++        self.tx.write32(index, 0, OWN | end | FS | LS | length as u32);
++        self.tx.advance();
++        self.w8(self.tx_poll, if self.tx_poll == reg::TX_POLL { TX_POLL_NORMAL } else { 0x01 });
++        true
++    }
++
++    fn link_up(&self) -> bool {
++        self.r8(reg::PHY_STATUS) & LINK_STATUS != 0
++    }
++}
+diff --git a/kernel/comps/ethernet/src/ring.rs b/kernel/comps/ethernet/src/ring.rs
+new file mode 100755
+index 0000000..50878a7
+--- /dev/null
++++ b/kernel/comps/ethernet/src/ring.rs
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A ring of 16-byte DMA descriptors with a 2 KiB buffer each, the shape
++//! both families use (their descriptors' fields differ).
++
++use alloc::sync::Arc;
++use core::sync::atomic::{AtomicUsize, Ordering};
++
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++
++pub(crate) const DESCRIPTOR: usize = 16;
++pub(crate) const BUFFER: usize = 2048;
++
++pub(crate) struct Ring {
++    pub(crate) descriptors: Arc<DmaCoherent>,
++    buffers: DmaCoherent,
++    pub(crate) count: usize,
++    /// The next descriptor to look at (shared with the timer for receive rings).
++    pub(crate) next: Arc<AtomicUsize>,
++}
++
++impl Ring {
++    pub(crate) fn new(count: usize) -> Option<Self> {
++        let descriptor_pages = (count * DESCRIPTOR).div_ceil(PAGE_SIZE);
++        let buffer_pages = (count * BUFFER).div_ceil(PAGE_SIZE);
++        Some(Self {
++            descriptors: Arc::new(DmaCoherent::alloc(descriptor_pages, true).ok()?),
++            buffers: DmaCoherent::alloc(buffer_pages, true).ok()?,
++            count,
++            next: Arc::new(AtomicUsize::new(0)),
++        })
++    }
++
++    pub(crate) fn base(&self) -> u64 {
++        self.descriptors.daddr() as u64
++    }
++
++    pub(crate) fn bytes(&self) -> usize {
++        self.count * DESCRIPTOR
++    }
++
++    pub(crate) fn buffer_address(&self, index: usize) -> u64 {
++        (self.buffers.daddr() + index * BUFFER) as u64
++    }
++
++    pub(crate) fn read32(&self, index: usize, offset: usize) -> u32 {
++        self.descriptors.read_val(index * DESCRIPTOR + offset).unwrap_or(0)
++    }
++
++    pub(crate) fn read8(&self, index: usize, offset: usize) -> u8 {
++        self.descriptors.read_val(index * DESCRIPTOR + offset).unwrap_or(0)
++    }
++
++    pub(crate) fn read16(&self, index: usize, offset: usize) -> u16 {
++        self.descriptors.read_val(index * DESCRIPTOR + offset).unwrap_or(0)
++    }
++
++    pub(crate) fn write32(&self, index: usize, offset: usize, value: u32) {
++        let _ = self.descriptors.write_val(index * DESCRIPTOR + offset, &value);
++    }
++
++    pub(crate) fn write64(&self, index: usize, offset: usize, value: u64) {
++        let _ = self.descriptors.write_val(index * DESCRIPTOR + offset, &value);
++    }
++
++    pub(crate) fn write8(&self, index: usize, offset: usize, value: u8) {
++        let _ = self.descriptors.write_val(index * DESCRIPTOR + offset, &value);
++    }
++
++    pub(crate) fn write16(&self, index: usize, offset: usize, value: u16) {
++        let _ = self.descriptors.write_val(index * DESCRIPTOR + offset, &value);
++    }
++
++    pub(crate) fn read_buffer(&self, index: usize, length: usize) -> alloc::vec::Vec<u8> {
++        let mut data = alloc::vec![0u8; length.min(BUFFER)];
++        let _ = self.buffers.read_bytes(index * BUFFER, &mut data);
++        data
++    }
++
++    pub(crate) fn write_buffer(&self, index: usize, data: &[u8]) {
++        let _ = self.buffers.write_bytes(index * BUFFER, &data[..data.len().min(BUFFER)]);
++    }
++
++    pub(crate) fn next(&self) -> usize {
++        self.next.load(Ordering::Acquire)
++    }
++
++    pub(crate) fn advance(&self) {
++        self.next.store((self.next() + 1) % self.count, Ordering::Release);
++    }
++}
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index abf38c1..48a1674 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -20,6 +20,7 @@ extern crate aster_i8042 as _;
+ extern crate aster_simpledrm as _;
+ extern crate aster_uart as _;
+ extern crate aster_usb as _;
++extern crate aster_ethernet as _;
+ 
+ #[ostd::main]
+ fn main() {

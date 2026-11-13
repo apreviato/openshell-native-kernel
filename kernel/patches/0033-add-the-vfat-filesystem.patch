@@ -1,0 +1,2576 @@
+diff --git a/kernel/core/src/fs/file/inode_handle.rs b/kernel/core/src/fs/file/inode_handle.rs
+index 1178d93..cc5330d 100644
+--- a/kernel/core/src/fs/file/inode_handle.rs
++++ b/kernel/core/src/fs/file/inode_handle.rs
+@@ -537,6 +537,7 @@ impl FileLike for InodeHandle {
+ impl Drop for InodeHandle {
+     fn drop(&mut self) {
+         let _ = self.unlock_flock();
++        self.path().inode().release();
+     }
+ }
+ 
+diff --git a/kernel/core/src/fs/fs_impls/exfat/fs.rs b/kernel/core/src/fs/fs_impls/exfat/fs.rs
+index e81bef2..8f998cd 100644
+--- a/kernel/core/src/fs/fs_impls/exfat/fs.rs
++++ b/kernel/core/src/fs/fs_impls/exfat/fs.rs
+@@ -473,6 +473,32 @@ pub(crate) struct ExfatMountOptions {
+     pub(super) zero_size_dir: bool,
+ }
+ 
++impl ExfatMountOptions {
++    /// The options that change what is seen: whose the files are and their
++    /// permissions (as Linux's exfat takes them); the rest is ignored.
++    fn parse(args: Option<&str>) -> Self {
++        let mut options = Self::default();
++        for item in args.unwrap_or("").split(',') {
++            let (key, value) = item.split_once('=').unwrap_or((item, ""));
++            let mask = u16::from_str_radix(value, 8).ok().map(|mask| mask & 0o777);
++            match key {
++                "uid" => options.fs_uid = value.parse().unwrap_or(options.fs_uid),
++                "gid" => options.fs_gid = value.parse().unwrap_or(options.fs_gid),
++                "umask" => {
++                    if let Some(mask) = mask {
++                        options.fs_fmask = mask;
++                        options.fs_dmask = mask;
++                    }
++                }
++                "fmask" => options.fs_fmask = mask.unwrap_or(options.fs_fmask),
++                "dmask" => options.fs_dmask = mask.unwrap_or(options.fs_dmask),
++                _ => {}
++            }
++        }
++        options
++    }
++}
++
+ pub(super) struct ExfatType {
+     cache: FsCache<DeviceId>,
+ }
+@@ -493,8 +519,9 @@ impl FsType for ExfatType {
+     }
+ 
+     fn create(&self, fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
++        let options = ExfatMountOptions::parse(fs_creation_ctx.args());
+         let disk = fs_creation_ctx.resolve_block_device()?.clone();
+-        Ok(ExfatFs::open(disk, ExfatMountOptions::default())?)
++        Ok(ExfatFs::open(disk, options)?)
+     }
+ 
+     fn obtain_key_and_cache(
+diff --git a/kernel/core/src/fs/fs_impls/exfat/inode.rs b/kernel/core/src/fs/fs_impls/exfat/inode.rs
+index 9a669e4..cece137 100644
+--- a/kernel/core/src/fs/fs_impls/exfat/inode.rs
++++ b/kernel/core/src/fs/fs_impls/exfat/inode.rs
+@@ -258,7 +258,7 @@ impl ExfatInodeInner {
+ 
+     fn make_mode(&self) -> InodeMode {
+         self.attr
+-            .make_mode(self.fs().mount_option(), InodeMode::all())
++            .make_mode(self.fs().mount_option(), InodeMode::from_bits_truncate(0o777))
+     }
+ 
+     fn count_num_sub_inode_and_dir(&self, fs_guard: &MutexGuard<()>) -> Result<(usize, usize)> {
+diff --git a/kernel/core/src/fs/fs_impls/mod.rs b/kernel/core/src/fs/fs_impls/mod.rs
+index a831272..e7a29c6 100644
+--- a/kernel/core/src/fs/fs_impls/mod.rs
++++ b/kernel/core/src/fs/fs_impls/mod.rs
+@@ -16,6 +16,7 @@ pub(crate) mod pseudofs;
+ pub(crate) mod ramfs;
+ pub(crate) mod sysfs;
+ pub(crate) mod tmpfs;
++mod vfat;
+ pub(crate) mod virtiofs;
+ 
+ pub(super) fn init() {
+@@ -31,6 +32,7 @@ pub(super) fn init() {
+ 
+     ext2::init();
+     exfat::init();
++    vfat::init();
+     overlayfs::init();
+     virtiofs::init();
+ }
+diff --git a/kernel/core/src/fs/fs_impls/vfat/fs.rs b/kernel/core/src/fs/fs_impls/vfat/fs.rs
+new file mode 100755
+index 0000000..1f00157
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/vfat/fs.rs
+@@ -0,0 +1,607 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A mounted FAT volume: its geometry, a write-back cache of the sectors
++//! holding its metadata (the FATs, the directories), cluster allocation and
++//! the free count, its inodes, and the `vfat` filesystem type.
++//!
++//! File data does not go through the sector cache but through each file's
++//! page cache, straight to its clusters; metadata sectors are written back
++//! one by one, so that they never overwrite file data sharing a page.
++
++use core::{
++    sync::atomic::{AtomicBool, Ordering},
++    time::Duration,
++};
++
++use aster_block::BlockDevice;
++use device_id::DeviceId;
++use ostd::mm::VmIo;
++
++use super::{
++    inode::VfatInode,
++    layout::{self, FatEntry, FatKind, Geometry},
++};
++use crate::{
++    fs::{
++        vfs::{
++            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
++            inode::Inode,
++            registry::{FsCache, FsCreationCtx, FsProperties, FsType},
++        },
++    },
++    prelude::*,
++};
++
++/// `statfs`'s type for FAT volumes (Linux's `MSDOS_SUPER_MAGIC`).
++const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
++/// Metadata sectors kept (8 MiB), and how many a miss reads at once.
++const CACHE_SECTORS: usize = 16 * 1024;
++const READ_AHEAD_SECTORS: u64 = 64;
++const SECTOR: u64 = 512;
++/// The largest piece zeros are written in.
++const ZERO_CHUNK: usize = 64 * 1024;
++
++/// The mount options of Linux's vfat that change what is seen.
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Options {
++    pub(super) uid: u32,
++    pub(super) gid: u32,
++    pub(super) fmask: u16,
++    pub(super) dmask: u16,
++    /// Only `.exe`, `.com` and `.bat` files executable.
++    pub(super) showexec: bool,
++}
++
++impl Options {
++    fn parse(args: Option<&str>) -> Self {
++        let mut options = Self { uid: 0, gid: 0, fmask: 0o022, dmask: 0o022, showexec: false };
++        for item in args.unwrap_or("").split(',') {
++            let (key, value) = item.split_once('=').unwrap_or((item, ""));
++            let octal = || u16::from_str_radix(value, 8).ok().map(|mask| mask & 0o777);
++            match key {
++                "uid" => options.uid = value.parse().unwrap_or(options.uid),
++                "gid" => options.gid = value.parse().unwrap_or(options.gid),
++                "umask" => {
++                    if let Some(mask) = octal() {
++                        options.fmask = mask;
++                        options.dmask = mask;
++                    }
++                }
++                "fmask" => options.fmask = octal().unwrap_or(options.fmask),
++                "dmask" => options.dmask = octal().unwrap_or(options.dmask),
++                "showexec" => options.showexec = true,
++                // utf8, iocharset, codepage, shortname, flush, quiet, errors,
++                // tz, ...: what they ask for is what is done anyway.
++                _ => {}
++            }
++        }
++        options
++    }
++}
++
++struct CachedSector {
++    data: Box<[u8; SECTOR as usize]>,
++    dirty: bool,
++    used: u64,
++}
++
++#[derive(Default)]
++struct SectorCache {
++    sectors: BTreeMap<u64, CachedSector>,
++    clock: u64,
++}
++
++/// The free cluster count (when known) and where to look for a free one.
++struct Allocation {
++    free: Option<u32>,
++    next: u32,
++}
++
++pub(super) struct VfatFs {
++    device: Arc<dyn BlockDevice>,
++    pub(super) geo: Geometry,
++    pub(super) options: Options,
++    cache: Mutex<SectorCache>,
++    allocation: Mutex<Allocation>,
++    /// Directory and FAT changes go one at a time.
++    op: Mutex<()>,
++    /// The inodes in use, by the position of their short entry (0: the root).
++    pub(super) inodes: SpinLock<BTreeMap<u64, Arc<VfatInode>>>,
++    /// Chains of deleted files to free once nothing uses them.
++    pending_free: SpinLock<Vec<u32>>,
++    root: spin::Once<Arc<VfatInode>>,
++    /// File data was written since the disk's cache was last flushed.
++    data_written: AtomicBool,
++    stats: FsEventSubscriberStats,
++}
++
++impl Debug for VfatFs {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("VfatFs").field("geometry", &self.geo).finish_non_exhaustive()
++    }
++}
++
++pub(super) const ROOT_INO: u64 = 1;
++
++impl VfatFs {
++    fn open(device: Arc<dyn BlockDevice>, options: Options) -> Result<Arc<Self>> {
++        let mut boot = [0u8; 512];
++        device.read_bytes(0, &mut boot)?;
++        let Some(geo) = layout::parse_boot_sector(&boot) else {
++            return_errno_with_message!(Errno::EINVAL, "not a FAT filesystem");
++        };
++        let device_bytes = device.metadata().nr_sectors as u64 * SECTOR;
++        if geo.data_offset() + u64::from(geo.cluster_size) > device_bytes {
++            return_errno_with_message!(Errno::EINVAL, "the FAT filesystem is larger than its device");
++        }
++        let fs = Arc::new(Self {
++            device,
++            geo,
++            options,
++            cache: Mutex::new(SectorCache::default()),
++            allocation: Mutex::new(Allocation { free: None, next: 2 }),
++            op: Mutex::new(()),
++            inodes: SpinLock::new(BTreeMap::new()),
++            pending_free: SpinLock::new(Vec::new()),
++            root: spin::Once::new(),
++            data_written: AtomicBool::new(false),
++            stats: FsEventSubscriberStats::new(),
++        });
++        // FAT32 remembers its free count (trusted as Linux does); FAT12 and
++        // FAT16 are small enough to count.
++        if geo.fsinfo_sector != 0 {
++            let mut info = [0u8; 512];
++            fs.read_meta(u64::from(geo.fsinfo_sector) * u64::from(geo.sector_size), &mut info)?;
++            if let Some((free, next)) = layout::parse_fsinfo(&info) {
++                let mut allocation = fs.allocation.lock();
++                allocation.free = free.filter(|&free| free <= geo.clusters);
++                allocation.next = next.filter(|&next| geo.is_data_cluster(next)).unwrap_or(2);
++            }
++        }
++        if geo.kind != FatKind::Fat32 {
++            let free = fs.count_free()?;
++            fs.allocation.lock().free = Some(free);
++        }
++        let root = VfatInode::new_root(&fs)?;
++        fs.root.call_once(|| root.clone());
++        fs.inodes.lock().insert(0, root);
++        Ok(fs)
++    }
++
++    pub(super) fn now() -> Duration {
++        crate::time::clocks::RealTimeClock::get().read_time()
++    }
++
++    pub(super) fn device(&self) -> &Arc<dyn BlockDevice> {
++        &self.device
++    }
++
++    /// The lock of directory and FAT changes, after freeing what deleted
++    /// files left.
++    pub(super) fn lock(&self) -> MutexGuard<'_, ()> {
++        let guard = self.op.lock();
++        let chains: Vec<u32> = core::mem::take(&mut *self.pending_free.lock());
++        for start in chains {
++            if let Err(error) = self.free_chain(start) {
++                warn!("vfat: clusters of a deleted file not freed: {:?}", error);
++            }
++        }
++        guard
++    }
++
++    pub(super) fn defer_free(&self, start: u32) {
++        if self.geo.is_data_cluster(start) {
++            self.pending_free.lock().push(start);
++        }
++    }
++
++    // ── Metadata sectors ─────────────────────────────────────────────────
++
++    /// Reads metadata bytes (the FATs, directories) through the cache.
++    pub(super) fn read_meta(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
++        let mut cache = self.cache.lock();
++        let mut done = 0;
++        while done < buf.len() {
++            let at = offset + done as u64;
++            let (sector, within) = (at / SECTOR, (at % SECTOR) as usize);
++            let length = (SECTOR as usize - within).min(buf.len() - done);
++            if !cache.sectors.contains_key(&sector) {
++                let wanted = (buf.len() - done).div_ceil(SECTOR as usize) as u64;
++                self.load(&mut cache, sector, wanted.max(READ_AHEAD_SECTORS))?;
++            }
++            cache.clock += 1;
++            let clock = cache.clock;
++            let entry = cache.sectors.get_mut(&sector).ok_or(Error::new(Errno::EIO))?;
++            entry.used = clock;
++            buf[done..done + length].copy_from_slice(&entry.data[within..within + length]);
++            done += length;
++        }
++        Ok(())
++    }
++
++    /// Writes metadata bytes into the cache; they reach the disk on sync.
++    pub(super) fn write_meta(&self, offset: u64, buf: &[u8]) -> Result<()> {
++        let mut cache = self.cache.lock();
++        let mut done = 0;
++        while done < buf.len() {
++            let at = offset + done as u64;
++            let (sector, within) = (at / SECTOR, (at % SECTOR) as usize);
++            let length = (SECTOR as usize - within).min(buf.len() - done);
++            if !cache.sectors.contains_key(&sector) {
++                if length == SECTOR as usize {
++                    cache.sectors.insert(sector, CachedSector { data: Box::new([0; SECTOR as usize]), dirty: false, used: 0 });
++                } else {
++                    self.load(&mut cache, sector, 1)?;
++                }
++            }
++            cache.clock += 1;
++            let clock = cache.clock;
++            let entry = cache.sectors.get_mut(&sector).ok_or(Error::new(Errno::EIO))?;
++            entry.data[within..within + length].copy_from_slice(&buf[done..done + length]);
++            entry.dirty = true;
++            entry.used = clock;
++            done += length;
++        }
++        self.trim(&mut cache)
++    }
++
++    /// Reads up to `count` sectors from `sector` that are not cached yet.
++    fn load(&self, cache: &mut SectorCache, sector: u64, count: u64) -> Result<()> {
++        let end = (sector + count).min(self.geo.bytes() / SECTOR).max(sector + 1);
++        let mut last = sector + 1;
++        while last < end && !cache.sectors.contains_key(&last) {
++            last += 1;
++        }
++        let mut data = vec![0u8; ((last - sector) * SECTOR) as usize];
++        self.device.read_bytes((sector * SECTOR) as usize, &mut data)?;
++        for (index, chunk) in data.chunks_exact(SECTOR as usize).enumerate() {
++            let mut sector_data = Box::new([0u8; SECTOR as usize]);
++            sector_data.copy_from_slice(chunk);
++            cache.sectors.insert(sector + index as u64, CachedSector { data: sector_data, dirty: false, used: 0 });
++        }
++        Ok(())
++    }
++
++    /// Keeps the cache within its size: written back, then the least used
++    /// half dropped.
++    fn trim(&self, cache: &mut SectorCache) -> Result<()> {
++        if cache.sectors.len() <= CACHE_SECTORS {
++            return Ok(());
++        }
++        self.write_back(cache)?;
++        let mut uses: Vec<u64> = cache.sectors.values().map(|sector| sector.used).collect();
++        uses.sort_unstable();
++        let keep_from = uses[uses.len() / 2];
++        cache.sectors.retain(|_, sector| sector.used >= keep_from);
++        Ok(())
++    }
++
++    /// Writes the dirty sectors, runs of them at once; returns how many.
++    fn write_back(&self, cache: &mut SectorCache) -> Result<usize> {
++        let dirty: Vec<u64> = cache.sectors.iter().filter(|(_, sector)| sector.dirty).map(|(&at, _)| at).collect();
++        let mut index = 0;
++        while index < dirty.len() {
++            let mut end = index + 1;
++            while end < dirty.len() && dirty[end] == dirty[end - 1] + 1 && end - index < 128 {
++                end += 1;
++            }
++            let mut data = Vec::with_capacity((end - index) * SECTOR as usize);
++            for at in &dirty[index..end] {
++                data.extend_from_slice(&cache.sectors[at].data[..]);
++            }
++            self.device.write_bytes((dirty[index] * SECTOR) as usize, &data)?;
++            for at in &dirty[index..end] {
++                if let Some(sector) = cache.sectors.get_mut(at) {
++                    sector.dirty = false;
++                }
++            }
++            index = end;
++        }
++        Ok(dirty.len())
++    }
++
++    /// Forgets cached sectors in a byte range (clusters that held a
++    /// directory and were freed: what was cached must not be written there).
++    pub(super) fn discard_meta(&self, start: u64, length: u64) {
++        let (first, last) = (start / SECTOR, (start + length).div_ceil(SECTOR));
++        let mut cache = self.cache.lock();
++        let doomed: Vec<u64> = cache.sectors.range(first..last).map(|(&at, _)| at).collect();
++        for at in doomed {
++            cache.sectors.remove(&at);
++        }
++    }
++
++    // ── The FAT ──────────────────────────────────────────────────────────
++
++    pub(super) fn fat_get(&self, cluster: u32) -> Result<FatEntry> {
++        if !self.geo.is_data_cluster(cluster) {
++            return_errno_with_message!(Errno::EIO, "a cluster outside the FAT volume");
++        }
++        let (at, length) = layout::fat_entry_at(self.geo.kind, cluster);
++        let mut raw = [0u8; 4];
++        self.read_meta(self.geo.fat_offset(self.geo.active_fat) + at, &mut raw[..length])?;
++        Ok(layout::decode_fat(self.geo.kind, cluster, u32::from_le_bytes(raw), self.geo.clusters))
++    }
++
++    fn fat_set(&self, cluster: u32, entry: FatEntry) -> Result<()> {
++        let (at, length) = layout::fat_entry_at(self.geo.kind, cluster);
++        let fats = if self.geo.mirror { 0..self.geo.fats } else { self.geo.active_fat..self.geo.active_fat + 1 };
++        for fat in fats {
++            let offset = self.geo.fat_offset(fat) + at;
++            let mut raw = [0u8; 4];
++            self.read_meta(offset, &mut raw[..length])?;
++            let value = layout::encode_fat(self.geo.kind, cluster, u32::from_le_bytes(raw), entry);
++            self.write_meta(offset, &value.to_le_bytes()[..length])?;
++        }
++        Ok(())
++    }
++
++    /// The clusters of a chain, in order.
++    pub(super) fn chain(&self, start: u32) -> Result<Vec<u32>> {
++        let mut clusters = Vec::new();
++        if start == 0 {
++            return Ok(clusters);
++        }
++        let mut cluster = start;
++        loop {
++            clusters.push(cluster);
++            if clusters.len() > self.geo.clusters as usize {
++                return_errno_with_message!(Errno::EIO, "a FAT chain loops");
++            }
++            match self.fat_get(cluster)? {
++                FatEntry::Next(next) => cluster = next,
++                FatEntry::End => return Ok(clusters),
++                FatEntry::Free | FatEntry::Bad => return_errno_with_message!(Errno::EIO, "a broken FAT chain"),
++            }
++        }
++    }
++
++    /// Allocates `count` clusters as a chain, linked after `after` if given;
++    /// returns them. Nothing is allocated if they are not all there.
++    pub(super) fn allocate(&self, count: usize, after: Option<u32>) -> Result<Vec<u32>> {
++        let mut allocation = self.allocation.lock();
++        if allocation.free.is_none() {
++            drop(allocation);
++            let free = self.count_free()?;
++            allocation = self.allocation.lock();
++            allocation.free = Some(free);
++        }
++        if (allocation.free.unwrap_or(0) as usize) < count {
++            return_errno_with_message!(Errno::ENOSPC, "the FAT volume is full");
++        }
++        let clusters = self.geo.clusters;
++        let mut found = Vec::with_capacity(count);
++        let mut candidate = allocation.next.clamp(2, clusters + 1);
++        for _ in 0..clusters {
++            if found.len() == count {
++                break;
++            }
++            if self.fat_get(candidate)? == FatEntry::Free {
++                found.push(candidate);
++            }
++            candidate = if candidate - 2 + 1 >= clusters { 2 } else { candidate + 1 };
++        }
++        if found.len() < count {
++            allocation.free = Some(0);
++            return_errno_with_message!(Errno::ENOSPC, "the FAT volume is full");
++        }
++        for (index, &cluster) in found.iter().enumerate() {
++            let entry = found.get(index + 1).map_or(FatEntry::End, |&next| FatEntry::Next(next));
++            self.fat_set(cluster, entry)?;
++        }
++        if let Some(last) = after {
++            self.fat_set(last, FatEntry::Next(found[0]))?;
++        }
++        allocation.free = allocation.free.map(|free| free - count as u32);
++        allocation.next = candidate;
++        Ok(found)
++    }
++
++    /// Frees a chain from `start` on.
++    pub(super) fn free_chain(&self, start: u32) -> Result<()> {
++        let clusters = self.chain(start)?;
++        for &cluster in &clusters {
++            self.fat_set(cluster, FatEntry::Free)?;
++        }
++        let mut allocation = self.allocation.lock();
++        allocation.free = allocation.free.map(|free| (free + clusters.len() as u32).min(self.geo.clusters));
++        Ok(())
++    }
++
++    /// Ends a chain at `last`, freeing what came after it.
++    pub(super) fn cut_chain(&self, last: u32) -> Result<()> {
++        if let FatEntry::Next(next) = self.fat_get(last)? {
++            self.fat_set(last, FatEntry::End)?;
++            self.free_chain(next)?;
++        }
++        Ok(())
++    }
++
++    /// Counts the free clusters, reading the FAT straight from the disk
++    /// (after writing back what changed).
++    fn count_free(&self) -> Result<u32> {
++        self.write_back(&mut self.cache.lock())?;
++        let (_, length) = layout::fat_entry_at(self.geo.kind, 2);
++        let fat_bytes = layout::fat_entry_at(self.geo.kind, self.geo.clusters + 2).0 as usize + length;
++        let start = self.geo.fat_offset(self.geo.active_fat) as usize;
++        let mut free = 0;
++        // FAT12 entries straddle bytes: its whole FAT (at most 6 KiB) at once.
++        let chunk = if self.geo.kind == FatKind::Fat12 { fat_bytes.next_multiple_of(512) } else { 256 * 1024 };
++        let mut buf = vec![0u8; chunk];
++        let mut cluster = 2u32;
++        let mut offset = 0usize;
++        while cluster < self.geo.clusters + 2 {
++            let length = chunk.min(fat_bytes.next_multiple_of(512) - offset);
++            self.device.read_bytes(start + offset, &mut buf[..length])?;
++            loop {
++                if cluster >= self.geo.clusters + 2 {
++                    break;
++                }
++                let (at, size) = layout::fat_entry_at(self.geo.kind, cluster);
++                let at = at as usize;
++                if at + size > offset + length {
++                    break;
++                }
++                let mut raw = [0u8; 4];
++                raw[..size].copy_from_slice(&buf[at - offset..at - offset + size]);
++                if layout::decode_fat(self.geo.kind, cluster, u32::from_le_bytes(raw), self.geo.clusters) == FatEntry::Free {
++                    free += 1;
++                }
++                cluster += 1;
++            }
++            offset += length;
++        }
++        Ok(free)
++    }
++
++    pub(super) fn free_clusters(&self) -> u32 {
++        if let Some(free) = self.allocation.lock().free {
++            return free;
++        }
++        let free = self.count_free().unwrap_or(0);
++        self.allocation.lock().free = Some(free);
++        free
++    }
++
++    // ── Clusters ─────────────────────────────────────────────────────────
++
++    /// Zeros a directory's new cluster (through the cache).
++    pub(super) fn zero_meta_cluster(&self, cluster: u32) -> Result<()> {
++        let zeros = vec![0u8; self.geo.cluster_size as usize];
++        self.write_meta(self.geo.cluster_offset(cluster), &zeros)
++    }
++
++    /// Writes zeros on the disk (file clusters a file grew into).
++    pub(super) fn zero_disk(&self, offset: u64, length: u64) -> Result<()> {
++        let zeros = vec![0u8; ZERO_CHUNK.min(length as usize)];
++        let mut done = 0;
++        while done < length {
++            let piece = (length - done).min(ZERO_CHUNK as u64);
++            self.device.write_bytes((offset + done) as usize, &zeros[..piece as usize])?;
++            done += piece;
++        }
++        Ok(())
++    }
++
++    /// Writes the free count back to FAT32's FSInfo sector.
++    fn write_fsinfo(&self) -> Result<()> {
++        if self.geo.fsinfo_sector == 0 {
++            return Ok(());
++        }
++        let (free, next) = {
++            let allocation = self.allocation.lock();
++            (allocation.free.unwrap_or(u32::MAX), allocation.next)
++        };
++        let offset = u64::from(self.geo.fsinfo_sector) * u64::from(self.geo.sector_size);
++        let mut info = [0u8; 512];
++        self.read_meta(offset, &mut info)?;
++        let known = |value: u32| (value != u32::MAX).then_some(value);
++        match layout::parse_fsinfo(&info) {
++            Some(stored) if stored != (known(free), known(next)) => {
++                layout::update_fsinfo(&mut info, free, next);
++                self.write_meta(offset, &info)?;
++            }
++            _ => {}
++        }
++        Ok(())
++    }
++
++    /// Everything written to the disk, and the disk's cache flushed.
++    pub(super) fn sync_all(&self) -> Result<()> {
++        let inodes: Vec<Arc<VfatInode>> = self.inodes.lock().values().cloned().collect();
++        for inode in inodes {
++            inode.flush()?;
++        }
++        self.sync_meta()
++    }
++
++    pub(super) fn note_data_written(&self) {
++        self.data_written.store(true, Ordering::Relaxed);
++    }
++
++    /// Writes the metadata out (after a file was closed, a directory
++    /// changed), and has the disk store what it was given.
++    pub(super) fn sync_meta(&self) -> Result<()> {
++        let _guard = self.lock();
++        self.write_fsinfo()?;
++        let written = self.write_back(&mut self.cache.lock())?;
++        if written > 0 || self.data_written.swap(false, Ordering::Relaxed) {
++            let _ = self.device.sync();
++        }
++        Ok(())
++    }
++}
++
++impl FileSystem for VfatFs {
++    fn name(&self) -> &'static str {
++        "vfat"
++    }
++
++    fn sync(&self) -> Result<()> {
++        self.sync_all()
++    }
++
++    fn root_inode(&self) -> Arc<dyn Inode> {
++        self.root.get().unwrap().clone()
++    }
++
++    fn sb(&self) -> SuperBlock {
++        let mut sb = SuperBlock::new(
++            MSDOS_SUPER_MAGIC,
++            self.geo.cluster_size as usize,
++            layout::MAX_NAME_UNITS,
++            self.device.id(),
++        );
++        let free = self.free_clusters() as usize;
++        sb.blocks = self.geo.clusters as usize;
++        sb.bfree = free;
++        sb.bavail = free;
++        sb.frsize = self.geo.cluster_size as usize;
++        sb.fsid = u64::from(self.geo.serial);
++        sb
++    }
++
++    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
++        &self.stats
++    }
++}
++
++impl Drop for VfatFs {
++    fn drop(&mut self) {
++        let _ = self.write_fsinfo();
++        let _ = self.write_back(&mut self.cache.lock());
++    }
++}
++
++pub(super) struct VfatType {
++    cache: FsCache<DeviceId>,
++}
++
++pub(super) static VFAT_TYPE: VfatType = VfatType { cache: FsCache::new() };
++
++impl FsType for VfatType {
++    type Key = DeviceId;
++
++    fn name(&self) -> &'static str {
++        "vfat"
++    }
++
++    fn properties(&self) -> FsProperties {
++        FsProperties::NEED_DISK
++    }
++
++    fn create(&self, fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
++        let options = Options::parse(fs_creation_ctx.args());
++        let device = fs_creation_ctx.resolve_block_device()?.clone();
++        Ok(VfatFs::open(device, options)?)
++    }
++
++    fn obtain_key_and_cache(&self, fs_creation_ctx: &mut FsCreationCtx) -> Option<(DeviceId, &FsCache<DeviceId>)> {
++        let key = fs_creation_ctx.resolve_block_device().ok().map(|device| device.id())?;
++        Some((key, &self.cache))
++    }
++
++    fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
++        None
++    }
++}
+diff --git a/kernel/core/src/fs/fs_impls/vfat/inode.rs b/kernel/core/src/fs/fs_impls/vfat/inode.rs
+new file mode 100755
+index 0000000..7f3b1fe
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/vfat/inode.rs
+@@ -0,0 +1,1156 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The files and directories of a FAT volume.
++//!
++//! A file's data goes through its page cache, which reads and writes its
++//! clusters directly (a page at a time when a cluster holds whole pages,
++//! piece by piece for smaller clusters). Directories are read and written
++//! through the volume's metadata cache. An inode is known by where its
++//! short entry is; the volume keeps the inodes in use.
++
++use core::time::Duration;
++
++use align_ext::AlignExt;
++use aster_block::{
++    bio::{Bio, BioCompleteFn, BioSegment, BioStatus, BioType},
++    id::Sid,
++};
++use io_util::batch::IoBatch;
++use ostd::mm::VmIo;
++
++use super::{
++    fs::{ROOT_INO, VfatFs},
++    layout::{self, ENTRY_SIZE, FatKind, LongName, ShortEntry, Slot, attr},
++};
++use crate::{
++    fs::{
++        file::{InodeMode, InodeType, StatusFlags, SyncMode},
++        utils::DirentVisitor,
++        vfs::{
++            file_system::FileSystem,
++            inode::{Extension, FileOps, Inode, Metadata, MknodType, RenameMode, SymbolicLink},
++            path::Dentry,
++        },
++    },
++    prelude::*,
++    process::{Gid, Uid},
++    vm::page_cache::{BlockAsPageCacheBackend, PageCache, Vmo},
++};
++
++/// Directories hold at most this many slots (the FAT specification's limit).
++const MAX_DIR_SLOTS: usize = 65_536;
++/// The largest FAT file.
++const MAX_FILE_SIZE: usize = u32::MAX as usize;
++
++pub(super) struct VfatInode {
++    ino: u64,
++    is_dir: bool,
++    fs: Weak<VfatFs>,
++    inner: RwMutex<Inner>,
++    /// What the page cache's I/O needs, apart from `inner` (which callers of
++    /// the page cache hold).
++    map: Mutex<FileMap>,
++    extension: Extension,
++}
++
++struct Inner {
++    /// Where the short entry is (0: the root, which has none).
++    pos: u64,
++    /// All its slots: the long-name ones, then the short one.
++    slots: Vec<u64>,
++    parent_ino: u64,
++    /// The short entry as on disk (its cluster and size are in `map`).
++    short: ShortEntry,
++    atime: Duration,
++    mtime: Duration,
++    ctime: Duration,
++    crtime: Duration,
++    deleted: bool,
++    page_cache: Option<PageCache>,
++}
++
++struct FileMap {
++    size: usize,
++    start: u32,
++    /// The clusters, once looked up.
++    chain: Option<Vec<u32>>,
++}
++
++/// A directory entry found by a scan.
++struct Entry {
++    name: String,
++    short: ShortEntry,
++    pos: u64,
++    /// Its short slot's index in the directory.
++    index: usize,
++    slots: Vec<u64>,
++}
++
++enum Scanned {
++    Entry(Entry),
++    /// A free slot; `after_end` ones come after the end marker.
++    Free { index: usize, pos: u64, after_end: bool },
++}
++
++fn duration((seconds, millis): (u64, u32)) -> Duration {
++    Duration::new(seconds, millis * 1_000_000)
++}
++
++fn dos(time: Duration) -> (u16, u16, u8) {
++    layout::to_dos(time.as_secs(), time.subsec_millis())
++}
++
++impl Debug for VfatInode {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("VfatInode").field("ino", &self.ino).field("is_dir", &self.is_dir).finish_non_exhaustive()
++    }
++}
++
++impl VfatInode {
++    pub(super) fn new_root(fs: &Arc<VfatFs>) -> Result<Arc<Self>> {
++        let start = if fs.geo.kind == FatKind::Fat32 { fs.geo.root_cluster } else { 0 };
++        let short = ShortEntry { attr: attr::DIRECTORY, cluster: start, ..Default::default() };
++        Ok(Self::build(fs, ROOT_INO, 0, Vec::new(), ROOT_INO, short))
++    }
++
++    fn build(fs: &Arc<VfatFs>, ino: u64, pos: u64, slots: Vec<u64>, parent_ino: u64, short: ShortEntry) -> Arc<Self> {
++        let is_dir = short.is_dir();
++        let mtime = duration(layout::from_dos(short.mdate, short.mtime, 0));
++        let atime = duration(layout::from_dos(short.adate, 0, 0));
++        let crtime = if short.cdate == 0 { mtime } else { duration(layout::from_dos(short.cdate, short.ctime, short.ctime_tenth)) };
++        let size = if is_dir { 0 } else { short.size as usize };
++        Arc::new_cyclic(|weak: &Weak<VfatInode>| {
++            let page_cache = if is_dir { None } else { PageCache::new_with_backend(size, weak.clone() as _).ok() };
++            Self {
++                ino,
++                is_dir,
++                fs: Arc::downgrade(fs),
++                inner: RwMutex::new(Inner {
++                    pos,
++                    slots,
++                    parent_ino,
++                    short,
++                    atime,
++                    mtime,
++                    ctime: mtime,
++                    crtime,
++                    deleted: false,
++                    page_cache,
++                }),
++                map: Mutex::new(FileMap { size, start: short.cluster, chain: None }),
++                extension: Extension::new(),
++            }
++        })
++    }
++
++    fn vfat(&self) -> Result<Arc<VfatFs>> {
++        self.fs.upgrade().ok_or(Error::with_message(Errno::EIO, "the FAT volume is gone"))
++    }
++
++    /// The fixed root directory of FAT12 and FAT16.
++    fn is_fixed_root(&self, fs: &VfatFs) -> bool {
++        self.ino == ROOT_INO && fs.geo.kind != FatKind::Fat32
++    }
++
++    fn chain_of<'a>(&self, fs: &VfatFs, map: &'a mut FileMap) -> Result<&'a mut Vec<u32>> {
++        if map.chain.is_none() {
++            map.chain = Some(fs.chain(map.start)?);
++        }
++        Ok(map.chain.as_mut().unwrap())
++    }
++
++    // ── Directories ──────────────────────────────────────────────────────
++
++    /// Where a directory's slots are: runs of (byte offset, length).
++    fn dir_runs(&self, fs: &VfatFs) -> Result<Vec<(u64, u64)>> {
++        if self.is_fixed_root(fs) {
++            return Ok(vec![(fs.geo.root_offset(), fs.geo.root_bytes())]);
++        }
++        let mut map = self.map.lock();
++        let cluster_size = u64::from(fs.geo.cluster_size);
++        Ok(self.chain_of(fs, &mut map)?.iter().map(|&cluster| (fs.geo.cluster_offset(cluster), cluster_size)).collect())
++    }
++
++    /// Goes over a directory's slots until `visit` says to stop; `.`, `..`
++    /// and the volume label are not shown.
++    fn scan(&self, fs: &VfatFs, visit: &mut dyn FnMut(Scanned) -> bool) -> Result<()> {
++        let mut long = LongName::default();
++        let mut pending: Vec<u64> = Vec::new();
++        let mut ended = false;
++        let mut index = 0usize;
++        let mut buf = [0u8; 512];
++        for (start, length) in self.dir_runs(fs)? {
++            let mut offset = 0;
++            while offset < length {
++                let chunk = (length - offset).min(512) as usize;
++                fs.read_meta(start + offset, &mut buf[..chunk])?;
++                for slot in 0..chunk / ENTRY_SIZE {
++                    let pos = start + offset + (slot * ENTRY_SIZE) as u64;
++                    let raw: &[u8; ENTRY_SIZE] = buf[slot * ENTRY_SIZE..(slot + 1) * ENTRY_SIZE].try_into().unwrap();
++                    let go = if ended {
++                        visit(Scanned::Free { index, pos, after_end: true })
++                    } else {
++                        match layout::parse_slot(raw) {
++                            Slot::End => {
++                                ended = true;
++                                visit(Scanned::Free { index, pos, after_end: true })
++                            }
++                            Slot::Free => {
++                                long.reset();
++                                pending.clear();
++                                visit(Scanned::Free { index, pos, after_end: false })
++                            }
++                            Slot::Long { ord, last, checksum, units } => {
++                                if last {
++                                    pending.clear();
++                                }
++                                long.push(ord, last, checksum, units);
++                                if long.active() {
++                                    pending.push(pos);
++                                } else {
++                                    pending.clear();
++                                }
++                                true
++                            }
++                            Slot::Short(short) => {
++                                let name = long.take(layout::checksum(&short.name));
++                                let mut slots = if name.is_some() { core::mem::take(&mut pending) } else { Vec::new() };
++                                pending.clear();
++                                slots.push(pos);
++                                if short.is_volume_label() || short.is_dot() {
++                                    true
++                                } else {
++                                    let name = name.unwrap_or_else(|| short.display_name());
++                                    visit(Scanned::Entry(Entry { name, short, pos, index, slots }))
++                                }
++                            }
++                        }
++                    };
++                    index += 1;
++                    if !go {
++                        return Ok(());
++                    }
++                }
++                offset += chunk as u64;
++            }
++        }
++        Ok(())
++    }
++
++    fn matches(entry: &Entry, name: &str) -> bool {
++        layout::names_equal(&entry.name, name) || layout::names_equal(&entry.short.display_name(), name)
++    }
++
++    fn find(&self, fs: &VfatFs, name: &str, ignore: Option<u64>) -> Result<Option<Entry>> {
++        let mut found = None;
++        self.scan(fs, &mut |item| match item {
++            Scanned::Entry(entry) if Some(entry.pos) != ignore && Self::matches(&entry, name) => {
++                found = Some(entry);
++                false
++            }
++            _ => true,
++        })?;
++        Ok(found)
++    }
++
++    fn is_empty(&self, fs: &VfatFs) -> Result<bool> {
++        let mut empty = true;
++        self.scan(fs, &mut |item| match item {
++            Scanned::Entry(_) => {
++                empty = false;
++                false
++            }
++            _ => true,
++        })?;
++        Ok(empty)
++    }
++
++    /// The inode of an entry: the one in use, or a new one.
++    fn child(&self, fs: &Arc<VfatFs>, entry: Entry) -> Arc<VfatInode> {
++        if let Some(inode) = fs.inodes.lock().get(&entry.pos) {
++            return inode.clone();
++        }
++        let inode = Self::build(fs, entry.pos / ENTRY_SIZE as u64 + 2, entry.pos, entry.slots, self.ino, entry.short);
++        fs.inodes.lock().insert(entry.pos, inode.clone());
++        inode
++    }
++
++    /// Adds the entries of `name` (long-name ones when needed, then `short`
++    /// with a short name made for it); returns their slots and the short
++    /// entry written. `ignore` is an entry that does not count (the one a
++    /// rename moves).
++    fn add_entry(&self, fs: &VfatFs, name: &str, mut short: ShortEntry, ignore: Option<u64>) -> Result<(Vec<u64>, ShortEntry)> {
++        let mut shorts = BTreeSet::new();
++        let mut exists = false;
++        let mut free: Vec<(usize, u64, bool)> = Vec::new();
++        let mut slots_total = 0usize;
++        self.scan(fs, &mut |item| {
++            match item {
++                Scanned::Entry(entry) => {
++                    slots_total = entry.index + 1;
++                    if Some(entry.pos) == ignore {
++                        return true;
++                    }
++                    if Self::matches(&entry, name) {
++                        exists = true;
++                        return false;
++                    }
++                    shorts.insert(entry.short.name);
++                }
++                Scanned::Free { index, pos, after_end } => {
++                    slots_total = index + 1;
++                    free.push((index, pos, after_end));
++                }
++            }
++            true
++        })?;
++        if exists {
++            return_errno!(Errno::EEXIST);
++        }
++        let (short_name, needs_long) =
++            layout::short_name_for(name, |candidate| shorts.contains(candidate)).ok_or(Error::new(Errno::EEXIST))?;
++        short.name = short_name;
++        short.case = 0;
++        let units: Vec<u16> = name.encode_utf16().collect();
++        let mut raws = if needs_long { layout::long_entries(&units, layout::checksum(&short_name)) } else { Vec::new() };
++        raws.push(short.encode());
++        let slots_total = slots_total.max((self.dir_runs(fs)?.iter().map(|(_, length)| length).sum::<u64>() / ENTRY_SIZE as u64) as usize);
++        let positions = self.find_slots(fs, &free, raws.len(), slots_total)?;
++        for (pos, raw) in positions.iter().zip(&raws) {
++            fs.write_meta(*pos, raw)?;
++        }
++        // Written where the end marker was: the end marker moves on.
++        let last_index = free.iter().find(|(_, pos, _)| Some(pos) == positions.last()).map(|(index, _, _)| *index);
++        if let Some(last_index) = last_index {
++            if let Some((_, pos, true)) = free.iter().find(|(index, _, _)| *index == last_index + 1) {
++                fs.write_meta(*pos, &[0])?;
++            }
++        }
++        Ok((positions, short))
++    }
++
++    /// `count` consecutive free slots, the directory grown for them if needed.
++    fn find_slots(&self, fs: &VfatFs, free: &[(usize, u64, bool)], count: usize, slots_total: usize) -> Result<Vec<u64>> {
++        let mut run: Vec<u64> = Vec::new();
++        let mut last_index: Option<usize> = None;
++        for &(index, pos, _) in free {
++            if last_index.is_none_or(|last| last + 1 != index) {
++                run.clear();
++            }
++            run.push(pos);
++            last_index = Some(index);
++            if run.len() == count {
++                return Ok(run);
++            }
++        }
++        if self.is_fixed_root(fs) {
++            return_errno_with_message!(Errno::ENOSPC, "the root directory is full");
++        }
++        // The free slots at the very end stay part of the run.
++        if last_index.is_none_or(|last| last + 1 != slots_total) {
++            run.clear();
++        }
++        let per_cluster = fs.geo.cluster_size as usize / ENTRY_SIZE;
++        let clusters = (count - run.len()).div_ceil(per_cluster);
++        if slots_total + clusters * per_cluster > MAX_DIR_SLOTS {
++            return_errno_with_message!(Errno::ENOSPC, "the directory is full");
++        }
++        let mut map = self.map.lock();
++        let last = self.chain_of(fs, &mut map)?.last().copied();
++        let added = fs.allocate(clusters, last)?;
++        for &cluster in &added {
++            fs.zero_meta_cluster(cluster)?;
++        }
++        if map.start == 0 {
++            map.start = added[0];
++        }
++        self.chain_of(fs, &mut map)?.extend_from_slice(&added);
++        for &cluster in &added {
++            for slot in 0..per_cluster {
++                if run.len() == count {
++                    break;
++                }
++                run.push(fs.geo.cluster_offset(cluster) + (slot * ENTRY_SIZE) as u64);
++            }
++        }
++        Ok(run)
++    }
++
++    /// Marks the inode's slots deleted; it leaves the inodes in use.
++    fn remove_entries(&self, fs: &VfatFs) -> Result<Vec<(u64, [u8; ENTRY_SIZE])>> {
++        let inner = self.inner.read();
++        let mut saved = Vec::with_capacity(inner.slots.len());
++        for &pos in &inner.slots {
++            let mut raw = [0u8; ENTRY_SIZE];
++            fs.read_meta(pos, &mut raw)?;
++            saved.push((pos, raw));
++            fs.write_meta(pos, &[layout::DELETED])?;
++        }
++        let removed = fs.inodes.lock().remove(&inner.pos);
++        drop(inner);
++        drop(removed);
++        Ok(saved)
++    }
++
++    /// The first cluster this directory's `..` entries point at.
++    fn dotdot_cluster(&self) -> u32 {
++        if self.ino == ROOT_INO { 0 } else { self.map.lock().start }
++    }
++
++    /// The directory changed: its time.
++    fn touch(&self, fs: &VfatFs) -> Result<()> {
++        let now = VfatFs::now();
++        {
++            let mut inner = self.inner.write();
++            inner.mtime = now;
++            inner.ctime = now;
++        }
++        self.write_entry(fs)
++    }
++
++    /// Writes the short entry back (into the metadata cache).
++    fn write_entry(&self, fs: &VfatFs) -> Result<()> {
++        let inner = self.inner.read();
++        if inner.pos == 0 || inner.deleted {
++            return Ok(());
++        }
++        let mut short = inner.short;
++        {
++            let map = self.map.lock();
++            short.cluster = map.start;
++            short.size = if self.is_dir { 0 } else { map.size as u32 };
++        }
++        (short.mdate, short.mtime, _) = dos(inner.mtime);
++        short.adate = dos(inner.atime).0;
++        fs.write_meta(inner.pos, &short.encode())
++    }
++
++    fn type_of(short: &ShortEntry) -> InodeType {
++        if short.is_dir() { InodeType::Dir } else { InodeType::File }
++    }
++
++    // ── Files ────────────────────────────────────────────────────────────
++
++    /// The pieces of the disk a page of the file is in: (offset in the
++    /// page, disk offset, length), contiguous ones merged; what is past the
++    /// file's clusters is not in any.
++    fn page_pieces(&self, fs: &VfatFs, map: &mut FileMap, page_start: usize) -> Result<Vec<(usize, u64, usize)>> {
++        let cluster_size = fs.geo.cluster_size as usize;
++        let chain = self.chain_of(fs, map)?;
++        let mut pieces: Vec<(usize, u64, usize)> = Vec::new();
++        let mut at = 0;
++        while at < PAGE_SIZE {
++            let offset = page_start + at;
++            let Some(&cluster) = chain.get(offset / cluster_size) else { break };
++            let within = offset % cluster_size;
++            let length = (cluster_size - within).min(PAGE_SIZE - at);
++            let disk = fs.geo.cluster_offset(cluster) + within as u64;
++            match pieces.last_mut() {
++                Some(last) if last.1 + last.2 as u64 == disk => last.2 += length,
++                _ => pieces.push((at, disk, length)),
++            }
++            at += length;
++        }
++        Ok(pieces)
++    }
++
++    /// Zeros on the disk for the file's bytes `from..to`.
++    fn zero_range(&self, fs: &VfatFs, from: usize, to: usize) -> Result<()> {
++        let cluster_size = fs.geo.cluster_size as usize;
++        let mut map = self.map.lock();
++        let chain = self.chain_of(fs, &mut map)?;
++        let mut offset = from;
++        while offset < to {
++            let Some(&cluster) = chain.get(offset / cluster_size) else { break };
++            let within = offset % cluster_size;
++            let length = (cluster_size - within).min(to - offset);
++            fs.zero_disk(fs.geo.cluster_offset(cluster) + within as u64, length as u64)?;
++            offset += length;
++        }
++        Ok(())
++    }
++
++    /// The file grows to `new_size`, its new bytes before `data_from` zeros.
++    fn grow(&self, fs: &VfatFs, inner: &mut Inner, new_size: usize, data_from: usize) -> Result<()> {
++        let cluster_size = fs.geo.cluster_size as usize;
++        let old_size = {
++            let mut map = self.map.lock();
++            let old_size = map.size;
++            let needed = new_size.div_ceil(cluster_size);
++            let have = self.chain_of(fs, &mut map)?.len();
++            if needed > have {
++                let last = self.chain_of(fs, &mut map)?.last().copied();
++                let added = fs.allocate(needed - have, last)?;
++                if map.start == 0 {
++                    map.start = added[0];
++                }
++                self.chain_of(fs, &mut map)?.extend_from_slice(&added);
++            }
++            old_size
++        };
++        let cache = inner.page_cache.as_mut().ok_or(Error::new(Errno::EIO))?;
++        cache.resize(new_size, old_size)?;
++        let page_end = old_size.align_up(PAGE_SIZE);
++        if data_from > old_size {
++            cache.fill_zeros(old_size..data_from.min(page_end).min(new_size))?;
++            if data_from > page_end {
++                self.zero_range(fs, page_end, data_from.align_up(PAGE_SIZE).min(new_size.align_up(cluster_size)))?;
++            }
++        }
++        self.map.lock().size = new_size;
++        Ok(())
++    }
++
++    /// The file shrinks to `new_size`, its clusters past it freed.
++    fn shrink(&self, fs: &VfatFs, inner: &mut Inner, new_size: usize) -> Result<()> {
++        let old_size = core::mem::replace(&mut self.map.lock().size, new_size);
++        inner.page_cache.as_mut().ok_or(Error::new(Errno::EIO))?.resize(new_size, old_size)?;
++        let cluster_size = fs.geo.cluster_size as usize;
++        let mut map = self.map.lock();
++        let needed = new_size.div_ceil(cluster_size);
++        let chain = self.chain_of(fs, &mut map)?;
++        if needed < chain.len() {
++            if needed == 0 {
++                let start = chain[0];
++                chain.clear();
++                fs.free_chain(start)?;
++                map.start = 0;
++            } else {
++                let last = chain[needed - 1];
++                chain.truncate(needed);
++                fs.cut_chain(last)?;
++            }
++        }
++        Ok(())
++    }
++
++    fn set_size(&self, new_size: usize, data_from: usize) -> Result<()> {
++        if new_size > MAX_FILE_SIZE {
++            return_errno_with_message!(Errno::EFBIG, "FAT files end at 4 GiB");
++        }
++        let fs = self.vfat()?;
++        let _guard = fs.lock();
++        let mut inner = self.inner.write();
++        let old_size = self.map.lock().size;
++        if new_size > old_size {
++            self.grow(&fs, &mut inner, new_size, data_from)?;
++        } else if new_size < old_size {
++            self.shrink(&fs, &mut inner, new_size)?;
++        }
++        Ok(())
++    }
++
++    fn read_file(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        if self.is_dir {
++            return_errno!(Errno::EISDIR);
++        }
++        let inner = self.inner.read();
++        let size = self.map.lock().size;
++        let (start, end) = (offset.min(size), offset.saturating_add(writer.avail()).min(size));
++        if end > start {
++            let cache = inner.page_cache.as_ref().ok_or(Error::new(Errno::EIO))?;
++            let mut limited = writer.clone_exclusive();
++            limited.limit(end - start);
++            cache.read(start, &mut limited)?;
++            writer.skip(end - start);
++        }
++        Ok(end - start)
++    }
++
++    fn write_file(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        if self.is_dir {
++            return_errno!(Errno::EISDIR);
++        }
++        let length = reader.remain();
++        if length == 0 {
++            return Ok(0);
++        }
++        let end = offset.checked_add(length).ok_or(Error::new(Errno::EFBIG))?;
++        if end > self.map.lock().size {
++            self.set_size(end, offset)?;
++        }
++        {
++            let inner = self.inner.read();
++            let cache = inner.page_cache.as_ref().ok_or(Error::new(Errno::EIO))?;
++            cache.write(offset, reader)?;
++        }
++        let fs = self.vfat()?;
++        fs.note_data_written();
++        let now = VfatFs::now();
++        {
++            let mut inner = self.inner.write();
++            inner.mtime = now;
++            inner.ctime = now;
++            inner.short.attr |= attr::ARCHIVE;
++        }
++        let _guard = fs.lock();
++        self.write_entry(&fs)?;
++        Ok(length)
++    }
++
++    /// The file's data and entry written out.
++    pub(super) fn flush(&self) -> Result<()> {
++        if let Some(cache) = self.inner.read().page_cache.as_ref() {
++            let size = self.map.lock().size;
++            cache.flush_range(0..size.align_up(PAGE_SIZE))?;
++        }
++        let fs = self.vfat()?;
++        let _guard = fs.lock();
++        self.write_entry(&fs)
++    }
++}
++
++impl Drop for VfatInode {
++    fn drop(&mut self) {
++        // The clusters of a deleted file go once nothing uses it.
++        if self.inner.read().deleted {
++            if let Some(fs) = self.fs.upgrade() {
++                fs.defer_free(self.map.lock().start);
++            }
++        }
++    }
++}
++
++impl BlockAsPageCacheBackend for VfatInode {
++    fn submit_read_bio(&self, idx: usize, bio_segment: BioSegment, complete_fn: BioCompleteFn, io_batch: &mut IoBatch) -> Result<()> {
++        let fs = self.vfat()?;
++        let page_start = idx * PAGE_SIZE;
++        let pieces = {
++            let mut map = self.map.lock();
++            if page_start >= map.size {
++                drop(map);
++                complete_fn(BioStatus::Zeros);
++                return Ok(());
++            }
++            self.page_pieces(&fs, &mut map, page_start)?
++        };
++        if let [(0, disk, PAGE_SIZE)] = pieces[..] {
++            let bio = Bio::new(BioType::Read, Sid::new(disk / 512), vec![bio_segment], Some(complete_fn));
++            bio.submit(fs.device().as_ref(), io_batch)?;
++            return Ok(());
++        }
++        // Clusters smaller than a page, apart on the disk: piece by piece
++        // (through the page itself: the segment only gives what the device
++        // filled).
++        let mut page = vec![0u8; PAGE_SIZE];
++        let mut status = BioStatus::Complete;
++        for (at, disk, length) in pieces {
++            if fs.device().read_bytes(disk as usize, &mut page[at..at + length]).is_err() {
++                status = BioStatus::IoError;
++            }
++        }
++        if status == BioStatus::Complete && bio_segment.dma_slice().write_bytes(0, &page).is_err() {
++            status = BioStatus::IoError;
++        }
++        complete_fn(status);
++        Ok(())
++    }
++
++    fn submit_write_bio(&self, idx: usize, bio_segment: BioSegment, complete_fn: BioCompleteFn, io_batch: &mut IoBatch) -> Result<()> {
++        let fs = self.vfat()?;
++        let page_start = idx * PAGE_SIZE;
++        let pieces = {
++            let mut map = self.map.lock();
++            if page_start >= map.size {
++                // Past the end (truncated meanwhile): nothing to keep.
++                drop(map);
++                complete_fn(BioStatus::Complete);
++                return Ok(());
++            }
++            self.page_pieces(&fs, &mut map, page_start)?
++        };
++        if let [(0, disk, PAGE_SIZE)] = pieces[..] {
++            let bio = Bio::new(BioType::Write, Sid::new(disk / 512), vec![bio_segment], Some(complete_fn));
++            bio.submit(fs.device().as_ref(), io_batch)?;
++            return Ok(());
++        }
++        let mut page = vec![0u8; PAGE_SIZE];
++        let mut status = BioStatus::Complete;
++        if bio_segment.dma_slice().read_bytes(0, &mut page).is_err() {
++            status = BioStatus::IoError;
++        } else {
++            for (at, disk, length) in pieces {
++                if fs.device().write_bytes(disk as usize, &page[at..at + length]).is_err() {
++                    status = BioStatus::IoError;
++                }
++            }
++        }
++        complete_fn(status);
++        Ok(())
++    }
++}
++
++impl FileOps for VfatInode {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter, _status_flags: StatusFlags) -> Result<usize> {
++        self.read_file(offset, writer)
++    }
++
++    fn write_at(&self, offset: usize, reader: &mut VmReader, _status_flags: StatusFlags) -> Result<usize> {
++        self.write_file(offset, reader)
++    }
++
++    fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
++        if !self.is_dir {
++            return_errno!(Errno::ENOTDIR);
++        }
++        let fs = self.vfat()?;
++        let _guard = fs.lock();
++        let parent_ino = self.inner.read().parent_ino;
++        let mut next = offset;
++        if next == 0 {
++            visitor.visit(".", self.ino, InodeType::Dir, 0)?;
++            next = 1;
++        }
++        if next == 1 {
++            if let Err(error) = visitor.visit("..", parent_ino, InodeType::Dir, 1) {
++                return if next == offset { Err(error) } else { Ok(next - offset) };
++            }
++            next = 2;
++        }
++        let first = next - 2;
++        let mut failed = None;
++        self.scan(&fs, &mut |item| {
++            let Scanned::Entry(entry) = item else { return true };
++            if entry.index < first {
++                return true;
++            }
++            let ino = fs.inodes.lock().get(&entry.pos).map_or(entry.pos / ENTRY_SIZE as u64 + 2, |inode| inode.ino);
++            match visitor.visit(&entry.name, ino, Self::type_of(&entry.short), entry.index + 2) {
++                Ok(()) => {
++                    next = entry.index + 3;
++                    true
++                }
++                Err(error) => {
++                    failed = Some(error);
++                    false
++                }
++            }
++        })?;
++        if let Some(error) = failed {
++            if next == offset {
++                return Err(error);
++            }
++        }
++        Ok(next - offset)
++    }
++}
++
++impl Inode for VfatInode {
++    fn size(&self) -> usize {
++        self.map.lock().size
++    }
++
++    fn resize(&self, _self_dentry: &Dentry, new_size: usize) -> Result<()> {
++        if self.is_dir {
++            return_errno!(Errno::EISDIR);
++        }
++        self.set_size(new_size, new_size)?;
++        let now = VfatFs::now();
++        {
++            let mut inner = self.inner.write();
++            inner.mtime = now;
++            inner.ctime = now;
++        }
++        let fs = self.vfat()?;
++        let _guard = fs.lock();
++        self.write_entry(&fs)
++    }
++
++    fn metadata(&self) -> Result<Metadata> {
++        let fs = self.vfat()?;
++        let inner = self.inner.read();
++        let cluster_size = fs.geo.cluster_size as usize;
++        let (size, allocated) = {
++            let map = self.map.lock();
++            let allocated = match &map.chain {
++                Some(chain) => chain.len() * cluster_size,
++                None if self.is_dir => cluster_size,
++                None => map.size.align_up(cluster_size),
++            };
++            (if self.is_dir { allocated } else { map.size }, allocated)
++        };
++        Ok(Metadata {
++            ino: self.ino,
++            size,
++            optimal_block_size: cluster_size,
++            nr_sectors_allocated: allocated / 512,
++            last_access_at: inner.atime,
++            last_modify_at: inner.mtime,
++            last_meta_change_at: inner.ctime,
++            type_: self.type_(),
++            mode: self.mode_of(&fs, &inner),
++            // Directories too (GNU find counts subdirectories otherwise).
++            nr_hard_links: 1,
++            uid: Uid::new(fs.options.uid),
++            gid: Gid::new(fs.options.gid),
++            container_dev_id: fs.device().id(),
++            self_dev_id: None,
++            birth_at: Some(inner.crtime),
++        })
++    }
++
++    fn ino(&self) -> u64 {
++        self.ino
++    }
++
++    fn type_(&self) -> InodeType {
++        if self.is_dir { InodeType::Dir } else { InodeType::File }
++    }
++
++    fn mode(&self) -> Result<InodeMode> {
++        let fs = self.vfat()?;
++        Ok(self.mode_of(&fs, &self.inner.read()))
++    }
++
++    fn set_mode(&self, _self_dentry: &Dentry, mode: InodeMode) -> Result<()> {
++        // Only the read-only attribute is kept (Linux's `quiet` behavior
++        // for the rest).
++        if self.is_dir {
++            return Ok(());
++        }
++        let read_only = mode.bits() & 0o222 == 0;
++        {
++            let mut inner = self.inner.write();
++            if read_only {
++                inner.short.attr |= attr::READ_ONLY;
++            } else {
++                inner.short.attr &= !attr::READ_ONLY;
++            }
++            inner.ctime = VfatFs::now();
++        }
++        let fs = self.vfat()?;
++        let _guard = fs.lock();
++        self.write_entry(&fs)
++    }
++
++    fn owner(&self) -> Result<Uid> {
++        Ok(Uid::new(self.vfat()?.options.uid))
++    }
++
++    fn set_owner(&self, _self_dentry: &Dentry, uid: Uid) -> Result<()> {
++        if uid == Uid::new(self.vfat()?.options.uid) {
++            return Ok(());
++        }
++        return_errno_with_message!(Errno::EPERM, "FAT files have no owners")
++    }
++
++    fn group(&self) -> Result<Gid> {
++        Ok(Gid::new(self.vfat()?.options.gid))
++    }
++
++    fn set_group(&self, _self_dentry: &Dentry, gid: Gid) -> Result<()> {
++        if gid == Gid::new(self.vfat()?.options.gid) {
++            return Ok(());
++        }
++        return_errno_with_message!(Errno::EPERM, "FAT files have no groups")
++    }
++
++    fn atime(&self) -> Duration {
++        self.inner.read().atime
++    }
++
++    fn set_atime(&self, _self_dentry: &Dentry, time: Duration) {
++        self.inner.write().atime = time;
++        if let Ok(fs) = self.vfat() {
++            let _guard = fs.lock();
++            let _ = self.write_entry(&fs);
++        }
++    }
++
++    fn mtime(&self) -> Duration {
++        self.inner.read().mtime
++    }
++
++    fn set_mtime(&self, _self_dentry: &Dentry, time: Duration) {
++        self.inner.write().mtime = time;
++        if let Ok(fs) = self.vfat() {
++            let _guard = fs.lock();
++            let _ = self.write_entry(&fs);
++        }
++    }
++
++    fn ctime(&self) -> Duration {
++        self.inner.read().ctime
++    }
++
++    fn set_ctime(&self, _self_dentry: &Dentry, time: Duration) {
++        self.inner.write().ctime = time;
++    }
++
++    fn page_cache(&self) -> Option<Arc<Vmo>> {
++        self.inner.read().page_cache.as_ref().map(|cache| cache.as_vmo().clone())
++    }
++
++    fn create(&self, _self_dentry: &Dentry, name: &str, type_: InodeType, _mode: InodeMode) -> Result<Arc<dyn Inode>> {
++        if !self.is_dir {
++            return_errno!(Errno::ENOTDIR);
++        }
++        if !matches!(type_, InodeType::File | InodeType::Dir) {
++            return_errno_with_message!(Errno::EPERM, "FAT holds only files and directories");
++        }
++        let name = layout::trim_name(name);
++        if !layout::valid_long_name(name) {
++            return_errno_with_message!(Errno::EINVAL, "the name is not valid on FAT");
++        }
++        let fs = self.vfat()?;
++        let guard = fs.lock();
++        let now = VfatFs::now();
++        let (date, time, hundredths) = dos(now);
++        let is_dir = type_ == InodeType::Dir;
++        let mut short = ShortEntry {
++            attr: if is_dir { attr::DIRECTORY } else { attr::ARCHIVE },
++            ctime_tenth: hundredths,
++            ctime: time,
++            cdate: date,
++            adate: date,
++            mtime: time,
++            mdate: date,
++            ..Default::default()
++        };
++        // A directory starts with a cluster holding `.` and `..`.
++        if is_dir {
++            let cluster = fs.allocate(1, None)?[0];
++            let made = fs.zero_meta_cluster(cluster).and_then(|()| {
++                let base = fs.geo.cluster_offset(cluster);
++                let dot = ShortEntry { name: *b".          ", cluster, ..short };
++                let dotdot = ShortEntry { name: *b"..         ", cluster: self.dotdot_cluster(), ..short };
++                fs.write_meta(base, &dot.encode())?;
++                fs.write_meta(base + ENTRY_SIZE as u64, &dotdot.encode())
++            });
++            if let Err(error) = made {
++                let _ = fs.free_chain(cluster);
++                return Err(error);
++            }
++            short.cluster = cluster;
++        }
++        let (slots, short) = match self.add_entry(&fs, name, short, None) {
++            Ok(added) => added,
++            Err(error) => {
++                if is_dir {
++                    let _ = fs.free_chain(short.cluster);
++                }
++                return Err(error);
++            }
++        };
++        let pos = *slots.last().unwrap();
++        let inode = Self::build(&fs, pos / ENTRY_SIZE as u64 + 2, pos, slots, self.ino, short);
++        fs.inodes.lock().insert(pos, inode.clone());
++        self.touch(&fs)?;
++        drop(guard);
++        // A file's entry is written out once it is closed.
++        if is_dir {
++            fs.sync_meta()?;
++        }
++        Ok(inode)
++    }
++
++    fn create_symlink(&self, _self_dentry: &Dentry, _name: &str, _target: &str, _mode: InodeMode) -> Result<Arc<dyn Inode>> {
++        return_errno_with_message!(Errno::EPERM, "FAT has no symbolic links")
++    }
++
++    fn mknod(&self, _self_dentry: &Dentry, _name: &str, _mode: InodeMode, _type_: MknodType) -> Result<Arc<dyn Inode>> {
++        return_errno_with_message!(Errno::EPERM, "FAT has no device nodes")
++    }
++
++    fn link(&self, _self_dentry: &Dentry, _old_dentry: &Dentry, _name: &str) -> Result<()> {
++        return_errno_with_message!(Errno::EPERM, "FAT has no hard links")
++    }
++
++    fn unlink(&self, child_dentry: &Dentry) -> Result<()> {
++        let child = child_dentry.inode().downcast_ref::<VfatInode>().ok_or(Error::new(Errno::EXDEV))?;
++        if child.is_dir {
++            return_errno!(Errno::EISDIR);
++        }
++        let fs = self.vfat()?;
++        {
++            let _guard = fs.lock();
++            child.remove_entries(&fs)?;
++            child.inner.write().deleted = true;
++            self.touch(&fs)?;
++        }
++        fs.sync_meta()
++    }
++
++    fn rmdir(&self, child_dentry: &Dentry) -> Result<()> {
++        let child = child_dentry.inode().downcast_ref::<VfatInode>().ok_or(Error::new(Errno::EXDEV))?;
++        if !child.is_dir {
++            return_errno!(Errno::ENOTDIR);
++        }
++        let fs = self.vfat()?;
++        {
++            let _guard = fs.lock();
++            if !child.is_empty(&fs)? {
++                return_errno!(Errno::ENOTEMPTY);
++            }
++            child.remove_entries(&fs)?;
++            child.inner.write().deleted = true;
++            // What is cached of it must never be written where it was.
++            for (start, length) in child.dir_runs(&fs)? {
++                fs.discard_meta(start, length);
++            }
++            self.touch(&fs)?;
++        }
++        fs.sync_meta()
++    }
++
++    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
++        if !self.is_dir {
++            return_errno!(Errno::ENOTDIR);
++        }
++        let name = layout::trim_name(name);
++        if name.encode_utf16().count() > layout::MAX_NAME_UNITS {
++            return_errno!(Errno::ENAMETOOLONG);
++        }
++        let fs = self.vfat()?;
++        let _guard = fs.lock();
++        let entry = self.find(&fs, name, None)?.ok_or(Error::new(Errno::ENOENT))?;
++        Ok(self.child(&fs, entry))
++    }
++
++    fn rename(
++        &self,
++        old_child_dentry: &Dentry,
++        new_dir_dentry: &Dentry,
++        new_name: &str,
++        replaced_inode: Option<&Arc<dyn Inode>>,
++        mode: RenameMode,
++    ) -> Result<()> {
++        if mode == RenameMode::Exchange {
++            return_errno_with_message!(Errno::EINVAL, "RENAME_EXCHANGE is not supported on FAT");
++        }
++        let child = Arc::downcast::<VfatInode>(old_child_dentry.inode().clone()).map_err(|_| Error::new(Errno::EXDEV))?;
++        let new_dir = Arc::downcast::<VfatInode>(new_dir_dentry.inode().clone()).map_err(|_| Error::new(Errno::EXDEV))?;
++        let new_name = layout::trim_name(new_name);
++        if !layout::valid_long_name(new_name) {
++            return_errno_with_message!(Errno::EINVAL, "the name is not valid on FAT");
++        }
++        let fs = self.vfat()?;
++        {
++            let _guard = fs.lock();
++            let child_pos = child.inner.read().pos;
++            // What is there already under the new name.
++            let target = match replaced_inode {
++                Some(inode) => Arc::downcast::<VfatInode>(inode.clone()).ok(),
++                None => new_dir.find(&fs, new_name, None)?.map(|entry| new_dir.child(&fs, entry)),
++            };
++            if let Some(target) = target.as_ref().filter(|target| !Arc::ptr_eq(target, &child)) {
++                if mode == RenameMode::NoReplace {
++                    return_errno!(Errno::EEXIST);
++                }
++                if child.is_dir && !target.is_dir {
++                    return_errno!(Errno::ENOTDIR);
++                }
++                if !child.is_dir && target.is_dir {
++                    return_errno!(Errno::EISDIR);
++                }
++                if target.is_dir && !target.is_empty(&fs)? {
++                    return_errno!(Errno::ENOTEMPTY);
++                }
++                target.remove_entries(&fs)?;
++                target.inner.write().deleted = true;
++                if target.is_dir {
++                    for (start, length) in target.dir_runs(&fs)? {
++                        fs.discard_meta(start, length);
++                    }
++                }
++            }
++            // The old entries go, the new ones come (where the old ones were,
++            // when they fit); the inode stays the same.
++            let saved = child.remove_entries(&fs)?;
++            let short = child.inner.read().short;
++            let short = {
++                let map = child.map.lock();
++                ShortEntry { cluster: map.start, size: if child.is_dir { 0 } else { map.size as u32 }, ..short }
++            };
++            let (slots, short) = match new_dir.add_entry(&fs, new_name, short, Some(child_pos)) {
++                Ok(added) => added,
++                Err(error) => {
++                    for (pos, raw) in saved {
++                        let _ = fs.write_meta(pos, &raw);
++                    }
++                    fs.inodes.lock().insert(child_pos, child.clone());
++                    return Err(error);
++                }
++            };
++            let pos = *slots.last().unwrap();
++            {
++                let mut inner = child.inner.write();
++                inner.pos = pos;
++                inner.slots = slots;
++                inner.parent_ino = new_dir.ino;
++                inner.short.name = short.name;
++                inner.short.case = short.case;
++                inner.ctime = VfatFs::now();
++            }
++            fs.inodes.lock().insert(pos, child.clone());
++            // A directory moved elsewhere: its `..`.
++            if child.is_dir && !core::ptr::eq(self, Arc::as_ptr(&new_dir)) {
++                let start = child.map.lock().start;
++                if fs.geo.is_data_cluster(start) {
++                    let at = fs.geo.cluster_offset(start) + ENTRY_SIZE as u64;
++                    let mut raw = [0u8; ENTRY_SIZE];
++                    fs.read_meta(at, &mut raw)?;
++                    let dotdot = ShortEntry { cluster: new_dir.dotdot_cluster(), ..ShortEntry::parse(&raw) };
++                    fs.write_meta(at, &dotdot.encode())?;
++                }
++            }
++            self.touch(&fs)?;
++            if !core::ptr::eq(self, Arc::as_ptr(&new_dir)) {
++                new_dir.touch(&fs)?;
++            }
++        }
++        fs.sync_meta()
++    }
++
++    fn read_link(&self) -> Result<SymbolicLink> {
++        return_errno_with_message!(Errno::EINVAL, "FAT has no symbolic links")
++    }
++
++    fn sync(&self, _mode: SyncMode) -> Result<()> {
++        self.flush()?;
++        self.vfat()?.sync_meta()
++    }
++
++    fn release(&self) {
++        if self.is_dir {
++            return;
++        }
++        // Written out as soon as it is closed (removable media), and its
++        // cached pages let go.
++        if let Some(cache) = self.inner.read().page_cache.as_ref() {
++            let size = self.map.lock().size;
++            let _ = cache.invalidate_range(0..size.align_up(PAGE_SIZE));
++        }
++        if let Ok(fs) = self.vfat() {
++            {
++                let _guard = fs.lock();
++                let _ = self.write_entry(&fs);
++            }
++            let _ = fs.sync_meta();
++        }
++    }
++
++    fn fs(&self) -> Arc<dyn FileSystem> {
++        self.fs.upgrade().unwrap()
++    }
++
++    fn extension(&self) -> &Extension {
++        &self.extension
++    }
++}
++
++impl VfatInode {
++    fn mode_of(&self, fs: &VfatFs, inner: &Inner) -> InodeMode {
++        let options = fs.options;
++        let mut bits = if self.is_dir { 0o777 & !options.dmask } else { 0o777 & !options.fmask };
++        if !self.is_dir {
++            if options.showexec && !matches!(&inner.short.name[8..11], b"EXE" | b"COM" | b"BAT") {
++                bits &= !0o111;
++            }
++            if inner.short.attr & attr::READ_ONLY != 0 {
++                bits &= !0o222;
++            }
++        }
++        InodeMode::from_bits_truncate(bits)
++    }
++}
+diff --git a/kernel/core/src/fs/fs_impls/vfat/layout.rs b/kernel/core/src/fs/fs_impls/vfat/layout.rs
+new file mode 100755
+index 0000000..286c2a3
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/vfat/layout.rs
+@@ -0,0 +1,667 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The on-disk layout of FAT12, FAT16 and FAT32 volumes (pendrives, memory
++//! cards, cameras, the EFI system partition): the boot sector's geometry,
++//! FAT entries, directory entries with their long (VFAT) names, short-name
++//! generation, DOS timestamps and the OEM code page. No device access here:
++//! its tests run on the host.
++//!
++//! References: Microsoft's "FAT: General Overview of On-Disk Format" 1.03;
++//! Linux's `fs/fat`.
++
++use alloc::{string::String, vec::Vec};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum FatKind {
++    Fat12,
++    Fat16,
++    Fat32,
++}
++
++/// Where everything is on a volume.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Geometry {
++    pub(crate) kind: FatKind,
++    pub(crate) sector_size: u32,
++    pub(crate) cluster_size: u32,
++    pub(crate) reserved_sectors: u32,
++    pub(crate) fats: u32,
++    pub(crate) fat_sectors: u32,
++    /// Entries of the fixed root directory (FAT12 and FAT16).
++    pub(crate) root_entries: u32,
++    /// The root directory's first cluster (FAT32).
++    pub(crate) root_cluster: u32,
++    /// The FSInfo sector (FAT32), or 0.
++    pub(crate) fsinfo_sector: u32,
++    /// Every FAT kept the same, or only `active_fat` used.
++    pub(crate) mirror: bool,
++    pub(crate) active_fat: u32,
++    pub(crate) total_sectors: u64,
++    /// Data clusters, numbered from 2.
++    pub(crate) clusters: u32,
++    pub(crate) serial: u32,
++}
++
++fn le16(b: &[u8], at: usize) -> u32 {
++    u32::from(u16::from_le_bytes([b[at], b[at + 1]]))
++}
++
++fn le32(b: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
++}
++
++/// The highest cluster numbers each kind can address (Linux's `MAX_FAT*`).
++const MAX_FAT12: u64 = 0xff4;
++const MAX_FAT16: u64 = 0xfff4;
++const MAX_FAT32: u64 = 0x0fff_fff6;
++
++impl Geometry {
++    /// Where FAT number `fat` starts, in bytes.
++    pub(crate) fn fat_offset(&self, fat: u32) -> u64 {
++        (u64::from(self.reserved_sectors) + u64::from(fat) * u64::from(self.fat_sectors)) * u64::from(self.sector_size)
++    }
++
++    /// Where the fixed root directory starts (FAT12 and FAT16).
++    pub(crate) fn root_offset(&self) -> u64 {
++        self.fat_offset(self.fats)
++    }
++
++    pub(crate) fn root_bytes(&self) -> u64 {
++        u64::from(self.root_entries) * 32
++    }
++
++    /// Where cluster 2 starts.
++    pub(crate) fn data_offset(&self) -> u64 {
++        let sector = u64::from(self.sector_size);
++        self.root_offset() + self.root_bytes().div_ceil(sector) * sector
++    }
++
++    pub(crate) fn cluster_offset(&self, cluster: u32) -> u64 {
++        self.data_offset() + u64::from(cluster - 2) * u64::from(self.cluster_size)
++    }
++
++    pub(crate) fn is_data_cluster(&self, cluster: u32) -> bool {
++        cluster >= 2 && cluster - 2 < self.clusters
++    }
++
++    pub(crate) fn bytes(&self) -> u64 {
++        self.total_sectors * u64::from(self.sector_size)
++    }
++}
++
++/// The geometry a boot sector describes, if it describes a FAT volume
++/// (with Linux's checks: `fat_read_bpb`).
++pub(crate) fn parse_boot_sector(b: &[u8]) -> Option<Geometry> {
++    if b.len() < 512 {
++        return None;
++    }
++    let sector_size = le16(b, 11);
++    let sectors_per_cluster = u32::from(b[13]);
++    let reserved_sectors = le16(b, 14);
++    let fats = u32::from(b[16]);
++    let root_entries = le16(b, 17);
++    let total16 = le16(b, 19);
++    let media = b[21];
++    let fat16_sectors = le16(b, 22);
++    let total32 = le32(b, 32);
++    let fat32_sectors = le32(b, 36);
++    if !sector_size.is_power_of_two() || !(512..=4096).contains(&sector_size) {
++        return None;
++    }
++    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
++        return None;
++    }
++    if reserved_sectors == 0 || fats == 0 || !(media == 0xf0 || media >= 0xf8) {
++        return None;
++    }
++    let total_sectors = u64::from(if total16 != 0 { total16 } else { total32 });
++    let fat32_layout = fat16_sectors == 0 && fat32_sectors != 0;
++    let fat_sectors = if fat32_layout { fat32_sectors } else { fat16_sectors };
++    if fat_sectors == 0 || total_sectors == 0 {
++        return None;
++    }
++    let root_sectors = (u64::from(root_entries) * 32).div_ceil(u64::from(sector_size));
++    let data_sector = u64::from(reserved_sectors) + u64::from(fats) * u64::from(fat_sectors) + root_sectors;
++    if data_sector >= total_sectors {
++        return None;
++    }
++    let mut clusters = (total_sectors - data_sector) / u64::from(sectors_per_cluster);
++    let kind = if fat32_layout {
++        FatKind::Fat32
++    } else if clusters <= MAX_FAT12 {
++        FatKind::Fat12
++    } else {
++        FatKind::Fat16
++    };
++    if kind != FatKind::Fat32 && root_entries == 0 {
++        return None;
++    }
++    // No more clusters than the FAT has entries for, nor than the kind addresses.
++    let fat_bytes = u64::from(fat_sectors) * u64::from(sector_size);
++    let (entries, max) = match kind {
++        FatKind::Fat12 => (fat_bytes * 2 / 3, MAX_FAT12),
++        FatKind::Fat16 => (fat_bytes / 2, MAX_FAT16),
++        FatKind::Fat32 => (fat_bytes / 4, MAX_FAT32),
++    };
++    clusters = clusters.min(entries.saturating_sub(2)).min(max - 1);
++    if clusters == 0 {
++        return None;
++    }
++    let clusters = clusters as u32;
++    let (root_cluster, fsinfo, flags, signature_at) = if kind == FatKind::Fat32 {
++        (le32(b, 44), le16(b, 48), le16(b, 40), 66)
++    } else {
++        (0, 0, 0, 38)
++    };
++    if kind == FatKind::Fat32 && (root_cluster < 2 || root_cluster - 2 >= clusters) {
++        return None;
++    }
++    let mirror = !(kind == FatKind::Fat32 && flags & 0x80 != 0);
++    Some(Geometry {
++        kind,
++        sector_size,
++        cluster_size: sector_size * sectors_per_cluster,
++        reserved_sectors,
++        fats,
++        fat_sectors,
++        root_entries,
++        root_cluster,
++        fsinfo_sector: if kind == FatKind::Fat32 && fsinfo != 0 && fsinfo < reserved_sectors { fsinfo } else { 0 },
++        mirror,
++        active_fat: if mirror { 0 } else { (flags & 0xf).min(fats - 1) },
++        total_sectors,
++        clusters,
++        serial: if matches!(b[signature_at], 0x28 | 0x29) { le32(b, signature_at + 1) } else { 0 },
++    })
++}
++
++// ── FAT entries ─────────────────────────────────────────────────────────
++
++/// What a FAT says of a cluster.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum FatEntry {
++    Free,
++    Next(u32),
++    End,
++    Bad,
++}
++
++/// Where cluster `cluster`'s entry is in a FAT, and how many bytes to read
++/// there (FAT12 entries are 12 bits, in two bytes).
++pub(crate) fn fat_entry_at(kind: FatKind, cluster: u32) -> (u64, usize) {
++    let cluster = u64::from(cluster);
++    match kind {
++        FatKind::Fat12 => (cluster + cluster / 2, 2),
++        FatKind::Fat16 => (cluster * 2, 2),
++        FatKind::Fat32 => (cluster * 4, 4),
++    }
++}
++
++/// The entry in `raw` (the little-endian bytes at `fat_entry_at`).
++pub(crate) fn decode_fat(kind: FatKind, cluster: u32, raw: u32, clusters: u32) -> FatEntry {
++    let (value, bad, end) = match kind {
++        FatKind::Fat12 => (if cluster & 1 == 1 { raw >> 4 } else { raw & 0xfff }, 0xff7, 0xff8),
++        FatKind::Fat16 => (raw & 0xffff, 0xfff7, 0xfff8),
++        FatKind::Fat32 => (raw & 0x0fff_ffff, 0x0fff_fff7, 0x0fff_fff8),
++    };
++    match value {
++        0 => FatEntry::Free,
++        _ if value >= end => FatEntry::End,
++        _ if value == bad => FatEntry::Bad,
++        // Pointing outside the volume: a broken chain.
++        _ if value < 2 || value - 2 >= clusters => FatEntry::Bad,
++        _ => FatEntry::Next(value),
++    }
++}
++
++/// The bytes to write back at `fat_entry_at` for `entry`, keeping what is
++/// not the entry's (the other half byte of FAT12, FAT32's top 4 bits).
++pub(crate) fn encode_fat(kind: FatKind, cluster: u32, old_raw: u32, entry: FatEntry) -> u32 {
++    let value = match entry {
++        FatEntry::Free => 0,
++        FatEntry::Next(next) => next,
++        FatEntry::End => 0x0fff_ffff,
++        FatEntry::Bad => 0x0fff_fff7,
++    };
++    match kind {
++        FatKind::Fat12 if cluster & 1 == 1 => (old_raw & 0x000f) | (value & 0xfff) << 4,
++        FatKind::Fat12 => (old_raw & 0xf000) | (value & 0xfff),
++        FatKind::Fat16 => value & 0xffff,
++        FatKind::Fat32 => (old_raw & 0xf000_0000) | (value & 0x0fff_ffff),
++    }
++}
++
++/// FAT32's FSInfo sector: the free cluster count and where to look for a
++/// free one, when known.
++pub(crate) fn parse_fsinfo(b: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
++    if b.len() < 512 || le32(b, 0) != 0x4161_5252 || le32(b, 484) != 0x6141_7272 {
++        return None;
++    }
++    let known = |value: u32| (value != u32::MAX).then_some(value);
++    Some((known(le32(b, 488)), known(le32(b, 492))))
++}
++
++pub(crate) fn update_fsinfo(b: &mut [u8], free: u32, next: u32) {
++    b[488..492].copy_from_slice(&free.to_le_bytes());
++    b[492..496].copy_from_slice(&next.to_le_bytes());
++}
++
++// ── Directory entries ───────────────────────────────────────────────────
++
++pub(crate) const ENTRY_SIZE: usize = 32;
++pub(crate) const DELETED: u8 = 0xe5;
++/// The longest long name, in UTF-16 units.
++pub(crate) const MAX_NAME_UNITS: usize = 255;
++
++pub(crate) mod attr {
++    pub(crate) const READ_ONLY: u8 = 0x01;
++    pub(crate) const VOLUME: u8 = 0x08;
++    pub(crate) const DIRECTORY: u8 = 0x10;
++    pub(crate) const ARCHIVE: u8 = 0x20;
++    pub(crate) const LONG_NAME: u8 = 0x0f;
++}
++
++/// Windows NT's case flags: the short name's base or extension shown in
++/// lower case.
++const CASE_LOWER_BASE: u8 = 0x08;
++const CASE_LOWER_EXT: u8 = 0x10;
++
++/// A short (8.3) directory entry.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++pub(crate) struct ShortEntry {
++    pub(crate) name: [u8; 11],
++    pub(crate) attr: u8,
++    pub(crate) case: u8,
++    pub(crate) ctime_tenth: u8,
++    pub(crate) ctime: u16,
++    pub(crate) cdate: u16,
++    pub(crate) adate: u16,
++    pub(crate) cluster: u32,
++    pub(crate) mtime: u16,
++    pub(crate) mdate: u16,
++    pub(crate) size: u32,
++}
++
++fn u16_at(b: &[u8], at: usize) -> u16 {
++    u16::from_le_bytes([b[at], b[at + 1]])
++}
++
++impl ShortEntry {
++    pub(crate) fn parse(raw: &[u8; ENTRY_SIZE]) -> Self {
++        let mut name = [0u8; 11];
++        name.copy_from_slice(&raw[0..11]);
++        Self {
++            name,
++            attr: raw[11],
++            case: raw[12],
++            ctime_tenth: raw[13],
++            ctime: u16_at(raw, 14),
++            cdate: u16_at(raw, 16),
++            adate: u16_at(raw, 18),
++            cluster: u32::from(u16_at(raw, 20)) << 16 | u32::from(u16_at(raw, 26)),
++            mtime: u16_at(raw, 22),
++            mdate: u16_at(raw, 24),
++            size: le32(raw, 28),
++        }
++    }
++
++    pub(crate) fn encode(&self) -> [u8; ENTRY_SIZE] {
++        let mut raw = [0u8; ENTRY_SIZE];
++        raw[0..11].copy_from_slice(&self.name);
++        raw[11] = self.attr;
++        raw[12] = self.case;
++        raw[13] = self.ctime_tenth;
++        raw[14..16].copy_from_slice(&self.ctime.to_le_bytes());
++        raw[16..18].copy_from_slice(&self.cdate.to_le_bytes());
++        raw[18..20].copy_from_slice(&self.adate.to_le_bytes());
++        raw[20..22].copy_from_slice(&((self.cluster >> 16) as u16).to_le_bytes());
++        raw[22..24].copy_from_slice(&self.mtime.to_le_bytes());
++        raw[24..26].copy_from_slice(&self.mdate.to_le_bytes());
++        raw[26..28].copy_from_slice(&(self.cluster as u16).to_le_bytes());
++        raw[28..32].copy_from_slice(&self.size.to_le_bytes());
++        raw
++    }
++
++    pub(crate) fn is_dir(&self) -> bool {
++        self.attr & attr::DIRECTORY != 0
++    }
++
++    pub(crate) fn is_volume_label(&self) -> bool {
++        self.attr & attr::VOLUME != 0
++    }
++
++    /// `.` or `..`, which every subdirectory starts with.
++    pub(crate) fn is_dot(&self) -> bool {
++        self.name == *b".          " || self.name == *b"..         "
++    }
++
++    /// The short name as shown: `NAME.EXT`, in lower case where Windows NT
++    /// marked it so, in the OEM code page (437).
++    pub(crate) fn display_name(&self) -> String {
++        let mut raw = self.name;
++        // 0x05 stands for a first byte 0xe5 (which would mean "deleted").
++        if raw[0] == 0x05 {
++            raw[0] = DELETED;
++        }
++        let part = |bytes: &[u8], lower: bool| -> String {
++            let end = bytes.iter().rposition(|&b| b != b' ').map_or(0, |at| at + 1);
++            bytes[..end]
++                .iter()
++                .map(|&b| {
++                    let c = cp437_char(b);
++                    if lower { c.to_ascii_lowercase() } else { c }
++                })
++                .collect()
++        };
++        let base = part(&raw[0..8], self.case & CASE_LOWER_BASE != 0);
++        let ext = part(&raw[8..11], self.case & CASE_LOWER_EXT != 0);
++        if ext.is_empty() { base } else { alloc::format!("{}.{}", base, ext) }
++    }
++}
++
++/// One 32-byte directory slot.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Slot {
++    /// This and every slot after it are free.
++    End,
++    Free,
++    Long { ord: u8, last: bool, checksum: u8, units: [u16; 13] },
++    Short(ShortEntry),
++}
++
++/// Where a long-name entry keeps its 13 UTF-16 units.
++const LONG_UNIT_OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
++
++pub(crate) fn parse_slot(raw: &[u8; ENTRY_SIZE]) -> Slot {
++    match raw[0] {
++        0x00 => Slot::End,
++        DELETED => Slot::Free,
++        _ if raw[11] & 0x3f == attr::LONG_NAME => {
++            let mut units = [0u16; 13];
++            for (unit, &at) in units.iter_mut().zip(LONG_UNIT_OFFSETS.iter()) {
++                *unit = u16_at(raw, at);
++            }
++            Slot::Long { ord: raw[0] & 0x1f, last: raw[0] & 0x40 != 0, checksum: raw[13], units }
++        }
++        _ => Slot::Short(ShortEntry::parse(raw)),
++    }
++}
++
++/// The checksum of a short name that its long-name entries carry.
++pub(crate) fn checksum(name: &[u8; 11]) -> u8 {
++    name.iter().fold(0u8, |sum, &b| ((sum & 1) << 7).wrapping_add(sum >> 1).wrapping_add(b))
++}
++
++/// The long-name entries of `name` (UTF-16), in the order they go on disk
++/// (the last part first), before the short entry.
++pub(crate) fn long_entries(name: &[u16], checksum: u8) -> Vec<[u8; ENTRY_SIZE]> {
++    let count = name.len().div_ceil(13);
++    let mut entries = Vec::with_capacity(count);
++    for ord in (1..=count).rev() {
++        let mut raw = [0u8; ENTRY_SIZE];
++        raw[0] = ord as u8 | if ord == count { 0x40 } else { 0 };
++        raw[11] = attr::LONG_NAME;
++        raw[13] = checksum;
++        for (index, &at) in LONG_UNIT_OFFSETS.iter().enumerate() {
++            let position = (ord - 1) * 13 + index;
++            // The name ends with 0x0000, then 0xffff pads the entry.
++            let unit = match position.cmp(&name.len()) {
++                core::cmp::Ordering::Less => name[position],
++                core::cmp::Ordering::Equal => 0x0000,
++                core::cmp::Ordering::Greater => 0xffff,
++            };
++            raw[at..at + 2].copy_from_slice(&unit.to_le_bytes());
++        }
++        entries.push(raw);
++    }
++    entries
++}
++
++/// Puts a long name together from its entries, as they come before their
++/// short entry; a name whose parts are missing, out of order or for
++/// another short name is dropped (the short name is shown instead).
++#[derive(Default)]
++pub(crate) struct LongName {
++    parts: Vec<[u16; 13]>,
++    checksum: u8,
++    /// The next ordinal expected; 0 when complete.
++    next: u8,
++    started: bool,
++}
++
++impl LongName {
++    pub(crate) fn push(&mut self, ord: u8, last: bool, checksum: u8, units: [u16; 13]) {
++        if last {
++            if ord == 0 || ord > 20 {
++                self.reset();
++                return;
++            }
++            self.parts = alloc::vec![[0u16; 13]; usize::from(ord)];
++            self.parts[usize::from(ord) - 1] = units;
++            self.checksum = checksum;
++            self.next = ord - 1;
++            self.started = true;
++        } else if self.started && ord != 0 && ord == self.next && checksum == self.checksum {
++            self.parts[usize::from(ord) - 1] = units;
++            self.next -= 1;
++        } else {
++            self.reset();
++        }
++    }
++
++    pub(crate) fn reset(&mut self) {
++        self.parts.clear();
++        self.started = false;
++        self.next = 0;
++    }
++
++    /// A name is being put together.
++    pub(crate) fn active(&self) -> bool {
++        self.started
++    }
++
++    /// The name, if complete and for the short entry `short_checksum` is of.
++    pub(crate) fn take(&mut self, short_checksum: u8) -> Option<String> {
++        let complete = self.started && self.next == 0 && self.checksum == short_checksum;
++        let units: Vec<u16> = if complete {
++            self.parts.iter().flatten().copied().take_while(|&unit| unit != 0x0000).collect()
++        } else {
++            Vec::new()
++        };
++        self.reset();
++        if units.is_empty() || units.len() > MAX_NAME_UNITS {
++            return None;
++        }
++        Some(char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect())
++    }
++}
++
++// ── Names ───────────────────────────────────────────────────────────────
++
++/// What Linux's vfat refuses in a name.
++fn bad_char(c: char) -> bool {
++    (c as u32) < 0x20 || matches!(c, '*' | '?' | '<' | '>' | '|' | '"' | ':' | '/' | '\\')
++}
++
++/// The name as stored: Linux's vfat drops trailing dots.
++pub(crate) fn trim_name(name: &str) -> &str {
++    name.trim_end_matches('.')
++}
++
++pub(crate) fn valid_long_name(name: &str) -> bool {
++    !name.is_empty()
++        && name != "."
++        && name != ".."
++        && name.encode_utf16().count() <= MAX_NAME_UNITS
++        && !name.chars().any(bad_char)
++}
++
++fn fold(c: char) -> char {
++    let mut upper = c.to_uppercase();
++    match (upper.next(), upper.next()) {
++        (Some(single), None) => single,
++        _ => c,
++    }
++}
++
++/// FAT names are the same in any case.
++pub(crate) fn names_equal(a: &str, b: &str) -> bool {
++    a.chars().map(fold).eq(b.chars().map(fold))
++}
++
++/// Characters a short name may hold besides letters and digits.
++fn short_char(b: u8) -> bool {
++    b.is_ascii_uppercase() || b.is_ascii_digit() || b >= 0x80 || b"$%'-_@~`!(){}^#&".contains(&b)
++}
++
++/// The OEM byte for a character in a short name: upper-cased, `None` when
++/// code page 437 has no such character or it may not be in a short name.
++fn short_byte(c: char) -> Option<u8> {
++    let c = fold(c);
++    if c.is_ascii() {
++        let b = c as u8;
++        return short_char(b).then_some(b);
++    }
++    cp437_byte(c)
++}
++
++/// The short name for a new entry named `name`: the name itself when it is
++/// a valid upper-case 8.3 name (no long-name entries then), otherwise one
++/// made from it with a numeric tail (`LONGFI~1.TXT`) that `taken` does not
++/// report, and long-name entries.
++pub(crate) fn short_name_for(name: &str, taken: impl Fn(&[u8; 11]) -> bool) -> Option<([u8; 11], bool)> {
++    if let Some(exact) = exact_short_name(name) {
++        if !taken(&exact) {
++            return Some((exact, false));
++        }
++    }
++    // Leading dots and every space go; the extension is after the last dot.
++    let stripped = name.trim_start_matches('.');
++    let (base_part, ext_part) = match stripped.rfind('.') {
++        Some(at) => (&stripped[..at], &stripped[at + 1..]),
++        None => (stripped, ""),
++    };
++    let convert = |part: &str, max: usize| -> Vec<u8> {
++        part.chars().filter(|&c| c != ' ' && c != '.').map(|c| short_byte(c).unwrap_or(b'_')).take(max).collect()
++    };
++    let mut base = convert(base_part, 8);
++    let ext = convert(ext_part, 3);
++    if base.is_empty() {
++        base.push(b'_');
++    }
++    for number in 1..1_000_000u32 {
++        let tail = alloc::format!("~{}", number);
++        let keep = base.len().min(8 - tail.len());
++        let mut candidate = [b' '; 11];
++        candidate[..keep].copy_from_slice(&base[..keep]);
++        candidate[keep..keep + tail.len()].copy_from_slice(tail.as_bytes());
++        candidate[8..8 + ext.len()].copy_from_slice(&ext);
++        if candidate[0] == DELETED {
++            candidate[0] = 0x05;
++        }
++        if !taken(&candidate) {
++            return Some((candidate, true));
++        }
++    }
++    None
++}
++
++/// `name` as an 8.3 name, if it is one exactly (upper case, at most one dot).
++fn exact_short_name(name: &str) -> Option<[u8; 11]> {
++    if name.is_empty() || name.starts_with('.') || !name.is_ascii() {
++        return None;
++    }
++    let (base, ext) = match name.split_once('.') {
++        Some((base, ext)) => (base, ext),
++        None => (name, ""),
++    };
++    if base.is_empty() || base.len() > 8 || ext.len() > 3 || ext.contains('.') {
++        return None;
++    }
++    if !base.bytes().chain(ext.bytes()).all(short_char) {
++        return None;
++    }
++    let mut short = [b' '; 11];
++    short[..base.len()].copy_from_slice(base.as_bytes());
++    short[8..8 + ext.len()].copy_from_slice(ext.as_bytes());
++    Some(short)
++}
++
++// ── Time ────────────────────────────────────────────────────────────────
++
++/// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
++fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
++    let year = if month <= 2 { year - 1 } else { year };
++    let era = year.div_euclid(400);
++    let yoe = year - era * 400;
++    let month = i64::from(month);
++    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
++    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++    era * 146_097 + doe - 719_468
++}
++
++fn civil_from_days(days: i64) -> (i64, u32, u32) {
++    let z = days + 719_468;
++    let era = z.div_euclid(146_097);
++    let doe = z - era * 146_097;
++    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
++    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
++    (yoe + era * 400 + i64::from(month <= 2), month, day)
++}
++
++/// A time (seconds and milliseconds since 1970, UTC) as a DOS date, time
++/// and hundredths of seconds (0..=199) past its even second; clamped to
++/// what DOS dates hold (1980 to 2107).
++pub(crate) fn to_dos(seconds: u64, millis: u32) -> (u16, u16, u8) {
++    const FIRST: u64 = 315_532_800; // 1980-01-01
++    const LAST: u64 = 4_354_819_198; // 2107-12-31 23:59:58
++    let seconds = seconds.clamp(FIRST, LAST);
++    let days = (seconds / 86_400) as i64;
++    let rest = (seconds % 86_400) as u32;
++    let (year, month, day) = civil_from_days(days);
++    let date = ((year - 1980) as u16) << 9 | (month as u16) << 5 | day as u16;
++    let time = ((rest / 3600) as u16) << 11 | ((rest / 60 % 60) as u16) << 5 | ((rest % 60) / 2) as u16;
++    let hundredths = ((rest % 2) * 100 + millis.min(999) / 10) as u8;
++    (date, time, hundredths)
++}
++
++/// A DOS date and time (and hundredths, for creation times) as seconds and
++/// milliseconds since 1970; a zero date is the start of 1980.
++pub(crate) fn from_dos(date: u16, time: u16, hundredths: u8) -> (u64, u32) {
++    let year = 1980 + i64::from(date >> 9);
++    let month = u32::from((date >> 5) & 0xf).clamp(1, 12);
++    let day = u32::from(date & 0x1f).clamp(1, 31);
++    let days = days_from_civil(year, month, day);
++    let hour = u64::from(time >> 11).min(23);
++    let minute = u64::from((time >> 5) & 0x3f).min(59);
++    let second = u64::from(time & 0x1f).min(29) * 2;
++    let hundredths = u32::from(hundredths.min(199));
++    let seconds = days as u64 * 86_400 + hour * 3600 + minute * 60 + second + u64::from(hundredths / 100);
++    (seconds, (hundredths % 100) * 10)
++}
++
++// ── Code page 437 ───────────────────────────────────────────────────────
++
++/// The upper half of code page 437, the OEM code page short names are in
++/// (Linux's default `codepage=437`).
++const CP437_HIGH: [char; 128] = [
++    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', //
++    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', //
++    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', //
++    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐', //
++    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', //
++    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀', //
++    'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', //
++    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
++];
++
++fn cp437_char(b: u8) -> char {
++    if b < 0x80 { b as char } else { CP437_HIGH[usize::from(b - 0x80)] }
++}
++
++fn cp437_byte(c: char) -> Option<u8> {
++    CP437_HIGH.iter().position(|&high| high == c).map(|at| 0x80 + at as u8)
++}
+diff --git a/kernel/core/src/fs/fs_impls/vfat/mod.rs b/kernel/core/src/fs/fs_impls/vfat/mod.rs
+new file mode 100755
+index 0000000..717b98f
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/vfat/mod.rs
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! FAT12, FAT16 and FAT32 with long names (`vfat`): pendrives, memory
++//! cards, cameras and the EFI system partition, read and written as Linux
++//! does.
++
++mod fs;
++mod inode;
++mod layout;
++
++pub(super) fn init() {
++    crate::fs::vfs::registry::register(&fs::VFAT_TYPE).unwrap();
++}
+diff --git a/kernel/core/src/fs/vfs/fs_apis/inode.rs b/kernel/core/src/fs/vfs/fs_apis/inode.rs
+index f762543..0a377c3 100644
+--- a/kernel/core/src/fs/vfs/fs_apis/inode.rs
++++ b/kernel/core/src/fs/vfs/fs_apis/inode.rs
+@@ -536,6 +536,11 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
+         Ok(())
+     }
+ 
++    /// The last handle of an opened file was closed. Filesystems of
++    /// removable media write the file out then, as Linux's `flush` mount
++    /// option does, and let go of its cached pages.
++    fn release(&self) {}
++
+     /// Manipulates a range of space of the file according to the specified allocate mode,
+     /// the manipulated range starts at `offset` and continues for `len` bytes.
+     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {

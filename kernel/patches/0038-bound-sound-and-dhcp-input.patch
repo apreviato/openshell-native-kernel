@@ -1,0 +1,104 @@
+diff --git a/kernel/core/src/device/snd/control.rs b/kernel/core/src/device/snd/control.rs
+index 03db5f1..5e3c7ec 100755
+--- a/kernel/core/src/device/snd/control.rs
++++ b/kernel/core/src/device/snd/control.rs
+@@ -71,6 +71,10 @@ const TYPE_INTEGER64: u32 = 6;
+ const MAX_VALUES: u32 = 128;
+ /// TLV data a control of the user's keeps at most.
+ const MAX_TLV: usize = 4096;
++/// Controls the programs may add to a card (softvol makes one or two), as
++/// Linux's MAX_USER_CONTROLS bounded them: no program can fill the kernel's
++/// memory with them.
++const MAX_USER_CONTROLS: usize = 32;
+ const EVENT_ELEM: u32 = 0;
+ const EVENT_MASK_VALUE: u32 = 1 << 0;
+ /// `SNDRV_CTL_TLVT_DB_SCALE`.
+@@ -486,6 +490,9 @@ impl PerOpenFileOps for ControlHandle {
+                 let mut users = USER_CONTROLS.lock();
+                 let list = users.entry(card.index).or_default();
+                 let existing = list.iter().position(|c| c.iface == iface && c.name == name && c.index == index);
++                if existing.is_none() && list.len() >= MAX_USER_CONTROLS {
++                    return_errno_with_message!(Errno::ENOMEM, "the card has as many controls of programs as it takes");
++                }
+                 let numid = match (existing, replace) {
+                     (Some(_), false) => return_errno_with_message!(Errno::EBUSY, "the control exists"),
+                     (None, true) => return_errno_with_message!(Errno::ENOENT, "no control to replace"),
+@@ -546,7 +553,7 @@ impl PerOpenFileOps for ControlHandle {
+             }
+             ioctl::TLV_READ => {
+                 let numid = current_userspace!().read_val::<u32>(arg)?;
+-                let length = current_userspace!().read_val::<u32>(arg + 4)? as usize;
++                let length = current_userspace!().read_val::<u32>(arg.checked_add(4).ok_or(Error::new(Errno::EFAULT))?)? as usize;
+                 if numid as usize > card.controls.len() {
+                     let tlv = with_user(card, numid, |control| control.tlv.clone()).ok_or(Error::new(Errno::ENOENT))?;
+                     if tlv.is_empty() {
+@@ -555,7 +562,7 @@ impl PerOpenFileOps for ControlHandle {
+                     if length < tlv.len() {
+                         return_errno!(Errno::ENOMEM);
+                     }
+-                    current_userspace!().write_bytes(arg + 8, &tlv)?;
++                    current_userspace!().write_bytes(arg.checked_add(8).ok_or(Error::new(Errno::EFAULT))?, &tlv)?;
+                     return Ok(0);
+                 }
+                 let control = (numid as usize).checked_sub(1).and_then(|index| card.controls.get(index)).ok_or(Error::new(Errno::ENOENT))?;
+@@ -568,16 +575,16 @@ impl PerOpenFileOps for ControlHandle {
+                 put_u32(&mut tlv, 4, 8);
+                 put_u32(&mut tlv, 8, min as u32);
+                 put_u32(&mut tlv, 12, step | if mute { TLV_DB_SCALE_MUTE } else { 0 });
+-                current_userspace!().write_bytes(arg + 8, &tlv)?;
++                current_userspace!().write_bytes(arg.checked_add(8).ok_or(Error::new(Errno::EFAULT))?, &tlv)?;
+             }
+             ioctl::TLV_WRITE => {
+                 let numid = current_userspace!().read_val::<u32>(arg)?;
+-                let length = current_userspace!().read_val::<u32>(arg + 4)? as usize;
++                let length = current_userspace!().read_val::<u32>(arg.checked_add(4).ok_or(Error::new(Errno::EFAULT))?)? as usize;
+                 if length > MAX_TLV {
+                     return_errno!(Errno::ENOMEM);
+                 }
+                 let mut tlv = vec![0u8; length];
+-                current_userspace!().read_bytes(arg + 8, &mut tlv)?;
++                current_userspace!().read_bytes(arg.checked_add(8).ok_or(Error::new(Errno::EFAULT))?, &mut tlv)?;
+                 if numid as usize <= card.controls.len() {
+                     return_errno_with_message!(Errno::ENXIO, "the card's own controls keep their scales");
+                 }
+diff --git a/kernel/core/src/device/snd/pcm.rs b/kernel/core/src/device/snd/pcm.rs
+index f7d14c9..446409f 100755
+--- a/kernel/core/src/device/snd/pcm.rs
++++ b/kernel/core/src/device/snd/pcm.rs
+@@ -333,7 +333,11 @@ impl PcmHandle {
+                 continue;
+             }
+             let bytes = count as usize * setup.frame_bytes;
+-            let at = addr + done as usize * setup.frame_bytes;
++            // A pointer the program gave: past the address space, a fault.
++            let at = (done as usize)
++                .checked_mul(setup.frame_bytes)
++                .and_then(|skip| addr.checked_add(skip))
++                .ok_or(Error::new(Errno::EFAULT))?;
+             // Through a bounce buffer: sound moves a few hundred KiB a
+             // second at most.
+             let mut bounce = vec![0u8; bytes];
+diff --git a/kernel/libs/aster-bigtcp/src/iface/dhcp.rs b/kernel/libs/aster-bigtcp/src/iface/dhcp.rs
+index 7c11ae4..97cfc43 100755
+--- a/kernel/libs/aster-bigtcp/src/iface/dhcp.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/dhcp.rs
+@@ -348,9 +348,17 @@ pub(crate) fn dhcp_datagram(ipv4: &[u8]) -> Option<&[u8]> {
+ pub fn resolv_conf(leases: &[Lease]) -> Vec<u8> {
+     let mut text = Vec::new();
+     for lease in leases {
+-        if !lease.domain.is_empty() {
++        // A name as dhclient takes option 15: letters, digits, '-' and '.',
++        // without the NUL some servers end it with. Anything else (a line
++        // break, a space, a byte that is not text) and it is left out: the
++        // server cannot add lines of its own.
++        let domain = lease.domain.strip_suffix(&[0]).unwrap_or(&lease.domain);
++        let valid = !domain.is_empty()
++            && domain.len() <= 253
++            && domain.iter().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'));
++        if valid {
+             text.extend_from_slice(b"domain ");
+-            text.extend_from_slice(&lease.domain);
++            text.extend_from_slice(domain);
+             text.push(b'\n');
+         }
+     }

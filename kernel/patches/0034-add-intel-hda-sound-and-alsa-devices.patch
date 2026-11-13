@@ -1,0 +1,4955 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 4b27dbe..a885234 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -161,6 +161,7 @@ dependencies = [
+  "aster-rights",
+  "aster-rights-proc",
+  "aster-softirq",
++ "aster-sound",
+  "aster-systree",
+  "aster-time",
+  "aster-util",
+@@ -403,6 +404,16 @@ dependencies = [
+  "spin",
+ ]
+ 
++[[package]]
++name = "aster-sound"
++version = "0.1.0"
++dependencies = [
++ "aster-pci",
++ "component",
++ "ostd",
++ "spin",
++]
++
+ [[package]]
+ name = "aster-systree"
+ version = "0.1.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index a138b30..6f68f73 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,7 @@ members = [
+     "kernel/comps/drm",
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
++    "kernel/comps/sound",
+     "kernel/comps/uart",
+     "kernel/comps/usb",
+     "kernel/core",
+@@ -88,6 +89,7 @@ default-members = [
+     "kernel/comps/drm",
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
++    "kernel/comps/sound",
+     "kernel/comps/uart",
+     "kernel/comps/usb",
+     "kernel/core",
+@@ -176,6 +178,7 @@ aster-drm = { path = "kernel/comps/drm" }
+ aster-backlight = { path = "kernel/comps/backlight" }
+ aster-i8042 = { path = "kernel/comps/i8042" }
+ aster-usb = { path = "kernel/comps/usb" }
++aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+ aster-uart = { path = "kernel/comps/uart" }
+ 
+diff --git a/Components.toml b/Components.toml
+index e1a8e5a..c353ee5 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -17,6 +17,7 @@ nvme = { name = "aster-nvme" }
+ pci = { name = "aster-pci" }
+ simpledrm = { name = "aster-simpledrm" }
+ softirq = { name = "aster-softirq" }
++sound = { name = "aster-sound" }
+ systree = { name = "aster-systree" }
+ time = { name = "aster-time" }
+ uart = { name = "aster-uart" }
+diff --git a/kernel/comps/sound/Cargo.toml b/kernel/comps/sound/Cargo.toml
+new file mode 100755
+index 0000000..22da0bd
+--- /dev/null
++++ b/kernel/comps/sound/Cargo.toml
+@@ -0,0 +1,13 @@
++[package]
++name = "aster-sound"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-pci.workspace = true
++component.workspace = true
++ostd.workspace = true
++spin.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/sound/src/card.rs b/kernel/comps/sound/src/card.rs
+new file mode 100755
+index 0000000..e11a444
+--- /dev/null
++++ b/kernel/comps/sound/src/card.rs
+@@ -0,0 +1,434 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A sound card as ALSA presents it: an HDA controller with its first codec
++//! that has analog outputs or inputs; a playback and a capture stream; the
++//! mixer controls (the master volume and switch, the capture ones, the
++//! jacks); and a task that follows the headphone jack, turning the speakers
++//! off while headphones are in.
++
++use alloc::{
++    boxed::Box,
++    format,
++    string::{String, ToString},
++    sync::Arc,
++    vec,
++    vec::Vec,
++};
++use core::sync::atomic::{AtomicU64, Ordering};
++
++use ostd::sync::{LocalIrqDisabled, SpinLock, WaitQueue};
++
++use crate::{
++    codec::{self, Amp, Codec, Kind, PinDevice, Route, parameter, verb},
++    hda::{self, Controller, Stream},
++    params::{HwLimits, Mask, format, info},
++    pcm::{Direction, Pcm},
++};
++
++/// `SNDRV_CTL_ELEM_IFACE_*`.
++pub const IFACE_CARD: i32 = 0;
++pub const IFACE_MIXER: i32 = 2;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ControlKind {
++    Boolean,
++    Integer { min: i64, max: i64 },
++}
++
++/// What a control does when set.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Target {
++    PlaybackVolume,
++    PlaybackSwitch,
++    CaptureVolume,
++    CaptureSwitch,
++    /// A jack's presence (read only).
++    Jack,
++}
++
++pub struct Control {
++    pub name: String,
++    pub iface: i32,
++    pub kind: ControlKind,
++    pub count: u32,
++    pub writable: bool,
++    /// A dB scale: (the lowest step's gain, the step, in hundredths of a
++    /// dB; whether the lowest is a mute).
++    pub db_scale: Option<(i32, u32, bool)>,
++    values: SpinLock<Vec<i64>, LocalIrqDisabled>,
++    target: Target,
++    /// When it last changed (the card's event counter).
++    pub changed: AtomicU64,
++}
++
++impl Control {
++    pub fn values(&self) -> Vec<i64> {
++        self.values.lock().clone()
++    }
++}
++
++pub struct Card {
++    pub index: u32,
++    pub id: String,
++    pub driver: String,
++    pub name: String,
++    pub longname: String,
++    pub mixer_name: String,
++    pub components: String,
++    pub pcm_name: String,
++    pub playback: Option<Arc<Pcm>>,
++    pub capture: Option<Arc<Pcm>>,
++    pub controls: Vec<Control>,
++    /// Counts control changes; readers of events wait for it to move.
++    pub events: AtomicU64,
++    pub event_wait: WaitQueue,
++    controller: Arc<Controller>,
++    codec: usize,
++    outputs: Vec<Route>,
++    inputs: Vec<Route>,
++    /// Whether each output plays now (headphones in: not the speakers).
++    enabled: SpinLock<Vec<bool>, LocalIrqDisabled>,
++}
++
++/// Makers' names for the codecs' vendor IDs (as Linux's `hda_codec.c`).
++fn vendor_name(vendor: u32) -> String {
++    let (maker, device) = ((vendor >> 16) as u16, vendor as u16);
++    match maker {
++        0x10ec => format!("Realtek ALC{:x}", device),
++        0x14f1 => format!("Conexant CX{:x}", device),
++        0x111d | 0x8384 => format!("IDT 92HD{:x}", device),
++        0x1013 => format!("Cirrus Logic CS{:x}", device),
++        0x11d4 => format!("Analog Devices AD{:x}", device),
++        0x1106 => format!("VIA VT{:x}", device),
++        0x8086 => format!("Intel {:x}", device),
++        0x1002 => format!("ATI {:x}", device),
++        0x10de => format!("Nvidia {:x}", device),
++        0x434d => format!("C-Media CMI{:x}", device),
++        0x1af4 => "QEMU".to_string(),
++        _ => format!("Generic {:04x} ID {:04x}", maker, device),
++    }
++}
++
++/// ALSA's names for the controller (card ID, name).
++fn card_names(vendor: u16) -> (&'static str, &'static str) {
++    match vendor {
++        0x8086 => ("PCH", "HDA Intel PCH"),
++        0x1022 | 0x1002 => ("Generic", "HD-Audio Generic"),
++        0x10de => ("NVidia", "HDA NVidia"),
++        _ => ("Intel", "HDA Intel"),
++    }
++}
++
++impl Card {
++    /// The card of a controller, if one of its codecs has analog outputs or
++    /// inputs (a GPU's HDMI-only controller has none).
++    pub(crate) fn new(index: u32, controller: Arc<Controller>, vendor: u16, location: String) -> Option<Arc<Self>> {
++        let (codec_index, codec) = controller
++            .codecs
++            .iter()
++            .enumerate()
++            .find(|(_, codec)| !codec.output_routes().is_empty() || !codec.input_routes().is_empty())?;
++        let outputs = codec.output_routes();
++        let inputs = codec.input_routes();
++        let mixer_name = vendor_name(codec.vendor);
++        let (id, name) = card_names(vendor);
++        let pcm_name = format!("{} Analog", mixer_name.split(' ').nth(1).unwrap_or("HDA"));
++
++        // Set the paths up: powered, routed, at 0 dB.
++        for route in &outputs {
++            for (nid, verb, payload) in codec.setup_verbs(route, true) {
++                controller.command(codec.address, nid, verb, payload);
++            }
++        }
++        for route in &inputs {
++            for (nid, verb, payload) in codec.setup_verbs(route, false) {
++                controller.command(codec.address, nid, verb, payload);
++            }
++        }
++
++        let playback = if outputs.is_empty() {
++            None
++        } else {
++            let mut converters: Vec<(u8, u8)> = outputs.iter().map(|route| (codec.address, route.path.converter)).collect();
++            converters.dedup();
++            let base = controller.output_descriptor(0)?;
++            let stream = Stream::new(controller.clone(), base, 1, converters.clone())?;
++            let limits = limits_of(&controller, codec, &converters);
++            Pcm::new(Direction::Playback, limits, pcm_name.clone(), pcm_name.clone(), Box::new(stream))
++        };
++        let capture = match inputs.first() {
++            None => None,
++            Some(route) => {
++                let converters = vec![(codec.address, route.path.converter)];
++                let base = controller.input_descriptor(0)?;
++                let stream = Stream::new(controller.clone(), base, 1, converters.clone())?;
++                let limits = limits_of(&controller, codec, &converters);
++                Pcm::new(Direction::Capture, limits, pcm_name.clone(), pcm_name.clone(), Box::new(stream))
++            }
++        };
++
++        let mut controls = Vec::new();
++        let mut add_amp_controls = |prefix: &str, amp: Option<Amp>, volume: Target, switch: Target| {
++            if let Some(amp) = amp {
++                let step = (amp.caps.step_size + 1) * 25;
++                controls.push(Control {
++                    name: format!("{} Volume", prefix),
++                    iface: IFACE_MIXER,
++                    kind: ControlKind::Integer { min: 0, max: i64::from(amp.caps.steps) },
++                    count: 2,
++                    writable: true,
++                    db_scale: Some((amp.caps.centibels(0), step, false)),
++                    values: SpinLock::new(vec![i64::from(amp.caps.offset); 2]),
++                    target: volume,
++                    changed: AtomicU64::new(0),
++                });
++            }
++            controls.push(Control {
++                name: format!("{} Switch", prefix),
++                iface: IFACE_MIXER,
++                kind: ControlKind::Boolean,
++                count: 2,
++                writable: true,
++                db_scale: None,
++                values: SpinLock::new(vec![1; 2]),
++                target: switch,
++                changed: AtomicU64::new(0),
++            });
++        };
++        if let Some(route) = outputs.first() {
++            add_amp_controls("Master Playback", codec.volume_amp(route, true), Target::PlaybackVolume, Target::PlaybackSwitch);
++        }
++        if let Some(route) = inputs.first() {
++            add_amp_controls("Capture", codec.volume_amp(route, false), Target::CaptureVolume, Target::CaptureSwitch);
++        }
++        for (device, label) in [(PinDevice::Headphone, "Headphone Jack"), (PinDevice::Mic, "Mic Jack")] {
++            let routes = if device == PinDevice::Headphone { &outputs } else { &inputs };
++            if routes.iter().any(|route| route.device == device && !route.internal && pin(codec, route.pin).is_some_and(|w| w.presence_detect())) {
++                controls.push(Control {
++                    name: label.to_string(),
++                    iface: IFACE_CARD,
++                    kind: ControlKind::Boolean,
++                    count: 1,
++                    writable: false,
++                    db_scale: None,
++                    values: SpinLock::new(vec![0]),
++                    target: Target::Jack,
++                    changed: AtomicU64::new(0),
++                });
++            }
++        }
++
++        let card = Arc::new(Self {
++            index,
++            id: id.to_string(),
++            driver: "HDA-Intel".to_string(),
++            name: name.to_string(),
++            longname: format!("{} at {}", name, location),
++            components: format!("HDA:{:08x}", codec.vendor),
++            mixer_name,
++            pcm_name,
++            playback,
++            capture,
++            controls,
++            events: AtomicU64::new(0),
++            event_wait: WaitQueue::new(),
++            controller: controller.clone(),
++            codec: codec_index,
++            enabled: SpinLock::new(vec![true; outputs.len()]),
++            outputs,
++            inputs,
++        });
++        card.apply_all();
++        Some(card)
++    }
++
++    fn codec(&self) -> &Codec {
++        &self.controller.codecs[self.codec]
++    }
++
++    /// Sets a control's values; returns whether they changed.
++    pub fn set_control(&self, index: usize, values: &[i64]) -> bool {
++        let Some(control) = self.controls.get(index) else { return false };
++        if !control.writable {
++            return false;
++        }
++        let clamped: Vec<i64> = (0..control.count as usize)
++            .map(|channel| {
++                let value = values.get(channel).copied().unwrap_or(0);
++                match control.kind {
++                    ControlKind::Boolean => i64::from(value != 0),
++                    ControlKind::Integer { min, max } => value.clamp(min, max),
++                }
++            })
++            .collect();
++        {
++            let mut current = control.values.lock();
++            if *current == clamped {
++                return false;
++            }
++            *current = clamped;
++        }
++        self.apply(control.target);
++        self.note_changed(index);
++        true
++    }
++
++    fn note_changed(&self, index: usize) {
++        let event = self.events.fetch_add(1, Ordering::AcqRel) + 1;
++        if let Some(control) = self.controls.get(index) {
++            control.changed.store(event, Ordering::Release);
++        }
++        self.event_wait.wake_all();
++        crate::note_activity();
++    }
++
++    fn control_values(&self, target: Target) -> Option<Vec<i64>> {
++        self.controls.iter().find(|control| control.target == target).map(Control::values)
++    }
++
++    fn apply_all(&self) {
++        for target in [Target::PlaybackVolume, Target::CaptureVolume] {
++            self.apply(target);
++        }
++    }
++
++    /// Puts a control's values on the codec: the volume and the mute on the
++    /// routes' amplifiers (or, without one, the pins).
++    fn apply(&self, target: Target) {
++        let (routes, output, volume, switch) = match target {
++            Target::PlaybackVolume | Target::PlaybackSwitch => (&self.outputs[..], true, Target::PlaybackVolume, Target::PlaybackSwitch),
++            Target::CaptureVolume | Target::CaptureSwitch => (&self.inputs[..self.inputs.len().min(1)], false, Target::CaptureVolume, Target::CaptureSwitch),
++            Target::Jack => return,
++        };
++        let codec = self.codec();
++        let levels = self.control_values(volume);
++        let on = self.control_values(switch).unwrap_or_else(|| vec![1, 1]);
++        let enabled = self.enabled.lock().clone();
++        for (index, route) in routes.iter().enumerate() {
++            let playing = !output || enabled.get(index).copied().unwrap_or(true);
++            match codec.volume_amp(route, output) {
++                Some(amp) => {
++                    for channel in 0..2usize {
++                        // Each route's amplifier at the same share of its range.
++                        let gain = match (&levels, self.controls.iter().find(|c| c.target == volume)) {
++                            (Some(levels), Some(Control { kind: ControlKind::Integer { max, .. }, .. })) if *max > 0 => {
++                                (levels[channel].max(0) as u64 * u64::from(amp.caps.steps) / *max as u64) as u32
++                            }
++                            _ => amp.caps.offset,
++                        };
++                        let mute = on.get(channel).copied().unwrap_or(1) == 0 || !playing;
++                        let side = if channel == 0 { 1 << 13 } else { 1 << 12 };
++                        let payload = (codec::amp_payload(&amp, gain, mute) & !(3 << 12)) | side;
++                        self.controller.command(codec.address, amp.nid, verb::SET_AMP_GAIN_MUTE, payload);
++                    }
++                }
++                None => {}
++            }
++            if output {
++                // The pin itself on or off (for routes without a mutable amplifier).
++                let audible = playing && on.iter().any(|&value| value != 0);
++                let control = if audible {
++                    codec::PIN_OUT | if route.device == PinDevice::Headphone && pin(codec, route.pin).is_some_and(|w| w.pin_caps & (1 << 3) != 0) { codec::PIN_HP } else { 0 }
++                } else {
++                    0
++                };
++                self.controller.command(codec.address, route.pin, verb::SET_PIN_WIDGET_CONTROL, control);
++            }
++        }
++    }
++
++    /// Whether something is plugged into a pin's jack.
++    fn sense(&self, nid: u8) -> bool {
++        let codec = self.codec();
++        if pin(codec, nid).is_some_and(|w| w.needs_sense_trigger()) {
++            self.controller.command(codec.address, nid, verb::SET_PIN_SENSE, 0);
++        }
++        self.controller.command(codec.address, nid, verb::GET_PIN_SENSE, 0).is_some_and(|sense| sense & (1 << 31) != 0)
++    }
++
++    /// Looks at the jacks: headphones in turn the speakers and line outs
++    /// off; the jack controls follow.
++    pub(crate) fn poll_jacks(&self) {
++        let headphones = self.outputs.iter().filter(|r| r.device == PinDevice::Headphone && !r.internal).find(|r| pin(self.codec(), r.pin).is_some_and(|w| w.presence_detect()));
++        let mic = self.inputs.iter().filter(|r| r.device == PinDevice::Mic && !r.internal).find(|r| pin(self.codec(), r.pin).is_some_and(|w| w.presence_detect()));
++        let headphones_in = headphones.is_some_and(|route| self.sense(route.pin));
++        let mic_in = mic.is_some_and(|route| self.sense(route.pin));
++        let enabled = codec::outputs_enabled(&self.outputs, headphones_in);
++        let changed = {
++            let mut current = self.enabled.lock();
++            let changed = *current != enabled;
++            *current = enabled;
++            changed
++        };
++        if changed {
++            self.apply(Target::PlaybackSwitch);
++        }
++        for (label, present) in [("Headphone Jack", headphones_in), ("Mic Jack", mic_in)] {
++            if let Some(index) = self.controls.iter().position(|control| control.name == label) {
++                let value = i64::from(present);
++                let moved = {
++                    let mut values = self.controls[index].values.lock();
++                    let moved = values[0] != value;
++                    values[0] = value;
++                    moved
++                };
++                if moved {
++                    self.note_changed(index);
++                }
++            }
++        }
++    }
++
++    /// A control of the user's changed (the device files keep those):
++    /// subscribers hear of it. Returns the event's number.
++    pub fn note_user_change(&self) -> u64 {
++        let event = self.events.fetch_add(1, Ordering::AcqRel) + 1;
++        self.event_wait.wake_all();
++        crate::note_activity();
++        event
++    }
++
++    pub fn pcms(&self) -> impl Iterator<Item = &Arc<Pcm>> {
++        self.playback.iter().chain(self.capture.iter())
++    }
++}
++
++fn pin(codec: &Codec, nid: u8) -> Option<&codec::Widget> {
++    codec.widgets.get(&nid).filter(|widget| widget.kind() == Kind::Pin)
++}
++
++/// What a stream over these converters can do: the rates and sample sizes
++/// all of them take (theirs, or the function group's).
++fn limits_of(controller: &Controller, codec: &Codec, converters: &[(u8, u8)]) -> HwLimits {
++    let group = controller.command(codec.address, codec.afg, verb::GET_PARAMETER, parameter::PCM).unwrap_or(0);
++    let mut rates: Option<Vec<u32>> = None;
++    let mut bits = 32;
++    for &(address, nid) in converters {
++        let own = controller.command(address, nid, verb::GET_PARAMETER, parameter::PCM).unwrap_or(0);
++        let pcm = if own & 0xfff != 0 { own } else { group };
++        let these = codec::rates_of(pcm);
++        rates = Some(match rates {
++            None => these,
++            Some(rates) => rates.into_iter().filter(|rate| these.contains(rate)).collect(),
++        });
++        bits = bits.min(codec::max_bits_of(pcm));
++    }
++    let mut rates = rates.unwrap_or_default();
++    // Rates the stream format cannot express go.
++    rates.retain(|&rate| codec::stream_format(rate, 16, 2).is_some());
++    if rates.is_empty() {
++        rates = vec![48000];
++    }
++    let formats = if bits >= 20 { Mask::of(&[format::S16_LE, format::S32_LE]) } else { Mask::of(&[format::S16_LE]) };
++    HwLimits {
++        info: info::MMAP | info::MMAP_VALID | info::INTERLEAVED | info::BLOCK_TRANSFER | info::PAUSE,
++        formats,
++        rates,
++        channels: (2, 2),
++        period_bytes: (128, 512 * 1024),
++        periods: (2, hda::MAX_PERIODS),
++        buffer_bytes_max: 1024 * 1024,
++        byte_step: 128,
++        msbits: bits.max(16),
++    }
++}
+diff --git a/kernel/comps/sound/src/codec.rs b/kernel/comps/sound/src/codec.rs
+new file mode 100755
+index 0000000..f9165f9
+--- /dev/null
++++ b/kernel/comps/sound/src/codec.rs
+@@ -0,0 +1,551 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! An HDA codec's widgets and how sound gets through them: from each output
++//! jack or speaker back to a digital-to-analog converter, from an
++//! analog-to-digital converter back to each microphone, through mixers and
++//! selectors; the verbs that set those paths up (powered, selected,
++//! unmuted, at 0 dB, the pins driven, the external amplifiers on); stream
++//! formats; and turning speakers off while headphones are in, as Linux's
++//! generic HDA codec driver does. No hardware here: its tests run on the
++//! host.
++//!
++//! References: Intel High Definition Audio Specification 1.0a, chapter 7;
++//! Linux's `sound/pci/hda/hda_generic.c`.
++
++use alloc::{collections::BTreeMap, vec::Vec};
++
++/// Verbs (with a 12-bit identifier and an 8-bit payload, or a 4-bit one
++/// and a 16-bit payload).
++pub mod verb {
++    pub const GET_PARAMETER: u32 = 0xf00;
++    pub const GET_CONNECT_SELECT: u32 = 0xf01;
++    pub const SET_CONNECT_SELECT: u32 = 0x701;
++    pub const GET_CONNECTION_LIST: u32 = 0xf02;
++    pub const SET_POWER_STATE: u32 = 0x705;
++    pub const SET_CHANNEL_STREAM_ID: u32 = 0x706;
++    pub const SET_PIN_WIDGET_CONTROL: u32 = 0x707;
++    pub const SET_UNSOLICITED: u32 = 0x708;
++    pub const SET_PIN_SENSE: u32 = 0x709;
++    pub const GET_PIN_SENSE: u32 = 0xf09;
++    pub const SET_EAPD_BTL: u32 = 0x70c;
++    pub const SET_GPIO_DATA: u32 = 0x715;
++    pub const SET_GPIO_MASK: u32 = 0x716;
++    pub const SET_GPIO_DIRECTION: u32 = 0x717;
++    pub const GET_CONFIG_DEFAULT: u32 = 0xf1c;
++    pub const SET_CODEC_RESET: u32 = 0x7ff;
++    /// 4-bit verbs.
++    pub const SET_STREAM_FORMAT: u32 = 0x2;
++    pub const SET_AMP_GAIN_MUTE: u32 = 0x3;
++}
++
++/// `GET_PARAMETER` parameters.
++pub mod parameter {
++    pub const VENDOR_ID: u32 = 0x00;
++    pub const SUBNODE_COUNT: u32 = 0x04;
++    pub const FUNCTION_TYPE: u32 = 0x05;
++    pub const AUDIO_WIDGET_CAP: u32 = 0x09;
++    pub const PCM: u32 = 0x0a;
++    pub const STREAM_FORMATS: u32 = 0x0b;
++    pub const PIN_CAP: u32 = 0x0c;
++    pub const AMP_IN_CAP: u32 = 0x0d;
++    pub const CONNECTION_LIST_LENGTH: u32 = 0x0e;
++    pub const GPIO_COUNT: u32 = 0x11;
++    pub const AMP_OUT_CAP: u32 = 0x12;
++}
++
++/// A command for codec `codec`'s node `nid`.
++pub fn command(codec: u8, nid: u8, verb: u32, payload: u32) -> u32 {
++    let head = u32::from(codec & 0xf) << 28 | u32::from(nid) << 20;
++    if verb <= 0xf { head | verb << 16 | (payload & 0xffff) } else { head | (verb & 0xfff) << 8 | (payload & 0xff) }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Kind {
++    Output,
++    Input,
++    Mixer,
++    Selector,
++    Pin,
++    Power,
++    VolumeKnob,
++    Beep,
++    Vendor,
++}
++
++/// What a pin is connected to, from its configuration default.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub enum PinDevice {
++    LineOut,
++    Speaker,
++    Headphone,
++    LineIn,
++    Mic,
++    Digital,
++    Other,
++}
++
++const PIN_CAP_PRESENCE: u32 = 1 << 2;
++const PIN_CAP_TRIGGER: u32 = 1 << 1;
++const PIN_CAP_HEADPHONE: u32 = 1 << 3;
++const PIN_CAP_OUT: u32 = 1 << 4;
++const PIN_CAP_IN: u32 = 1 << 5;
++const PIN_CAP_HDMI: u32 = 1 << 7;
++const PIN_CAP_EAPD: u32 = 1 << 16;
++const PIN_CAP_DP: u32 = 1 << 24;
++/// Pin widget control bits.
++pub const PIN_OUT: u32 = 0x40;
++pub const PIN_HP: u32 = 0x80;
++pub const PIN_IN: u32 = 0x20;
++const PIN_VREF_80: u32 = 0x04;
++const PIN_VREF_50: u32 = 0x01;
++
++/// One widget of the audio function group.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Widget {
++    pub nid: u8,
++    pub caps: u32,
++    pub pin_caps: u32,
++    pub config: u32,
++    pub connections: Vec<u8>,
++    pub amp_in: u32,
++    pub amp_out: u32,
++}
++
++impl Widget {
++    pub fn kind(&self) -> Kind {
++        match (self.caps >> 20) & 0xf {
++            0 => Kind::Output,
++            1 => Kind::Input,
++            2 => Kind::Mixer,
++            3 => Kind::Selector,
++            4 => Kind::Pin,
++            5 => Kind::Power,
++            6 => Kind::VolumeKnob,
++            7 => Kind::Beep,
++            _ => Kind::Vendor,
++        }
++    }
++
++    pub fn has_in_amp(&self) -> bool {
++        self.caps & (1 << 1) != 0
++    }
++
++    pub fn has_out_amp(&self) -> bool {
++        self.caps & (1 << 2) != 0
++    }
++
++    /// Its amplifier capabilities are its own, not the function group's.
++    pub fn amp_override(&self) -> bool {
++        self.caps & (1 << 3) != 0
++    }
++
++    pub fn digital(&self) -> bool {
++        self.caps & (1 << 9) != 0
++    }
++
++    pub fn power_control(&self) -> bool {
++        self.caps & (1 << 10) != 0
++    }
++
++    pub fn stereo(&self) -> bool {
++        self.caps & 1 != 0
++    }
++
++    /// Not connected to anything (configuration default: "no connection").
++    pub fn unconnected(&self) -> bool {
++        self.config >> 30 == 1
++    }
++
++    pub fn device(&self) -> PinDevice {
++        if self.pin_caps & (PIN_CAP_HDMI | PIN_CAP_DP) != 0 {
++            return PinDevice::Digital;
++        }
++        match (self.config >> 20) & 0xf {
++            0x0 => PinDevice::LineOut,
++            0x1 => PinDevice::Speaker,
++            0x2 => PinDevice::Headphone,
++            0x4 | 0x5 | 0xc | 0xd => PinDevice::Digital,
++            0x8 => PinDevice::LineIn,
++            0xa => PinDevice::Mic,
++            _ => PinDevice::Other,
++        }
++    }
++
++    /// Built in (fixed: a laptop's speakers or microphone), not a jack.
++    pub fn internal(&self) -> bool {
++        self.config >> 30 == 2
++    }
++
++    pub fn can_output(&self) -> bool {
++        self.pin_caps & PIN_CAP_OUT != 0
++    }
++
++    pub fn can_input(&self) -> bool {
++        self.pin_caps & PIN_CAP_IN != 0
++    }
++
++    pub fn presence_detect(&self) -> bool {
++        self.pin_caps & PIN_CAP_PRESENCE != 0 && (self.config >> 8) & 1 == 0
++    }
++
++    pub fn needs_sense_trigger(&self) -> bool {
++        self.pin_caps & PIN_CAP_TRIGGER != 0
++    }
++}
++
++/// Expands a connection list's entries (`GET_CONNECTION_LIST`), where an
++/// entry with its top bit set ends a range starting at the one before.
++pub fn expand_connections(entries: &[u16], long_form: bool) -> Vec<u8> {
++    let range_bit = if long_form { 0x8000 } else { 0x80 };
++    let mut list: Vec<u8> = Vec::new();
++    for &entry in entries {
++        let nid = (entry & !range_bit) as u8;
++        if entry & range_bit != 0 {
++            if let Some(&previous) = list.last() {
++                for nid in previous.saturating_add(1)..=nid {
++                    list.push(nid);
++                }
++                continue;
++            }
++        }
++        list.push(nid);
++    }
++    list
++}
++
++/// Amplifier capabilities: the 0 dB step, how many steps, mute.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AmpCaps {
++    pub offset: u32,
++    pub steps: u32,
++    pub step_size: u32,
++    pub mute: bool,
++}
++
++impl AmpCaps {
++    pub fn parse(raw: u32) -> Self {
++        Self { offset: raw & 0x7f, steps: (raw >> 8) & 0x7f, step_size: (raw >> 16) & 0x7f, mute: raw >> 31 != 0 }
++    }
++
++    /// The gain in hundredths of a dB of `step`.
++    pub fn centibels(&self, step: u32) -> i32 {
++        (step as i32 - self.offset as i32) * (self.step_size as i32 + 1) * 25
++    }
++}
++
++/// An amplifier: on a widget's output, or on one of its inputs.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Amp {
++    pub nid: u8,
++    pub output: bool,
++    pub index: u8,
++    pub caps: AmpCaps,
++}
++
++/// The payload of `SET_AMP_GAIN_MUTE` for both channels of `amp`.
++pub fn amp_payload(amp: &Amp, gain: u32, mute: bool) -> u32 {
++    let direction = if amp.output { 1 << 15 } else { 1 << 14 };
++    direction | 3 << 12 | u32::from(amp.index) << 8 | u32::from(mute) << 7 | gain.min(amp.caps.steps) & 0x7f
++}
++
++/// The widgets of a codec's audio function group, by node.
++#[derive(Clone, Debug, Default)]
++pub struct Codec {
++    pub address: u8,
++    pub afg: u8,
++    pub vendor: u32,
++    pub widgets: BTreeMap<u8, Widget>,
++    /// The function group's amplifier capabilities, for widgets without their own.
++    pub amp_in: u32,
++    pub amp_out: u32,
++    pub gpios: u32,
++}
++
++/// A path through the codec: its widgets from the pin (or converter) end,
++/// each with the input it takes (its connection index), the last one the
++/// converter.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Path {
++    pub hops: Vec<(u8, u8)>,
++    pub converter: u8,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Route {
++    pub pin: u8,
++    pub device: PinDevice,
++    pub internal: bool,
++    pub path: Path,
++}
++
++impl Codec {
++    fn amp_caps(&self, widget: &Widget, output: bool) -> AmpCaps {
++        let own = if output { widget.amp_out } else { widget.amp_in };
++        let shared = if output { self.amp_out } else { self.amp_in };
++        AmpCaps::parse(if widget.amp_override() || own != 0 { own } else { shared })
++    }
++
++    /// A path from `from` back to a converter of `kind`, at most `depth`
++    /// widgets long, avoiding `used` converters; the shortest found first.
++    fn find(&self, from: u8, kind: Kind, used: &[u8], seen: &mut Vec<u8>, depth: usize) -> Option<Path> {
++        let widget = self.widgets.get(&from)?;
++        if depth == 0 || seen.contains(&from) {
++            return None;
++        }
++        seen.push(from);
++        // Converters straight on the list first.
++        for (index, &source) in widget.connections.iter().enumerate() {
++            let Some(next) = self.widgets.get(&source) else { continue };
++            if next.kind() == kind && !next.digital() && !used.contains(&source) {
++                seen.pop();
++                return Some(Path { hops: alloc::vec![(from, index as u8)], converter: source });
++            }
++        }
++        for (index, &source) in widget.connections.iter().enumerate() {
++            let Some(next) = self.widgets.get(&source) else { continue };
++            if matches!(next.kind(), Kind::Mixer | Kind::Selector) {
++                if let Some(mut path) = self.find(source, kind, used, seen, depth - 1) {
++                    path.hops.insert(0, (from, index as u8));
++                    seen.pop();
++                    return Some(path);
++                }
++            }
++        }
++        seen.pop();
++        None
++    }
++
++    /// Where a path from a converter's side reaches it: for an input path
++    /// (the converter takes from the pin), the hops from the converter.
++    fn find_input(&self, converter: u8, pin: u8, seen: &mut Vec<u8>, depth: usize) -> Option<Vec<(u8, u8)>> {
++        let widget = self.widgets.get(&converter)?;
++        if depth == 0 || seen.contains(&converter) {
++            return None;
++        }
++        seen.push(converter);
++        for (index, &source) in widget.connections.iter().enumerate() {
++            if source == pin {
++                seen.pop();
++                return Some(alloc::vec![(converter, index as u8)]);
++            }
++        }
++        for (index, &source) in widget.connections.iter().enumerate() {
++            let Some(next) = self.widgets.get(&source) else { continue };
++            if matches!(next.kind(), Kind::Mixer | Kind::Selector) {
++                if let Some(mut hops) = self.find_input(source, pin, seen, depth - 1) {
++                    hops.insert(0, (converter, index as u8));
++                    seen.pop();
++                    return Some(hops);
++                }
++            }
++        }
++        seen.pop();
++        None
++    }
++
++    fn pins(&self, output: bool) -> Vec<&Widget> {
++        let mut pins: Vec<&Widget> = self
++            .widgets
++            .values()
++            .filter(|w| w.kind() == Kind::Pin && !w.unconnected() && w.device() != PinDevice::Digital)
++            .filter(|w| if output { w.can_output() } else { w.can_input() })
++            .collect();
++        // Pins without a configuration (all zero: a line out by default)
++        // are taken only when nothing else is there.
++        let configured: Vec<&Widget> = pins.iter().copied().filter(|w| w.config != 0).collect();
++        if !configured.is_empty() {
++            pins = configured;
++        }
++        if output {
++            pins.retain(|w| matches!(w.device(), PinDevice::LineOut | PinDevice::Speaker | PinDevice::Headphone));
++        } else {
++            pins.retain(|w| matches!(w.device(), PinDevice::Mic | PinDevice::LineIn));
++        }
++        pins.sort_by_key(|w| (w.device(), !w.internal(), w.nid));
++        pins
++    }
++
++    /// The outputs: each speaker, headphone and line-out pin with a path
++    /// from a converter, each its own converter while there are enough.
++    pub fn output_routes(&self) -> Vec<Route> {
++        let mut used = Vec::new();
++        let mut routes = Vec::new();
++        for pin in self.pins(true) {
++            let path = self.find(pin.nid, Kind::Output, &used, &mut Vec::new(), 6).or_else(|| self.find(pin.nid, Kind::Output, &[], &mut Vec::new(), 6));
++            if let Some(path) = path {
++                used.push(path.converter);
++                routes.push(Route { pin: pin.nid, device: pin.device(), internal: pin.internal(), path });
++            }
++        }
++        routes
++    }
++
++    /// The inputs: microphones and line inputs with a converter reaching them.
++    pub fn input_routes(&self) -> Vec<Route> {
++        let mut routes = Vec::new();
++        let converters: Vec<u8> = self.widgets.values().filter(|w| w.kind() == Kind::Input && !w.digital()).map(|w| w.nid).collect();
++        for pin in self.pins(false) {
++            for &converter in &converters {
++                if let Some(hops) = self.find_input(converter, pin.nid, &mut Vec::new(), 6) {
++                    routes.push(Route { pin: pin.nid, device: pin.device(), internal: pin.internal(), path: Path { hops, converter } });
++                    break;
++                }
++            }
++        }
++        routes
++    }
++
++    /// The amplifier that sets a route's volume: the first with steps from
++    /// the converter on (its output, the mixers', the pin's).
++    pub fn volume_amp(&self, route: &Route, output_route: bool) -> Option<Amp> {
++        let mut candidates: Vec<Amp> = Vec::new();
++        let mut push = |nid: u8, output: bool, index: u8| {
++            if let Some(widget) = self.widgets.get(&nid) {
++                let present = if output { widget.has_out_amp() } else { widget.has_in_amp() };
++                let caps = self.amp_caps(widget, output);
++                if present && caps.steps > 0 {
++                    candidates.push(Amp { nid, output, index, caps });
++                }
++            }
++        };
++        if output_route {
++            push(route.path.converter, true, 0);
++            for &(nid, index) in route.path.hops.iter().rev() {
++                push(nid, false, index);
++                push(nid, true, 0);
++            }
++        } else {
++            for &(nid, index) in &route.path.hops {
++                push(nid, false, index);
++            }
++            push(route.pin, true, 0);
++        }
++        candidates.into_iter().next()
++    }
++
++    /// The verbs that set a route up: powered, its inputs selected, its
++    /// amplifiers unmuted at 0 dB (other mixer inputs muted), the pin
++    /// driven or listening, an external amplifier on.
++    pub fn setup_verbs(&self, route: &Route, output_route: bool) -> Vec<(u8, u32, u32)> {
++        let mut verbs = Vec::new();
++        let mut nids: Vec<u8> = alloc::vec![route.pin];
++        nids.extend(route.path.hops.iter().map(|&(nid, _)| nid));
++        nids.push(route.path.converter);
++        nids.dedup();
++        for &nid in &nids {
++            if self.widgets.get(&nid).is_some_and(Widget::power_control) {
++                verbs.push((nid, verb::SET_POWER_STATE, 0));
++            }
++        }
++        let unmute = |verbs: &mut Vec<(u8, u32, u32)>, widget: &Widget, output: bool, index: u8, mute: bool| {
++            let present = if output { widget.has_out_amp() } else { widget.has_in_amp() };
++            if present {
++                let caps = self.amp_caps(widget, output);
++                let amp = Amp { nid: widget.nid, output, index, caps };
++                verbs.push((widget.nid, verb::SET_AMP_GAIN_MUTE, amp_payload(&amp, caps.offset, mute)));
++            }
++        };
++        for &(nid, index) in &route.path.hops {
++            let Some(widget) = self.widgets.get(&nid) else { continue };
++            match widget.kind() {
++                // A pin picks its source; its own amplifiers are set below.
++                Kind::Pin => {
++                    if widget.connections.len() > 1 {
++                        verbs.push((nid, verb::SET_CONNECT_SELECT, u32::from(index)));
++                    }
++                    continue;
++                }
++                Kind::Selector | Kind::Input if widget.connections.len() > 1 => {
++                    verbs.push((nid, verb::SET_CONNECT_SELECT, u32::from(index)));
++                }
++                _ => {}
++            }
++            // The input taken, unmuted; the others (the loopback mixer's
++            // inputs among them) muted.
++            for other in 0..widget.connections.len().max(1) as u8 {
++                unmute(&mut verbs, widget, false, other, other != index);
++            }
++            unmute(&mut verbs, widget, true, 0, false);
++        }
++        if output_route {
++            if let Some(converter) = self.widgets.get(&route.path.converter) {
++                unmute(&mut verbs, converter, true, 0, false);
++            }
++        }
++        if let Some(pin) = self.widgets.get(&route.pin) {
++            if output_route {
++                let control = PIN_OUT | if route.device == PinDevice::Headphone && pin.pin_caps & PIN_CAP_HEADPHONE != 0 { PIN_HP } else { 0 };
++                verbs.push((pin.nid, verb::SET_PIN_WIDGET_CONTROL, control));
++                unmute(&mut verbs, pin, true, 0, false);
++            } else {
++                // A microphone's bias voltage, where the pin offers it.
++                let vref_caps = (pin.pin_caps >> 8) & 0xff;
++                let vref = if route.device != PinDevice::Mic {
++                    0
++                } else if vref_caps & (1 << 4) != 0 {
++                    PIN_VREF_80
++                } else if vref_caps & (1 << 1) != 0 {
++                    PIN_VREF_50
++                } else {
++                    0
++                };
++                verbs.push((pin.nid, verb::SET_PIN_WIDGET_CONTROL, PIN_IN | vref));
++                unmute(&mut verbs, pin, false, 0, false);
++            }
++            if pin.pin_caps & PIN_CAP_EAPD != 0 {
++                verbs.push((pin.nid, verb::SET_EAPD_BTL, 0x02));
++            }
++        }
++        verbs
++    }
++}
++
++/// Which outputs play: with headphones in, not the speakers nor the line
++/// outs (Linux's auto-mute); otherwise all of them.
++pub fn outputs_enabled(routes: &[Route], headphones_in: bool) -> Vec<bool> {
++    let has_headphones = routes.iter().any(|route| route.device == PinDevice::Headphone);
++    routes.iter().map(|route| route.device == PinDevice::Headphone || !(has_headphones && headphones_in)).collect()
++}
++
++/// Sample rates a converter offers (`PCM` parameter bits 0..11).
++pub const RATES: [u32; 12] = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 384000];
++
++pub fn rates_of(pcm: u32) -> Vec<u32> {
++    RATES.iter().enumerate().filter(|(bit, _)| pcm & (1 << bit) != 0).map(|(_, &rate)| rate).collect()
++}
++
++/// The largest sample size a converter takes (`PCM` bits 16..20).
++pub fn max_bits_of(pcm: u32) -> u32 {
++    [(20, 32), (19, 24), (18, 20), (17, 16), (16, 8)].iter().find(|(bit, _)| pcm & (1 << bit) != 0).map_or(16, |&(_, bits)| bits)
++}
++
++/// The stream format word for a rate, sample size and channel count.
++pub fn stream_format(rate: u32, bits: u32, channels: u32) -> Option<u16> {
++    let (base, mult, div): (u16, u16, u16) = match rate {
++        8000 => (0, 1, 6),
++        11025 => (1, 1, 4),
++        16000 => (0, 1, 3),
++        22050 => (1, 1, 2),
++        24000 => (0, 1, 2),
++        32000 => (0, 2, 3),
++        44100 => (1, 1, 1),
++        48000 => (0, 1, 1),
++        88200 => (1, 2, 1),
++        96000 => (0, 2, 1),
++        176400 => (1, 4, 1),
++        192000 => (0, 4, 1),
++        _ => return None,
++    };
++    let bits = match bits {
++        8 => 0,
++        16 => 1,
++        20 => 2,
++        24 => 3,
++        32 => 4,
++        _ => return None,
++    };
++    if !(1..=16).contains(&channels) {
++        return None;
++    }
++    Some(base << 14 | (mult - 1) << 11 | (div - 1) << 8 | bits << 4 | (channels as u16 - 1))
++}
+diff --git a/kernel/comps/sound/src/hda.rs b/kernel/comps/sound/src/hda.rs
+new file mode 100755
+index 0000000..cd8a2b9
+--- /dev/null
++++ b/kernel/comps/sound/src/hda.rs
+@@ -0,0 +1,527 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The Intel High Definition Audio controller: the sound of nearly every PC
++//! since 2004, whatever its maker (Intel, AMD, NVIDIA, VIA, SiS, ATI,
++//! Zhaoxin). It is reset and taken over, its codecs found through the
++//! command rings (or the immediate command registers, where the rings do not
++//! answer), each codec's widgets read, and its streams run over buffers
++//! described by buffer descriptor lists. Positions are polled; interrupts are
++//! not needed.
++//!
++//! References: Intel High Definition Audio Specification 1.0a, chapters 3
++//! and 4; Linux's `sound/pci/hda/hda_intel.c` and `sound/hda/hdac_*.c`.
++
++use alloc::{string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, Ordering};
++
++use aster_pci::{cfg_space::BarAccess, common_device::PciCommonDevice};
++use ostd::{
++    mm::{HasDaddr, VmIo, dma::DmaCoherent},
++    sync::Mutex,
++};
++
++use crate::{
++    codec::{self, Codec, Widget, parameter, verb},
++    pcm::{self, PcmError, Setup, StreamHw},
++};
++
++mod reg {
++    pub(super) const GCAP: usize = 0x00;
++    pub(super) const GCTL: usize = 0x08;
++    pub(super) const STATESTS: usize = 0x0e;
++    pub(super) const INTCTL: usize = 0x20;
++    pub(super) const CORBLBASE: usize = 0x40;
++    pub(super) const CORBUBASE: usize = 0x44;
++    pub(super) const CORBWP: usize = 0x48;
++    pub(super) const CORBRP: usize = 0x4a;
++    pub(super) const CORBCTL: usize = 0x4c;
++    pub(super) const CORBSIZE: usize = 0x4e;
++    pub(super) const RIRBLBASE: usize = 0x50;
++    pub(super) const RIRBUBASE: usize = 0x54;
++    pub(super) const RIRBWP: usize = 0x58;
++    pub(super) const RINTCNT: usize = 0x5a;
++    pub(super) const RIRBCTL: usize = 0x5c;
++    pub(super) const RIRBSTS: usize = 0x5d;
++    pub(super) const RIRBSIZE: usize = 0x5e;
++    pub(super) const ICOI: usize = 0x60;
++    pub(super) const ICII: usize = 0x64;
++    pub(super) const ICIS: usize = 0x68;
++    pub(super) const DPLBASE: usize = 0x70;
++    pub(super) const DPUBASE: usize = 0x74;
++    pub(super) const SD_BASE: usize = 0x80;
++    pub(super) const SD_SIZE: usize = 0x20;
++    /// Stream descriptor registers.
++    pub(super) const SD_CTL: usize = 0x00;
++    pub(super) const SD_STS: usize = 0x03;
++    pub(super) const SD_LPIB: usize = 0x04;
++    pub(super) const SD_CBL: usize = 0x08;
++    pub(super) const SD_LVI: usize = 0x0c;
++    pub(super) const SD_FMT: usize = 0x12;
++    pub(super) const SD_BDPL: usize = 0x18;
++    pub(super) const SD_BDPU: usize = 0x1c;
++}
++
++const GCTL_RESET: u32 = 1 << 0;
++const SD_CTL_RESET: u8 = 1 << 0;
++const SD_CTL_RUN: u8 = 1 << 1;
++/// Busy-wait budget, in register reads (one takes about a microsecond).
++const WAIT_READS: usize = 200_000;
++/// Buffer descriptor list entries: one per period.
++pub(crate) const MAX_PERIODS: u32 = 32;
++
++/// The controller's registers, shared with its streams.
++#[derive(Clone)]
++pub(crate) struct Regs(BarAccess);
++
++impl Regs {
++    pub(crate) fn r8(&self, at: usize) -> u8 {
++        self.0.read_once::<u8>(at).unwrap_or(u8::MAX)
++    }
++    pub(crate) fn r16(&self, at: usize) -> u16 {
++        self.0.read_once::<u16>(at).unwrap_or(u16::MAX)
++    }
++    pub(crate) fn r32(&self, at: usize) -> u32 {
++        self.0.read_once::<u32>(at).unwrap_or(u32::MAX)
++    }
++    pub(crate) fn w8(&self, at: usize, value: u8) {
++        let _ = self.0.write_once::<u8>(at, value);
++    }
++    pub(crate) fn w16(&self, at: usize, value: u16) {
++        let _ = self.0.write_once::<u16>(at, value);
++    }
++    pub(crate) fn w32(&self, at: usize, value: u32) {
++        let _ = self.0.write_once::<u32>(at, value);
++    }
++
++    /// Waits until `done`, reading the registers meanwhile.
++    fn wait(&self, mut done: impl FnMut(&Self) -> bool) -> bool {
++        (0..WAIT_READS).any(|_| {
++            if done(self) {
++                return true;
++            }
++            core::hint::spin_loop();
++            false
++        })
++    }
++
++    /// About `micros` microseconds, by reading a register.
++    fn delay(&self, micros: usize) {
++        for _ in 0..micros {
++            let _ = self.r32(reg::GCAP);
++        }
++    }
++}
++
++/// How commands reach the codecs.
++struct Commands {
++    corb: DmaCoherent,
++    rirb: DmaCoherent,
++    corb_entries: u16,
++    rirb_entries: u16,
++    corb_wp: u16,
++    rirb_rp: u16,
++    /// The rings did not answer: the immediate command registers instead.
++    immediate: bool,
++}
++
++pub(crate) struct Controller {
++    pub(crate) regs: Regs,
++    pub(crate) name: String,
++    commands: Mutex<Commands>,
++    pub(crate) codecs: Vec<Codec>,
++    input_streams: usize,
++    output_streams: usize,
++    _positions: DmaCoherent,
++    _device: PciCommonDevice,
++}
++
++/// A ring size the controller offers: 256, 16 or 2 entries (and its code).
++fn ring_size(capability: u8) -> (u8, u16) {
++    if capability & 0x40 != 0 {
++        (2, 256)
++    } else if capability & 0x20 != 0 {
++        (1, 16)
++    } else {
++        (0, 2)
++    }
++}
++
++impl Controller {
++    pub(crate) fn new(mut device: PciCommonDevice, name: String) -> Option<Self> {
++        let location = *device.location();
++        let id = *device.device_id();
++        let mmio = device.bar_manager_mut().bar_mut(0)?.acquire().ok()?;
++        let regs = Regs(mmio);
++        // Memory decoding and bus mastering.
++        let command = location.read16(0x04);
++        location.write16(0x04, command | 0x06);
++        // Traffic class 0 (Linux clears TCSEL on every controller: static
++        // on some codecs otherwise).
++        let tcsel = location.read8(0x44);
++        location.write8(0x44, tcsel & !0x07);
++        // Intel's SCH-family controllers (Atom): snooping on.
++        if id.vendor_id == 0x8086 && matches!(id.device_id, 0x811b | 0x080a | 0x0f04 | 0x2284 | 0x5a98 | 0x3198) {
++            let devc = location.read16(0x78);
++            location.write16(0x78, devc & !(1 << 11));
++        }
++        let gcap = regs.r16(reg::GCAP);
++        if gcap == u16::MAX {
++            return None;
++        }
++        let output_streams = usize::from((gcap >> 12) & 0xf);
++        let input_streams = usize::from((gcap >> 8) & 0xf);
++
++        // Reset: in and out of it, then the codecs report themselves.
++        regs.w8(reg::RIRBCTL, 0);
++        regs.w8(reg::CORBCTL, 0);
++        regs.w32(reg::GCTL, regs.r32(reg::GCTL) & !GCTL_RESET);
++        if !regs.wait(|r| r.r32(reg::GCTL) & GCTL_RESET == 0) {
++            ostd::notice!("{}: the controller did not enter reset", name);
++        }
++        regs.delay(200);
++        regs.w32(reg::GCTL, regs.r32(reg::GCTL) | GCTL_RESET);
++        if !regs.wait(|r| r.r32(reg::GCTL) & GCTL_RESET != 0) {
++            ostd::warn!("{}: the controller did not leave reset", name);
++            return None;
++        }
++        // Codecs take 521 µs after the reset to ask for an address.
++        regs.delay(1500);
++        let present = regs.r16(reg::STATESTS) & 0x7fff;
++        regs.w16(reg::STATESTS, 0x7fff);
++        regs.w32(reg::INTCTL, 0);
++
++        let corb = DmaCoherent::alloc(1, true).ok()?;
++        let rirb = DmaCoherent::alloc(1, true).ok()?;
++        let positions = DmaCoherent::alloc(1, true).ok()?;
++        let (corb_code, corb_entries) = ring_size(regs.r8(reg::CORBSIZE));
++        let (rirb_code, rirb_entries) = ring_size(regs.r8(reg::RIRBSIZE));
++        regs.w32(reg::CORBLBASE, corb.daddr() as u32);
++        regs.w32(reg::CORBUBASE, (corb.daddr() as u64 >> 32) as u32);
++        regs.w8(reg::CORBSIZE, (regs.r8(reg::CORBSIZE) & !0x3) | corb_code);
++        regs.w16(reg::CORBWP, 0);
++        // The read pointer's reset: set, seen, cleared (some controllers
++        // never show it set; Linux carries on then).
++        regs.w16(reg::CORBRP, 1 << 15);
++        regs.wait(|r| r.r16(reg::CORBRP) & (1 << 15) != 0);
++        regs.w16(reg::CORBRP, 0);
++        regs.wait(|r| r.r16(reg::CORBRP) & (1 << 15) == 0);
++        regs.w8(reg::CORBCTL, 0x02);
++        regs.w32(reg::RIRBLBASE, rirb.daddr() as u32);
++        regs.w32(reg::RIRBUBASE, (rirb.daddr() as u64 >> 32) as u32);
++        regs.w8(reg::RIRBSIZE, (regs.r8(reg::RIRBSIZE) & !0x3) | rirb_code);
++        regs.w16(reg::RIRBWP, 1 << 15);
++        regs.w16(reg::RINTCNT, 1);
++        // DMA and its interrupt status (as Linux sets it): without the
++        // latter, some controllers stop taking commands once RINTCNT
++        // responses came. The interrupt itself stays off (INTCTL).
++        regs.w8(reg::RIRBCTL, 0x03);
++        regs.w32(reg::DPLBASE, positions.daddr() as u32 | 1);
++        regs.w32(reg::DPUBASE, (positions.daddr() as u64 >> 32) as u32);
++
++        let mut controller = Self {
++            regs,
++            name,
++            commands: Mutex::new(Commands {
++                corb,
++                rirb,
++                corb_entries,
++                rirb_entries,
++                corb_wp: 0,
++                rirb_rp: 0,
++                immediate: false,
++            }),
++            codecs: Vec::new(),
++            input_streams,
++            output_streams,
++            _positions: positions,
++            _device: device,
++        };
++        for address in 0..15u8 {
++            if present & (1 << address) == 0 {
++                continue;
++            }
++            match controller.read_codec(address) {
++                Some(codec) => controller.codecs.push(codec),
++                None => ostd::notice!("{}: codec {} did not answer", controller.name, address),
++            }
++        }
++        ostd::notice!(
++            "{}: HDA {:04x}:{:04x}, {} output and {} input streams, codecs {:?}",
++            controller.name,
++            id.vendor_id,
++            id.device_id,
++            output_streams,
++            input_streams,
++            controller.codecs.iter().map(|codec| alloc::format!("{:08x}", codec.vendor)).collect::<Vec<_>>()
++        );
++        Some(controller)
++    }
++
++    // ── Commands ─────────────────────────────────────────────────────────
++
++    /// Sends a verb and waits for the codec's answer.
++    pub(crate) fn command(&self, codec: u8, nid: u8, verb: u32, payload: u32) -> Option<u32> {
++        let word = codec::command(codec, nid, verb, payload);
++        let mut commands = self.commands.lock();
++        if !commands.immediate {
++            if let Some(answer) = self.ring_command(&mut commands, word, codec) {
++                return Some(answer);
++            }
++            ostd::notice!(
++                "{}: no answer on the command rings (CORBRP {:#x} CORBWP {:#x} RIRBWP {:#x} CORBCTL {:#x} RIRBCTL {:#x} RINTCNT {:#x} RIRBSTS {:#x} CORBSIZE {:#x}); using the immediate command registers",
++                self.name,
++                self.regs.r16(reg::CORBRP),
++                self.regs.r16(reg::CORBWP),
++                self.regs.r16(reg::RIRBWP),
++                self.regs.r8(reg::CORBCTL),
++                self.regs.r8(reg::RIRBCTL),
++                self.regs.r16(reg::RINTCNT),
++                self.regs.r8(reg::RIRBSTS),
++                self.regs.r8(reg::CORBSIZE)
++            );
++            commands.immediate = true;
++            self.regs.w8(reg::CORBCTL, 0);
++            self.regs.w8(reg::RIRBCTL, 0);
++        }
++        self.immediate_command(word)
++    }
++
++    fn ring_command(&self, commands: &mut Commands, word: u32, codec: u8) -> Option<u32> {
++        let wp = (commands.corb_wp + 1) % commands.corb_entries;
++        commands.corb.write_val(usize::from(wp) * 4, &word).ok()?;
++        commands.corb_wp = wp;
++        self.regs.w16(reg::CORBWP, wp);
++        let mut answer = None;
++        let found = self.regs.wait(|r| {
++            let written = r.r16(reg::RIRBWP) & 0xff;
++            while commands.rirb_rp != written % commands.rirb_entries {
++                commands.rirb_rp = (commands.rirb_rp + 1) % commands.rirb_entries;
++                let at = usize::from(commands.rirb_rp) * 8;
++                let response: u32 = commands.rirb.read_val(at).unwrap_or(0);
++                let extended: u32 = commands.rirb.read_val(at + 4).unwrap_or(0);
++                // Unsolicited responses (jacks) are not answers.
++                if extended & (1 << 4) == 0 && (extended & 0xf) as u8 == codec {
++                    answer = Some(response);
++                }
++            }
++            answer.is_some()
++        });
++        self.regs.w8(reg::RIRBSTS, 0x05);
++        if found { answer } else { None }
++    }
++
++    fn immediate_command(&self, word: u32) -> Option<u32> {
++        let regs = &self.regs;
++        if !regs.wait(|r| r.r16(reg::ICIS) & 1 == 0) {
++            return None;
++        }
++        regs.w16(reg::ICIS, regs.r16(reg::ICIS) | 0x2);
++        regs.w32(reg::ICOI, word);
++        regs.w16(reg::ICIS, regs.r16(reg::ICIS) | 0x1);
++        if !regs.wait(|r| r.r16(reg::ICIS) & 0x3 == 0x2) {
++            return None;
++        }
++        Some(regs.r32(reg::ICII))
++    }
++
++    fn parameter(&self, codec: u8, nid: u8, which: u32) -> u32 {
++        self.command(codec, nid, verb::GET_PARAMETER, which).unwrap_or(0)
++    }
++
++    /// A codec's audio function group and its widgets.
++    fn read_codec(&self, address: u8) -> Option<Codec> {
++        let vendor = self.command(address, 0, verb::GET_PARAMETER, parameter::VENDOR_ID)?;
++        let nodes = self.parameter(address, 0, parameter::SUBNODE_COUNT);
++        let (first, count) = (((nodes >> 16) & 0xff) as u8, (nodes & 0xff) as u8);
++        let afg = (first..first.saturating_add(count)).find(|&nid| self.parameter(address, nid, parameter::FUNCTION_TYPE) & 0xff == 1)?;
++        self.command(address, afg, verb::SET_POWER_STATE, 0);
++        let mut codec = Codec {
++            address,
++            afg,
++            vendor,
++            amp_in: self.parameter(address, afg, parameter::AMP_IN_CAP),
++            amp_out: self.parameter(address, afg, parameter::AMP_OUT_CAP),
++            gpios: self.parameter(address, afg, parameter::GPIO_COUNT) & 0xff,
++            ..Codec::default()
++        };
++        let widgets = self.parameter(address, afg, parameter::SUBNODE_COUNT);
++        let (first, count) = (((widgets >> 16) & 0xff) as u8, (widgets & 0xff) as u8);
++        for nid in first..first.saturating_add(count) {
++            let caps = self.parameter(address, nid, parameter::AUDIO_WIDGET_CAP);
++            let mut widget = Widget { nid, caps, ..Widget::default() };
++            if widget.has_in_amp() {
++                widget.amp_in = if widget.amp_override() { self.parameter(address, nid, parameter::AMP_IN_CAP) } else { 0 };
++            }
++            if widget.has_out_amp() {
++                widget.amp_out = if widget.amp_override() { self.parameter(address, nid, parameter::AMP_OUT_CAP) } else { 0 };
++            }
++            if widget.kind() == codec::Kind::Pin {
++                widget.pin_caps = self.parameter(address, nid, parameter::PIN_CAP);
++                widget.config = self.command(address, nid, verb::GET_CONFIG_DEFAULT, 0).unwrap_or(0);
++            }
++            if caps & (1 << 8) != 0 {
++                widget.connections = self.connections(address, nid);
++            }
++            codec.widgets.insert(nid, widget);
++        }
++        Some(codec)
++    }
++
++    fn connections(&self, codec: u8, nid: u8) -> Vec<u8> {
++        let length = self.parameter(codec, nid, parameter::CONNECTION_LIST_LENGTH);
++        let long_form = length & 0x80 != 0;
++        let count = (length & 0x7f) as usize;
++        let per_answer = if long_form { 2 } else { 4 };
++        let mut entries = Vec::with_capacity(count);
++        let mut index = 0;
++        while index < count {
++            let answer = self.command(codec, nid, verb::GET_CONNECTION_LIST, index as u32).unwrap_or(0);
++            for slot in 0..per_answer {
++                if index + slot >= count {
++                    break;
++                }
++                let entry = if long_form { (answer >> (16 * slot)) & 0xffff } else { (answer >> (8 * slot)) & 0xff };
++                entries.push(entry as u16);
++            }
++            index += per_answer;
++        }
++        codec::expand_connections(&entries, long_form)
++    }
++
++    // ── Streams ──────────────────────────────────────────────────────────
++
++    pub(crate) fn output_descriptor(&self, index: usize) -> Option<usize> {
++        (index < self.output_streams).then(|| reg::SD_BASE + reg::SD_SIZE * (self.input_streams + index))
++    }
++
++    pub(crate) fn input_descriptor(&self, index: usize) -> Option<usize> {
++        (index < self.input_streams).then(|| reg::SD_BASE + reg::SD_SIZE * index)
++    }
++}
++
++/// One stream of the controller, feeding (or fed by) converters.
++pub(crate) struct Stream {
++    pub(crate) controller: Arc<Controller>,
++    /// The stream descriptor's registers.
++    pub(crate) base: usize,
++    pub(crate) tag: u8,
++    /// The converters (codec, node) that play or record it.
++    pub(crate) converters: Vec<(u8, u8)>,
++    bdl: DmaCoherent,
++    running: AtomicBool,
++}
++
++impl Stream {
++    pub(crate) fn new(controller: Arc<Controller>, base: usize, tag: u8, converters: Vec<(u8, u8)>) -> Option<Self> {
++        Some(Self { controller, base, tag, converters, bdl: DmaCoherent::alloc(1, true).ok()?, running: AtomicBool::new(false) })
++    }
++
++    fn regs(&self) -> &Regs {
++        &self.controller.regs
++    }
++
++    fn reset(&self) {
++        let regs = self.regs();
++        let ctl = self.base + reg::SD_CTL;
++        regs.w8(ctl, regs.r8(ctl) & !SD_CTL_RUN);
++        regs.wait(|r| r.r8(ctl) & SD_CTL_RUN == 0);
++        regs.w8(ctl, regs.r8(ctl) | SD_CTL_RESET);
++        regs.wait(|r| r.r8(ctl) & SD_CTL_RESET != 0);
++        regs.w8(ctl, regs.r8(ctl) & !SD_CTL_RESET);
++        regs.wait(|r| r.r8(ctl) & SD_CTL_RESET == 0);
++        regs.w8(self.base + reg::SD_STS, 0x1c);
++    }
++}
++
++impl StreamHw for Stream {
++    fn prepare(&self, setup: &Setup, buffer: u64) -> pcm::Result<()> {
++        let bits = if setup.sample_bits == 16 { 16 } else { codec_bits(&self.controller, &self.converters) };
++        let format = codec::stream_format(setup.rate, bits, setup.channels).ok_or(PcmError::Invalid)?;
++        if setup.periods > MAX_PERIODS {
++            return Err(PcmError::Invalid);
++        }
++        self.reset();
++        let period = setup.period_bytes();
++        for period_index in 0..setup.periods as usize {
++            let at = period_index * 16;
++            let address = buffer + (period_index * period) as u64;
++            self.bdl.write_val(at, &address).map_err(|_| PcmError::Io)?;
++            self.bdl.write_val(at + 8, &(period as u32)).map_err(|_| PcmError::Io)?;
++            self.bdl.write_val(at + 12, &1u32).map_err(|_| PcmError::Io)?;
++        }
++        let regs = self.regs();
++        regs.w32(self.base + reg::SD_BDPL, self.bdl.daddr() as u32);
++        regs.w32(self.base + reg::SD_BDPU, (self.bdl.daddr() as u64 >> 32) as u32);
++        regs.w32(self.base + reg::SD_CBL, setup.buffer_bytes() as u32);
++        regs.w16(self.base + reg::SD_LVI, (setup.periods - 1) as u16);
++        regs.w16(self.base + reg::SD_FMT, format);
++        // The stream's tag, in bits 23:20 of the 24-bit control register.
++        let ctl2 = self.base + reg::SD_CTL + 2;
++        regs.w8(ctl2, (regs.r8(ctl2) & 0x0f) | self.tag << 4);
++        for &(codec, nid) in &self.converters {
++            self.controller.command(codec, nid, verb::SET_CHANNEL_STREAM_ID, u32::from(self.tag) << 4);
++            self.controller.command(codec, nid, verb::SET_STREAM_FORMAT, u32::from(format));
++        }
++        Ok(())
++    }
++
++    fn start(&self) {
++        let ctl = self.base + reg::SD_CTL;
++        self.regs().w8(ctl, self.regs().r8(ctl) | SD_CTL_RUN);
++        self.running.store(true, Ordering::Release);
++    }
++
++    fn stop(&self) {
++        let ctl = self.base + reg::SD_CTL;
++        self.regs().w8(ctl, self.regs().r8(ctl) & !SD_CTL_RUN);
++        self.running.store(false, Ordering::Release);
++    }
++
++    fn position(&self) -> usize {
++        self.regs().r32(self.base + reg::SD_LPIB) as usize
++    }
++
++    fn describe(&self) -> String {
++        let regs = self.regs();
++        alloc::format!(
++            "stream at {:#x}: CTL {:#x} STS {:#x} LPIB {} CBL {} LVI {} FMT {:#x} tag {}",
++            self.base,
++            regs.r32(self.base + reg::SD_CTL) & 0xff_ffff,
++            regs.r8(self.base + reg::SD_STS),
++            regs.r32(self.base + reg::SD_LPIB),
++            regs.r32(self.base + reg::SD_CBL),
++            regs.r16(self.base + reg::SD_LVI),
++            regs.r16(self.base + reg::SD_FMT),
++            self.tag
++        ) + &self
++            .converters
++            .iter()
++            .map(|&(codec, nid)| {
++                alloc::format!(
++                    "; converter {}:{:#x} stream {:#x} format {:#x}",
++                    codec,
++                    nid,
++                    self.controller.command(codec, nid, 0xf06, 0).unwrap_or(u32::MAX),
++                    self.controller.command(codec, nid, 0xa, 0).unwrap_or(u32::MAX)
++                )
++            })
++            .collect::<String>()
++    }
++
++    fn release(&self) {
++        self.stop();
++        for &(codec, nid) in &self.converters {
++            self.controller.command(codec, nid, verb::SET_CHANNEL_STREAM_ID, 0);
++        }
++    }
++}
++
++/// The sample size the converters take for 32-bit samples: their largest.
++fn codec_bits(controller: &Controller, converters: &[(u8, u8)]) -> u32 {
++    converters
++        .iter()
++        .map(|&(codec, nid)| codec::max_bits_of(controller.parameter(codec, nid, parameter::PCM)))
++        .min()
++        .unwrap_or(16)
++        .max(16)
++}
+diff --git a/kernel/comps/sound/src/lib.rs b/kernel/comps/sound/src/lib.rs
+new file mode 100755
+index 0000000..985a067
+--- /dev/null
++++ b/kernel/comps/sound/src/lib.rs
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Sound: the HDA controllers (`hda`) and their codecs (`codec`) as ALSA
++//! cards (`card`), with their PCM streams (`pcm`, whose parameters `params`
++//! negotiates). The ALSA device files (`/dev/snd`) are the kernel's
++//! (`aster-core`'s `device::snd`), on top of this.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++// This crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "sound: "
++    };
++}
++
++pub mod card;
++pub mod codec;
++mod hda;
++pub mod params;
++pub mod pcm;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    common_device::PciCommonDevice,
++};
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    sync::{SpinLock, WaitQueue},
++};
++
++pub use card::Card;
++pub use pcm::{Direction, Pcm};
++
++static CARDS: SpinLock<Vec<Arc<Card>>> = SpinLock::new(Vec::new());
++static CARD_HOOK: spin::Once<fn(&Arc<Card>)> = spin::Once::new();
++/// Streams running: the timer looks at their positions while there are some.
++static RUNNING: AtomicUsize = AtomicUsize::new(0);
++static TICKS: AtomicU64 = AtomicU64::new(0);
++/// Something a poller may wait for happened: a stream moved on or changed
++/// state, a control changed. The device files' notifier waits here.
++pub static ACTIVITY: WaitQueue = WaitQueue::new();
++static ACTIVITY_SEQ: AtomicU64 = AtomicU64::new(0);
++/// The jack task's half-second.
++static JACKS: WaitQueue = WaitQueue::new();
++static JACKS_DUE: AtomicBool = AtomicBool::new(false);
++
++pub fn activity_seq() -> u64 {
++    ACTIVITY_SEQ.load(Ordering::Acquire)
++}
++
++pub(crate) fn note_activity() {
++    ACTIVITY_SEQ.fetch_add(1, Ordering::AcqRel);
++    ACTIVITY.wake_all();
++}
++
++/// The sound cards found.
++pub fn cards() -> Vec<Arc<Card>> {
++    CARDS.lock().clone()
++}
++
++/// Sets the hook told of each card once it is ready (its device files).
++pub fn set_card_hook(hook: fn(&Arc<Card>)) {
++    CARD_HOOK.call_once(|| hook);
++}
++
++pub(crate) fn note_running(running: bool) {
++    if running {
++        RUNNING.fetch_add(1, Ordering::AcqRel);
++    } else {
++        let _ = RUNNING.try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1));
++    }
++}
++
++/// Every other millisecond while streams run: their positions move on and
++/// whoever waits for room or data wakes.
++fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    if ticks % 500 == 0 {
++        JACKS_DUE.store(true, Ordering::Release);
++        JACKS.wake_all();
++    }
++    if RUNNING.load(Ordering::Acquire) == 0 || ticks % 2 != 0 {
++        return;
++    }
++    let Some(cards) = CARDS.try_lock() else { return };
++    for card in cards.iter() {
++        for pcm in card.pcms() {
++            if pcm.is_running() {
++                pcm.update();
++            }
++        }
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++/// Claims the HDA controllers: multimedia, audio device (0x0403); Intel's
++/// audio DSPs (0x0401) also present the HDA registers.
++#[derive(Debug)]
++struct Driver {
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        let hda = (id.class, id.subclass) == (0x04, 0x03) || (id.vendor_id == 0x8086 && (id.class, id.subclass) == (0x04, 0x01));
++        if !hda {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.found.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
++    PCI_BUS.lock().register_driver(driver.clone());
++    let found = core::mem::take(&mut *driver.found.lock());
++    if !found.is_empty() {
++        ostd::timer::register_callback_on_cpu(tick);
++    }
++    PENDING.lock().extend(found);
++    Ok(())
++}
++
++/// Sets the controllers up and then follows their jacks, forever: the
++/// kernel runs it as a task of its own (resets and codec commands take a
++/// while), once its device files can be made.
++pub fn run() {
++    let devices = core::mem::take(&mut *PENDING.lock());
++    if devices.is_empty() {
++        return;
++    }
++    let mut index = 0;
++    for device in devices {
++        let id = *device.device_id();
++        let location = *device.location();
++        let name: String = format!("hda {:02x}:{:02x}.{}", location.bus, location.device, location.function);
++        let Some(controller) = hda::Controller::new(device, name.clone()) else {
++            ostd::warn!("{}: the controller did not start", name);
++            continue;
++        };
++        let place = format!("pci {:02x}:{:02x}.{}", location.bus, location.device, location.function);
++        match Card::new(index, Arc::new(controller), id.vendor_id, place) {
++            Some(card) => {
++                ostd::notice!(
++                    "card {}: {} ({}){}{}",
++                    index,
++                    card.name,
++                    card.mixer_name,
++                    if card.playback.is_some() { ", playback" } else { "" },
++                    if card.capture.is_some() { ", capture" } else { "" }
++                );
++                CARDS.lock().push(card.clone());
++                if let Some(hook) = CARD_HOOK.get() {
++                    hook(&card);
++                }
++                index += 1;
++            }
++            None => ostd::notice!("{}: no analog outputs or inputs (HDMI only)", name),
++        }
++    }
++    if index == 0 {
++        return;
++    }
++    // The jacks, twice a second.
++    loop {
++        for card in cards() {
++            card.poll_jacks();
++        }
++        JACKS.wait_until(|| JACKS_DUE.swap(false, Ordering::AcqRel).then_some(()));
++    }
++}
+diff --git a/kernel/comps/sound/src/params.rs b/kernel/comps/sound/src/params.rs
+new file mode 100755
+index 0000000..f00c176
+--- /dev/null
++++ b/kernel/comps/sound/src/params.rs
+@@ -0,0 +1,657 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! ALSA's hardware parameter space, as `snd_pcm_hw_params` carries it: three
++//! masks (access, format, subformat) and twelve intervals (sample and frame
++//! bits, channels, rate, period and buffer sizes and times), narrowed by the
++//! hardware's limits and by the rules that tie them together until nothing
++//! changes, as Linux's `snd_pcm_hw_refine` does; and the final choice
++//! `snd_pcm_hw_params` makes. alsa-lib relies on these exact semantics. No
++//! hardware here: its tests run on the host.
++//!
++//! Reference: Linux's `sound/core/pcm_native.c`, `pcm_lib.c`.
++
++/// Parameter numbers (`SNDRV_PCM_HW_PARAM_*`).
++pub mod param {
++    pub const ACCESS: usize = 0;
++    pub const FORMAT: usize = 1;
++    pub const SUBFORMAT: usize = 2;
++    pub const SAMPLE_BITS: usize = 8;
++    pub const FRAME_BITS: usize = 9;
++    pub const CHANNELS: usize = 10;
++    pub const RATE: usize = 11;
++    pub const PERIOD_TIME: usize = 12;
++    pub const PERIOD_SIZE: usize = 13;
++    pub const PERIOD_BYTES: usize = 14;
++    pub const PERIODS: usize = 15;
++    pub const BUFFER_TIME: usize = 16;
++    pub const BUFFER_SIZE: usize = 17;
++    pub const BUFFER_BYTES: usize = 18;
++    pub const TICK_TIME: usize = 19;
++    pub const FIRST_INTERVAL: usize = SAMPLE_BITS;
++}
++
++/// Access types (`SNDRV_PCM_ACCESS_*`).
++pub mod access {
++    pub const MMAP_INTERLEAVED: u32 = 0;
++    pub const RW_INTERLEAVED: u32 = 3;
++}
++
++/// Sample formats (`SNDRV_PCM_FORMAT_*`) and their sizes in bits.
++pub mod format {
++    pub const S16_LE: u32 = 2;
++    pub const S32_LE: u32 = 10;
++
++    /// The bits a sample of `format` takes in memory.
++    pub fn physical_width(format: u32) -> Option<u32> {
++        match format {
++            0 | 1 => Some(8),
++            2..=5 => Some(16),
++            6..=9 => Some(32),
++            10..=13 => Some(32),
++            14 | 15 => Some(32),
++            16 | 17 => Some(64),
++            32..=35 => Some(24),
++            _ => None,
++        }
++    }
++}
++
++pub const SUBFORMAT_STD: u32 = 0;
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Mask(pub [u32; 8]);
++
++impl Mask {
++    pub const fn any() -> Self {
++        Self([u32::MAX; 8])
++    }
++
++    pub fn of(values: &[u32]) -> Self {
++        let mut mask = Self([0; 8]);
++        for &value in values {
++            mask.set(value);
++        }
++        mask
++    }
++
++    pub fn test(&self, value: u32) -> bool {
++        value < 256 && self.0[(value / 32) as usize] & (1 << (value % 32)) != 0
++    }
++
++    pub fn set(&mut self, value: u32) {
++        if value < 256 {
++            self.0[(value / 32) as usize] |= 1 << (value % 32);
++        }
++    }
++
++    pub fn reset(&mut self, value: u32) {
++        if value < 256 {
++            self.0[(value / 32) as usize] &= !(1 << (value % 32));
++        }
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.0.iter().all(|&word| word == 0)
++    }
++
++    pub fn first(&self) -> Option<u32> {
++        (0..256).find(|&value| self.test(value))
++    }
++
++    pub fn is_single(&self) -> bool {
++        self.0.iter().map(|word| word.count_ones()).sum::<u32>() == 1
++    }
++
++    /// `self &= other`; whether it changed, or an error when it empties.
++    fn refine(&mut self, other: &Mask) -> Result<bool, ()> {
++        let old = *self;
++        for (word, other) in self.0.iter_mut().zip(other.0.iter()) {
++            *word &= other;
++        }
++        if self.is_empty() {
++            return Err(());
++        }
++        Ok(old != *self)
++    }
++
++    fn choose_first(&mut self) -> bool {
++        match self.first() {
++            Some(first) if !self.is_single() => {
++                *self = Self::of(&[first]);
++                true
++            }
++            _ => false,
++        }
++    }
++}
++
++/// A range of values, its ends open or closed, maybe integers only
++/// (`struct snd_interval`).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Interval {
++    pub min: u32,
++    pub max: u32,
++    pub openmin: bool,
++    pub openmax: bool,
++    pub integer: bool,
++    pub empty: bool,
++}
++
++fn mul(a: u32, b: u32) -> u32 {
++    a.checked_mul(b).unwrap_or(u32::MAX)
++}
++
++/// a / b and whether there is a remainder.
++fn div32(a: u32, b: u32) -> (u32, bool) {
++    if b == 0 {
++        return (u32::MAX, false);
++    }
++    (a / b, a % b != 0)
++}
++
++/// a * b / c and whether there is a remainder.
++fn muldiv32(a: u32, b: u32, c: u32) -> (u32, bool) {
++    if c == 0 {
++        return (u32::MAX, false);
++    }
++    let n = u64::from(a) * u64::from(b);
++    let (q, r) = (n / u64::from(c), n % u64::from(c));
++    if q > u64::from(u32::MAX) {
++        return (u32::MAX, false);
++    }
++    (q as u32, r != 0)
++}
++
++impl Interval {
++    pub const fn any() -> Self {
++        Self { min: 0, max: u32::MAX, openmin: false, openmax: false, integer: false, empty: false }
++    }
++
++    pub const fn range(min: u32, max: u32) -> Self {
++        Self { min, max, openmin: false, openmax: false, integer: false, empty: false }
++    }
++
++    pub const fn integer_range(min: u32, max: u32) -> Self {
++        Self { min, max, openmin: false, openmax: false, integer: true, empty: false }
++    }
++
++    pub const fn single(value: u32) -> Self {
++        Self::integer_range(value, value)
++    }
++
++    fn none() -> Self {
++        Self { empty: true, ..Self::any() }
++    }
++
++    fn check_empty(&self) -> bool {
++        self.min > self.max || ((self.openmin || self.openmax) && self.min == self.max)
++    }
++
++    pub fn is_single(&self) -> bool {
++        !self.empty && (self.min == self.max || (self.min + 1 == self.max && (self.openmin || self.openmax)))
++    }
++
++    /// Its value when single.
++    pub fn value(&self) -> u32 {
++        if self.openmin && !self.openmax { self.max } else { self.min }
++    }
++
++    /// Narrows `self` to `other` (`snd_interval_refine`).
++    pub fn refine(&mut self, other: &Interval) -> Result<bool, ()> {
++        if self.empty || other.empty {
++            return Err(());
++        }
++        let mut changed = false;
++        if self.min < other.min {
++            self.min = other.min;
++            self.openmin = other.openmin;
++            changed = true;
++        } else if self.min == other.min && !self.openmin && other.openmin {
++            self.openmin = true;
++            changed = true;
++        }
++        if self.max > other.max {
++            self.max = other.max;
++            self.openmax = other.openmax;
++            changed = true;
++        } else if self.max == other.max && !self.openmax && other.openmax {
++            self.openmax = true;
++            changed = true;
++        }
++        if !self.integer && other.integer {
++            self.integer = true;
++            changed = true;
++        }
++        if self.integer {
++            if self.openmin {
++                self.min = self.min.saturating_add(1);
++                self.openmin = false;
++            }
++            if self.openmax {
++                self.max = self.max.saturating_sub(1);
++                self.openmax = false;
++            }
++        } else if !self.openmin && !self.openmax && self.min == self.max {
++            self.integer = true;
++        }
++        if self.check_empty() {
++            *self = Self::none();
++            return Err(());
++        }
++        Ok(changed)
++    }
++
++    fn mul(a: &Self, b: &Self) -> Self {
++        if a.empty || b.empty {
++            return Self::none();
++        }
++        Self {
++            min: mul(a.min, b.min),
++            openmin: a.openmin || b.openmin,
++            max: mul(a.max, b.max),
++            openmax: a.openmax || b.openmax,
++            integer: a.integer && b.integer,
++            empty: false,
++        }
++    }
++
++    fn div(a: &Self, b: &Self) -> Self {
++        if a.empty || b.empty {
++            return Self::none();
++        }
++        let (min, r) = div32(a.min, b.max);
++        let mut c = Self { min, openmin: r || a.openmin || b.openmax, ..Self::any() };
++        if b.min > 0 {
++            let (max, r) = div32(a.max, b.min);
++            if r {
++                c.max = max.saturating_add(1);
++                c.openmax = true;
++            } else {
++                c.max = max;
++                c.openmax = a.openmax || b.openmin;
++            }
++        }
++        c
++    }
++
++    fn muldivk(a: &Self, b: &Self, k: u32) -> Self {
++        if a.empty || b.empty {
++            return Self::none();
++        }
++        let (min, r) = muldiv32(a.min, b.min, k);
++        let (max, rmax) = muldiv32(a.max, b.max, k);
++        Self {
++            min,
++            openmin: r || a.openmin || b.openmin,
++            max: if rmax { max.saturating_add(1) } else { max },
++            openmax: rmax || a.openmax || b.openmax,
++            integer: false,
++            empty: false,
++        }
++    }
++
++    fn mulkdiv(a: &Self, k: u32, b: &Self) -> Self {
++        if a.empty || b.empty {
++            return Self::none();
++        }
++        let (min, r) = muldiv32(a.min, k, b.max);
++        let mut c = Self { min, openmin: r || a.openmin || b.openmax, ..Self::any() };
++        if b.min > 0 {
++            let (max, r) = muldiv32(a.max, k, b.min);
++            if r {
++                c.max = max.saturating_add(1);
++                c.openmax = true;
++            } else {
++                c.max = max;
++                c.openmax = a.openmax || b.openmin;
++            }
++        }
++        c
++    }
++
++    /// Narrowed to its smallest value (`snd_interval_refine_first`): just
++    /// above its minimum when that is open.
++    fn refine_first(&mut self) -> bool {
++        if self.is_single() {
++            return false;
++        }
++        let last_max = self.max;
++        self.max = self.min;
++        if self.openmin {
++            self.max = self.max.saturating_add(1);
++        }
++        self.openmax = self.openmax && self.max >= last_max;
++        true
++    }
++
++    /// Narrowed to its largest value (`snd_interval_refine_last`).
++    fn refine_last(&mut self) -> bool {
++        if self.is_single() {
++            return false;
++        }
++        let last_min = self.min;
++        self.min = self.max;
++        if self.openmax {
++            self.min = self.min.saturating_sub(1);
++        }
++        self.openmin = self.openmin && self.min <= last_min;
++        true
++    }
++
++    /// The values of `list` within `self`, as an interval.
++    fn of_list(&self, list: &[u32]) -> Self {
++        let inside = |value: u32| {
++            let above = if self.openmin { value > self.min } else { value >= self.min };
++            let below = if self.openmax { value < self.max } else { value <= self.max };
++            above && below
++        };
++        let mut found = list.iter().copied().filter(|&value| inside(value));
++        match found.next() {
++            Some(first) => {
++                let (min, max) = found.fold((first, first), |(min, max), value| (min.min(value), max.max(value)));
++                Self::integer_range(min, max)
++            }
++            None => Self::none(),
++        }
++    }
++
++    /// Narrowed to multiples of `step` (`snd_pcm_hw_constraint_step`).
++    fn step(&self, step: u32) -> Self {
++        let mut c = *self;
++        if step <= 1 || self.empty {
++            return c;
++        }
++        let min = if self.openmin { self.min.saturating_add(1) } else { self.min };
++        let max = if self.openmax { self.max.saturating_sub(1) } else { self.max };
++        c.min = min.div_ceil(step).saturating_mul(step);
++        c.max = max / step * step;
++        c.openmin = false;
++        c.openmax = false;
++        if c.min > c.max { Self::none() } else { c }
++    }
++}
++
++/// `struct snd_pcm_hw_params`, without its reserved fields.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct HwParams {
++    pub flags: u32,
++    pub masks: [Mask; 3],
++    pub intervals: [Interval; 12],
++    pub rmask: u32,
++    pub cmask: u32,
++    pub info: u32,
++    pub msbits: u32,
++    pub rate_num: u32,
++    pub rate_den: u32,
++    pub fifo_size: u64,
++}
++
++impl HwParams {
++    /// Everything allowed (`snd_pcm_hw_params_any`).
++    pub fn any() -> Self {
++        Self {
++            flags: 0,
++            masks: [Mask::any(); 3],
++            intervals: [Interval::any(); 12],
++            rmask: u32::MAX,
++            cmask: 0,
++            info: 0,
++            msbits: 0,
++            rate_num: 0,
++            rate_den: 0,
++            fifo_size: 0,
++        }
++    }
++
++    pub fn interval(&self, param: usize) -> &Interval {
++        &self.intervals[param - param::FIRST_INTERVAL]
++    }
++
++    pub fn interval_mut(&mut self, param: usize) -> &mut Interval {
++        &mut self.intervals[param - param::FIRST_INTERVAL]
++    }
++
++    /// The single value of an interval parameter (after `HW_PARAMS`).
++    pub fn get(&self, param: usize) -> u32 {
++        self.interval(param).value()
++    }
++
++    pub fn access(&self) -> Option<u32> {
++        self.masks[param::ACCESS].first()
++    }
++
++    pub fn format(&self) -> Option<u32> {
++        self.masks[param::FORMAT].first()
++    }
++}
++
++/// What a stream's hardware can do.
++#[derive(Clone, Debug)]
++pub struct HwLimits {
++    pub info: u32,
++    pub formats: Mask,
++    pub rates: alloc::vec::Vec<u32>,
++    pub channels: (u32, u32),
++    pub period_bytes: (u32, u32),
++    pub periods: (u32, u32),
++    pub buffer_bytes_max: u32,
++    /// Period and buffer sizes in bytes must be multiples of this.
++    pub byte_step: u32,
++    /// The bits of a sample the converter uses (24 of a 32-bit sample).
++    pub msbits: u32,
++}
++
++/// The rules between parameters: (target, how, dependencies).
++#[derive(Clone, Copy)]
++enum Rule {
++    Mul(usize, usize, usize),
++    Div(usize, usize, usize),
++    MulDivK(usize, usize, usize, u32),
++    MulKDiv(usize, usize, u32, usize),
++}
++
++const RULES: [Rule; 18] = {
++    use param::*;
++    [
++        Rule::Div(SAMPLE_BITS, FRAME_BITS, CHANNELS),
++        Rule::Mul(FRAME_BITS, SAMPLE_BITS, CHANNELS),
++        Rule::MulKDiv(FRAME_BITS, PERIOD_BYTES, 8, PERIOD_SIZE),
++        Rule::MulKDiv(FRAME_BITS, BUFFER_BYTES, 8, BUFFER_SIZE),
++        Rule::Div(CHANNELS, FRAME_BITS, SAMPLE_BITS),
++        Rule::MulKDiv(RATE, PERIOD_SIZE, 1_000_000, PERIOD_TIME),
++        Rule::MulKDiv(RATE, BUFFER_SIZE, 1_000_000, BUFFER_TIME),
++        Rule::Div(PERIODS, BUFFER_SIZE, PERIOD_SIZE),
++        Rule::Div(PERIOD_SIZE, BUFFER_SIZE, PERIODS),
++        Rule::MulKDiv(PERIOD_SIZE, PERIOD_BYTES, 8, FRAME_BITS),
++        Rule::MulDivK(PERIOD_SIZE, PERIOD_TIME, RATE, 1_000_000),
++        Rule::Mul(BUFFER_SIZE, PERIOD_SIZE, PERIODS),
++        Rule::MulKDiv(BUFFER_SIZE, BUFFER_BYTES, 8, FRAME_BITS),
++        Rule::MulDivK(BUFFER_SIZE, BUFFER_TIME, RATE, 1_000_000),
++        Rule::MulDivK(PERIOD_BYTES, PERIOD_SIZE, FRAME_BITS, 8),
++        Rule::MulKDiv(PERIOD_TIME, PERIOD_SIZE, 1_000_000, RATE),
++        Rule::MulDivK(BUFFER_BYTES, BUFFER_SIZE, FRAME_BITS, 8),
++        Rule::MulKDiv(BUFFER_TIME, BUFFER_SIZE, 1_000_000, RATE),
++    ]
++};
++
++/// The parameter space the hardware allows, before any rule.
++fn constraints(limits: &HwLimits) -> HwParams {
++    use param::*;
++    let mut c = HwParams::any();
++    let mut access = alloc::vec::Vec::new();
++    access.push(access::RW_INTERLEAVED);
++    if limits.info & info::MMAP != 0 {
++        access.push(access::MMAP_INTERLEAVED);
++    }
++    c.masks[ACCESS] = Mask::of(&access);
++    c.masks[FORMAT] = limits.formats;
++    c.masks[SUBFORMAT] = Mask::of(&[SUBFORMAT_STD]);
++    for p in [CHANNELS, BUFFER_SIZE, BUFFER_BYTES, SAMPLE_BITS, FRAME_BITS] {
++        c.interval_mut(p).integer = true;
++    }
++    *c.interval_mut(CHANNELS) = Interval::integer_range(limits.channels.0, limits.channels.1);
++    let (rate_min, rate_max) = (limits.rates.iter().copied().min().unwrap_or(0), limits.rates.iter().copied().max().unwrap_or(0));
++    *c.interval_mut(RATE) = Interval::range(rate_min, rate_max);
++    *c.interval_mut(PERIOD_BYTES) = Interval::range(limits.period_bytes.0, limits.period_bytes.1);
++    *c.interval_mut(PERIODS) = Interval::integer_range(limits.periods.0, limits.periods.1);
++    *c.interval_mut(BUFFER_BYTES) = Interval::integer_range(limits.period_bytes.0, limits.buffer_bytes_max);
++    c
++}
++
++pub mod info {
++    pub const MMAP: u32 = 0x0000_0001;
++    pub const MMAP_VALID: u32 = 0x0000_0002;
++    pub const DOUBLE: u32 = 0x0000_0004;
++    pub const BATCH: u32 = 0x0000_0010;
++    pub const INTERLEAVED: u32 = 0x0000_0100;
++    pub const BLOCK_TRANSFER: u32 = 0x0001_0000;
++    pub const OVERRANGE: u32 = 0x0002_0000;
++    pub const RESUME: u32 = 0x0004_0000;
++    pub const PAUSE: u32 = 0x0008_0000;
++    pub const HALF_DUPLEX: u32 = 0x0010_0000;
++    pub const JOINT_DUPLEX: u32 = 0x0020_0000;
++    pub const SYNC_START: u32 = 0x0040_0000;
++    pub const NO_PERIOD_WAKEUP: u32 = 0x0080_0000;
++    pub const FIFO_IN_FRAMES: u32 = 0x8000_0000;
++}
++
++fn apply_rule(params: &mut HwParams, rule: Rule) -> Result<bool, ()> {
++    let i = |p: usize| *params.interval(p);
++    let (target, value) = match rule {
++        Rule::Mul(t, a, b) => (t, Interval::mul(&i(a), &i(b))),
++        Rule::Div(t, a, b) => (t, Interval::div(&i(a), &i(b))),
++        Rule::MulDivK(t, a, b, k) => (t, Interval::muldivk(&i(a), &i(b), k)),
++        Rule::MulKDiv(t, a, k, b) => (t, Interval::mulkdiv(&i(a), k, &i(b))),
++    };
++    params.interval_mut(target).refine(&value)
++}
++
++/// The formats of `mask` whose width is in `bits`, and the widths of the
++/// formats left.
++fn rule_formats(params: &mut HwParams) -> Result<bool, ()> {
++    let bits = *params.interval(param::SAMPLE_BITS);
++    let mut changed = false;
++    let mut formats = params.masks[param::FORMAT];
++    for format in 0..256 {
++        if !formats.test(format) {
++            continue;
++        }
++        let fits = format::physical_width(format).is_some_and(|width| {
++            let above = if bits.openmin { width > bits.min } else { width >= bits.min };
++            let below = if bits.openmax { width < bits.max } else { width <= bits.max };
++            above && below
++        });
++        if !fits {
++            formats.reset(format);
++            changed = true;
++        }
++    }
++    if formats.is_empty() {
++        return Err(());
++    }
++    params.masks[param::FORMAT] = formats;
++    let widths: alloc::vec::Vec<u32> = (0..256).filter(|&f| formats.test(f)).filter_map(format::physical_width).collect();
++    let (min, max) = (widths.iter().copied().min().unwrap_or(0), widths.iter().copied().max().unwrap_or(0));
++    Ok(params.interval_mut(param::SAMPLE_BITS).refine(&Interval::integer_range(min, max))? || changed)
++}
++
++/// Narrows `params` to what the hardware allows and the rules imply
++/// (`SNDRV_PCM_IOCTL_HW_REFINE`). An empty parameter: `Err`.
++pub fn refine(params: &mut HwParams, limits: &HwLimits) -> Result<(), ()> {
++    let c = constraints(limits);
++    let mut changed = 0u32;
++    for p in 0..3 {
++        if params.rmask & (1 << p) != 0 && params.masks[p].refine(&c.masks[p])? {
++            changed |= 1 << p;
++        }
++    }
++    for p in param::FIRST_INTERVAL..=param::TICK_TIME {
++        if params.rmask & (1 << p) != 0 && params.interval_mut(p).refine(c.interval(p))? {
++            changed |= 1 << p;
++        }
++    }
++    // The rates the hardware has, and the byte step of its DMA.
++    let rates = params.interval(param::RATE).of_list(&limits.rates);
++    if params.interval_mut(param::RATE).refine(&rates)? {
++        changed |= 1 << param::RATE;
++    }
++    for p in [param::PERIOD_BYTES, param::BUFFER_BYTES] {
++        let stepped = params.interval(p).step(limits.byte_step);
++        if params.interval_mut(p).refine(&stepped)? {
++            changed |= 1 << p;
++        }
++    }
++    // The rules, until nothing changes.
++    for _ in 0..64 {
++        let mut again = false;
++        if rule_formats(params)? {
++            changed |= 1 << param::FORMAT | 1 << param::SAMPLE_BITS;
++            again = true;
++        }
++        for rule in RULES {
++            let target = match rule {
++                Rule::Mul(t, ..) | Rule::Div(t, ..) | Rule::MulDivK(t, ..) | Rule::MulKDiv(t, ..) => t,
++            };
++            if apply_rule(params, rule)? {
++                changed |= 1 << target;
++                again = true;
++            }
++        }
++        for p in [param::PERIOD_BYTES, param::BUFFER_BYTES] {
++            let stepped = params.interval(p).step(limits.byte_step);
++            if params.interval_mut(p).refine(&stepped)? {
++                changed |= 1 << p;
++                again = true;
++            }
++        }
++        if !again {
++            break;
++        }
++    }
++    params.cmask = changed;
++    params.rmask = 0;
++    params.info = limits.info;
++    if params.msbits == 0 && params.interval(param::SAMPLE_BITS).is_single() {
++        let bits = params.get(param::SAMPLE_BITS);
++        params.msbits = if bits > limits.msbits && limits.msbits != 0 { limits.msbits } else { bits };
++    }
++    if params.rate_den == 0 && params.interval(param::RATE).is_single() {
++        params.rate_num = params.get(param::RATE);
++        params.rate_den = 1;
++    }
++    Ok(())
++}
++
++/// Makes every parameter single, as `snd_pcm_hw_params` does: the first
++/// access, format and subformat, the smallest value of each interval but
++/// the buffer size, the largest of that; refining after each choice.
++pub fn choose(params: &mut HwParams, limits: &HwLimits) -> Result<(), ()> {
++    use param::*;
++    params.rmask = u32::MAX;
++    refine(params, limits)?;
++    for p in [ACCESS, FORMAT, SUBFORMAT] {
++        if params.masks[p].choose_first() {
++            params.rmask = u32::MAX;
++            refine(params, limits)?;
++        }
++    }
++    for p in [CHANNELS, RATE, PERIOD_TIME, PERIOD_SIZE, PERIOD_BYTES, PERIODS, BUFFER_TIME, BUFFER_SIZE, BUFFER_BYTES, TICK_TIME] {
++        let interval = params.interval_mut(p);
++        let changed = if p == BUFFER_SIZE { interval.refine_last() } else { interval.refine_first() };
++        if changed {
++            params.rmask = u32::MAX;
++            refine(params, limits)?;
++        }
++    }
++    Ok(())
++}
++
++/// The boundary pointers wrap at: the buffer size doubled while it stays
++/// well inside a signed 64-bit number (Linux's `snd_pcm_hw_params`).
++pub fn boundary(buffer_size: u64) -> u64 {
++    let mut boundary = buffer_size.max(1);
++    while boundary * 2 <= (i64::MAX as u64) - buffer_size {
++        boundary *= 2;
++    }
++    boundary
++}
+diff --git a/kernel/comps/sound/src/pcm.rs b/kernel/comps/sound/src/pcm.rs
+new file mode 100755
+index 0000000..c4f205f
+--- /dev/null
++++ b/kernel/comps/sound/src/pcm.rs
+@@ -0,0 +1,791 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A PCM stream as ALSA's core keeps it (`snd_pcm_runtime`): its state, its
++//! parameters, its buffer, the hardware's position in it and the
++//! application's, the status and control pages applications map (alsa-lib
++//! reads the hardware pointer from one and writes its own pointer into the
++//! other), underruns and overruns, draining, pausing. The hardware itself is
++//! behind [`StreamHw`].
++//!
++//! Reference: Linux's `sound/core/pcm_native.c`, `pcm_lib.c`.
++
++use alloc::{boxed::Box, string::String, sync::Arc};
++use core::{
++    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
++    time::Duration,
++};
++
++use ostd::{
++    mm::{FrameAllocOptions, HasDaddr, HasSize, PAGE_SIZE, UFrame, USegment, VmIo, dma::DmaStream},
++    sync::{LocalIrqDisabled, SpinLock, WaitQueue},
++};
++
++use crate::params::{self, HwLimits, HwParams, param};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Direction {
++    Playback,
++    Capture,
++}
++
++/// `SNDRV_PCM_STATE_*`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(i32)]
++pub enum State {
++    Open = 0,
++    Setup = 1,
++    Prepared = 2,
++    Running = 3,
++    Xrun = 4,
++    Draining = 5,
++    Paused = 6,
++    Suspended = 7,
++    Disconnected = 8,
++}
++
++/// What a request can fail with; the device files turn it into an errno.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PcmError {
++    /// The stream is not in a state for it (EBADFD).
++    BadState,
++    /// An underrun or overrun (EPIPE).
++    Xrun,
++    /// Nothing can be done without waiting (EAGAIN).
++    WouldBlock,
++    Invalid,
++    NoMemory,
++    Busy,
++    Io,
++}
++
++pub type Result<T> = core::result::Result<T, PcmError>;
++
++/// The parameters a stream was set up with.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Setup {
++    pub access: u32,
++    pub format: u32,
++    pub channels: u32,
++    pub rate: u32,
++    pub sample_bits: u32,
++    pub frame_bytes: usize,
++    pub period_size: u64,
++    pub periods: u32,
++    pub buffer_size: u64,
++    pub boundary: u64,
++}
++
++impl Setup {
++    pub fn buffer_bytes(&self) -> usize {
++        self.buffer_size as usize * self.frame_bytes
++    }
++
++    pub fn period_bytes(&self) -> usize {
++        self.period_size as usize * self.frame_bytes
++    }
++}
++
++/// `struct snd_pcm_sw_params`'s values.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct SwParams {
++    pub tstamp_mode: i32,
++    pub period_step: u32,
++    pub sleep_min: u32,
++    pub avail_min: u64,
++    pub xfer_align: u64,
++    pub start_threshold: u64,
++    pub stop_threshold: u64,
++    pub silence_threshold: u64,
++    pub silence_size: u64,
++    pub boundary: u64,
++    pub proto: u32,
++    pub tstamp_type: u32,
++}
++
++/// The hardware side of a stream.
++pub trait StreamHw: Send + Sync {
++    /// Sets the stream up to run over a buffer at `buffer`, in periods.
++    fn prepare(&self, setup: &Setup, buffer: u64) -> Result<()>;
++    fn start(&self);
++    fn stop(&self);
++    /// Where in the buffer the hardware is, in bytes.
++    fn position(&self) -> usize;
++    /// The stream is let go (closed, or set up anew).
++    fn release(&self);
++    /// Its registers, for a stall's report.
++    fn describe(&self) -> String {
++        String::new()
++    }
++}
++
++/// A stream's buffer: frames applications may map, and their DMA mapping.
++pub struct Buffer {
++    pub frames: USegment,
++    pub dma: DmaStream,
++}
++
++/// Where the status and control pages keep each field.
++mod page {
++    pub(super) const STATE: usize = 0;
++    pub(super) const HW_PTR: usize = 8;
++    pub(super) const TSTAMP: usize = 16;
++    pub(super) const SUSPENDED_STATE: usize = 32;
++    pub(super) const AUDIO_TSTAMP: usize = 40;
++    pub(super) const APPL_PTR: usize = 0;
++    pub(super) const AVAIL_MIN: usize = 8;
++}
++
++/// What `SNDRV_PCM_IOCTL_STATUS` reports.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct Status {
++    pub state: i32,
++    pub trigger: Duration,
++    pub now: Duration,
++    pub appl_ptr: u64,
++    pub hw_ptr: u64,
++    pub delay: i64,
++    pub avail: u64,
++    pub avail_max: u64,
++}
++
++struct Runtime {
++    state: State,
++    setup: Option<Setup>,
++    sw: SwParams,
++    hw_ptr: u64,
++    /// The hardware's last position, in bytes.
++    last_position: usize,
++    buffer: Option<Arc<Buffer>>,
++    avail_max: u64,
++    trigger: Duration,
++    /// The state before a pause.
++    paused_from: State,
++    /// Frames played (or recorded) since the last whole period.
++    partial: u64,
++}
++
++pub struct Pcm {
++    pub direction: Direction,
++    pub limits: HwLimits,
++    pub id: String,
++    pub name: String,
++    hw: Box<dyn StreamHw>,
++    runtime: SpinLock<Runtime, LocalIrqDisabled>,
++    status_page: UFrame,
++    control_page: UFrame,
++    /// Waits for room (playback) or data (capture), and for a state change.
++    pub wait: WaitQueue,
++    opened: AtomicBool,
++    /// Mappings of its buffer that applications hold.
++    mapped: AtomicUsize,
++    /// Periods completed, ever: its timer's ticks.
++    periods: AtomicU64,
++}
++
++fn now() -> Duration {
++    ostd::timer::Jiffies::elapsed().as_duration()
++}
++
++fn page() -> Option<UFrame> {
++    Some(FrameAllocOptions::new().zeroed(true).alloc_frame().ok()?.into())
++}
++
++impl Pcm {
++    pub fn new(direction: Direction, limits: HwLimits, id: String, name: String, hw: Box<dyn StreamHw>) -> Option<Arc<Self>> {
++        Some(Arc::new(Self {
++            direction,
++            limits,
++            id,
++            name,
++            hw,
++            runtime: SpinLock::new(Runtime {
++                state: State::Open,
++                setup: None,
++                sw: SwParams::default(),
++                hw_ptr: 0,
++                last_position: 0,
++                buffer: None,
++                avail_max: 0,
++                trigger: Duration::ZERO,
++                paused_from: State::Running,
++                partial: 0,
++            }),
++            status_page: page()?,
++            control_page: page()?,
++            wait: WaitQueue::new(),
++            opened: AtomicBool::new(false),
++            mapped: AtomicUsize::new(0),
++            periods: AtomicU64::new(0),
++        }))
++    }
++
++    /// Periods the stream completed, ever (its timer ticks with each).
++    pub fn periods_elapsed(&self) -> u64 {
++        self.periods.load(Ordering::Acquire)
++    }
++
++    pub fn status_page(&self) -> &UFrame {
++        &self.status_page
++    }
++
++    pub fn control_page(&self) -> &UFrame {
++        &self.control_page
++    }
++
++    pub fn appl_ptr(&self) -> u64 {
++        self.control_page.read_val::<u64>(page::APPL_PTR).unwrap_or(0)
++    }
++
++    fn set_appl_ptr(&self, value: u64) {
++        let _ = self.control_page.write_val(page::APPL_PTR, &value);
++    }
++
++    pub fn avail_min(&self) -> u64 {
++        self.control_page.read_val::<u64>(page::AVAIL_MIN).unwrap_or(1).max(1)
++    }
++
++    pub fn set_avail_min(&self, value: u64) {
++        let _ = self.control_page.write_val(page::AVAIL_MIN, &value.max(1));
++    }
++
++    /// The status page, as the runtime is.
++    fn publish(&self, runtime: &Runtime) {
++        let stamp = now();
++        let _ = self.status_page.write_val(page::STATE, &(runtime.state as i32));
++        let _ = self.status_page.write_val(page::HW_PTR, &runtime.hw_ptr);
++        let _ = self.status_page.write_val(page::TSTAMP, &(stamp.as_secs() as i64));
++        let _ = self.status_page.write_val(page::TSTAMP + 8, &i64::from(stamp.subsec_nanos()));
++        let _ = self.status_page.write_val(page::SUSPENDED_STATE, &0i32);
++        let _ = self.status_page.write_val(page::AUDIO_TSTAMP, &0i64);
++    }
++
++    // ── Opening and closing ──────────────────────────────────────────────
++
++    pub fn open(&self) -> Result<()> {
++        if self.opened.swap(true, Ordering::AcqRel) {
++            return Err(PcmError::Busy);
++        }
++        let mut runtime = self.runtime.lock();
++        runtime.state = State::Open;
++        runtime.setup = None;
++        runtime.buffer = None;
++        self.set_appl_ptr(0);
++        self.set_avail_min(1);
++        self.publish(&runtime);
++        Ok(())
++    }
++
++    pub fn close(&self) {
++        let buffer = {
++            let mut runtime = self.runtime.lock();
++            if matches!(runtime.state, State::Running | State::Draining | State::Paused) {
++                self.hw.stop();
++            }
++            runtime.state = State::Open;
++            runtime.setup = None;
++            self.publish(&runtime);
++            runtime.buffer.take()
++        };
++        self.hw.release();
++        drop(buffer);
++        self.opened.store(false, Ordering::Release);
++        self.wait.wake_all();
++        crate::note_activity();
++    }
++
++    pub fn state(&self) -> State {
++        self.runtime.lock().state
++    }
++
++    pub fn setup(&self) -> Option<Setup> {
++        self.runtime.lock().setup
++    }
++
++    pub fn buffer(&self) -> Option<Arc<Buffer>> {
++        self.runtime.lock().buffer.clone()
++    }
++
++    pub fn note_mapped(&self, mapped: bool) {
++        if mapped {
++            self.mapped.fetch_add(1, Ordering::AcqRel);
++        } else {
++            self.mapped.fetch_sub(1, Ordering::AcqRel);
++        }
++    }
++
++    // ── Parameters ───────────────────────────────────────────────────────
++
++    pub fn hw_refine(&self, params: &mut HwParams) -> Result<()> {
++        params::refine(params, &self.limits).map_err(|()| PcmError::Invalid)
++    }
++
++    pub fn hw_params(&self, params: &mut HwParams) -> Result<Setup> {
++        if matches!(self.state(), State::Running | State::Draining | State::Paused | State::Xrun) {
++            return Err(PcmError::BadState);
++        }
++        params::choose(params, &self.limits).map_err(|()| PcmError::Invalid)?;
++        let format = params.format().ok_or(PcmError::Invalid)?;
++        let access = params.access().ok_or(PcmError::Invalid)?;
++        let frame_bits = params.get(param::FRAME_BITS);
++        let buffer_size = u64::from(params.get(param::BUFFER_SIZE));
++        let setup = Setup {
++            access,
++            format,
++            channels: params.get(param::CHANNELS),
++            rate: params.get(param::RATE),
++            sample_bits: params.get(param::SAMPLE_BITS),
++            frame_bytes: (frame_bits / 8) as usize,
++            period_size: u64::from(params.get(param::PERIOD_SIZE)),
++            periods: params.get(param::PERIODS),
++            buffer_size,
++            boundary: params::boundary(buffer_size),
++        };
++        if setup.frame_bytes == 0 || setup.period_size == 0 || setup.periods == 0 {
++            return Err(PcmError::Invalid);
++        }
++        // A new buffer, unless one is mapped (it cannot change then).
++        let pages = setup.buffer_bytes().div_ceil(PAGE_SIZE);
++        let reuse = self.runtime.lock().buffer.as_ref().filter(|buffer| buffer.frames.size() / PAGE_SIZE == pages).cloned();
++        let buffer = match reuse {
++            Some(buffer) => buffer,
++            None => {
++                if self.mapped.load(Ordering::Acquire) > 0 {
++                    return Err(PcmError::BadState);
++                }
++                let segment = FrameAllocOptions::new().zeroed(true).alloc_segment(pages).map_err(|_| PcmError::NoMemory)?;
++                let frames: USegment = segment.into();
++                let dma = DmaStream::map(frames.clone(), true).map_err(|_| PcmError::NoMemory)?;
++                Arc::new(Buffer { frames, dma })
++            }
++        };
++        let mut runtime = self.runtime.lock();
++        runtime.setup = Some(setup);
++        runtime.buffer = Some(buffer);
++        runtime.sw = SwParams {
++            avail_min: setup.period_size,
++            start_threshold: 1,
++            stop_threshold: setup.buffer_size,
++            boundary: setup.boundary,
++            ..SwParams::default()
++        };
++        runtime.state = State::Setup;
++        runtime.hw_ptr = 0;
++        self.set_appl_ptr(0);
++        self.set_avail_min(setup.period_size);
++        self.publish(&runtime);
++        Ok(setup)
++    }
++
++    pub fn hw_free(&self) -> Result<()> {
++        let buffer = {
++            let mut runtime = self.runtime.lock();
++            if matches!(runtime.state, State::Running | State::Draining | State::Paused) {
++                return Err(PcmError::BadState);
++            }
++            if self.mapped.load(Ordering::Acquire) > 0 {
++                return Err(PcmError::BadState);
++            }
++            runtime.state = State::Open;
++            runtime.setup = None;
++            self.publish(&runtime);
++            runtime.buffer.take()
++        };
++        self.hw.release();
++        drop(buffer);
++        Ok(())
++    }
++
++    pub fn sw_params(&self, sw: &mut SwParams) -> Result<()> {
++        let mut runtime = self.runtime.lock();
++        let setup = runtime.setup.ok_or(PcmError::BadState)?;
++        if sw.avail_min == 0 || sw.silence_size > setup.boundary {
++            return Err(PcmError::Invalid);
++        }
++        sw.boundary = setup.boundary;
++        runtime.sw = *sw;
++        self.set_avail_min(sw.avail_min);
++        drop(runtime);
++        self.update();
++        Ok(())
++    }
++
++    // ── Running ──────────────────────────────────────────────────────────
++
++    /// Frames the application may transfer now: room to write (playback) or
++    /// data to read (capture).
++    fn avail_of(&self, runtime: &Runtime) -> u64 {
++        let Some(setup) = runtime.setup else { return 0 };
++        let (hw, appl, boundary) = (runtime.hw_ptr as i128, self.appl_ptr() as i128, setup.boundary as i128);
++        let mut avail = match self.direction {
++            Direction::Playback => hw + setup.buffer_size as i128 - appl,
++            Direction::Capture => hw - appl,
++        };
++        if avail < 0 {
++            avail += boundary;
++        } else if avail >= boundary {
++            avail -= boundary;
++        }
++        avail.max(0) as u64
++    }
++
++    pub fn prepare(&self) -> Result<()> {
++        let (setup, buffer) = {
++            let runtime = self.runtime.lock();
++            match runtime.state {
++                State::Open | State::Disconnected => return Err(PcmError::BadState),
++                State::Running | State::Draining | State::Paused => self.hw.stop(),
++                _ => {}
++            }
++            (runtime.setup.ok_or(PcmError::BadState)?, runtime.buffer.clone().ok_or(PcmError::BadState)?)
++        };
++        // Silence to start from (what a short write leaves is not noise).
++        let silence = alloc::vec![0u8; PAGE_SIZE];
++        let mut offset = 0;
++        while offset < buffer.frames.size() {
++            let _ = buffer.frames.write_bytes(offset, &silence);
++            offset += PAGE_SIZE;
++        }
++        self.hw.prepare(&setup, buffer.dma.daddr() as u64)?;
++        let mut runtime = self.runtime.lock();
++        runtime.hw_ptr = 0;
++        runtime.last_position = 0;
++        runtime.avail_max = 0;
++        runtime.partial = 0;
++        runtime.state = State::Prepared;
++        self.set_appl_ptr(0);
++        self.publish(&runtime);
++        Ok(())
++    }
++
++    fn start_locked(&self, runtime: &mut Runtime) -> Result<()> {
++        if runtime.state != State::Prepared {
++            return Err(PcmError::BadState);
++        }
++        runtime.last_position = 0;
++        self.hw.start();
++        runtime.state = State::Running;
++        runtime.trigger = now();
++        crate::note_running(true);
++        self.publish(runtime);
++        Ok(())
++    }
++
++    pub fn start(&self) -> Result<()> {
++        let mut runtime = self.runtime.lock();
++        // Playback with nothing written would underrun at once.
++        if self.direction == Direction::Playback && self.avail_of(&runtime) >= runtime.setup.map_or(0, |s| s.buffer_size) {
++            return Err(PcmError::Xrun);
++        }
++        self.start_locked(&mut runtime)
++    }
++
++    fn stop_locked(&self, runtime: &mut Runtime, state: State) {
++        if matches!(runtime.state, State::Running | State::Draining) {
++            self.hw.stop();
++            crate::note_running(false);
++        }
++        runtime.state = state;
++        runtime.trigger = now();
++        self.publish(runtime);
++    }
++
++    /// Stops at once, dropping what is pending.
++    pub fn drop_(&self) -> Result<()> {
++        let mut runtime = self.runtime.lock();
++        if matches!(runtime.state, State::Open | State::Disconnected) {
++            return Err(PcmError::BadState);
++        }
++        if runtime.state == State::Paused {
++            crate::note_running(true);
++            runtime.state = State::Running;
++        }
++        self.stop_locked(&mut runtime, State::Setup);
++        drop(runtime);
++        self.wait.wake_all();
++        crate::note_activity();
++        Ok(())
++    }
++
++    /// Starts draining: playback plays what was written, then stops.
++    /// Returns whether it is done already.
++    pub fn drain_begin(&self) -> Result<bool> {
++        let mut runtime = self.runtime.lock();
++        match runtime.state {
++            State::Open | State::Disconnected => Err(PcmError::BadState),
++            State::Setup | State::Xrun => {
++                runtime.state = State::Setup;
++                self.publish(&runtime);
++                Ok(true)
++            }
++            State::Prepared if self.direction == Direction::Playback => {
++                // Written but not started: play it.
++                if self.avail_of(&runtime) >= runtime.setup.map_or(0, |s| s.buffer_size) {
++                    runtime.state = State::Setup;
++                    self.publish(&runtime);
++                    return Ok(true);
++                }
++                self.start_locked(&mut runtime)?;
++                runtime.state = State::Draining;
++                self.publish(&runtime);
++                Ok(false)
++            }
++            State::Running | State::Paused if self.direction == Direction::Playback => {
++                if runtime.state == State::Paused {
++                    self.hw.start();
++                    crate::note_running(true);
++                }
++                runtime.state = State::Draining;
++                self.publish(&runtime);
++                Ok(false)
++            }
++            State::Draining => Ok(false),
++            // Capture: what was captured stays to be read.
++            _ => {
++                self.stop_locked(&mut runtime, State::Setup);
++                Ok(true)
++            }
++        }
++    }
++
++    pub fn pause(&self, on: bool) -> Result<()> {
++        let mut runtime = self.runtime.lock();
++        match (runtime.state, on) {
++            (State::Running, true) => {
++                self.hw.stop();
++                crate::note_running(false);
++                runtime.paused_from = State::Running;
++                runtime.state = State::Paused;
++            }
++            (State::Paused, false) => {
++                self.hw.start();
++                crate::note_running(true);
++                runtime.state = runtime.paused_from;
++            }
++            _ => return Err(PcmError::BadState),
++        }
++        runtime.trigger = now();
++        self.publish(&runtime);
++        Ok(())
++    }
++
++    /// Takes back up to `frames` the application gave (playback: written
++    /// but not yet played; capture: recorded but not yet read): its pointer
++    /// moves back. Returns how many (Linux's `snd_pcm_rewind`).
++    pub fn rewind(&self, frames: u64) -> Result<u64> {
++        self.update();
++        let runtime = self.runtime.lock();
++        let setup = runtime.setup.ok_or(PcmError::BadState)?;
++        match runtime.state {
++            State::Prepared | State::Running | State::Paused | State::Draining => {}
++            State::Xrun => return Err(PcmError::Xrun),
++            _ => return Err(PcmError::BadState),
++        }
++        let avail = self.avail_of(&runtime);
++        let rewindable = match self.direction {
++            Direction::Playback => setup.buffer_size.saturating_sub(avail),
++            Direction::Capture => avail,
++        };
++        let count = frames.min(rewindable);
++        let appl = (self.appl_ptr() + setup.boundary - count) % setup.boundary;
++        self.set_appl_ptr(appl);
++        Ok(count)
++    }
++
++    /// Skips up to `frames` ahead (playback: room left unwritten; capture:
++    /// recorded frames left unread). Returns how many.
++    pub fn forward(&self, frames: u64) -> Result<u64> {
++        self.update();
++        let runtime = self.runtime.lock();
++        let setup = runtime.setup.ok_or(PcmError::BadState)?;
++        match runtime.state {
++            State::Prepared | State::Running | State::Paused | State::Draining => {}
++            State::Xrun => return Err(PcmError::Xrun),
++            _ => return Err(PcmError::BadState),
++        }
++        let count = frames.min(self.avail_of(&runtime));
++        self.set_appl_ptr((self.appl_ptr() + count) % setup.boundary);
++        Ok(count)
++    }
++
++    pub fn reset(&self) -> Result<()> {
++        let runtime = self.runtime.lock();
++        if !matches!(runtime.state, State::Prepared | State::Running | State::Paused) {
++            return Err(PcmError::BadState);
++        }
++        self.set_appl_ptr(runtime.hw_ptr);
++        Ok(())
++    }
++
++    /// Takes the hardware's position: the hardware pointer moves on; an
++    /// underrun or overrun stops the stream; draining ends; waiters wake.
++    pub fn update(&self) {
++        let mut wake = false;
++        {
++            let mut runtime = self.runtime.lock();
++            let Some(setup) = runtime.setup else { return };
++            if !matches!(runtime.state, State::Running | State::Draining) {
++                return;
++            }
++            let bytes = setup.buffer_bytes();
++            let position = self.hw.position() % bytes.max(1);
++            let moved = (position + bytes - runtime.last_position) % bytes;
++            let frames = (moved / setup.frame_bytes) as u64;
++            if frames > 0 {
++                runtime.last_position = (runtime.last_position + frames as usize * setup.frame_bytes) % bytes;
++                runtime.hw_ptr = (runtime.hw_ptr + frames) % setup.boundary;
++                // Whole periods: the timer ticks, period waiters wake.
++                runtime.partial += frames;
++                let periods = runtime.partial / setup.period_size;
++                if periods > 0 {
++                    runtime.partial %= setup.period_size;
++                    self.periods.fetch_add(periods, Ordering::AcqRel);
++                    wake = true;
++                }
++            }
++            let avail = self.avail_of(&runtime);
++            runtime.avail_max = runtime.avail_max.max(avail);
++            if runtime.state == State::Draining && avail >= setup.buffer_size {
++                self.stop_locked(&mut runtime, State::Setup);
++                wake = true;
++            } else if avail >= runtime.sw.stop_threshold.max(1) && runtime.sw.stop_threshold < setup.boundary {
++                self.stop_locked(&mut runtime, State::Xrun);
++                wake = true;
++            } else {
++                self.publish(&runtime);
++                if frames > 0 && avail >= self.avail_min() {
++                    wake = true;
++                }
++            }
++        }
++        if wake {
++            self.wait.wake_all();
++            crate::note_activity();
++        }
++    }
++
++    pub fn avail(&self) -> u64 {
++        self.update();
++        let runtime = self.runtime.lock();
++        self.avail_of(&runtime)
++    }
++
++    pub fn status(&self) -> Status {
++        self.update();
++        let mut runtime = self.runtime.lock();
++        let avail = self.avail_of(&runtime);
++        let buffer_size = runtime.setup.map_or(0, |s| s.buffer_size);
++        let delay = match (self.direction, runtime.state) {
++            (_, State::Running | State::Draining | State::Paused) => match self.direction {
++                Direction::Playback => buffer_size as i64 - avail as i64,
++                Direction::Capture => avail as i64,
++            },
++            _ => 0,
++        };
++        let status = Status {
++            state: runtime.state as i32,
++            trigger: runtime.trigger,
++            now: now(),
++            appl_ptr: self.appl_ptr(),
++            hw_ptr: runtime.hw_ptr,
++            delay,
++            avail,
++            avail_max: runtime.avail_max.max(avail),
++        };
++        runtime.avail_max = 0;
++        status
++    }
++
++    /// The pointers for `SNDRV_PCM_IOCTL_SYNC_PTR`: the application's ones
++    /// taken (unless asked for), the hardware's given back.
++    pub fn sync_ptr(&self, hwsync: bool, appl_ptr: Option<u64>, avail_min: Option<u64>) -> (i32, u64, u64, u64) {
++        if let Some(setup) = self.setup() {
++            if let Some(appl_ptr) = appl_ptr {
++                self.set_appl_ptr(appl_ptr % setup.boundary);
++            }
++        }
++        if let Some(avail_min) = avail_min {
++            self.set_avail_min(avail_min);
++        }
++        if hwsync {
++            self.update();
++        }
++        let runtime = self.runtime.lock();
++        (runtime.state as i32, runtime.hw_ptr, self.appl_ptr(), self.avail_min())
++    }
++
++    // ── Transfers ────────────────────────────────────────────────────────
++
++    /// The part of the buffer the next transfer of at most `frames` uses:
++    /// (byte offset, frames), contiguous; none when there is no room or
++    /// data yet. An underrun or overrun, or a stream stopped: an error.
++    pub fn transfer_window(&self, frames: u64) -> Result<(usize, u64)> {
++        self.update();
++        let runtime = self.runtime.lock();
++        let setup = runtime.setup.ok_or(PcmError::BadState)?;
++        match runtime.state {
++            State::Xrun => return Err(PcmError::Xrun),
++            State::Prepared | State::Running | State::Paused => {}
++            State::Draining if self.direction == Direction::Capture => {}
++            _ => return Err(PcmError::BadState),
++        }
++        let avail = self.avail_of(&runtime);
++        let at = self.appl_ptr() % setup.buffer_size;
++        let contiguous = setup.buffer_size - at;
++        let count = frames.min(avail).min(contiguous);
++        Ok((at as usize * setup.frame_bytes, count))
++    }
++
++    /// The application moved `frames` on (written or read); playback starts
++    /// once enough is written, capture once a read asks.
++    pub fn commit(&self, frames: u64) -> Result<()> {
++        let mut runtime = self.runtime.lock();
++        let setup = runtime.setup.ok_or(PcmError::BadState)?;
++        self.set_appl_ptr((self.appl_ptr() + frames) % setup.boundary);
++        if runtime.state == State::Prepared && self.direction == Direction::Playback {
++            let written = setup.buffer_size - self.avail_of(&runtime).min(setup.buffer_size);
++            if written >= runtime.sw.start_threshold.max(1) {
++                self.start_locked(&mut runtime)?;
++            }
++        }
++        Ok(())
++    }
++
++    /// A read waits for data: capture starts when one is asked for.
++    pub fn start_capture_for(&self, frames: u64) -> Result<()> {
++        let mut runtime = self.runtime.lock();
++        if self.direction == Direction::Capture && runtime.state == State::Prepared && frames >= runtime.sw.start_threshold.max(1) {
++            self.start_locked(&mut runtime)?;
++        }
++        Ok(())
++    }
++
++    /// Whether a waiting transfer may go on: room or data enough, or the
++    /// stream no longer running.
++    pub fn ready(&self, wanted: u64) -> bool {
++        self.update();
++        let runtime = self.runtime.lock();
++        match runtime.state {
++            State::Prepared | State::Running | State::Draining | State::Paused => {
++                let avail = self.avail_of(&runtime);
++                avail >= wanted.min(self.avail_min()).max(1)
++                    || (runtime.state == State::Prepared && self.direction == Direction::Playback && avail > 0)
++            }
++            _ => true,
++        }
++    }
++
++    /// Whether a drain is over.
++    pub fn drained(&self) -> bool {
++        self.update();
++        !matches!(self.state(), State::Draining)
++    }
++
++    /// The hardware's state, for a stall's report.
++    pub fn describe(&self) -> String {
++        self.hw.describe()
++    }
++
++    pub fn is_running(&self) -> bool {
++        matches!(self.state(), State::Running | State::Draining)
++    }
++}
+diff --git a/kernel/core/Cargo.toml b/kernel/core/Cargo.toml
+index ccda255..d96524a 100644
+--- a/kernel/core/Cargo.toml
++++ b/kernel/core/Cargo.toml
+@@ -21,6 +21,7 @@ aster-nvme.workspace = true
+ aster-rights.workspace = true
+ aster-rights-proc.workspace = true
+ aster-softirq.workspace = true
++aster-sound.workspace = true
+ aster-systree.workspace = true
+ aster-time.workspace = true
+ aster-util.workspace = true
+diff --git a/kernel/core/src/device/mod.rs b/kernel/core/src/device/mod.rs
+index bd570e2..e1bc1b6 100644
+--- a/kernel/core/src/device/mod.rs
++++ b/kernel/core/src/device/mod.rs
+@@ -6,6 +6,7 @@ mod mem;
+ pub(crate) mod misc;
+ mod model;
+ mod pty;
++mod snd;
+ pub mod registry;
+ pub(crate) mod tty;
+ 
+@@ -58,6 +59,7 @@ pub(crate) fn init_in_first_kthread() {
+     mem::init_in_first_kthread();
+     misc::init_in_first_kthread();
+     evdev::init_in_first_kthread();
++    snd::init_in_first_kthread();
+     // TODO: Transfer ownership of the boot framebuffer to DRM and skip registering the
+     // legacy framebuffer device once DRM has initialized successfully.
+     fb::init_in_first_kthread();
+diff --git a/kernel/core/src/device/snd/control.rs b/kernel/core/src/device/snd/control.rs
+new file mode 100755
+index 0000000..03db5f1
+--- /dev/null
++++ b/kernel/core/src/device/snd/control.rs
+@@ -0,0 +1,618 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A card's control device: what the card is, its PCM devices, its mixer
++//! controls (listed, described, read, written, their dB scales) and the
++//! events of their changes for those who subscribe.
++
++use alloc::format;
++use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++
++use aster_sound::{Card, card::ControlKind};
++use device_id::DeviceId;
++use ostd::mm::VmIo;
++
++use super::{device_id, get_u32, put_str, put_u32, put_u64, watch};
++use crate::{
++    context::current_userspace,
++    device::{Device, DeviceType},
++    events::IoEvents,
++    fs::{
++        devtmpfs::DevtmpfsNodeMeta,
++        file::{PerOpenFileOps, StatusFlags},
++        vfs::{inode::FileOps, path::Path},
++    },
++    prelude::*,
++    process::signal::{PollHandle, Pollable, Pollee},
++    util::ioctl::RawIoctl,
++};
++
++/// `SNDRV_CTL_VERSION`: 2.0.9.
++const VERSION: u32 = 0x0002_0009;
++
++mod ioctl {
++    pub(super) const PVERSION: u32 = 0x8004_5500;
++    pub(super) const CARD_INFO: u32 = 0x8178_5501;
++    pub(super) const ELEM_LIST: u32 = 0xc050_5510;
++    pub(super) const ELEM_INFO: u32 = 0xc110_5511;
++    pub(super) const ELEM_READ: u32 = 0xc4c8_5512;
++    pub(super) const ELEM_WRITE: u32 = 0xc4c8_5513;
++    pub(super) const ELEM_LOCK: u32 = 0x4040_5514;
++    pub(super) const ELEM_ADD: u32 = 0xc110_5517;
++    pub(super) const ELEM_REPLACE: u32 = 0xc110_5518;
++    pub(super) const ELEM_REMOVE: u32 = 0xc040_5519;
++    pub(super) const TLV_WRITE: u32 = 0xc008_551b;
++    pub(super) const ELEM_UNLOCK: u32 = 0x4040_5515;
++    pub(super) const SUBSCRIBE_EVENTS: u32 = 0xc004_5516;
++    pub(super) const TLV_READ: u32 = 0xc008_551a;
++    pub(super) const HWDEP_NEXT_DEVICE: u32 = 0xc004_5520;
++    pub(super) const PCM_NEXT_DEVICE: u32 = 0xc004_5530;
++    pub(super) const PCM_INFO: u32 = 0xc120_5531;
++    pub(super) const PCM_PREFER_SUBDEVICE: u32 = 0x4004_5532;
++    pub(super) const RAWMIDI_NEXT_DEVICE: u32 = 0xc004_5540;
++    pub(super) const UMP_NEXT_DEVICE: u32 = 0xc004_5543;
++    pub(super) const POWER: u32 = 0xc004_55d0;
++    pub(super) const POWER_STATE: u32 = 0x8004_55d1;
++}
++
++const ID_SIZE: usize = 64;
++const INFO_SIZE: usize = 272;
++const VALUE_SIZE: usize = 1224;
++const EVENT_SIZE: usize = 72;
++/// `SNDRV_CTL_ELEM_TYPE_*`, `SNDRV_CTL_ELEM_ACCESS_*`.
++const TYPE_BOOLEAN: u32 = 1;
++const TYPE_INTEGER: u32 = 2;
++const ACCESS_READ: u32 = 1 << 0;
++const ACCESS_WRITE: u32 = 1 << 1;
++const ACCESS_TLV_READ: u32 = 1 << 4;
++const ACCESS_TLV_WRITE: u32 = 1 << 5;
++const ACCESS_USER: u32 = 1 << 29;
++const TYPE_INTEGER64: u32 = 6;
++/// Values a control holds at most (Linux's limit for integers).
++const MAX_VALUES: u32 = 128;
++/// TLV data a control of the user's keeps at most.
++const MAX_TLV: usize = 4096;
++const EVENT_ELEM: u32 = 0;
++const EVENT_MASK_VALUE: u32 = 1 << 0;
++/// `SNDRV_CTL_TLVT_DB_SCALE`.
++const TLV_DB_SCALE: u32 = 1;
++const TLV_DB_SCALE_MUTE: u32 = 0x10000;
++
++pub(super) struct ControlDevice {
++    card: Arc<Card>,
++}
++
++impl Debug for ControlDevice {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("ControlDevice").field("card", &self.card.index).finish()
++    }
++}
++
++impl ControlDevice {
++    pub(super) fn new(card: Arc<Card>) -> Self {
++        Self { card }
++    }
++}
++
++impl Device for ControlDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        device_id(self.card.index, 0)
++    }
++
++    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
++        DevtmpfsNodeMeta::new(format!("snd/controlC{}", self.card.index)).ok()
++    }
++
++    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        let pollee = Arc::new(Pollee::new());
++        watch(&pollee);
++        Ok(Box::new(ControlHandle {
++            card: self.card.clone(),
++            subscribed: AtomicBool::new(false),
++            seen: AtomicU64::new(self.card.events.load(Ordering::Acquire)),
++            pollee,
++        }))
++    }
++}
++
++/// A control applications made (alsa-lib's softvol makes its volume one):
++/// it lasts as long as the card, as on Linux.
++#[derive(Clone, Debug)]
++struct UserControl {
++    numid: u32,
++    name: String,
++    iface: i32,
++    index: u32,
++    kind: u32,
++    min: i64,
++    max: i64,
++    step: i64,
++    access: u32,
++    values: Vec<i64>,
++    tlv: Vec<u8>,
++    changed: u64,
++}
++
++/// The user's controls of each card, by card.
++static USER_CONTROLS: Mutex<BTreeMap<u32, Vec<UserControl>>> = Mutex::new(BTreeMap::new());
++
++struct ControlHandle {
++    card: Arc<Card>,
++    subscribed: AtomicBool,
++    /// The card's event count this handle has reported up to.
++    seen: AtomicU64,
++    pollee: Arc<Pollee>,
++}
++
++impl Debug for ControlHandle {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("ControlHandle").field("card", &self.card.index).finish()
++    }
++}
++
++/// A control's identifier as ALSA lays it out (`struct snd_ctl_elem_id`).
++fn write_id(buf: &mut [u8], at: usize, card: &Card, index: usize) {
++    let control = &card.controls[index];
++    buf[at..at + ID_SIZE].fill(0);
++    put_u32(buf, at, index as u32 + 1);
++    put_u32(buf, at + 4, control.iface as u32);
++    put_str(buf, at + 16, 44, &control.name);
++}
++
++/// Which control an identifier names: the card's own (by its index) or
++/// one of the user's (by its number).
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Which {
++    Card(usize),
++    User(u32),
++}
++
++fn name_of(id: &[u8]) -> Option<&str> {
++    let end = id[16..60].iter().position(|&b| b == 0).unwrap_or(44);
++    core::str::from_utf8(&id[16..16 + end]).ok()
++}
++
++fn find_any(card: &Card, id: &[u8]) -> Option<Which> {
++    let numid = get_u32(id, 0);
++    let users = USER_CONTROLS.lock();
++    let mine = users.get(&card.index);
++    if numid != 0 {
++        if numid as usize <= card.controls.len() {
++            return Some(Which::Card(numid as usize - 1));
++        }
++        return mine.and_then(|list| list.iter().find(|c| c.numid == numid)).map(|c| Which::User(c.numid));
++    }
++    if let Some(index) = find(card, id) {
++        return Some(Which::Card(index));
++    }
++    let (iface, name, index) = (get_u32(id, 4) as i32, name_of(id)?, get_u32(id, 60));
++    mine.and_then(|list| list.iter().find(|c| c.iface == iface && c.name == name && c.index == index)).map(|c| Which::User(c.numid))
++}
++
++fn write_user_id(buf: &mut [u8], at: usize, control: &UserControl) {
++    buf[at..at + ID_SIZE].fill(0);
++    put_u32(buf, at, control.numid);
++    put_u32(buf, at + 4, control.iface as u32);
++    put_str(buf, at + 16, 44, &control.name);
++    put_u32(buf, at + 60, control.index);
++}
++
++fn with_user<R>(card: &Card, numid: u32, f: impl FnOnce(&mut UserControl) -> R) -> Option<R> {
++    let mut users = USER_CONTROLS.lock();
++    users.get_mut(&card.index)?.iter_mut().find(|c| c.numid == numid).map(f)
++}
++
++/// The control an identifier names: by number, or by interface, name and index.
++fn find(card: &Card, id: &[u8]) -> Option<usize> {
++    let numid = get_u32(id, 0) as usize;
++    if numid != 0 {
++        return (numid <= card.controls.len()).then(|| numid - 1);
++    }
++    let iface = get_u32(id, 4) as i32;
++    let name_end = id[16..60].iter().position(|&b| b == 0).unwrap_or(44);
++    let name = core::str::from_utf8(&id[16..16 + name_end]).ok()?;
++    let index = get_u32(id, 60);
++    if index != 0 {
++        return None;
++    }
++    card.controls.iter().position(|control| control.iface == iface && control.name == name)
++}
++
++impl ControlHandle {
++    /// Controls changed since this handle last looked.
++    fn pending(&self) -> Vec<Which> {
++        let seen = self.seen.load(Ordering::Acquire);
++        let mut pending: Vec<Which> = self
++            .card
++            .controls
++            .iter()
++            .enumerate()
++            .filter(|(_, control)| control.changed.load(Ordering::Acquire) > seen)
++            .map(|(index, _)| Which::Card(index))
++            .collect();
++        if let Some(list) = USER_CONTROLS.lock().get(&self.card.index) {
++            pending.extend(list.iter().filter(|c| c.changed > seen).map(|c| Which::User(c.numid)));
++        }
++        pending
++    }
++
++    fn has_events(&self) -> bool {
++        self.subscribed.load(Ordering::Acquire) && self.card.events.load(Ordering::Acquire) > self.seen.load(Ordering::Acquire)
++    }
++
++    fn pcm_info(&self, buf: &mut [u8]) -> Result<()> {
++        let device = get_u32(buf, 0);
++        let subdevice = get_u32(buf, 4);
++        let stream = get_u32(buf, 8);
++        let pcm = match stream {
++            0 => self.card.playback.as_ref(),
++            1 => self.card.capture.as_ref(),
++            _ => None,
++        };
++        let Some(pcm) = pcm.filter(|_| device == 0 && subdevice == 0) else {
++            return_errno_with_message!(Errno::ENXIO, "no such PCM device");
++        };
++        super::pcm::fill_info(buf, &self.card, pcm);
++        Ok(())
++    }
++}
++
++impl Pollable for ControlHandle {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        self.pollee.poll_with(mask, poller, || if self.has_events() { IoEvents::IN } else { IoEvents::empty() })
++    }
++}
++
++impl FileOps for ControlHandle {
++    fn read_at(&self, _offset: usize, writer: &mut VmWriter, status_flags: StatusFlags) -> Result<usize> {
++        if writer.avail() < EVENT_SIZE {
++            return_errno!(Errno::EINVAL);
++        }
++        if !self.subscribed.load(Ordering::Acquire) {
++            return_errno!(Errno::EBADFD);
++        }
++        if !self.has_events() {
++            if status_flags.contains(StatusFlags::O_NONBLOCK) {
++                return_errno!(Errno::EAGAIN);
++            }
++            self.card.event_wait.pause_until(|| self.has_events().then_some(()))?;
++        }
++        let now = self.card.events.load(Ordering::Acquire);
++        let mut written = 0;
++        for which in self.pending() {
++            if writer.avail() < EVENT_SIZE {
++                break;
++            }
++            let mut event = [0u8; EVENT_SIZE];
++            put_u32(&mut event, 0, EVENT_ELEM);
++            put_u32(&mut event, 4, EVENT_MASK_VALUE);
++            match which {
++                Which::Card(index) => write_id(&mut event, 8, &self.card, index),
++                Which::User(numid) => {
++                    let _ = with_user(&self.card, numid, |c| write_user_id(&mut event, 8, c));
++                }
++            }
++            writer.write_fallible(&mut VmReader::from(&event[..]).to_fallible()).map_err(|(error, _)| error)?;
++            written += EVENT_SIZE;
++        }
++        self.seen.store(now, Ordering::Release);
++        self.pollee.invalidate();
++        Ok(written)
++    }
++
++    fn write_at(&self, _offset: usize, _reader: &mut VmReader, _status_flags: StatusFlags) -> Result<usize> {
++        return_errno!(Errno::EINVAL)
++    }
++}
++
++impl PerOpenFileOps for ControlHandle {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno!(Errno::ESPIPE)
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++
++    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
++        let arg = raw_ioctl.arg();
++        let card = &self.card;
++        match raw_ioctl.cmd() {
++            ioctl::PVERSION => current_userspace!().write_val(arg, &VERSION)?,
++            ioctl::CARD_INFO => {
++                let mut info = [0u8; 376];
++                put_u32(&mut info, 0, card.index);
++                put_str(&mut info, 8, 16, &card.id);
++                put_str(&mut info, 24, 16, &card.driver);
++                put_str(&mut info, 40, 32, &card.name);
++                put_str(&mut info, 72, 80, &card.longname);
++                put_str(&mut info, 168, 80, &card.mixer_name);
++                put_str(&mut info, 248, 128, &card.components);
++                current_userspace!().write_bytes(arg, &info)?;
++            }
++            ioctl::ELEM_LIST => {
++                let mut list = [0u8; 80];
++                current_userspace!().read_bytes(arg, &mut list)?;
++                let (offset, space) = (get_u32(&list, 0) as usize, get_u32(&list, 4) as usize);
++                let pointer = super::get_u64(&list, 16) as usize;
++                let users = USER_CONTROLS.lock().get(&card.index).cloned().unwrap_or_default();
++                let count = card.controls.len() + users.len();
++                let used = space.min(count.saturating_sub(offset));
++                for slot in 0..used {
++                    let mut id = [0u8; ID_SIZE];
++                    let at = offset + slot;
++                    if at < card.controls.len() {
++                        write_id(&mut id, 0, card, at);
++                    } else {
++                        write_user_id(&mut id, 0, &users[at - card.controls.len()]);
++                    }
++                    current_userspace!().write_bytes(pointer + slot * ID_SIZE, &id)?;
++                }
++                put_u32(&mut list, 8, used as u32);
++                put_u32(&mut list, 12, count as u32);
++                current_userspace!().write_bytes(arg, &list)?;
++            }
++            ioctl::ELEM_INFO => {
++                let mut info = [0u8; INFO_SIZE];
++                current_userspace!().read_bytes(arg, &mut info)?;
++                let which = find_any(card, &info).ok_or(Error::new(Errno::ENOENT))?;
++                info.fill(0);
++                match which {
++                    Which::Card(index) => {
++                        let control = &card.controls[index];
++                        write_id(&mut info, 0, card, index);
++                        let mut access = ACCESS_READ;
++                        if control.writable {
++                            access |= ACCESS_WRITE;
++                        }
++                        if control.db_scale.is_some() {
++                            access |= ACCESS_TLV_READ;
++                        }
++                        match control.kind {
++                            ControlKind::Boolean => {
++                                put_u32(&mut info, 64, TYPE_BOOLEAN);
++                                put_u64(&mut info, 88, 1);
++                            }
++                            ControlKind::Integer { min, max } => {
++                                put_u32(&mut info, 64, TYPE_INTEGER);
++                                put_u64(&mut info, 80, min as u64);
++                                put_u64(&mut info, 88, max as u64);
++                                put_u64(&mut info, 96, 1);
++                            }
++                        }
++                        put_u32(&mut info, 68, access);
++                        put_u32(&mut info, 72, control.count);
++                    }
++                    Which::User(numid) => {
++                        with_user(card, numid, |control| {
++                            write_user_id(&mut info, 0, control);
++                            put_u32(&mut info, 64, control.kind);
++                            put_u32(&mut info, 68, control.access);
++                            put_u32(&mut info, 72, control.values.len() as u32);
++                            put_u64(&mut info, 80, control.min as u64);
++                            put_u64(&mut info, 88, control.max as u64);
++                            put_u64(&mut info, 96, control.step as u64);
++                        });
++                    }
++                }
++                put_u32(&mut info, 76, u32::MAX);
++                current_userspace!().write_bytes(arg, &info)?;
++            }
++            ioctl::ELEM_READ => {
++                let mut value = [0u8; VALUE_SIZE];
++                current_userspace!().read_bytes(arg, &mut value)?;
++                let which = find_any(card, &value).ok_or(Error::new(Errno::ENOENT))?;
++                value.fill(0);
++                let levels = match which {
++                    Which::Card(index) => {
++                        write_id(&mut value, 0, card, index);
++                        card.controls[index].values()
++                    }
++                    Which::User(numid) => with_user(card, numid, |control| {
++                        write_user_id(&mut value, 0, control);
++                        control.values.clone()
++                    })
++                    .unwrap_or_default(),
++                };
++                for (channel, level) in levels.iter().enumerate() {
++                    put_u64(&mut value, 72 + channel * 8, *level as u64);
++                }
++                current_userspace!().write_bytes(arg, &value)?;
++            }
++            ioctl::ELEM_WRITE => {
++                let mut value = [0u8; VALUE_SIZE];
++                current_userspace!().read_bytes(arg, &mut value)?;
++                let which = find_any(card, &value).ok_or(Error::new(Errno::ENOENT))?;
++                match which {
++                    Which::Card(index) => {
++                        let control = &card.controls[index];
++                        if !control.writable {
++                            return_errno_with_message!(Errno::EPERM, "the control is read-only");
++                        }
++                        let levels: Vec<i64> = (0..control.count as usize).map(|channel| super::get_u64(&value, 72 + channel * 8) as i64).collect();
++                        // Out of range: refused, as Linux's validation does.
++                        if let ControlKind::Integer { min, max } = control.kind {
++                            if levels.iter().any(|level| *level < min || *level > max) {
++                                return_errno_with_message!(Errno::EINVAL, "the value is out of range");
++                            }
++                        }
++                        return Ok(i32::from(card.set_control(index, &levels)));
++                    }
++                    Which::User(numid) => {
++                        let changed = with_user(card, numid, |control| {
++                            let levels: Vec<i64> = (0..control.values.len()).map(|channel| super::get_u64(&value, 72 + channel * 8) as i64).collect();
++                            if control.kind != TYPE_BOOLEAN && levels.iter().any(|level| *level < control.min || *level > control.max) {
++                                return Err(Error::with_message(Errno::EINVAL, "the value is out of range"));
++                            }
++                            let changed = control.values != levels;
++                            control.values = levels;
++                            Ok(changed)
++                        })
++                        .ok_or(Error::new(Errno::ENOENT))??;
++                        if changed {
++                            let event = card.note_user_change();
++                            with_user(card, numid, |control| control.changed = event);
++                        }
++                        return Ok(i32::from(changed));
++                    }
++                }
++            }
++            ioctl::ELEM_ADD | ioctl::ELEM_REPLACE => {
++                let mut info = [0u8; INFO_SIZE];
++                current_userspace!().read_bytes(arg, &mut info)?;
++                let kind = get_u32(&info, 64);
++                let count = get_u32(&info, 72);
++                if !matches!(kind, TYPE_BOOLEAN | TYPE_INTEGER | TYPE_INTEGER64) || count == 0 || count > MAX_VALUES {
++                    return_errno_with_message!(Errno::EINVAL, "this kind of control cannot be made");
++                }
++                let name = name_of(&info).ok_or(Error::new(Errno::EINVAL))?.to_string();
++                let (iface, index) = (get_u32(&info, 4) as i32, get_u32(&info, 60));
++                let (min, max, step) = if kind == TYPE_BOOLEAN {
++                    (0, 1, 1)
++                } else {
++                    (super::get_u64(&info, 80) as i64, super::get_u64(&info, 88) as i64, super::get_u64(&info, 96) as i64)
++                };
++                if min > max {
++                    return_errno!(Errno::EINVAL);
++                }
++                let replace = raw_ioctl.cmd() == ioctl::ELEM_REPLACE;
++                if card.controls.iter().any(|c| c.iface == iface && c.name == name) {
++                    return_errno_with_message!(Errno::EBUSY, "the card has a control of that name");
++                }
++                let access = (get_u32(&info, 68) & (ACCESS_READ | ACCESS_WRITE | ACCESS_TLV_READ | ACCESS_TLV_WRITE)).max(ACCESS_READ | ACCESS_WRITE) | ACCESS_USER;
++                let mut users = USER_CONTROLS.lock();
++                let list = users.entry(card.index).or_default();
++                let existing = list.iter().position(|c| c.iface == iface && c.name == name && c.index == index);
++                let numid = match (existing, replace) {
++                    (Some(_), false) => return_errno_with_message!(Errno::EBUSY, "the control exists"),
++                    (None, true) => return_errno_with_message!(Errno::ENOENT, "no control to replace"),
++                    (Some(at), true) => list.remove(at).numid,
++                    (None, false) => {
++                        let used = list.iter().map(|c| c.numid).max().unwrap_or(0);
++                        used.max(card.controls.len() as u32) + 1
++                    }
++                };
++                let control = UserControl {
++                    numid,
++                    name,
++                    iface,
++                    index,
++                    kind,
++                    min,
++                    max,
++                    step,
++                    access,
++                    values: vec![min.max(0).min(max); count as usize],
++                    tlv: Vec::new(),
++                    changed: 0,
++                };
++                write_user_id(&mut info, 0, &control);
++                list.push(control);
++                drop(users);
++                card.note_user_change();
++                current_userspace!().write_bytes(arg, &info)?;
++            }
++            ioctl::ELEM_REMOVE => {
++                let mut id = [0u8; ID_SIZE];
++                current_userspace!().read_bytes(arg, &mut id)?;
++                match find_any(card, &id) {
++                    Some(Which::User(numid)) => {
++                        if let Some(list) = USER_CONTROLS.lock().get_mut(&card.index) {
++                            list.retain(|c| c.numid != numid);
++                        }
++                        card.note_user_change();
++                    }
++                    Some(Which::Card(_)) => return_errno_with_message!(Errno::EPERM, "the card's own controls stay"),
++                    None => return_errno!(Errno::ENOENT),
++                }
++            }
++            ioctl::ELEM_LOCK | ioctl::ELEM_UNLOCK => {}
++            ioctl::SUBSCRIBE_EVENTS => {
++                let mut wanted: i32 = current_userspace!().read_val(arg)?;
++                match wanted {
++                    0 => self.subscribed.store(false, Ordering::Release),
++                    1 => {
++                        self.seen.store(card.events.load(Ordering::Acquire), Ordering::Release);
++                        self.subscribed.store(true, Ordering::Release);
++                    }
++                    _ => {
++                        wanted = i32::from(self.subscribed.load(Ordering::Acquire));
++                        current_userspace!().write_val(arg, &wanted)?;
++                    }
++                }
++            }
++            ioctl::TLV_READ => {
++                let numid = current_userspace!().read_val::<u32>(arg)?;
++                let length = current_userspace!().read_val::<u32>(arg + 4)? as usize;
++                if numid as usize > card.controls.len() {
++                    let tlv = with_user(card, numid, |control| control.tlv.clone()).ok_or(Error::new(Errno::ENOENT))?;
++                    if tlv.is_empty() {
++                        return_errno!(Errno::ENXIO);
++                    }
++                    if length < tlv.len() {
++                        return_errno!(Errno::ENOMEM);
++                    }
++                    current_userspace!().write_bytes(arg + 8, &tlv)?;
++                    return Ok(0);
++                }
++                let control = (numid as usize).checked_sub(1).and_then(|index| card.controls.get(index)).ok_or(Error::new(Errno::ENOENT))?;
++                let (min, step, mute) = control.db_scale.ok_or(Error::new(Errno::ENXIO))?;
++                if length < 16 {
++                    return_errno!(Errno::ENOMEM);
++                }
++                let mut tlv = [0u8; 16];
++                put_u32(&mut tlv, 0, TLV_DB_SCALE);
++                put_u32(&mut tlv, 4, 8);
++                put_u32(&mut tlv, 8, min as u32);
++                put_u32(&mut tlv, 12, step | if mute { TLV_DB_SCALE_MUTE } else { 0 });
++                current_userspace!().write_bytes(arg + 8, &tlv)?;
++            }
++            ioctl::TLV_WRITE => {
++                let numid = current_userspace!().read_val::<u32>(arg)?;
++                let length = current_userspace!().read_val::<u32>(arg + 4)? as usize;
++                if length > MAX_TLV {
++                    return_errno!(Errno::ENOMEM);
++                }
++                let mut tlv = vec![0u8; length];
++                current_userspace!().read_bytes(arg + 8, &mut tlv)?;
++                if numid as usize <= card.controls.len() {
++                    return_errno_with_message!(Errno::ENXIO, "the card's own controls keep their scales");
++                }
++                let changed = with_user(card, numid, |control| {
++                    let changed = control.tlv != tlv;
++                    control.tlv = tlv;
++                    control.access |= ACCESS_TLV_READ;
++                    changed
++                })
++                .ok_or(Error::new(Errno::ENOENT))?;
++                if changed {
++                    card.note_user_change();
++                }
++                return Ok(i32::from(changed));
++            }
++            ioctl::PCM_NEXT_DEVICE => {
++                let device: i32 = current_userspace!().read_val(arg)?;
++                let next = if device < 0 && (card.playback.is_some() || card.capture.is_some()) { 0 } else { -1 };
++                current_userspace!().write_val(arg, &next)?;
++            }
++            ioctl::PCM_INFO => {
++                let mut info = [0u8; super::pcm::INFO_SIZE];
++                current_userspace!().read_bytes(arg, &mut info)?;
++                self.pcm_info(&mut info)?;
++                current_userspace!().write_bytes(arg, &info)?;
++            }
++            ioctl::PCM_PREFER_SUBDEVICE => {}
++            ioctl::HWDEP_NEXT_DEVICE | ioctl::RAWMIDI_NEXT_DEVICE | ioctl::UMP_NEXT_DEVICE => current_userspace!().write_val(arg, &-1i32)?,
++            ioctl::POWER => {}
++            ioctl::POWER_STATE => current_userspace!().write_val(arg, &0u32)?,
++            other => {
++                warn!("sound: unknown control ioctl {:#x}", other);
++                return_errno_with_message!(Errno::ENOTTY, "unknown sound control ioctl")
++            }
++        }
++        Ok(0)
++    }
++}
+diff --git a/kernel/core/src/device/snd/mod.rs b/kernel/core/src/device/snd/mod.rs
+new file mode 100755
+index 0000000..dcc0e92
+--- /dev/null
++++ b/kernel/core/src/device/snd/mod.rs
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! ALSA's device files, `/dev/snd`: each sound card's control device
++//! (`controlC<card>`: its identity, its mixer controls and their events) and
++//! its PCM devices (`pcmC<card>D0p` to play, `pcmC<card>D0c` to record), with
++//! the ioctls, reads, writes and mappings alsa-lib uses, and Linux's device
++//! numbers (major 116). The cards are `aster-sound`'s.
++//!
++//! Reference: Linux's `include/uapi/sound/asound.h`, `sound/core/control.c`,
++//! `pcm_native.c`.
++
++mod control;
++mod pcm;
++mod timer;
++
++use aster_sound::Card;
++use device_id::{DeviceId, MajorId, MinorId};
++
++use super::registry::char;
++use crate::{
++    events::IoEvents,
++    prelude::*,
++    process::signal::Pollee,
++    thread::kernel_thread::ThreadOptions,
++};
++
++/// ALSA's major number.
++const MAJOR: u16 = 116;
++
++fn device_id(card: u32, minor: u32) -> DeviceId {
++    DeviceId::new(MajorId::new(MAJOR), MinorId::new(card * 32 + minor))
++}
++
++/// Open device files waiting on the cards: told when something moved.
++static POLLEES: SpinLock<Vec<Weak<Pollee>>> = SpinLock::new(Vec::new());
++
++pub(super) fn watch(pollee: &Arc<Pollee>) {
++    POLLEES.lock().push(Arc::downgrade(pollee));
++}
++
++/// A card's device files (and, with the first card, the timer device).
++fn card_ready(card: &Arc<Card>) {
++    static TIMER: spin::Once<()> = spin::Once::new();
++    TIMER.call_once(|| {
++        if let Err(error) = char::register(Arc::new(timer::TimerDevice)) {
++            warn!("sound: timer: {:?}", error);
++        }
++    });
++    let index = card.index;
++    if let Err(error) = char::register(Arc::new(control::ControlDevice::new(card.clone()))) {
++        warn!("sound: controlC{}: {:?}", index, error);
++    }
++    for pcm in card.pcms() {
++        if let Err(error) = char::register(Arc::new(pcm::PcmDevice::new(card.clone(), pcm.clone()))) {
++            warn!("sound: card {} PCM: {:?}", index, error);
++        }
++    }
++}
++
++pub(super) fn init_in_first_kthread() {
++    aster_sound::set_card_hook(card_ready);
++    for card in aster_sound::cards() {
++        card_ready(&card);
++    }
++    // The controllers are set up apart (that takes a while); the jacks
++    // are then followed there.
++    ThreadOptions::new(aster_sound::run).spawn();
++    // Pollers of the device files hear of what the cards' timer and jack
++    // task see (they run where pollers cannot be told directly).
++    ThreadOptions::new(|| {
++        let mut seen = aster_sound::activity_seq();
++        loop {
++            aster_sound::ACTIVITY.wait_until(|| {
++                let now = aster_sound::activity_seq();
++                (now != seen).then_some(now)
++            });
++            seen = aster_sound::activity_seq();
++            let pollees: Vec<Arc<Pollee>> = {
++                let mut list = POLLEES.lock();
++                list.retain(|pollee| pollee.strong_count() > 0);
++                list.iter().filter_map(Weak::upgrade).collect()
++            };
++            for pollee in pollees {
++                pollee.notify(IoEvents::IN | IoEvents::OUT | IoEvents::ERR);
++            }
++        }
++    })
++    .spawn();
++}
++
++/// Copies a NUL-padded name into a fixed field.
++fn put_str(buf: &mut [u8], at: usize, length: usize, value: &str) {
++    let bytes = value.as_bytes();
++    let count = bytes.len().min(length - 1);
++    buf[at..at + length].fill(0);
++    buf[at..at + count].copy_from_slice(&bytes[..count]);
++}
++
++fn get_u32(buf: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes(buf[at..at + 4].try_into().unwrap())
++}
++
++fn get_u64(buf: &[u8], at: usize) -> u64 {
++    u64::from_le_bytes(buf[at..at + 8].try_into().unwrap())
++}
++
++fn put_u32(buf: &mut [u8], at: usize, value: u32) {
++    buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
++}
++
++fn put_u64(buf: &mut [u8], at: usize, value: u64) {
++    buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
++}
+diff --git a/kernel/core/src/device/snd/pcm.rs b/kernel/core/src/device/snd/pcm.rs
+new file mode 100755
+index 0000000..f7d14c9
+--- /dev/null
++++ b/kernel/core/src/device/snd/pcm.rs
+@@ -0,0 +1,601 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A PCM device file: the parameters' negotiation, the stream's control
++//! (prepare, start, drop, drain, pause), transfers through ioctls, reads
++//! and writes, and the mappings of the buffer and of the status and control
++//! pages alsa-lib reads and writes directly.
++
++use aster_sound::{
++    Card, Direction, Pcm,
++    params::{HwParams, Interval, Mask},
++    pcm::{PcmError, State, SwParams},
++};
++use device_id::DeviceId;
++use alloc::format;
++use ostd::mm::VmIo;
++
++use super::{device_id, get_u32, get_u64, put_str, put_u32, put_u64, watch};
++use crate::{
++    context::current_userspace,
++    device::{Device, DeviceType},
++    events::IoEvents,
++    fs::{
++        devtmpfs::DevtmpfsNodeMeta,
++        file::{Mappable, MappableObject, MappedObject, PerOpenFileOps, StatusFlags},
++        vfs::{inode::FileOps, path::Path},
++    },
++    prelude::*,
++    process::signal::{PollHandle, Pollable, Pollee},
++    util::ioctl::RawIoctl,
++    vm::vmar::{FileMmapRequest, MapHandle},
++};
++
++/// `SNDRV_PCM_VERSION`: 2.0.14.
++const VERSION: u32 = 0x0002_000e;
++
++mod ioctl {
++    pub(super) const PVERSION: u32 = 0x8004_4100;
++    pub(super) const INFO: u32 = 0x8120_4101;
++    pub(super) const TSTAMP: u32 = 0x4004_4102;
++    pub(super) const TTSTAMP: u32 = 0x4004_4103;
++    pub(super) const USER_PVERSION: u32 = 0x4004_4104;
++    pub(super) const HW_REFINE: u32 = 0xc260_4110;
++    pub(super) const HW_PARAMS: u32 = 0xc260_4111;
++    pub(super) const HW_FREE: u32 = 0x0000_4112;
++    pub(super) const SW_PARAMS: u32 = 0xc088_4113;
++    pub(super) const STATUS: u32 = 0x8098_4120;
++    pub(super) const DELAY: u32 = 0x8008_4121;
++    pub(super) const HWSYNC: u32 = 0x0000_4122;
++    pub(super) const SYNC_PTR: u32 = 0xc088_4123;
++    pub(super) const STATUS_EXT: u32 = 0xc098_4124;
++    pub(super) const CHANNEL_INFO: u32 = 0x8018_4132;
++    pub(super) const PREPARE: u32 = 0x0000_4140;
++    pub(super) const RESET: u32 = 0x0000_4141;
++    pub(super) const START: u32 = 0x0000_4142;
++    pub(super) const DROP: u32 = 0x0000_4143;
++    pub(super) const DRAIN: u32 = 0x0000_4144;
++    pub(super) const PAUSE: u32 = 0x4004_4145;
++    pub(super) const REWIND: u32 = 0x4008_4146;
++    pub(super) const RESUME: u32 = 0x0000_4147;
++    pub(super) const XRUN: u32 = 0x0000_4148;
++    pub(super) const FORWARD: u32 = 0x4008_4149;
++    pub(super) const WRITEI_FRAMES: u32 = 0x4018_4150;
++    pub(super) const READI_FRAMES: u32 = 0x8018_4151;
++    pub(super) const LINK: u32 = 0x4004_4160;
++    pub(super) const UNLINK: u32 = 0x0000_4161;
++}
++
++pub(super) const INFO_SIZE: usize = 288;
++const HW_PARAMS_SIZE: usize = 608;
++const SW_PARAMS_SIZE: usize = 136;
++const STATUS_SIZE: usize = 152;
++const SYNC_PTR_SIZE: usize = 136;
++/// Where the status and control pages are mapped (and their 64-bit-time
++/// variants of 32-bit programs).
++const MMAP_STATUS: usize = 0x8000_0000;
++const MMAP_CONTROL: usize = 0x8100_0000;
++const MMAP_STATUS_NEW: usize = 0x8200_0000;
++const MMAP_CONTROL_NEW: usize = 0x8300_0000;
++const SYNC_PTR_HWSYNC: u32 = 1 << 0;
++const SYNC_PTR_APPL: u32 = 1 << 1;
++const SYNC_PTR_AVAIL_MIN: u32 = 1 << 2;
++/// How long a transfer or a drain waits for the hardware before giving up
++/// (Linux's "DMA or IRQ trouble?").
++const STALL_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
++
++/// Waits for `cond` on the stream; a stream that does not move for
++/// [`STALL_TIMEOUT`] is an I/O error.
++fn wait_for(pcm: &Pcm, mut cond: impl FnMut() -> bool) -> Result<()> {
++    match pcm.wait.pause_until_or_timeout(|| cond().then_some(()), &STALL_TIMEOUT) {
++        Err(error) if error.error() == Errno::ETIME => {
++            warn!("sound: {} stalled: the hardware did not move for {:?} ({})", pcm.name, STALL_TIMEOUT, pcm.describe());
++            Err(Error::with_message(Errno::EIO, "the sound hardware stalled"))
++        }
++        other => other,
++    }
++}
++
++fn errno(error: PcmError) -> Error {
++    match error {
++        PcmError::BadState => Error::with_message(Errno::EBADFD, "the PCM stream is not in a state for that"),
++        PcmError::Xrun => Error::with_message(Errno::EPIPE, "the PCM stream underran or overran"),
++        PcmError::WouldBlock => Error::new(Errno::EAGAIN),
++        PcmError::Invalid => Error::with_message(Errno::EINVAL, "the PCM parameters are not supported"),
++        PcmError::NoMemory => Error::new(Errno::ENOMEM),
++        PcmError::Busy => Error::with_message(Errno::EBUSY, "the PCM device is open already"),
++        PcmError::Io => Error::new(Errno::EIO),
++    }
++}
++
++/// `struct snd_pcm_info`.
++pub(super) fn fill_info(buf: &mut [u8], card: &Card, pcm: &Pcm) {
++    buf.fill(0);
++    put_u32(buf, 8, if pcm.direction == Direction::Playback { 0 } else { 1 });
++    put_u32(buf, 12, card.index);
++    put_str(buf, 16, 64, &pcm.id);
++    put_str(buf, 80, 80, &pcm.name);
++    put_str(buf, 160, 32, "subdevice #0");
++    put_u32(buf, 200, 1);
++    put_u32(buf, 204, 1);
++}
++
++fn read_mask(buf: &[u8], at: usize) -> Mask {
++    let mut mask = Mask([0; 8]);
++    for (word, value) in mask.0.iter_mut().enumerate() {
++        *value = get_u32(buf, at + word * 4);
++    }
++    mask
++}
++
++fn write_mask(buf: &mut [u8], at: usize, mask: &Mask) {
++    for (word, value) in mask.0.iter().enumerate() {
++        put_u32(buf, at + word * 4, *value);
++    }
++}
++
++fn read_interval(buf: &[u8], at: usize) -> Interval {
++    let flags = get_u32(buf, at + 8);
++    Interval {
++        min: get_u32(buf, at),
++        max: get_u32(buf, at + 4),
++        openmin: flags & 1 != 0,
++        openmax: flags & 2 != 0,
++        integer: flags & 4 != 0,
++        empty: flags & 8 != 0,
++    }
++}
++
++fn write_interval(buf: &mut [u8], at: usize, interval: &Interval) {
++    put_u32(buf, at, interval.min);
++    put_u32(buf, at + 4, interval.max);
++    let flags = u32::from(interval.openmin) | u32::from(interval.openmax) << 1 | u32::from(interval.integer) << 2 | u32::from(interval.empty) << 3;
++    put_u32(buf, at + 8, flags);
++}
++
++/// `struct snd_pcm_hw_params`: flags, 3 masks (and 5 reserved), 12
++/// intervals (and 9 reserved), then the results.
++fn read_hw_params(buf: &[u8]) -> HwParams {
++    let mut params = HwParams::any();
++    params.flags = get_u32(buf, 0);
++    for (index, mask) in params.masks.iter_mut().enumerate() {
++        *mask = read_mask(buf, 4 + index * 32);
++    }
++    for (index, interval) in params.intervals.iter_mut().enumerate() {
++        *interval = read_interval(buf, 260 + index * 12);
++    }
++    params.rmask = get_u32(buf, 512);
++    params.cmask = get_u32(buf, 516);
++    params.info = get_u32(buf, 520);
++    params.msbits = get_u32(buf, 524);
++    params.rate_num = get_u32(buf, 528);
++    params.rate_den = get_u32(buf, 532);
++    params.fifo_size = get_u64(buf, 536);
++    params
++}
++
++fn write_hw_params(buf: &mut [u8], params: &HwParams) {
++    put_u32(buf, 0, params.flags);
++    for (index, mask) in params.masks.iter().enumerate() {
++        write_mask(buf, 4 + index * 32, mask);
++    }
++    for (index, interval) in params.intervals.iter().enumerate() {
++        write_interval(buf, 260 + index * 12, interval);
++    }
++    put_u32(buf, 512, params.rmask);
++    put_u32(buf, 516, params.cmask);
++    put_u32(buf, 520, params.info);
++    put_u32(buf, 524, params.msbits);
++    put_u32(buf, 528, params.rate_num);
++    put_u32(buf, 532, params.rate_den);
++    put_u64(buf, 536, params.fifo_size);
++}
++
++fn read_sw_params(buf: &[u8]) -> SwParams {
++    SwParams {
++        tstamp_mode: get_u32(buf, 0) as i32,
++        period_step: get_u32(buf, 4),
++        sleep_min: get_u32(buf, 8),
++        avail_min: get_u64(buf, 16),
++        xfer_align: get_u64(buf, 24),
++        start_threshold: get_u64(buf, 32),
++        stop_threshold: get_u64(buf, 40),
++        silence_threshold: get_u64(buf, 48),
++        silence_size: get_u64(buf, 56),
++        boundary: get_u64(buf, 64),
++        proto: get_u32(buf, 72),
++        tstamp_type: get_u32(buf, 76),
++    }
++}
++
++fn write_sw_params(buf: &mut [u8], sw: &SwParams) {
++    put_u32(buf, 0, sw.tstamp_mode as u32);
++    put_u32(buf, 4, sw.period_step);
++    put_u32(buf, 8, sw.sleep_min);
++    put_u64(buf, 16, sw.avail_min);
++    put_u64(buf, 24, sw.xfer_align);
++    put_u64(buf, 32, sw.start_threshold);
++    put_u64(buf, 40, sw.stop_threshold);
++    put_u64(buf, 48, sw.silence_threshold);
++    put_u64(buf, 56, sw.silence_size);
++    put_u64(buf, 64, sw.boundary);
++    put_u32(buf, 72, sw.proto);
++    put_u32(buf, 76, sw.tstamp_type);
++}
++
++pub(super) struct PcmDevice {
++    card: Arc<Card>,
++    pcm: Arc<Pcm>,
++}
++
++impl Debug for PcmDevice {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("PcmDevice").field("card", &self.card.index).field("direction", &self.pcm.direction).finish()
++    }
++}
++
++impl PcmDevice {
++    pub(super) fn new(card: Arc<Card>, pcm: Arc<Pcm>) -> Self {
++        Self { card, pcm }
++    }
++
++    fn suffix(&self) -> char {
++        if self.pcm.direction == Direction::Playback { 'p' } else { 'c' }
++    }
++}
++
++impl Device for PcmDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        device_id(self.card.index, if self.pcm.direction == Direction::Playback { 16 } else { 24 })
++    }
++
++    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
++        DevtmpfsNodeMeta::new(format!("snd/pcmC{}D0{}", self.card.index, self.suffix())).ok()
++    }
++
++    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        self.pcm.open().map_err(errno)?;
++        let pollee = Arc::new(Pollee::new());
++        watch(&pollee);
++        Ok(Box::new(PcmHandle { card: self.card.clone(), pcm: self.pcm.clone(), pollee }))
++    }
++}
++
++struct PcmHandle {
++    card: Arc<Card>,
++    pcm: Arc<Pcm>,
++    pollee: Arc<Pollee>,
++}
++
++impl Debug for PcmHandle {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("PcmHandle").field("card", &self.card.index).field("direction", &self.pcm.direction).finish()
++    }
++}
++
++impl Drop for PcmHandle {
++    fn drop(&mut self) {
++        self.pcm.close();
++    }
++}
++
++impl PcmHandle {
++    fn events(&self) -> IoEvents {
++        let ready = match self.pcm.state() {
++            State::Xrun | State::Disconnected => return IoEvents::OUT | IoEvents::IN | IoEvents::ERR,
++            State::Running | State::Prepared | State::Draining | State::Paused => self.pcm.avail() >= self.pcm.avail_min(),
++            _ => false,
++        };
++        match (ready, self.pcm.direction) {
++            (false, _) => IoEvents::empty(),
++            (true, Direction::Playback) => IoEvents::OUT,
++            (true, Direction::Capture) => IoEvents::IN,
++        }
++    }
++
++    /// Moves `frames` between the application's memory at `addr` and the
++    /// buffer, waiting for room or data unless asked not to.
++    fn transfer(&self, addr: usize, frames: u64, nonblocking: bool) -> Result<u64> {
++        let setup = self.pcm.setup().ok_or(Error::new(Errno::EBADFD))?;
++        let buffer = self.pcm.buffer().ok_or(Error::new(Errno::EBADFD))?;
++        let playback = self.pcm.direction == Direction::Playback;
++        if !playback {
++            self.pcm.start_capture_for(frames).map_err(errno)?;
++        }
++        let mut done = 0u64;
++        while done < frames {
++            let (offset, count) = match self.pcm.transfer_window(frames - done) {
++                Ok(window) => window,
++                Err(error) if done > 0 => {
++                    let _ = error;
++                    break;
++                }
++                Err(error) => return Err(errno(error)),
++            };
++            if count == 0 {
++                if nonblocking {
++                    if done == 0 {
++                        return_errno!(Errno::EAGAIN);
++                    }
++                    break;
++                }
++                let wanted = frames - done;
++                let waited = wait_for(&self.pcm, || self.pcm.ready(wanted));
++                if let Err(error) = waited {
++                    if done > 0 {
++                        break;
++                    }
++                    return Err(error);
++                }
++                continue;
++            }
++            let bytes = count as usize * setup.frame_bytes;
++            let at = addr + done as usize * setup.frame_bytes;
++            // Through a bounce buffer: sound moves a few hundred KiB a
++            // second at most.
++            let mut bounce = vec![0u8; bytes];
++            if playback {
++                current_userspace!().read_bytes(at, &mut bounce)?;
++                buffer.frames.write_bytes(offset, &bounce)?;
++            } else {
++                buffer.frames.read_bytes(offset, &mut bounce)?;
++                current_userspace!().write_bytes(at, &bounce)?;
++            }
++            self.pcm.commit(count).map_err(errno)?;
++            done += count;
++        }
++        self.pollee.invalidate();
++        Ok(done)
++    }
++
++    fn status(&self, buf: &mut [u8]) {
++        let status = self.pcm.status();
++        buf.fill(0);
++        put_u32(buf, 0, status.state as u32);
++        put_u64(buf, 8, status.trigger.as_secs());
++        put_u64(buf, 16, u64::from(status.trigger.subsec_nanos()));
++        put_u64(buf, 24, status.now.as_secs());
++        put_u64(buf, 32, u64::from(status.now.subsec_nanos()));
++        put_u64(buf, 40, status.appl_ptr);
++        put_u64(buf, 48, status.hw_ptr);
++        put_u64(buf, 56, status.delay as u64);
++        put_u64(buf, 64, status.avail);
++        put_u64(buf, 72, status.avail_max);
++        put_u64(buf, 96, status.now.as_secs());
++        put_u64(buf, 104, u64::from(status.now.subsec_nanos()));
++        put_u64(buf, 112, status.now.as_secs());
++        put_u64(buf, 120, u64::from(status.now.subsec_nanos()));
++    }
++}
++
++impl Pollable for PcmHandle {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        // What is ready changes as the stream plays (and as alsa-lib
++        // moves its pointer in the mapped control page): looked at anew.
++        self.pollee.invalidate();
++        self.pollee.poll_with(mask, poller, || self.events())
++    }
++}
++
++impl FileOps for PcmHandle {
++    fn read_at(&self, _offset: usize, _writer: &mut VmWriter, _status_flags: StatusFlags) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "read from the PCM device through its ioctls")
++    }
++
++    fn write_at(&self, _offset: usize, _reader: &mut VmReader, _status_flags: StatusFlags) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "write to the PCM device through its ioctls")
++    }
++}
++
++impl PerOpenFileOps for PcmHandle {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno!(Errno::ESPIPE)
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++
++    fn mappable(&self, _request: FileMmapRequest) -> Result<MappableObject<'_>> {
++        Ok(MappableObject::Device(self as &dyn Mappable))
++    }
++
++    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
++        let arg = raw_ioctl.arg();
++        let pcm = &self.pcm;
++        let result = match raw_ioctl.cmd() {
++            ioctl::PVERSION => current_userspace!().write_val(arg, &VERSION).map(|_| 0)?,
++            ioctl::INFO => {
++                let mut info = [0u8; INFO_SIZE];
++                fill_info(&mut info, &self.card, pcm);
++                current_userspace!().write_bytes(arg, &info)?;
++                0
++            }
++            ioctl::TSTAMP | ioctl::TTSTAMP | ioctl::USER_PVERSION => 0,
++            ioctl::HW_REFINE | ioctl::HW_PARAMS => {
++                let mut buf = [0u8; HW_PARAMS_SIZE];
++                current_userspace!().read_bytes(arg, &mut buf)?;
++                let mut params = read_hw_params(&buf);
++                if raw_ioctl.cmd() == ioctl::HW_REFINE {
++                    pcm.hw_refine(&mut params).map_err(errno)?;
++                } else {
++                    pcm.hw_params(&mut params).map_err(errno)?;
++                }
++                write_hw_params(&mut buf, &params);
++                current_userspace!().write_bytes(arg, &buf)?;
++                0
++            }
++            ioctl::HW_FREE => pcm.hw_free().map(|()| 0).map_err(errno)?,
++            ioctl::SW_PARAMS => {
++                let mut buf = [0u8; SW_PARAMS_SIZE];
++                current_userspace!().read_bytes(arg, &mut buf)?;
++                let mut sw = read_sw_params(&buf);
++                pcm.sw_params(&mut sw).map_err(errno)?;
++                write_sw_params(&mut buf, &sw);
++                current_userspace!().write_bytes(arg, &buf)?;
++                0
++            }
++            ioctl::STATUS | ioctl::STATUS_EXT => {
++                let mut buf = [0u8; STATUS_SIZE];
++                self.status(&mut buf);
++                current_userspace!().write_bytes(arg, &buf)?;
++                0
++            }
++            ioctl::DELAY => {
++                let status = pcm.status();
++                if status.state == State::Xrun as i32 {
++                    return_errno!(Errno::EPIPE);
++                }
++                current_userspace!().write_val(arg, &status.delay)?;
++                0
++            }
++            ioctl::HWSYNC => {
++                pcm.update();
++                if pcm.state() == State::Xrun {
++                    return_errno!(Errno::EPIPE);
++                }
++                0
++            }
++            ioctl::SYNC_PTR => {
++                let mut buf = [0u8; SYNC_PTR_SIZE];
++                current_userspace!().read_bytes(arg, &mut buf)?;
++                let flags = get_u32(&buf, 0);
++                let appl_ptr = (flags & SYNC_PTR_APPL == 0).then(|| get_u64(&buf, 72));
++                let avail_min = (flags & SYNC_PTR_AVAIL_MIN == 0).then(|| get_u64(&buf, 80));
++                let (state, hw_ptr, appl, avail_min) = pcm.sync_ptr(flags & SYNC_PTR_HWSYNC != 0, appl_ptr, avail_min);
++                let now = ostd::timer::Jiffies::elapsed().as_duration();
++                put_u32(&mut buf, 8, state as u32);
++                put_u64(&mut buf, 16, hw_ptr);
++                put_u64(&mut buf, 24, now.as_secs());
++                put_u64(&mut buf, 32, u64::from(now.subsec_nanos()));
++                put_u64(&mut buf, 72, appl);
++                put_u64(&mut buf, 80, avail_min);
++                current_userspace!().write_bytes(arg, &buf)?;
++                self.pollee.invalidate();
++                0
++            }
++            ioctl::CHANNEL_INFO => {
++                let setup = pcm.setup().ok_or(Error::new(Errno::EBADFD))?;
++                let mut buf = [0u8; 24];
++                current_userspace!().read_bytes(arg, &mut buf)?;
++                let channel = get_u32(&buf, 0);
++                if channel >= setup.channels {
++                    return_errno!(Errno::EINVAL);
++                }
++                put_u64(&mut buf, 8, 0);
++                put_u32(&mut buf, 16, channel * setup.sample_bits);
++                put_u32(&mut buf, 20, setup.frame_bytes as u32 * 8);
++                current_userspace!().write_bytes(arg, &buf)?;
++                0
++            }
++            ioctl::PREPARE => pcm.prepare().map(|()| 0).map_err(errno)?,
++            ioctl::RESET => pcm.reset().map(|()| 0).map_err(errno)?,
++            ioctl::START => pcm.start().map(|()| 0).map_err(errno)?,
++            ioctl::DROP => pcm.drop_().map(|()| 0).map_err(errno)?,
++            ioctl::DRAIN => {
++                if !pcm.drain_begin().map_err(errno)? {
++                    if let Err(error) = wait_for(pcm, || pcm.drained()) {
++                        let _ = pcm.drop_();
++                        return Err(error);
++                    }
++                }
++                0
++            }
++            ioctl::PAUSE => {
++                let on: i32 = current_userspace!().read_val(arg)?;
++                pcm.pause(on != 0).map(|()| 0).map_err(errno)?
++            }
++            ioctl::RESUME => return_errno!(Errno::ENOSYS),
++            ioctl::XRUN => {
++                pcm.drop_().map_err(errno)?;
++                0
++            }
++            ioctl::REWIND | ioctl::FORWARD => {
++                // The frames asked for in, the frames moved back out.
++                let frames: u64 = current_userspace!().read_val(arg)?;
++                let moved = if raw_ioctl.cmd() == ioctl::REWIND { pcm.rewind(frames) } else { pcm.forward(frames) }.map_err(errno)?;
++                current_userspace!().write_val(arg, &moved)?;
++                0
++            }
++            ioctl::WRITEI_FRAMES | ioctl::READI_FRAMES => {
++                let mut buf = [0u8; 24];
++                current_userspace!().read_bytes(arg, &mut buf)?;
++                let (address, frames) = (get_u64(&buf, 8) as usize, get_u64(&buf, 16));
++                let wanted = if raw_ioctl.cmd() == ioctl::WRITEI_FRAMES { Direction::Playback } else { Direction::Capture };
++                if pcm.direction != wanted {
++                    return_errno!(Errno::EINVAL);
++                }
++                let nonblocking = false;
++                let moved = self.transfer(address, frames, nonblocking)?;
++                put_u64(&mut buf, 0, moved);
++                current_userspace!().write_bytes(arg, &buf)?;
++                0
++            }
++            ioctl::LINK | ioctl::UNLINK => return_errno!(Errno::EOPNOTSUPP),
++            other => {
++                warn!("sound: unknown PCM ioctl {:#x}", other);
++                return_errno_with_message!(Errno::ENOTTY, "unknown PCM ioctl")
++            }
++        };
++        self.pollee.invalidate();
++        Ok(result)
++    }
++}
++
++impl Mappable for PcmHandle {
++    fn map(&self, offset: usize, mut handle: MapHandle) -> Result<Box<dyn MappedObject>> {
++        match offset {
++            MMAP_STATUS | MMAP_STATUS_NEW => handle.map_frame(0, self.pcm.status_page().clone()),
++            MMAP_CONTROL | MMAP_CONTROL_NEW => handle.map_frame(0, self.pcm.control_page().clone()),
++            _ => {
++                let buffer = self.pcm.buffer().ok_or(Error::new(Errno::EBADFD))?;
++                let first = offset / PAGE_SIZE;
++                for (index, frame) in buffer.frames.clone().into_iter().enumerate().skip(first) {
++                    let at = (index - first) * PAGE_SIZE;
++                    if at >= handle.size() {
++                        break;
++                    }
++                    handle.map_frame(at, frame);
++                }
++                self.pcm.note_mapped(true);
++                return Ok(Box::new(BufferMapping(self.pcm.clone())));
++            }
++        }
++        Ok(Box::new(PageMapping))
++    }
++}
++
++/// A mapping of the status or control page.
++#[derive(Debug)]
++struct PageMapping;
++
++impl MappedObject for PageMapping {
++    fn dup_at_offset(&self, _offset: usize) -> Box<dyn MappedObject> {
++        Box::new(Self)
++    }
++}
++
++/// A mapping of the buffer: while one lasts, the buffer stays.
++struct BufferMapping(Arc<Pcm>);
++
++impl Debug for BufferMapping {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("BufferMapping").finish()
++    }
++}
++
++impl MappedObject for BufferMapping {
++    fn dup_at_offset(&self, _offset: usize) -> Box<dyn MappedObject> {
++        self.0.note_mapped(true);
++        Box::new(Self(self.0.clone()))
++    }
++}
++
++impl Drop for BufferMapping {
++    fn drop(&mut self) {
++        self.0.note_mapped(false);
++    }
++}
+diff --git a/kernel/core/src/device/snd/timer.rs b/kernel/core/src/device/snd/timer.rs
+new file mode 100755
+index 0000000..cd4d698
+--- /dev/null
++++ b/kernel/core/src/device/snd/timer.rs
+@@ -0,0 +1,290 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! ALSA's timer device, `/dev/snd/timer`, with the timers of the PCM
++//! streams (class PCM): each ticks when its stream completes a period.
++//! alsa-lib's hw plugin waits on one for period events, and its dmix plugin
++//! for its clients.
++//!
++//! Reference: Linux's `sound/core/timer.c`, `include/uapi/sound/asound.h`.
++
++use alloc::format;
++
++use aster_sound::{Card, Direction, Pcm};
++use device_id::{DeviceId, MajorId, MinorId};
++use ostd::mm::VmIo;
++
++use super::{MAJOR, get_u32, put_str, put_u32, put_u64, watch};
++use crate::{
++    context::current_userspace,
++    device::{Device, DeviceType},
++    events::IoEvents,
++    fs::{
++        devtmpfs::DevtmpfsNodeMeta,
++        file::{PerOpenFileOps, StatusFlags},
++        vfs::{inode::FileOps, path::Path},
++    },
++    prelude::*,
++    process::signal::{PollHandle, Pollable, Pollee},
++    util::ioctl::RawIoctl,
++};
++
++/// `SNDRV_TIMER_VERSION`: 2.0.8.
++const VERSION: u32 = 0x0002_0008;
++/// The timer device's minor number.
++const MINOR: u32 = 33;
++/// `SNDRV_TIMER_CLASS_*`, `SNDRV_TIMER_EVENT_TICK`.
++const CLASS_NONE: i32 = -1;
++const CLASS_PCM: i32 = 3;
++const EVENT_TICK: u32 = 1;
++const TREAD_SIZE: usize = 32;
++const READ_SIZE: usize = 8;
++
++mod ioctl {
++    pub(super) const PVERSION: u32 = 0x8004_5400;
++    pub(super) const NEXT_DEVICE: u32 = 0xc014_5401;
++    pub(super) const TREAD_OLD: u32 = 0x4004_5402;
++    pub(super) const TREAD64: u32 = 0x4004_54a4;
++    pub(super) const SELECT: u32 = 0x4034_5410;
++    pub(super) const INFO: u32 = 0x80e8_5411;
++    pub(super) const PARAMS: u32 = 0x4050_5412;
++    pub(super) const STATUS: u32 = 0x8060_5414;
++    pub(super) const START: u32 = 0x0000_54a0;
++    pub(super) const STOP: u32 = 0x0000_54a1;
++    pub(super) const CONTINUE: u32 = 0x0000_54a2;
++    pub(super) const PAUSE: u32 = 0x0000_54a3;
++}
++
++#[derive(Debug)]
++pub(super) struct TimerDevice;
++
++impl Device for TimerDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        DeviceId::new(MajorId::new(MAJOR), MinorId::new(MINOR))
++    }
++
++    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
++        DevtmpfsNodeMeta::new("snd/timer").ok()
++    }
++
++    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        let pollee = Arc::new(Pollee::new());
++        watch(&pollee);
++        Ok(Box::new(TimerHandle { state: Mutex::new(TimerState::default()), pollee }))
++    }
++}
++
++/// The PCM timers there are: (card, device: the PCM device and its
++/// direction, as Linux numbers them).
++fn timers() -> Vec<(Arc<Card>, i32, Arc<Pcm>)> {
++    let mut list = Vec::new();
++    for card in aster_sound::cards() {
++        for pcm in card.pcms() {
++            let device = if pcm.direction == Direction::Playback { 0 } else { 1 };
++            list.push((card.clone(), device, pcm.clone()));
++        }
++    }
++    list
++}
++
++#[derive(Default)]
++struct TimerState {
++    tread: bool,
++    selected: Option<(Arc<Card>, i32, Arc<Pcm>)>,
++    /// Periods per tick.
++    ticks: u32,
++    running: bool,
++    /// The stream's period count the last event reported up to.
++    seen: u64,
++}
++
++struct TimerHandle {
++    state: Mutex<TimerState>,
++    pollee: Arc<Pollee>,
++}
++
++impl Debug for TimerHandle {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("TimerHandle").finish_non_exhaustive()
++    }
++}
++
++impl TimerHandle {
++    /// Ticks to report.
++    fn pending(state: &TimerState) -> u64 {
++        match &state.selected {
++            Some((_, _, pcm)) if state.running => pcm.periods_elapsed().saturating_sub(state.seen) / u64::from(state.ticks.max(1)),
++            _ => 0,
++        }
++    }
++}
++
++impl Pollable for TimerHandle {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        // What is ready changes as the stream plays (and as alsa-lib
++        // moves its pointer in the mapped control page): looked at anew.
++        self.pollee.invalidate();
++        self.pollee.poll_with(mask, poller, || {
++            if Self::pending(&self.state.lock()) > 0 { IoEvents::IN } else { IoEvents::empty() }
++        })
++    }
++}
++
++impl FileOps for TimerHandle {
++    fn read_at(&self, _offset: usize, writer: &mut VmWriter, status_flags: StatusFlags) -> Result<usize> {
++        let size = if self.state.lock().tread { TREAD_SIZE } else { READ_SIZE };
++        if writer.avail() < size {
++            return_errno!(Errno::EINVAL);
++        }
++        let pcm = self.state.lock().selected.as_ref().map(|(_, _, pcm)| pcm.clone()).ok_or(Error::new(Errno::EBADFD))?;
++        if Self::pending(&self.state.lock()) == 0 {
++            if status_flags.contains(StatusFlags::O_NONBLOCK) {
++                return_errno!(Errno::EAGAIN);
++            }
++            pcm.wait.pause_until(|| (Self::pending(&self.state.lock()) > 0).then_some(()))?;
++        }
++        let mut state = self.state.lock();
++        let ticks = Self::pending(&state);
++        state.seen += ticks * u64::from(state.ticks.max(1));
++        let tread = state.tread;
++        drop(state);
++        self.pollee.invalidate();
++        let mut event = [0u8; TREAD_SIZE];
++        if tread {
++            let now = ostd::timer::Jiffies::elapsed().as_duration();
++            put_u32(&mut event, 0, EVENT_TICK);
++            put_u64(&mut event, 8, now.as_secs());
++            put_u64(&mut event, 16, u64::from(now.subsec_nanos()));
++            put_u32(&mut event, 24, ticks as u32);
++        } else {
++            put_u32(&mut event, 0, period_ns(&pcm));
++            put_u32(&mut event, 4, ticks as u32);
++        }
++        writer.write_fallible(&mut VmReader::from(&event[..size]).to_fallible()).map_err(|(error, _)| error)?;
++        Ok(size)
++    }
++
++    fn write_at(&self, _offset: usize, _reader: &mut VmReader, _status_flags: StatusFlags) -> Result<usize> {
++        return_errno!(Errno::EINVAL)
++    }
++}
++
++/// A period's length in nanoseconds (the timer's resolution).
++fn period_ns(pcm: &Pcm) -> u32 {
++    pcm.setup().map_or(1_000_000, |setup| (setup.period_size * 1_000_000_000 / u64::from(setup.rate.max(1))) as u32)
++}
++
++impl PerOpenFileOps for TimerHandle {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno!(Errno::ESPIPE)
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++
++    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
++        let arg = raw_ioctl.arg();
++        match raw_ioctl.cmd() {
++            ioctl::PVERSION => current_userspace!().write_val(arg, &VERSION)?,
++            ioctl::NEXT_DEVICE => {
++                let mut id = [0u8; 20];
++                current_userspace!().read_bytes(arg, &mut id)?;
++                let (class, card, device) = (get_u32(&id, 0) as i32, get_u32(&id, 8) as i32, get_u32(&id, 12) as i32);
++                let list = timers();
++                let next = if class < CLASS_PCM {
++                    list.first()
++                } else if class == CLASS_PCM {
++                    list.iter().find(|(c, d, _)| (c.index as i32, *d) > (card, device))
++                } else {
++                    None
++                };
++                id.fill(0);
++                match next {
++                    Some((card, device, _)) => {
++                        put_u32(&mut id, 0, CLASS_PCM as u32);
++                        put_u32(&mut id, 8, card.index);
++                        put_u32(&mut id, 12, *device as u32);
++                    }
++                    None => put_u32(&mut id, 0, CLASS_NONE as u32),
++                }
++                current_userspace!().write_bytes(arg, &id)?;
++            }
++            ioctl::TREAD_OLD | ioctl::TREAD64 => {
++                let on: i32 = current_userspace!().read_val(arg)?;
++                self.state.lock().tread = on != 0;
++            }
++            ioctl::SELECT => {
++                let mut select = [0u8; 52];
++                current_userspace!().read_bytes(arg, &mut select)?;
++                let (class, card, device, subdevice) = (get_u32(&select, 0) as i32, get_u32(&select, 8), get_u32(&select, 12) as i32, get_u32(&select, 16));
++                if class != CLASS_PCM || subdevice > 1 {
++                    return_errno_with_message!(Errno::ENODEV, "only the PCM streams' timers are there");
++                }
++                // alsa-lib asks for the device as (subdevice << 1 | stream)
++                // with the PCM device in `device`.
++                let stream = if subdevice & 1 == 1 || device & 1 == 1 { 1 } else { 0 };
++                let found = timers().into_iter().find(|(c, d, _)| c.index == card && *d == stream);
++                let found = found.ok_or(Error::with_message(Errno::ENODEV, "no such PCM timer"))?;
++                let mut state = self.state.lock();
++                state.seen = found.2.periods_elapsed();
++                state.selected = Some(found);
++                state.running = false;
++                state.ticks = 1;
++            }
++            ioctl::INFO => {
++                let state = self.state.lock();
++                let (card, device, pcm) = state.selected.clone().ok_or(Error::new(Errno::EBADFD))?;
++                drop(state);
++                let mut info = [0u8; 232];
++                put_u32(&mut info, 0, 1);
++                put_u32(&mut info, 4, card.index);
++                let name = format!("PCM {} {}-{}-0", if device == 0 { "playback" } else { "capture" }, card.index, 0);
++                put_str(&mut info, 8, 64, &name);
++                put_str(&mut info, 72, 80, &name);
++                put_u64(&mut info, 160, u64::from(period_ns(&pcm)));
++                current_userspace!().write_bytes(arg, &info)?;
++            }
++            ioctl::PARAMS => {
++                let mut params = [0u8; 80];
++                current_userspace!().read_bytes(arg, &mut params)?;
++                let mut state = self.state.lock();
++                if state.selected.is_none() {
++                    return_errno!(Errno::EBADFD);
++                }
++                state.ticks = get_u32(&params, 4).max(1);
++            }
++            ioctl::STATUS => {
++                let state = self.state.lock();
++                let pcm = state.selected.as_ref().map(|(_, _, pcm)| pcm.clone()).ok_or(Error::new(Errno::EBADFD))?;
++                let queue = Self::pending(&state);
++                drop(state);
++                let now = ostd::timer::Jiffies::elapsed().as_duration();
++                let mut status = [0u8; 96];
++                put_u64(&mut status, 0, now.as_secs());
++                put_u64(&mut status, 8, u64::from(now.subsec_nanos()));
++                put_u32(&mut status, 16, period_ns(&pcm));
++                put_u32(&mut status, 28, queue.min(u64::from(u32::MAX)) as u32);
++                current_userspace!().write_bytes(arg, &status)?;
++            }
++            ioctl::START | ioctl::CONTINUE => {
++                let mut state = self.state.lock();
++                let pcm = state.selected.as_ref().map(|(_, _, pcm)| pcm.clone()).ok_or(Error::new(Errno::EBADFD))?;
++                if raw_ioctl.cmd() == ioctl::START || !state.running {
++                    state.seen = pcm.periods_elapsed();
++                }
++                state.running = true;
++            }
++            ioctl::STOP | ioctl::PAUSE => self.state.lock().running = false,
++            other => {
++                warn!("sound: unknown timer ioctl {:#x}", other);
++                return_errno_with_message!(Errno::ENOTTY, "unknown sound timer ioctl")
++            }
++        }
++        self.pollee.invalidate();
++        Ok(0)
++    }
++}

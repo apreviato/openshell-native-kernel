@@ -93,8 +93,25 @@ apply_update() {
     esac
     # The other system slot of the data partition's disk: system_a is 2, system_b 3.
     case "$slot" in a) other=3 ;; b) other=2 ;; *) other= ;; esac
-    if [ -z "$result" ] && [ -n "$other" ] && tar -xf "$updates_dir/inbox/$name" -C "$work" MANIFEST MANIFEST.sig kernel initramfs.cpio.gz boot.cfg &&
-        mount -t ext2 "${device%5}$other" "$target"; then
+    members="MANIFEST MANIFEST.sig kernel initramfs.cpio.gz boot.cfg"
+    # Nothing in the inbox is trusted before openshell-ab: each member must
+    # come out as a plain file, never a link or anything else the archive
+    # could make of it.
+    if [ -z "$result" ] && [ -z "$other" ]; then
+        result="failed the system runs from no known slot"
+    fi
+    if [ -z "$result" ]; then
+        if tar -xf "$updates_dir/inbox/$name" -C "$work" $members; then
+            for member in $members; do
+                if [ -L "$work/$member" ] || [ ! -f "$work/$member" ]; then
+                    result="failed the update's $member is not a plain file"
+                fi
+            done
+        else
+            result="failed the update cannot be unpacked"
+        fi
+    fi
+    if [ -z "$result" ] && mount -t ext2 "${device%5}$other" "$target"; then
         if "$root/openshell-ab" "$ab" update-mounted "$work" "$work/MANIFEST" "$data_schema" "$release_keys" "$target" > "$updates_dir/log" 2>&1; then
             result="applied $(sed -n 's/^release=//p' "$work/MANIFEST")"
             # That slot's copy on the data partition is of its old release:

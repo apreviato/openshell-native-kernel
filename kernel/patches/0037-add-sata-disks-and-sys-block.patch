@@ -1,0 +1,1940 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 150ba39..1985d9d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -76,6 +76,18 @@ version = "0.2.21"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+ 
++[[package]]
++name = "aster-ahci"
++version = "0.1.0"
++dependencies = [
++ "aster-block",
++ "aster-core",
++ "aster-pci",
++ "component",
++ "device-id",
++ "ostd",
++]
++
+ [[package]]
+ name = "aster-backlight"
+ version = "0.1.0"
+@@ -537,6 +549,7 @@ dependencies = [
+ name = "asterinas"
+ version = "0.1.0"
+ dependencies = [
++ "aster-ahci",
+  "aster-backlight",
+  "aster-core",
+  "aster-drm",
+diff --git a/Cargo.toml b/Cargo.toml
+index 450ef84..356c26c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -35,6 +35,7 @@ members = [
+     "kernel/comps/sound",
+     "kernel/comps/uart",
+     "kernel/comps/usb",
++    "kernel/comps/ahci",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -94,6 +95,7 @@ default-members = [
+     "kernel/comps/sound",
+     "kernel/comps/uart",
+     "kernel/comps/usb",
++    "kernel/comps/ahci",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -180,6 +182,7 @@ aster-drm = { path = "kernel/comps/drm" }
+ aster-backlight = { path = "kernel/comps/backlight" }
+ aster-i8042 = { path = "kernel/comps/i8042" }
+ aster-usb = { path = "kernel/comps/usb" }
++aster-ahci = { path = "kernel/comps/ahci" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+diff --git a/Components.toml b/Components.toml
+index 54139af..9280a84 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -22,6 +22,7 @@ systree = { name = "aster-systree" }
+ time = { name = "aster-time" }
+ uart = { name = "aster-uart" }
+ usb = { name = "aster-usb" }
++ahci = { name = "aster-ahci" }
+ ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+ 
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index a0a7c79..659b15e 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -14,6 +14,7 @@ aster-drm.workspace = true
+ aster-simpledrm.workspace = true
+ aster-uart.workspace = true
+ aster-usb.workspace = true
++aster-ahci.workspace = true
+ aster-ethernet.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+diff --git a/kernel/comps/ahci/Cargo.toml b/kernel/comps/ahci/Cargo.toml
+new file mode 100644
+index 0000000..fe773c9
+--- /dev/null
++++ b/kernel/comps/ahci/Cargo.toml
+@@ -0,0 +1,15 @@
++[package]
++name = "aster-ahci"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-block.workspace = true
++aster-core.workspace = true
++aster-pci.workspace = true
++component.workspace = true
++device-id.workspace = true
++ostd.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/ahci/src/disk.rs b/kernel/comps/ahci/src/disk.rs
+new file mode 100755
+index 0000000..1f97236
+--- /dev/null
++++ b/kernel/comps/ahci/src/disk.rs
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A SATA disk as the kernel's block device `sda`, `sdb`, ...: its requests
++//! wait in a queue that its controller's task serves (`crate::hba`).
++
++use alloc::{collections::VecDeque, string::String, sync::Arc};
++
++use aster_block::{
++    BlockDevice, BlockDeviceMeta, PartitionManager, ScsiDiskIdentity,
++    bio::{BioEnqueueError, SubmittedBio},
++};
++use device_id::DeviceId;
++use ostd::sync::{LocalIrqDisabled, SpinLock};
++
++pub(crate) struct AhciDisk {
++    identity: ScsiDiskIdentity,
++    /// 512-byte sectors.
++    sectors: usize,
++    pub(crate) queue: SpinLock<VecDeque<SubmittedBio>, LocalIrqDisabled>,
++    partitions: PartitionManager,
++    model: String,
++}
++
++impl core::fmt::Debug for AhciDisk {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("AhciDisk")
++            .field("name", &self.identity.name())
++            .field("sectors", &self.sectors)
++            .finish()
++    }
++}
++
++impl AhciDisk {
++    pub(crate) fn new(sectors: usize, model: String) -> Option<Arc<Self>> {
++        Some(Arc::new(Self {
++            identity: ScsiDiskIdentity::take()?,
++            sectors,
++            queue: SpinLock::new(VecDeque::new()),
++            partitions: PartitionManager::new(),
++            model,
++        }))
++    }
++
++    pub(crate) fn name(&self) -> &str {
++        self.identity.name()
++    }
++}
++
++impl BlockDevice for AhciDisk {
++    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
++        self.queue.lock().push_back(bio);
++        crate::wake();
++        Ok(())
++    }
++
++    fn metadata(&self) -> BlockDeviceMeta {
++        BlockDeviceMeta {
++            max_nr_segments_per_bio: crate::hba::MAX_PRDT,
++            nr_sectors: self.sectors,
++        }
++    }
++
++    fn name(&self) -> &str {
++        self.identity.name()
++    }
++
++    fn id(&self) -> DeviceId {
++        self.identity.id()
++    }
++
++    fn partition_manager(&self) -> Option<&PartitionManager> {
++        Some(&self.partitions)
++    }
++
++    /// "ATA", as Linux's libata names the vendor of every SATA disk
++    /// (/sys/block/sdX/device/vendor): how a SATA disk tells from a USB one.
++    fn vendor(&self) -> Option<&str> {
++        Some("ATA")
++    }
++
++    fn model(&self) -> Option<&str> {
++        Some(&self.model)
++    }
++}
+diff --git a/kernel/comps/ahci/src/hba.rs b/kernel/comps/ahci/src/hba.rs
+new file mode 100755
+index 0000000..373a6ad
+--- /dev/null
++++ b/kernel/comps/ahci/src/hba.rs
+@@ -0,0 +1,753 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The controller (the HBA of AHCI 1.3.1): its hand-over from the firmware
++//! and reset, its ports and the disks on them, and their commands. One
++//! command at a time per port, in slot 0: a request becomes READ/WRITE DMA
++//! (EXT) commands of up to MAX_PRDT pieces each, or a FLUSH CACHE (EXT).
++
++use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
++use core::sync::atomic::{AtomicU32, Ordering};
++
++use aster_block::bio::{BioStatus, BioType, SubmittedBio};
++use aster_pci::{
++    capability::msi::CapabilityMsiData, cfg_space::BarAccess, common_device::PciCommonDevice,
++};
++use ostd::{
++    io::IoMem,
++    irq::IrqLine,
++    mm::{HasDaddr, HasSize, VmIo, VmIoOnce, dma::DmaCoherent},
++};
++
++use crate::{disk::AhciDisk, identify::parse_identify, now_ms, sleep_ms};
++
++/// Pieces of a command's scatter-gather list: a 4 KiB command table holds
++/// 248 after its 128-byte header.
++pub(crate) const MAX_PRDT: usize = 248;
++/// The most one piece may hold (AHCI's 22-bit byte count).
++const PRD_MAX_BYTES: u64 = 4 << 20;
++/// How long a command may take, as Linux's SCSI layer waits.
++const COMMAND_TIMEOUT_MS: u64 = 30_000;
++
++/// The controller's registers.
++mod reg {
++    pub(super) const CAP: usize = 0x00;
++    pub(super) const GHC: usize = 0x04;
++    pub(super) const IS: usize = 0x08;
++    pub(super) const PI: usize = 0x0C;
++    pub(super) const CAP2: usize = 0x24;
++    pub(super) const BOHC: usize = 0x28;
++}
++
++/// A port's registers, from its base (0x100 + 0x80 × port).
++mod port {
++    pub(super) const CLB: usize = 0x00;
++    pub(super) const CLBU: usize = 0x04;
++    pub(super) const FB: usize = 0x08;
++    pub(super) const FBU: usize = 0x0C;
++    pub(super) const IS: usize = 0x10;
++    pub(super) const IE: usize = 0x14;
++    pub(super) const CMD: usize = 0x18;
++    pub(super) const TFD: usize = 0x20;
++    pub(super) const SIG: usize = 0x24;
++    pub(super) const SSTS: usize = 0x28;
++    pub(super) const SCTL: usize = 0x2C;
++    pub(super) const SERR: usize = 0x30;
++    pub(super) const CI: usize = 0x38;
++}
++
++const CAP_S64A: u32 = 1 << 31;
++const CAP_SCLO: u32 = 1 << 24;
++const GHC_HR: u32 = 1 << 0;
++const GHC_IE: u32 = 1 << 1;
++const GHC_AE: u32 = 1 << 31;
++const CAP2_BOH: u32 = 1 << 0;
++const BOHC_BOS: u32 = 1 << 0;
++const BOHC_OOS: u32 = 1 << 1;
++const BOHC_BB: u32 = 1 << 4;
++
++const CMD_ST: u32 = 1 << 0;
++const CMD_SUD: u32 = 1 << 1;
++const CMD_POD: u32 = 1 << 2;
++const CMD_CLO: u32 = 1 << 3;
++const CMD_FRE: u32 = 1 << 4;
++const CMD_FR: u32 = 1 << 14;
++const CMD_CR: u32 = 1 << 15;
++
++const TFD_ERR: u32 = 1 << 0;
++const TFD_DRQ: u32 = 1 << 3;
++const TFD_BSY: u32 = 1 << 7;
++
++/// PxIS errors: task file, host bus fatal and data, interface fatal and
++/// non-fatal, overflow.
++const IS_ERRORS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 26) | (1 << 24);
++/// What interrupts: the device's FISes (register, PIO setup, DMA setup, set
++/// device bits), a finished piece, and the errors.
++const IE_MASK: u32 = 0b10_1111 | IS_ERRORS;
++
++/// A disk (ATA), an optical drive (ATAPI), a port multiplier.
++const SIG_ATA: u32 = 0x0000_0101;
++const SIG_ATAPI: u32 = 0xEB14_0101;
++const SIG_PM: u32 = 0x9669_0101;
++
++mod ata {
++    pub(super) const IDENTIFY: u8 = 0xEC;
++    pub(super) const READ_DMA: u8 = 0xC8;
++    pub(super) const WRITE_DMA: u8 = 0xCA;
++    pub(super) const READ_DMA_EXT: u8 = 0x25;
++    pub(super) const WRITE_DMA_EXT: u8 = 0x35;
++    pub(super) const FLUSH_CACHE: u8 = 0xE7;
++    pub(super) const FLUSH_CACHE_EXT: u8 = 0xEA;
++}
++
++/// The controller's registers.
++struct Regs(IoMem);
++
++impl Regs {
++    fn read(&self, at: usize) -> u32 {
++        self.0.read_once::<u32>(at).unwrap_or(u32::MAX)
++    }
++
++    fn write(&self, at: usize, value: u32) {
++        let _ = self.0.write_once::<u32>(at, &value);
++    }
++
++    fn port_read(&self, n: usize, at: usize) -> u32 {
++        self.read(0x100 + 0x80 * n + at)
++    }
++
++    fn port_write(&self, n: usize, at: usize, value: u32) {
++        self.write(0x100 + 0x80 * n + at, value);
++    }
++
++    /// Whether `done` holds within `ms` milliseconds.
++    fn wait(&self, ms: u64, done: impl Fn(&Self) -> bool) -> bool {
++        let deadline = now_ms() + ms;
++        loop {
++            if done(self) {
++                return true;
++            }
++            if now_ms() >= deadline {
++                return false;
++            }
++            sleep_ms(1);
++        }
++    }
++}
++
++/// The interrupt: each port's status, cleared, for the task (MSI is edge
++/// triggered: the port's register first, then the controller's).
++fn interrupt(io: &IoMem, events: &[AtomicU32; 32]) {
++    let pending = io.read_once::<u32>(reg::IS).unwrap_or(0);
++    if pending == 0 || pending == u32::MAX {
++        return;
++    }
++    for (n, event) in events.iter().enumerate() {
++        if pending & (1 << n) != 0 {
++            let at = 0x100 + 0x80 * n + port::IS;
++            let status = io.read_once::<u32>(at).unwrap_or(0);
++            let _ = io.write_once::<u32>(at, &status);
++            event.fetch_or(status, Ordering::AcqRel);
++        }
++    }
++    let _ = io.write_once::<u32>(reg::IS, &pending);
++    crate::wake();
++}
++
++/// One ATA command, ready for slot 0.
++#[derive(Debug)]
++struct Command {
++    ata: u8,
++    lba: u64,
++    /// Logical blocks (0 with LBA28 is 256).
++    count: u32,
++    write: bool,
++    /// Bus addresses and lengths.
++    prds: Vec<(u64, u32)>,
++}
++
++/// The commands that do a request (`None`: one the disk cannot do).
++fn plan(
++    bio: &SubmittedBio,
++    logical: u64,
++    blocks: u64,
++    lba48: bool,
++    flush_ext: bool,
++    s64a: bool,
++) -> Option<VecDeque<Command>> {
++    let write = match bio.type_() {
++        BioType::Read => false,
++        BioType::Write => true,
++        BioType::Flush => {
++            let ata = if flush_ext {
++                ata::FLUSH_CACHE_EXT
++            } else {
++                ata::FLUSH_CACHE
++            };
++            return Some(VecDeque::from([Command {
++                ata,
++                lba: 0,
++                count: 0,
++                write: false,
++                prds: Vec::new(),
++            }]));
++        }
++    };
++    let ata = match (write, lba48) {
++        (false, true) => ata::READ_DMA_EXT,
++        (true, true) => ata::WRITE_DMA_EXT,
++        (false, false) => ata::READ_DMA,
++        (true, false) => ata::WRITE_DMA,
++    };
++    let max_bytes = if lba48 { 65535 } else { 256 } * logical;
++    // A partition's requests carry its start (`sid_offset`).
++    let mut at = (bio.sid_range().start.to_raw() + bio.sid_offset()) * 512;
++    let mut commands = VecDeque::new();
++    let mut prds = Vec::new();
++    let mut bytes = 0u64;
++    let mut finish = |prds: &mut Vec<(u64, u32)>, bytes: &mut u64, at: &mut u64| -> Option<()> {
++        if *at % logical != 0 || *bytes % logical != 0 {
++            return None;
++        }
++        let (lba, count) = (*at / logical, *bytes / logical);
++        if lba + count > blocks {
++            return None;
++        }
++        commands.push_back(Command {
++            ata,
++            lba,
++            count: count as u32,
++            write,
++            prds: core::mem::take(prds),
++        });
++        *at += *bytes;
++        *bytes = 0;
++        Some(())
++    };
++    for segment in bio.segments() {
++        let slice = segment.dma_slice();
++        let mut address = slice.daddr() as u64;
++        let mut left = slice.size() as u64;
++        while left > 0 {
++            let piece = left.min(PRD_MAX_BYTES).min(max_bytes - bytes);
++            // Pieces are whole words; without 64-bit addressing, below 4 GiB.
++            if address % 2 != 0 || piece % 2 != 0 || (!s64a && address + piece > 1 << 32) {
++                return None;
++            }
++            prds.push((address, piece as u32));
++            bytes += piece;
++            address += piece;
++            left -= piece;
++            if prds.len() == MAX_PRDT || bytes == max_bytes {
++                finish(&mut prds, &mut bytes, &mut at)?;
++            }
++        }
++    }
++    if !prds.is_empty() {
++        finish(&mut prds, &mut bytes, &mut at)?;
++    }
++    Some(commands)
++}
++
++/// A request being done: its commands still to go.
++struct Job {
++    bio: SubmittedBio,
++    commands: VecDeque<Command>,
++    /// Its current command failed once and runs again.
++    retried: bool,
++}
++
++enum Progress {
++    Running,
++    Done,
++    Failed,
++}
++
++/// A port's command slot 0 and its memory.
++struct Slot {
++    n: usize,
++    /// The command list (1 KiB) and, at 1 KiB, the received FISes.
++    lists: DmaCoherent,
++    /// Slot 0's command table.
++    table: DmaCoherent,
++    /// The port's interrupt status since its command was issued.
++    status: u32,
++    issued_at: u64,
++}
++
++/// A port with a disk.
++struct Port {
++    slot: Slot,
++    disk: Arc<AhciDisk>,
++    blocks: u64,
++    logical: u64,
++    lba48: bool,
++    flush_ext: bool,
++    job: Option<Job>,
++}
++
++pub(crate) struct Controller {
++    name: String,
++    regs: Regs,
++    cap: u32,
++    ports: Vec<Port>,
++    events: Arc<[AtomicU32; 32]>,
++    /// Holds the interrupt line.
++    _msi: Option<CapabilityMsiData>,
++}
++
++impl Controller {
++    pub(crate) fn new(mut device: PciCommonDevice, name: String) -> Option<Self> {
++        let id = *device.device_id();
++        let location = *device.location();
++        // Memory decoding and bus mastering; INTx stays off (MSI or polling).
++        location.write16(0x04, location.read16(0x04) | 0x0406);
++        let io = match device.bar_manager_mut().bar_mut(5)?.acquire().ok()? {
++            BarAccess::Memory(io) => io,
++            BarAccess::Io => return None,
++        };
++        let regs = Regs(io);
++        let events: Arc<[AtomicU32; 32]> = Arc::new(core::array::from_fn(|_| AtomicU32::new(0)));
++        let mut msi = device.acquire_msi_capability();
++        let interrupts = match (msi.as_mut(), IrqLine::alloc()) {
++            (Some(msi), Ok(mut irq)) => {
++                let io = regs.0.clone();
++                let events = events.clone();
++                irq.on_active(move |_| interrupt(&io, &events));
++                msi.set_interrupt_vector(irq);
++                true
++            }
++            _ => {
++                crate::no_interrupt();
++                ostd::notice!("{}: no MSI; polling", name);
++                false
++            }
++        };
++
++        // The firmware hands the controller over (BIOS/OS handoff).
++        if regs.read(reg::CAP2) & CAP2_BOH != 0 && regs.read(reg::BOHC) & BOHC_BOS != 0 {
++            regs.write(reg::BOHC, regs.read(reg::BOHC) | BOHC_OOS);
++            if !regs.wait(25, |regs| regs.read(reg::BOHC) & BOHC_BOS == 0)
++                && regs.read(reg::BOHC) & BOHC_BB != 0
++            {
++                regs.wait(2000, |regs| regs.read(reg::BOHC) & BOHC_BOS == 0);
++            }
++        }
++        // Reset; the ports the firmware enabled stay so.
++        let implemented = regs.read(reg::PI);
++        regs.write(reg::GHC, regs.read(reg::GHC) | GHC_AE);
++        regs.write(reg::GHC, regs.read(reg::GHC) | GHC_HR);
++        if !regs.wait(1000, |regs| regs.read(reg::GHC) & GHC_HR == 0) {
++            ostd::warn!("{}: the controller does not reset", name);
++            return None;
++        }
++        regs.write(reg::GHC, GHC_AE);
++        if regs.read(reg::PI) == 0 {
++            regs.write(reg::PI, implemented);
++        }
++        let implemented = regs.read(reg::PI);
++        // Intel's port enable bits (PCS), which a reset may clear: Linux's
++        // ahci_intel_pcs_quirk, for the chipsets before Denverton.
++        if id.vendor_id == 0x8086 && !(0x19b0..=0x19cf).contains(&id.device_id) {
++            let pcs = location.read16(0x92);
++            let wanted = (implemented & 0xff) as u16;
++            if pcs & wanted != wanted {
++                location.write16(0x92, pcs | wanted);
++            }
++        }
++        let cap = regs.read(reg::CAP);
++        let s64a = cap & CAP_S64A != 0;
++
++        // Every implemented port idle and set up, its link reset where it is
++        // not up, all together; then the disks.
++        let mut ready = Vec::new();
++        for n in (0..32).filter(|n| implemented & (1 << n) != 0) {
++            if let Some(memory) = prepare_port(&regs, n, s64a) {
++                ready.push((n, memory));
++            }
++        }
++        let det = |regs: &Regs, n: usize| regs.port_read(n, port::SSTS) & 0xF;
++        let down: Vec<usize> = ready
++            .iter()
++            .map(|(n, _)| *n)
++            .filter(|&n| det(&regs, n) != 3)
++            .collect();
++        if !down.is_empty() {
++            for &n in &down {
++                let sctl = regs.port_read(n, port::SCTL) & !0xF0F;
++                regs.port_write(n, port::SCTL, sctl | 0x301);
++            }
++            sleep_ms(2);
++            for &n in &down {
++                let sctl = regs.port_read(n, port::SCTL) & !0xF0F;
++                regs.port_write(n, port::SCTL, sctl | 0x300);
++            }
++            regs.wait(300, |regs| down.iter().all(|&n| det(regs, n) == 3));
++        }
++        let mut controller = Self {
++            name,
++            regs,
++            cap,
++            ports: Vec::new(),
++            events,
++            _msi: msi,
++        };
++        for (n, (lists, table)) in ready {
++            if det(&controller.regs, n) == 3 {
++                controller.start_port(n, lists, table);
++            }
++        }
++        if interrupts {
++            controller.regs.write(reg::IS, u32::MAX);
++            controller.regs.write(reg::GHC, GHC_AE | GHC_IE);
++        }
++        if controller.ports.is_empty() {
++            ostd::notice!("{}: no disks", controller.name);
++        }
++        Some(controller)
++    }
++
++    /// The disk on port `n`: ready, identified, offered to the system.
++    fn start_port(&mut self, n: usize, lists: DmaCoherent, table: DmaCoherent) {
++        let regs = &self.regs;
++        // Ready: not busy (a hard disk spinning up takes seconds).
++        if !regs.wait(10_000, |regs| {
++            regs.port_read(n, port::TFD) & (TFD_BSY | TFD_DRQ) == 0
++        }) {
++            ostd::warn!("{}: port {}: the device stays busy", self.name, n);
++            return;
++        }
++        match regs.port_read(n, port::SIG) {
++            SIG_ATA => {}
++            SIG_ATAPI => {
++                ostd::notice!(
++                    "{}: port {}: an optical drive (not supported)",
++                    self.name,
++                    n
++                );
++                return;
++            }
++            SIG_PM => {
++                ostd::notice!(
++                    "{}: port {}: a port multiplier (not supported)",
++                    self.name,
++                    n
++                );
++                return;
++            }
++            signature => {
++                ostd::notice!(
++                    "{}: port {}: a device of signature {:#x} (not supported)",
++                    self.name,
++                    n,
++                    signature
++                );
++                return;
++            }
++        }
++        regs.port_write(n, port::SERR, u32::MAX);
++        regs.port_write(n, port::IS, u32::MAX);
++        regs.port_write(n, port::CMD, regs.port_read(n, port::CMD) | CMD_ST);
++        regs.port_write(n, port::IE, IE_MASK);
++
++        let Ok(buffer) = DmaCoherent::alloc(1, true) else {
++            return;
++        };
++        let mut slot = Slot {
++            n,
++            lists,
++            table,
++            status: 0,
++            issued_at: 0,
++        };
++        let identify = Command {
++            ata: ata::IDENTIFY,
++            lba: 0,
++            count: 0,
++            write: false,
++            prds: vec![(buffer.daddr() as u64, 512)],
++        };
++        let mut data = [0u8; 512];
++        let identity = self
++            .run_now(&mut slot, &identify)
++            .then(|| buffer.read_bytes(0, &mut data[..]).ok())
++            .flatten()
++            .and_then(|()| parse_identify(&data));
++        let Some(identity) = identity else {
++            ostd::warn!(
++                "{}: port {}: the disk does not identify itself",
++                self.name,
++                n
++            );
++            return;
++        };
++        let sectors = (identity.blocks * identity.logical / 512) as usize;
++        let Some(disk) = AhciDisk::new(sectors, identity.model.clone()) else {
++            return;
++        };
++        ostd::notice!(
++            "{}: port {}: {}: {} ({} MB{}{})",
++            self.name,
++            n,
++            disk.name(),
++            identity.model,
++            sectors / 2048,
++            if identity.logical != 512 {
++                ", 4096-byte sectors"
++            } else {
++                ""
++            },
++            if identity.lba48 { "" } else { ", LBA28" }
++        );
++        self.ports.push(Port {
++            slot,
++            disk: disk.clone(),
++            blocks: identity.blocks,
++            logical: identity.logical,
++            lba48: identity.lba48,
++            flush_ext: identity.flush_ext,
++            job: None,
++        });
++        let device: Arc<dyn aster_block::BlockDevice> = disk;
++        if aster_block::register(device.clone()).is_ok() {
++            // Reading the partition table takes this task's service.
++            aster_core::spawn_kernel_thread(move || aster_block::scan_device_partitions(&device));
++        }
++    }
++
++    /// Runs one command and waits for it (while starting a port).
++    fn run_now(&self, slot: &mut Slot, command: &Command) -> bool {
++        issue(&self.regs, slot, command, &self.events);
++        loop {
++            match progress(&self.regs, slot, &self.events) {
++                Progress::Done => return true,
++                Progress::Failed => {
++                    recover(&self.regs, self.cap, slot.n, &self.events);
++                    return false;
++                }
++                Progress::Running if now_ms() - slot.issued_at > COMMAND_TIMEOUT_MS => {
++                    recover(&self.regs, self.cap, slot.n, &self.events);
++                    return false;
++                }
++                Progress::Running => sleep_ms(1),
++            }
++        }
++    }
++
++    /// Serves the disks' requests, for good.
++    pub(crate) fn run(mut self) -> ! {
++        loop {
++            for index in 0..self.ports.len() {
++                self.step(index);
++            }
++            crate::sleep();
++        }
++    }
++
++    /// Moves port `index`'s work on: what finished, what fails, what waits.
++    fn step(&mut self, index: usize) {
++        loop {
++            let port = &mut self.ports[index];
++            let Some(job) = port.job.as_mut() else {
++                let Some(bio) = port.disk.queue.lock().pop_front() else {
++                    return;
++                };
++                match plan(
++                    &bio,
++                    port.logical,
++                    port.blocks,
++                    port.lba48,
++                    port.flush_ext,
++                    self.cap & CAP_S64A != 0,
++                ) {
++                    Some(commands) if !commands.is_empty() => {
++                        crate::busy(true);
++                        issue(&self.regs, &mut port.slot, &commands[0], &self.events);
++                        port.job = Some(Job {
++                            bio,
++                            commands,
++                            retried: false,
++                        });
++                    }
++                    _ => bio.complete(BioStatus::IoError),
++                }
++                continue;
++            };
++            let outcome = match progress(&self.regs, &mut port.slot, &self.events) {
++                Progress::Running if now_ms() - port.slot.issued_at <= COMMAND_TIMEOUT_MS => return,
++                Progress::Running => {
++                    ostd::warn!("{}: {}: a command timed out", self.name, port.disk.name());
++                    Progress::Failed
++                }
++                other => other,
++            };
++            match outcome {
++                Progress::Done => {
++                    job.commands.pop_front();
++                    job.retried = false;
++                }
++                _ => {
++                    recover(&self.regs, self.cap, port.slot.n, &self.events);
++                    if job.retried {
++                        ostd::warn!(
++                            "{}: {}: an I/O error at block {}",
++                            self.name,
++                            port.disk.name(),
++                            job.commands[0].lba
++                        );
++                        let job = port.job.take().unwrap();
++                        job.bio.complete(BioStatus::IoError);
++                        crate::busy(false);
++                        continue;
++                    }
++                    job.retried = true;
++                }
++            }
++            let job = port.job.as_ref().unwrap();
++            if let Some(command) = job.commands.front() {
++                issue(&self.regs, &mut port.slot, command, &self.events);
++            } else {
++                let job = port.job.take().unwrap();
++                job.bio.complete(BioStatus::Complete);
++                crate::busy(false);
++            }
++        }
++    }
++}
++
++/// Port `n` idle (its engines stopped), its memory given; `None` where it
++/// does not stop or the memory is out of reach.
++fn prepare_port(regs: &Regs, n: usize, s64a: bool) -> Option<(DmaCoherent, DmaCoherent)> {
++    let command = regs.port_read(n, port::CMD);
++    if command & (CMD_ST | CMD_CR) != 0 {
++        regs.port_write(n, port::CMD, command & !CMD_ST);
++        if !regs.wait(500, |regs| regs.port_read(n, port::CMD) & CMD_CR == 0) {
++            return None;
++        }
++    }
++    let command = regs.port_read(n, port::CMD);
++    if command & (CMD_FRE | CMD_FR) != 0 {
++        regs.port_write(n, port::CMD, command & !CMD_FRE);
++        if !regs.wait(500, |regs| regs.port_read(n, port::CMD) & CMD_FR == 0) {
++            return None;
++        }
++    }
++    let lists = DmaCoherent::alloc(1, true).ok()?;
++    let table = DmaCoherent::alloc(1, true).ok()?;
++    let (lists_address, table_address) = (lists.daddr() as u64, table.daddr() as u64);
++    if !s64a && (lists_address >> 32 != 0 || table_address >> 32 != 0) {
++        return None;
++    }
++    regs.port_write(n, port::CLB, lists_address as u32);
++    regs.port_write(n, port::CLBU, (lists_address >> 32) as u32);
++    regs.port_write(n, port::FB, (lists_address + 1024) as u32);
++    regs.port_write(n, port::FBU, ((lists_address + 1024) >> 32) as u32);
++    regs.port_write(n, port::SERR, u32::MAX);
++    regs.port_write(n, port::IS, u32::MAX);
++    // Powered, spun up, receiving FISes; no partial or slumber link states.
++    regs.port_write(
++        n,
++        port::CMD,
++        regs.port_read(n, port::CMD) | CMD_SUD | CMD_POD | CMD_FRE,
++    );
++    let sctl = regs.port_read(n, port::SCTL) & !0xF0F;
++    regs.port_write(n, port::SCTL, sctl | 0x300);
++    Some((lists, table))
++}
++
++/// Writes `command` in slot 0 and issues it.
++fn issue(regs: &Regs, slot: &mut Slot, command: &Command, events: &[AtomicU32; 32]) {
++    let lba = command.lba;
++    let ext = matches!(command.ata, ata::READ_DMA_EXT | ata::WRITE_DMA_EXT);
++    let rw = ext || matches!(command.ata, ata::READ_DMA | ata::WRITE_DMA);
++    // The Register Host-to-Device FIS.
++    let mut fis = [0u8; 64];
++    fis[0] = 0x27;
++    fis[1] = 0x80;
++    fis[2] = command.ata;
++    if rw {
++        fis[4] = lba as u8;
++        fis[5] = (lba >> 8) as u8;
++        fis[6] = (lba >> 16) as u8;
++        fis[7] = if ext {
++            0x40
++        } else {
++            0x40 | ((lba >> 24) as u8 & 0x0F)
++        };
++        if ext {
++            fis[8] = (lba >> 24) as u8;
++            fis[9] = (lba >> 32) as u8;
++            fis[10] = (lba >> 40) as u8;
++        }
++        fis[12] = command.count as u8;
++        fis[13] = (command.count >> 8) as u8;
++    }
++    let _ = slot.table.write_bytes(0, &fis[..]);
++    for (index, &(address, length)) in command.prds.iter().enumerate() {
++        let entry = [address as u32, (address >> 32) as u32, 0, length - 1];
++        let _ = slot.table.write_val(0x80 + 16 * index, &entry);
++    }
++    let table = slot.table.daddr() as u64;
++    let header = [
++        5 | (u32::from(command.write) << 6) | ((command.prds.len() as u32) << 16),
++        0,
++        table as u32,
++        (table >> 32) as u32,
++        0,
++        0,
++        0,
++        0,
++    ];
++    let _ = slot.lists.write_val(0, &header);
++    events[slot.n].store(0, Ordering::Release);
++    slot.status = 0;
++    slot.issued_at = now_ms();
++    regs.port_write(slot.n, port::CI, 1);
++}
++
++/// Where slot 0's command is.
++fn progress(regs: &Regs, slot: &mut Slot, events: &[AtomicU32; 32]) -> Progress {
++    // From the interrupt, or read here without one.
++    let polled = regs.port_read(slot.n, port::IS);
++    if polled != 0 && polled != u32::MAX {
++        regs.port_write(slot.n, port::IS, polled);
++    }
++    slot.status |= events[slot.n].swap(0, Ordering::AcqRel) | polled;
++    if slot.status & IS_ERRORS != 0 {
++        return Progress::Failed;
++    }
++    if regs.port_read(slot.n, port::CI) & 1 != 0 {
++        return Progress::Running;
++    }
++    if regs.port_read(slot.n, port::TFD) & TFD_ERR != 0 {
++        Progress::Failed
++    } else {
++        Progress::Done
++    }
++}
++
++/// After an error or a time-out, as Linux's error handler: the engine
++/// stopped, the errors cleared, a stuck device let go (command list
++/// override, else a link reset), the engine started again.
++fn recover(regs: &Regs, cap: u32, n: usize, events: &[AtomicU32; 32]) {
++    regs.port_write(n, port::CMD, regs.port_read(n, port::CMD) & !CMD_ST);
++    regs.wait(500, |regs| regs.port_read(n, port::CMD) & CMD_CR == 0);
++    regs.port_write(n, port::SERR, u32::MAX);
++    regs.port_write(n, port::IS, u32::MAX);
++    events[n].store(0, Ordering::Release);
++    let stuck = |regs: &Regs| regs.port_read(n, port::TFD) & (TFD_BSY | TFD_DRQ) != 0;
++    if stuck(regs) && cap & CAP_SCLO != 0 {
++        regs.port_write(n, port::CMD, regs.port_read(n, port::CMD) | CMD_CLO);
++        regs.wait(500, |regs| regs.port_read(n, port::CMD) & CMD_CLO == 0);
++    }
++    if stuck(regs) {
++        let sctl = regs.port_read(n, port::SCTL) & !0xF0F;
++        regs.port_write(n, port::SCTL, sctl | 0x301);
++        sleep_ms(2);
++        regs.port_write(n, port::SCTL, sctl | 0x300);
++        regs.wait(1000, |regs| regs.port_read(n, port::SSTS) & 0xF == 3);
++        regs.wait(10_000, |regs| !stuck(regs));
++        regs.port_write(n, port::SERR, u32::MAX);
++        regs.port_write(n, port::IS, u32::MAX);
++    }
++    regs.port_write(n, port::CMD, regs.port_read(n, port::CMD) | CMD_ST);
++}
+diff --git a/kernel/comps/ahci/src/identify.rs b/kernel/comps/ahci/src/identify.rs
+new file mode 100755
+index 0000000..28a5684
+--- /dev/null
++++ b/kernel/comps/ahci/src/identify.rs
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! What IDENTIFY DEVICE tells of a disk (ACS-3, 7.12.7): its size, its
++//! logical block, the commands it takes, its model.
++
++use alloc::{string::String, vec::Vec};
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) struct Identity {
++    /// Logical blocks.
++    pub(crate) blocks: u64,
++    /// Bytes per logical block (512, or 4096 on "4Kn" disks).
++    pub(crate) logical: u64,
++    /// 48-bit addresses (READ/WRITE DMA EXT): every disk over 128 GiB.
++    pub(crate) lba48: bool,
++    /// FLUSH CACHE EXT.
++    pub(crate) flush_ext: bool,
++    pub(crate) model: String,
++}
++
++/// IDENTIFY DEVICE's 256 words; `None` for a disk without logical block
++/// addressing, without blocks, or with blocks of an odd size.
++pub(crate) fn parse_identify(data: &[u8]) -> Option<Identity> {
++    if data.len() < 512 {
++        return None;
++    }
++    let word = |index: usize| u16::from_le_bytes([data[2 * index], data[2 * index + 1]]);
++    // Logical block addressing (any disk since the 1990s).
++    if word(49) & (1 << 9) == 0 {
++        return None;
++    }
++    let lba48 = word(83) & (1 << 10) != 0;
++    let blocks = if lba48 {
++        (0..4).fold(0u64, |total, index| {
++            total | (u64::from(word(100 + index)) << (16 * index))
++        })
++    } else {
++        u64::from(word(60)) | (u64::from(word(61)) << 16)
++    };
++    // Words 117-118: the logical block's size in words, when word 106 is
++    // valid (bits 15:14 = 01) and says it is longer than 256 words.
++    let logical = if word(106) & 0xC000 == 0x4000 && word(106) & (1 << 12) != 0 {
++        (u64::from(word(117)) | (u64::from(word(118)) << 16)) * 2
++    } else {
++        512
++    };
++    if blocks == 0 || !matches!(logical, 512 | 1024 | 2048 | 4096) {
++        return None;
++    }
++    // The model: 40 characters, two per word, the first in the high byte.
++    let mut model = Vec::with_capacity(40);
++    for index in 27..47 {
++        let [low, high] = word(index).to_le_bytes();
++        model.extend([high, low]);
++    }
++    let model = String::from_utf8_lossy(&model).trim().into();
++    Some(Identity {
++        blocks,
++        logical,
++        lba48,
++        flush_ext: lba48 && word(83) & (1 << 13) != 0,
++        model,
++    })
++}
+diff --git a/kernel/comps/ahci/src/lib.rs b/kernel/comps/ahci/src/lib.rs
+new file mode 100755
+index 0000000..38e0cdd
+--- /dev/null
++++ b/kernel/comps/ahci/src/lib.rs
+@@ -0,0 +1,158 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! SATA disks through AHCI controllers, the way nearly every PC since 2008
++//! connects its SATA SSDs and hard disks (Intel, AMD, ASMedia, JMicron,
++//! Marvell and the others, and Intel's "RAID" mode, which is AHCI as well).
++//! Each disk is a block device `sda`, `sdb`, ... (names shared with USB
++//! disks, as in Linux), with its partitions. Requests are served by one
++//! task per controller, woken by the controller's MSI interrupt, or each
++//! millisecond where it has none.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++// This crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "ahci: "
++    };
++}
++
++mod disk;
++mod hba;
++mod identify;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    common_device::PciCommonDevice,
++};
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    sync::{SpinLock, WaitQueue},
++    timer::Jiffies,
++};
++
++/// Wakes the controllers' tasks: requests, interrupts, the timer.
++static WAKE: WaitQueue = WaitQueue::new();
++static WOKEN: AtomicBool = AtomicBool::new(false);
++/// Tasks waiting for a command or for time to pass: the timer wakes them.
++static BUSY: AtomicUsize = AtomicUsize::new(0);
++/// Whether some controller has no interrupt: then the timer wakes the tasks
++/// each millisecond while commands run, rather than every 20.
++static POLLING: AtomicBool = AtomicBool::new(false);
++static TICKS: AtomicUsize = AtomicUsize::new(0);
++static PENDING: SpinLock<Vec<(PciCommonDevice, String)>> = SpinLock::new(Vec::new());
++static NAMES: AtomicUsize = AtomicUsize::new(0);
++
++pub(crate) fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++pub(crate) fn wake() {
++    WOKEN.store(true, Ordering::Release);
++    WAKE.wake_all();
++}
++
++/// Waits for a request, an interrupt or the timer.
++pub(crate) fn sleep() {
++    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
++}
++
++/// Waits about `ms` milliseconds.
++pub(crate) fn sleep_ms(ms: u64) {
++    let deadline = now_ms() + ms;
++    BUSY.fetch_add(1, Ordering::AcqRel);
++    while now_ms() < deadline {
++        sleep();
++    }
++    BUSY.fetch_sub(1, Ordering::AcqRel);
++}
++
++/// Commands are running (`hba::Port::issue`), or not any more.
++pub(crate) fn busy(running: bool) {
++    if running {
++        BUSY.fetch_add(1, Ordering::AcqRel);
++    } else {
++        BUSY.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
++pub(crate) fn no_interrupt() {
++    POLLING.store(true, Ordering::Relaxed);
++}
++
++/// Each timer tick (1 ms): the tasks that wait, every tick without
++/// interrupts, every 20 with them (time-outs, a lost interrupt).
++fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    if BUSY.load(Ordering::Relaxed) == 0 {
++        return;
++    }
++    if POLLING.load(Ordering::Relaxed) || ticks % 20 == 0 {
++        wake();
++    }
++}
++
++/// AHCI (01:06:01); and Intel's RAID mode (01:04), which runs the same
++/// AHCI interface for its member disks, as Linux's `ahci` takes it.
++fn supports(id: &PciDeviceId) -> bool {
++    match (id.class, id.subclass, id.prog_if) {
++        (0x01, 0x06, 0x01) => true,
++        (0x01, 0x04, _) => id.vendor_id == 0x8086,
++        _ => false,
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++#[derive(Debug)]
++struct Driver;
++
++impl PciDriver for Driver {
++    fn probe(
++        &self,
++        device: PciCommonDevice,
++    ) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if !supports(&id) {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        let name = format!("ahci{}", NAMES.fetch_add(1, Ordering::Relaxed));
++        PENDING.lock().push((device, name));
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    PCI_BUS.lock().register_driver(Arc::new(Driver));
++    ostd::timer::register_callback_on_cpu(tick);
++    Ok(())
++}
++
++// One task per controller, once there is a scheduler: it resets the
++// controller, finds the disks and serves their requests.
++#[init_component(kthread)]
++fn start() -> Result<(), ComponentInitError> {
++    for (device, name) in core::mem::take(&mut *PENDING.lock()) {
++        aster_core::spawn_kernel_thread(move || match hba::Controller::new(device, name) {
++            Some(controller) => controller.run(),
++            None => ostd::warn!("a SATA controller did not start"),
++        });
++    }
++    Ok(())
++}
+diff --git a/kernel/comps/usb/src/disk.rs b/kernel/comps/usb/src/disk.rs
+index 31f059b..b55fe73 100755
+--- a/kernel/comps/usb/src/disk.rs
++++ b/kernel/comps/usb/src/disk.rs
+@@ -1,88 +1,72 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ //! A USB disk (a pendrive, an external disk, a card in a reader) as the
+-//! kernel's block device `sda`, `sdb`, ...: its requests wait in a queue
+-//! that the controller's thread serves (`crate::xhci`), moving the data
+-//! straight between the device and the requests' memory.
++//! kernel's block device `sda`, `sdb`, ... (names it shares with SATA disks,
++//! as in Linux): its requests wait in a queue that the controller's thread
++//! serves (`crate::xhci`), moving the data straight between the device and
++//! the requests' memory.
+ 
+ use alloc::{collections::VecDeque, string::String, sync::Arc};
+-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++use core::sync::atomic::{AtomicBool, Ordering};
+ 
+ use aster_block::{
+-    BlockDevice, BlockDeviceMeta, MajorIdOwner, PartitionManager,
++    BlockDevice, BlockDeviceMeta, PartitionManager, ScsiDiskIdentity,
+     bio::{BioEnqueueError, BioStatus, SubmittedBio},
+ };
+-use device_id::{DeviceId, MajorId, MinorId};
++use device_id::DeviceId;
+ use ostd::sync::{LocalIrqDisabled, SpinLock};
+-use spin::Once;
+-
+-const SCSI_DISK_MAJOR: u16 = 8;
+-static MAJOR: Once<Option<MajorIdOwner>> = Once::new();
+-static NEXT_INDEX: AtomicU32 = AtomicU32::new(0);
+ 
+ pub(crate) struct UsbDisk {
+-    name: String,
+-    id: DeviceId,
++    identity: ScsiDiskIdentity,
+     sectors: usize,
+     pub(crate) queue: SpinLock<VecDeque<SubmittedBio>, LocalIrqDisabled>,
+     partitions: PartitionManager,
+     /// Unplugged: requests fail at once.
+     gone: AtomicBool,
++    /// What its INQUIRY says.
++    removable: bool,
++    vendor: String,
++    model: String,
+ }
+ 
+ impl core::fmt::Debug for UsbDisk {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+-        f.debug_struct("UsbDisk").field("name", &self.name).field("sectors", &self.sectors).finish()
++        f.debug_struct("UsbDisk")
++            .field("name", &self.identity.name())
++            .field("sectors", &self.sectors)
++            .finish()
+     }
+ }
+ 
+ impl UsbDisk {
+-    /// A disk of `sectors` 512-byte sectors, with the next name (sda, sdb, ...).
+-    pub(crate) fn new(sectors: usize) -> Option<Arc<Self>> {
+-        // SCSI disks' major number on Linux (8), or any free one.
+-        let major = MAJOR
+-            .call_once(|| aster_block::acquire_major(MajorId::new(SCSI_DISK_MAJOR)).or_else(|_| aster_block::allocate_major()).ok())
+-            .as_ref()?
+-            .get();
+-        let index = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
+-        let name = disk_name(index);
++    /// A disk of `sectors` 512-byte sectors, with the lowest free name.
++    pub(crate) fn new(sectors: usize, inquiry: &crate::scsi::Inquiry) -> Option<Arc<Self>> {
+         Some(Arc::new(Self {
+-            name,
+-            id: DeviceId::new(major, MinorId::new(index * aster_block::DEVICE_MINORS)),
++            identity: ScsiDiskIdentity::take()?,
+             sectors,
+             queue: SpinLock::new(VecDeque::new()),
+             partitions: PartitionManager::new(),
+             gone: AtomicBool::new(false),
++            removable: inquiry.removable,
++            vendor: inquiry.vendor.clone(),
++            model: inquiry.product.clone(),
+         }))
+     }
+ 
+     pub(crate) fn name(&self) -> &str {
+-        &self.name
++        self.identity.name()
+     }
+ 
+     /// The disk was unplugged: what waits fails, and it leaves the system
+-    /// with its partitions.
++    /// with its partitions. Its name is free again once nothing holds it.
+     pub(crate) fn remove(self: &Arc<Self>) {
+         self.gone.store(true, Ordering::Release);
+         while let Some(bio) = self.queue.lock().pop_front() {
+             bio.complete(BioStatus::IoError);
+         }
+         self.partitions.remove_all();
+-        let _ = aster_block::unregister(self.id);
+-    }
+-}
+-
+-/// sda .. sdz, then sdaa, as Linux names them.
+-fn disk_name(index: u32) -> String {
+-    let mut letters = alloc::vec::Vec::new();
+-    let mut n = index + 1;
+-    while n > 0 {
+-        n -= 1;
+-        letters.push(b'a' + (n % 26) as u8);
+-        n /= 26;
++        let _ = aster_block::unregister(self.identity.id());
+     }
+-    letters.reverse();
+-    alloc::format!("sd{}", String::from_utf8(letters).unwrap_or_default())
+ }
+ 
+ impl BlockDevice for UsbDisk {
+@@ -97,18 +81,33 @@ impl BlockDevice for UsbDisk {
+     }
+ 
+     fn metadata(&self) -> BlockDeviceMeta {
+-        BlockDeviceMeta { max_nr_segments_per_bio: 64, nr_sectors: self.sectors }
++        BlockDeviceMeta {
++            max_nr_segments_per_bio: 64,
++            nr_sectors: self.sectors,
++        }
+     }
+ 
+     fn name(&self) -> &str {
+-        &self.name
++        self.identity.name()
+     }
+ 
+     fn id(&self) -> DeviceId {
+-        self.id
++        self.identity.id()
+     }
+ 
+     fn partition_manager(&self) -> Option<&PartitionManager> {
+         Some(&self.partitions)
+     }
++
++    fn removable(&self) -> bool {
++        self.removable
++    }
++
++    fn vendor(&self) -> Option<&str> {
++        Some(&self.vendor)
++    }
++
++    fn model(&self) -> Option<&str> {
++        Some(&self.model)
++    }
+ }
+diff --git a/kernel/comps/usb/src/xhci.rs b/kernel/comps/usb/src/xhci.rs
+index f9a4d0c..6544a4a 100755
+--- a/kernel/comps/usb/src/xhci.rs
++++ b/kernel/comps/usb/src/xhci.rs
+@@ -1625,7 +1625,7 @@ impl Controller {
+             return Err(Error::Descriptor);
+         }
+         let sectors = (blocks * u64::from(block_size) / 512) as usize;
+-        let disk = UsbDisk::new(sectors).ok_or(Error::NoMemory)?;
++        let disk = UsbDisk::new(sectors, &inquiry).ok_or(Error::NoMemory)?;
+         ostd::notice!(
+             "{}: {}: {} {} ({} MB, {}-byte blocks{})",
+             self.name, disk.name(), inquiry.vendor, inquiry.product, sectors / 2048, block_size,
+diff --git a/kernel/core/comps/block/src/lib.rs b/kernel/core/comps/block/src/lib.rs
+index 911648d..3d021d8 100644
+--- a/kernel/core/comps/block/src/lib.rs
++++ b/kernel/core/comps/block/src/lib.rs
+@@ -46,6 +46,7 @@ mod impl_block_device;
+ mod partition;
+ mod prelude;
+ pub mod request_queue;
++mod scsi_disk;
+ mod stats;
+ 
+ use ::device_id::DeviceId;
+@@ -59,6 +60,7 @@ use self::{
+ pub use self::{
+     device_id::{MAX_MAJOR, MajorIdOwner, acquire_major, allocate_major},
+     partition::PartitionManager,
++    scsi_disk::ScsiDiskIdentity,
+     stats::{IoStats, io_stats},
+ };
+ 
+@@ -98,6 +100,23 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
+     fn partition_manager(&self) -> Option<&PartitionManager> {
+         None
+     }
++
++    /// Whether its medium can be taken out (a card reader, most USB
++    /// sticks), as Linux's `/sys/block/<disk>/removable` says.
++    fn removable(&self) -> bool {
++        false
++    }
++
++    /// Its vendor, as Linux's `/sys/block/<disk>/device/vendor` says ("ATA"
++    /// for every SATA disk), where it has one.
++    fn vendor(&self) -> Option<&str> {
++        None
++    }
++
++    /// Its model, as Linux's `/sys/block/<disk>/device/model` says.
++    fn model(&self) -> Option<&str> {
++        None
++    }
+ }
+ 
+ /// Metadata for a block device.
+diff --git a/kernel/core/comps/block/src/scsi_disk.rs b/kernel/core/comps/block/src/scsi_disk.rs
+new file mode 100755
+index 0000000..f080636
+--- /dev/null
++++ b/kernel/core/comps/block/src/scsi_disk.rs
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The names and numbers of SCSI-style disks, which SATA and USB disks share
++//! as in Linux: `sda`, `sdb`, ... `sdz`, `sdaa`, ..., with major number 8
++//! (or another free one) and 16 minors each. A name freed by a disk that
++//! went away goes to the next disk, as Linux's lowest free index does.
++
++use alloc::{collections::BTreeSet, format};
++
++use device_id::{DeviceId, MajorId, MinorId};
++use ostd::sync::Mutex;
++use spin::Once;
++
++use crate::{DEVICE_MINORS, MajorIdOwner, acquire_major, allocate_major, prelude::*};
++
++/// Linux's SCSI disk major number.
++const SCSI_DISK_MAJOR: u16 = 8;
++
++static MAJOR: Once<Option<MajorIdOwner>> = Once::new();
++static TAKEN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
++
++/// A disk's name and numbers, held until it is released.
++#[derive(Debug)]
++pub struct ScsiDiskIdentity {
++    name: String,
++    id: DeviceId,
++    index: u32,
++}
++
++impl ScsiDiskIdentity {
++    /// The lowest free name (`sda` first) and its device numbers.
++    pub fn take() -> Option<Self> {
++        let major = MAJOR
++            .call_once(|| {
++                acquire_major(MajorId::new(SCSI_DISK_MAJOR))
++                    .or_else(|_| allocate_major())
++                    .ok()
++            })
++            .as_ref()?
++            .get();
++        let mut taken = TAKEN.lock();
++        let index = (0..).find(|index| !taken.contains(index))?;
++        let minor = index.checked_mul(DEVICE_MINORS)?;
++        if minor > 0xF_FFFF {
++            return None;
++        }
++        taken.insert(index);
++        Some(Self {
++            name: disk_name(index),
++            id: DeviceId::new(major, MinorId::new(minor)),
++            index,
++        })
++    }
++
++    pub fn name(&self) -> &str {
++        &self.name
++    }
++
++    pub fn id(&self) -> DeviceId {
++        self.id
++    }
++}
++
++impl Drop for ScsiDiskIdentity {
++    fn drop(&mut self) {
++        TAKEN.lock().remove(&self.index);
++    }
++}
++
++/// sda .. sdz, then sdaa, as Linux names them.
++fn disk_name(index: u32) -> String {
++    let mut letters = Vec::new();
++    let mut n = index + 1;
++    while n > 0 {
++        n -= 1;
++        letters.push(b'a' + (n % 26) as u8);
++        n /= 26;
++    }
++    letters.reverse();
++    format!("sd{}", String::from_utf8(letters).unwrap_or_default())
++}
+diff --git a/kernel/core/comps/pci/src/capability/mod.rs b/kernel/core/comps/pci/src/capability/mod.rs
+index 406134c..2cc90cf 100644
+--- a/kernel/core/comps/pci/src/capability/mod.rs
++++ b/kernel/core/comps/pci/src/capability/mod.rs
+@@ -9,6 +9,7 @@ use int_to_c_enum::TryFromInt;
+ use ostd::Result;
+ 
+ use self::{
++    msi::{CapabilityMsiData, RawCapabilityMsi},
+     msix::{CapabilityMsixData, RawCapabilityMsix},
+     vendor::{CapabilityVndrData, RawCapabilityVndr},
+ };
+@@ -18,12 +19,14 @@ use crate::{
+     common_device::{BarManager, PciCommonDevice},
+ };
+ 
++pub mod msi;
+ pub mod msix;
+ pub mod vendor;
+ 
+ /// Raw PCI Capabilities.
+ #[derive(Debug, Default)]
+ pub(super) struct RawCapabilities {
++    msi: Option<RawCapabilityMsi>,
+     msix: Option<RawCapabilityMsix>,
+     vndr: Vec<RawCapabilityVndr>,
+ }
+@@ -114,6 +117,11 @@ impl RawCapabilities {
+                 continue;
+             };
+             match cap_type {
++                CapabilityType::Msi => {
++                    if caps.msi.is_none() {
++                        caps.msi = Some(RawCapabilityMsi::parse(dev, cap_ptr));
++                    }
++                }
+                 CapabilityType::Msix => {
+                     // "More than one MSI-X Capability structure per Function is prohibited."
+                     if caps.msix.is_some() {
+@@ -136,6 +144,13 @@ impl RawCapabilities {
+         caps
+     }
+ 
++    /// Acquires a new [`CapabilityMsiData`] instance.
++    pub(super) fn acquire_msi_data(&self, loc: &PciDeviceLocation) -> Option<CapabilityMsiData> {
++        self.msi
++            .as_ref()
++            .map(|raw_msi| CapabilityMsiData::new(loc, raw_msi))
++    }
++
+     /// Acquires a new [`CapabilityMsixData`] instance.
+     pub(super) fn acquire_msix_data(
+         &self,
+diff --git a/kernel/core/comps/pci/src/capability/msi.rs b/kernel/core/comps/pci/src/capability/msi.rs
+new file mode 100755
+index 0000000..c946f8e
+--- /dev/null
++++ b/kernel/core/comps/pci/src/capability/msi.rs
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! MSI capability support: one message per function, for the devices that
++//! offer MSI but not MSI-X (most SATA controllers, HD Audio, many network
++//! controllers).
++
++use ostd::irq::IrqLine;
++
++use crate::{
++    PciDeviceLocation,
++    arch::{MSIX_DEFAULT_MSG_ADDR, construct_remappable_msix_address},
++    cfg_space::{Command, PciCommonCfgOffset},
++    common_device::PciCommonDevice,
++};
++
++/// Message Control: MSI Enable.
++const ENABLE: u16 = 1 << 0;
++/// Message Control: Multiple Message Enable (one message: 0).
++const MULTIPLE_MESSAGE_ENABLE: u16 = 0b111 << 4;
++/// Message Control: 64-bit Address Capable.
++const ADDRESS_64: u16 = 1 << 7;
++/// Message Control: Per-Vector Masking Capable.
++const PER_VECTOR_MASKING: u16 = 1 << 8;
++
++/// Raw information about the MSI capability.
++#[derive(Debug)]
++pub(super) struct RawCapabilityMsi {
++    cap_ptr: u16,
++    msg_ctrl: u16,
++}
++
++impl RawCapabilityMsi {
++    pub(super) fn parse(dev: &PciCommonDevice, cap_ptr: u16) -> Self {
++        Self {
++            cap_ptr,
++            msg_ctrl: dev.location().read16(cap_ptr + 2),
++        }
++    }
++}
++
++/// The MSI capability of a function.
++#[derive(Debug)]
++pub struct CapabilityMsiData {
++    loc: PciDeviceLocation,
++    ptr: u16,
++    msg_ctrl: u16,
++    irq: Option<IrqLine>,
++}
++
++impl CapabilityMsiData {
++    pub(super) fn new(loc: &PciDeviceLocation, raw_cap: &RawCapabilityMsi) -> Self {
++        Self {
++            loc: *loc,
++            ptr: raw_cap.cap_ptr,
++            msg_ctrl: raw_cap.msg_ctrl,
++            irq: None,
++        }
++    }
++
++    /// Sends the function's interrupts to `irq` and turns MSI on, and the
++    /// legacy INTx line off.
++    ///
++    /// If an interrupt line was set before, it is replaced.
++    pub fn set_interrupt_vector(&mut self, irq: IrqLine) {
++        let is_64bit = self.msg_ctrl & ADDRESS_64 != 0;
++        // With interrupt remapping, the message names the remapping entry
++        // and carries no vector; otherwise it is the vector itself.
++        let (address, data) = match irq.remapping_index() {
++            Some(index) => (construct_remappable_msix_address(index as u32), 0u16),
++            None => (MSIX_DEFAULT_MSG_ADDR, irq.num() as u16),
++        };
++
++        // Off while the message is written, with one message only.
++        let control = self.loc.read16(self.ptr + 2) & !(ENABLE | MULTIPLE_MESSAGE_ENABLE);
++        self.loc.write16(self.ptr + 2, control);
++        self.loc.write32(self.ptr + 4, address);
++        let data_offset = if is_64bit {
++            self.loc.write32(self.ptr + 8, 0);
++            12
++        } else {
++            8
++        };
++        self.loc.write16(self.ptr + data_offset, data);
++        if self.msg_ctrl & PER_VECTOR_MASKING != 0 {
++            let mask_offset = data_offset + 4;
++            let mask = self.loc.read32(self.ptr + mask_offset);
++            self.loc.write32(self.ptr + mask_offset, mask & !1);
++        }
++        self.irq = Some(irq);
++        self.loc.write16(self.ptr + 2, control | ENABLE);
++
++        // Disable INTx. Enable bus master.
++        self.loc.write16(
++            PciCommonCfgOffset::Command as u16,
++            self.loc.read16(PciCommonCfgOffset::Command as u16)
++                | (Command::INTERRUPT_DISABLE | Command::BUS_MASTER).bits(),
++        );
++    }
++
++    /// Returns a mutable reference to the [`IrqLine`], once set.
++    ///
++    /// Users can register callbacks using the returned [`IrqLine`] reference.
++    pub fn irq_mut(&mut self) -> Option<&mut IrqLine> {
++        self.irq.as_mut()
++    }
++
++    /// Returns true if the MSI Enable bit is set.
++    pub fn is_enabled(&self) -> bool {
++        self.loc.read16(self.ptr + 2) & ENABLE != 0
++    }
++}
+diff --git a/kernel/core/comps/pci/src/common_device.rs b/kernel/core/comps/pci/src/common_device.rs
+index ee678d8..8958dee 100644
+--- a/kernel/core/comps/pci/src/common_device.rs
++++ b/kernel/core/comps/pci/src/common_device.rs
+@@ -5,7 +5,10 @@
+ use ostd::Result;
+ 
+ use crate::{
+-    capability::{RawCapabilities, msix::CapabilityMsixData, vendor::CapabilityVndrData},
++    capability::{
++        RawCapabilities, msi::CapabilityMsiData, msix::CapabilityMsixData,
++        vendor::CapabilityVndrData,
++    },
+     cfg_space::{AddrLen, Bar, Command, PciBridgeCfgOffset, PciCommonCfgOffset, Status},
+     device_info::{PciDeviceId, PciDeviceLocation},
+ };
+@@ -69,6 +72,12 @@ impl PciCommonDevice {
+         Status::from_bits_truncate(self.location.read16(PciCommonCfgOffset::Status as u16))
+     }
+ 
++    /// Acquires the MSI capability data, if the capability exists (a device
++    /// without MSI-X may still signal through MSI, one message).
++    pub fn acquire_msi_capability(&mut self) -> Option<CapabilityMsiData> {
++        self.capabilities.acquire_msi_data(&self.location)
++    }
++
+     /// Acquires necessary resources to build the MSI-X capability data, if the capability exists.
+     ///
+     /// Note that the MSI-X capability data occupies some memory BARs. Therefore, it will fail if
+diff --git a/kernel/core/src/device/registry/block.rs b/kernel/core/src/device/registry/block.rs
+index bffb62d..0fc7154 100644
+--- a/kernel/core/src/device/registry/block.rs
++++ b/kernel/core/src/device/registry/block.rs
+@@ -80,6 +80,7 @@ fn add_node(device: &Arc<dyn BlockDevice>) -> Result<()> {
+     if !NODES.lock().insert(device.id().to_raw()) {
+         return Ok(());
+     }
++    crate::fs::sysfs::block::add_disk(device);
+     let file = BlockFile::new(device.clone());
+     if let Some(meta) = file.devtmpfs_meta() {
+         devtmpfs::create_node(DevtmpfsNode::new(file.type_(), file.id(), meta))?;
+@@ -98,6 +99,7 @@ fn device_changed(device: &Arc<dyn BlockDevice>, added: bool) {
+     let id = device.id();
+     DEVICE_REGISTRY.lock().remove(&id.to_raw());
+     if NODES.lock().remove(&id.to_raw()) {
++        crate::fs::sysfs::block::remove_disk(device);
+         let file = BlockFile::new(device.clone());
+         if let Some(meta) = file.devtmpfs_meta() {
+             let _ = devtmpfs::delete_node(DevtmpfsNode::new(file.type_(), id, meta));
+diff --git a/kernel/core/src/fs/fs_impls/sysfs/block.rs b/kernel/core/src/fs/fs_impls/sysfs/block.rs
+new file mode 100755
+index 0000000..0b8932a
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/sysfs/block.rs
+@@ -0,0 +1,206 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `/sys/block`: a directory for each disk (not its partitions), with what
++//! Linux tools and OpenShell's Drives read there:
++//!
++//! - `dev`: its numbers (`8:0`);
++//! - `size`: its size in 512-byte sectors;
++//! - `removable`: whether its medium can be taken out (a card reader, most
++//!   USB sticks);
++//! - `ro`: whether it is read-only (never, yet);
++//! - `device/vendor` and `device/model`: what the disk says of itself;
++//!   `ATA` is every SATA disk's vendor, as Linux's libata names it.
++
++use alloc::{format, string::String};
++
++use aster_block::BlockDevice;
++use aster_systree::{
++    BranchNodeFields, Error, Result, SysAttrSetBuilder, SysBranchNode, SysNode, SysPerms, SysStr,
++    inherit_sys_branch_node,
++};
++use aster_util::printer::VmPrinter;
++use inherit_methods_macro::inherit_methods;
++use ostd::mm::{VmReader, VmWriter};
++use spin::Once;
++
++use crate::prelude::*;
++
++static BLOCK_ROOT: Once<Arc<BlockRoot>> = Once::new();
++
++fn root() -> &'static Arc<BlockRoot> {
++    BLOCK_ROOT.call_once(|| {
++        let root = BlockRoot::new();
++        super::systree_singleton()
++            .root()
++            .add_child(root.clone())
++            .unwrap();
++        root
++    })
++}
++
++/// Gives a disk its `/sys/block/<name>` directory.
++pub(crate) fn add_disk(device: &Arc<dyn BlockDevice>) {
++    if device.is_partition() {
++        return;
++    }
++    let _ = root().add_child(DiskNode::new(device));
++}
++
++/// Takes a disk's directory away.
++pub(crate) fn remove_disk(device: &Arc<dyn BlockDevice>) {
++    if !device.is_partition() {
++        let _ = root().remove_child(device.name());
++    }
++}
++
++/// `/sys/block`.
++#[derive(Debug)]
++struct BlockRoot {
++    fields: BranchNodeFields<dyn SysNode, Self>,
++}
++
++#[inherit_methods(from = "self.fields")]
++impl BlockRoot {
++    fn new() -> Arc<Self> {
++        let attrs = SysAttrSetBuilder::new()
++            .build()
++            .expect("Failed to build the /sys/block attribute set");
++        Arc::new_cyclic(|weak_self| BlockRoot {
++            fields: BranchNodeFields::new(SysStr::from("block"), attrs, weak_self.clone()),
++        })
++    }
++
++    fn add_child(&self, new_child: Arc<dyn SysNode>) -> Result<()>;
++    fn remove_child(&self, child_name: &str) -> Result<Arc<dyn SysNode>>;
++}
++
++inherit_sys_branch_node!(BlockRoot, fields, {
++    fn read_attr_at(&self, _name: &str, _offset: usize, _writer: &mut VmWriter) -> Result<usize> {
++        Err(Error::AttributeError)
++    }
++
++    fn write_attr(&self, _name: &str, _reader: &mut VmReader) -> Result<usize> {
++        Err(Error::AttributeError)
++    }
++
++    fn perms(&self) -> SysPerms {
++        SysPerms::DEFAULT_RO_PERMS
++    }
++});
++
++fn read_only_attrs(names: &[&'static str]) -> aster_systree::SysAttrSet {
++    let mut builder = SysAttrSetBuilder::new();
++    for name in names {
++        builder.add(SysStr::from(*name), SysPerms::DEFAULT_RO_ATTR_PERMS);
++    }
++    builder
++        .build()
++        .expect("Failed to build a disk's attribute set")
++}
++
++fn print(text: &str, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++    let mut printer = VmPrinter::new_skip(writer, offset);
++    writeln!(printer, "{}", text)?;
++    Ok(printer.bytes_written())
++}
++
++/// `/sys/block/<disk>`.
++#[derive(Debug)]
++struct DiskNode {
++    fields: BranchNodeFields<dyn SysNode, Self>,
++    device: Weak<dyn BlockDevice>,
++    dev: String,
++    removable: bool,
++}
++
++#[inherit_methods(from = "self.fields")]
++impl DiskNode {
++    fn new(device: &Arc<dyn BlockDevice>) -> Arc<Self> {
++        let id = device.id();
++        let node = Arc::new_cyclic(|weak_self| DiskNode {
++            fields: BranchNodeFields::new(
++                SysStr::from(String::from(device.name())),
++                read_only_attrs(&["dev", "size", "removable", "ro"]),
++                weak_self.clone(),
++            ),
++            device: Arc::downgrade(device),
++            dev: format!("{}:{}", id.major().get(), id.minor().get()),
++            removable: device.removable(),
++        });
++        let about = DeviceNode::new(
++            device.vendor().unwrap_or("").into(),
++            device.model().unwrap_or("").into(),
++        );
++        let _ = node.add_child(about);
++        node
++    }
++
++    fn add_child(&self, new_child: Arc<dyn SysNode>) -> Result<()>;
++}
++
++inherit_sys_branch_node!(DiskNode, fields, {
++    fn read_attr_at(&self, name: &str, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        match name {
++            "dev" => print(&self.dev, offset, writer),
++            "size" => {
++                let sectors = self
++                    .device
++                    .upgrade()
++                    .map_or(0, |device| device.metadata().nr_sectors);
++                print(&format!("{}", sectors), offset, writer)
++            }
++            "removable" => print(if self.removable { "1" } else { "0" }, offset, writer),
++            "ro" => print("0", offset, writer),
++            _ => Err(Error::AttributeError),
++        }
++    }
++
++    fn write_attr(&self, _name: &str, _reader: &mut VmReader) -> Result<usize> {
++        Err(Error::AttributeError)
++    }
++
++    fn perms(&self) -> SysPerms {
++        SysPerms::DEFAULT_RO_PERMS
++    }
++});
++
++/// `/sys/block/<disk>/device`.
++#[derive(Debug)]
++struct DeviceNode {
++    fields: BranchNodeFields<dyn SysNode, Self>,
++    vendor: String,
++    model: String,
++}
++
++#[inherit_methods(from = "self.fields")]
++impl DeviceNode {
++    fn new(vendor: String, model: String) -> Arc<Self> {
++        Arc::new_cyclic(|weak_self| DeviceNode {
++            fields: BranchNodeFields::new(
++                SysStr::from("device"),
++                read_only_attrs(&["vendor", "model"]),
++                weak_self.clone(),
++            ),
++            vendor,
++            model,
++        })
++    }
++}
++
++inherit_sys_branch_node!(DeviceNode, fields, {
++    fn read_attr_at(&self, name: &str, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        match name {
++            "vendor" => print(&self.vendor, offset, writer),
++            "model" => print(&self.model, offset, writer),
++            _ => Err(Error::AttributeError),
++        }
++    }
++
++    fn write_attr(&self, _name: &str, _reader: &mut VmReader) -> Result<usize> {
++        Err(Error::AttributeError)
++    }
++
++    fn perms(&self) -> SysPerms {
++        SysPerms::DEFAULT_RO_PERMS
++    }
++});
+diff --git a/kernel/core/src/fs/fs_impls/sysfs/mod.rs b/kernel/core/src/fs/fs_impls/sysfs/mod.rs
+index 9e5051b..66a634c 100644
+--- a/kernel/core/src/fs/fs_impls/sysfs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/sysfs/mod.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++pub(crate) mod block;
+ mod fs;
+ mod inode;
+ mod kernel;
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 48a1674..533fad0 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -20,6 +20,7 @@ extern crate aster_i8042 as _;
+ extern crate aster_simpledrm as _;
+ extern crate aster_uart as _;
+ extern crate aster_usb as _;
++extern crate aster_ahci as _;
+ extern crate aster_ethernet as _;
+ 
+ #[ostd::main]

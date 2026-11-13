@@ -48,6 +48,7 @@
 #include "include/views/cef_window.h"
 #include "include/wrapper/cef_closure_task.h"
 #include "browser_features.h"
+#include "input_state.h"
 #include "session.h"
 #include "startup.h"
 
@@ -715,6 +716,30 @@ class BrowserClient final : public CefClient,
         }
       }
     }
+  }
+
+  // Hints (an element's title). Chromium's own box follows no theme: the
+  // Desktop draws its own hints in the theme's colours (themedTooltips.ts in
+  // the OpenShell repository), and a page's hint with them, where the
+  // pointer is (an empty text hides it). The probes' pages keep Chromium's.
+  bool OnTooltip(CefRefPtr<CefBrowser>, CefString& text) override {
+    if (IsDesktop()) {
+      return true;
+    }
+    if (!IsTab()) {
+      return false;
+    }
+    auto event = TabEvent(tab_, "tooltip");
+    event->SetString("text", text);
+    int x = 0;
+    int y = 0;
+    if (!text.empty() && session_->window && PointerOnScreen(x, y)) {
+      const auto origin = session_->window->GetClientAreaBoundsInScreen();
+      event->SetInt("x", x - origin.x);
+      event->SetInt("y", y - origin.y);
+    }
+    Emit(*session_, event);
+    return true;
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {

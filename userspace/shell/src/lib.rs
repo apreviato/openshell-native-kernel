@@ -1,5 +1,6 @@
 pub mod authproto;
 mod cef;
+pub mod drives;
 pub mod install;
 pub mod login;
 pub mod power;

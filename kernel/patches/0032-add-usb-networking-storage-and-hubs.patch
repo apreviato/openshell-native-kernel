@@ -1,0 +1,3597 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0dd5915..4b27dbe 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -447,10 +447,16 @@ dependencies = [
+ name = "aster-usb"
+ version = "0.1.0"
+ dependencies = [
++ "aster-bigtcp",
++ "aster-block",
++ "aster-cmdline",
+  "aster-core",
+  "aster-input",
++ "aster-network",
+  "aster-pci",
++ "aster-softirq",
+  "component",
++ "device-id",
+  "ostd",
+  "spin",
+ ]
+diff --git a/kernel/comps/usb/Cargo.toml b/kernel/comps/usb/Cargo.toml
+index 3f28bd3..3645631 100755
+--- a/kernel/comps/usb/Cargo.toml
++++ b/kernel/comps/usb/Cargo.toml
+@@ -4,10 +4,16 @@ version = "0.1.0"
+ edition.workspace = true
+ 
+ [dependencies]
++aster-bigtcp.workspace = true
++aster-block.workspace = true
++aster-cmdline.workspace = true
+ aster-core.workspace = true
++aster-network.workspace = true
++aster-softirq.workspace = true
+ aster-input.workspace = true
+ aster-pci.workspace = true
+ component.workspace = true
++device-id.workspace = true
+ ostd.workspace = true
+ spin.workspace = true
+ 
+diff --git a/kernel/comps/usb/src/desc.rs b/kernel/comps/usb/src/desc.rs
+index fae035b..448e39e 100755
+--- a/kernel/comps/usb/src/desc.rs
++++ b/kernel/comps/usb/src/desc.rs
+@@ -8,13 +8,13 @@
+ use alloc::vec::Vec;
+ 
+ pub(crate) mod kind {
+-    pub const DEVICE: u8 = 1;
+-    pub const CONFIGURATION: u8 = 2;
+-    pub const INTERFACE: u8 = 4;
+-    pub const ENDPOINT: u8 = 5;
+-    pub const HID: u8 = 0x21;
+-    pub const HID_REPORT: u8 = 0x22;
+-    pub const SS_ENDPOINT_COMPANION: u8 = 0x30;
++    pub(crate) const DEVICE: u8 = 1;
++    pub(crate) const CONFIGURATION: u8 = 2;
++    pub(crate) const INTERFACE: u8 = 4;
++    pub(crate) const ENDPOINT: u8 = 5;
++    pub(crate) const HID: u8 = 0x21;
++    pub(crate) const HID_REPORT: u8 = 0x22;
++    pub(crate) const SS_ENDPOINT_COMPANION: u8 = 0x30;
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -89,6 +89,20 @@ pub(crate) struct Interface {
+     pub endpoints: Vec<Endpoint>,
+     /// The HID report descriptor's length, for a HID interface.
+     pub hid_report_length: Option<u16>,
++    /// Its class-specific descriptors (CDC's functional descriptors), whole.
++    pub class_descriptors: Vec<Vec<u8>>,
++}
++
++pub(crate) const CS_INTERFACE: u8 = 0x24;
++
++impl Interface {
++    /// A CDC functional descriptor of this subtype.
++    pub(crate) fn functional(&self, subtype: u8) -> Option<&[u8]> {
++        self.class_descriptors
++            .iter()
++            .find(|d| d.len() >= 3 && d[1] == CS_INTERFACE && d[2] == subtype)
++            .map(Vec::as_slice)
++    }
+ }
+ 
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+@@ -120,7 +134,13 @@ pub(crate) fn parse_configuration(b: &[u8]) -> Option<Configuration> {
+                 protocol: d[7],
+                 endpoints: Vec::new(),
+                 hid_report_length: None,
++                class_descriptors: Vec::new(),
+             }),
++            CS_INTERFACE => {
++                if let Some(interface) = configuration.interfaces.last_mut() {
++                    interface.class_descriptors.push(d.to_vec());
++                }
++            }
+             kind::ENDPOINT if length >= 7 => {
+                 if let Some(interface) = configuration.interfaces.last_mut() {
+                     interface.endpoints.push(Endpoint {
+diff --git a/kernel/comps/usb/src/disk.rs b/kernel/comps/usb/src/disk.rs
+new file mode 100755
+index 0000000..31f059b
+--- /dev/null
++++ b/kernel/comps/usb/src/disk.rs
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A USB disk (a pendrive, an external disk, a card in a reader) as the
++//! kernel's block device `sda`, `sdb`, ...: its requests wait in a queue
++//! that the controller's thread serves (`crate::xhci`), moving the data
++//! straight between the device and the requests' memory.
++
++use alloc::{collections::VecDeque, string::String, sync::Arc};
++use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++
++use aster_block::{
++    BlockDevice, BlockDeviceMeta, MajorIdOwner, PartitionManager,
++    bio::{BioEnqueueError, BioStatus, SubmittedBio},
++};
++use device_id::{DeviceId, MajorId, MinorId};
++use ostd::sync::{LocalIrqDisabled, SpinLock};
++use spin::Once;
++
++const SCSI_DISK_MAJOR: u16 = 8;
++static MAJOR: Once<Option<MajorIdOwner>> = Once::new();
++static NEXT_INDEX: AtomicU32 = AtomicU32::new(0);
++
++pub(crate) struct UsbDisk {
++    name: String,
++    id: DeviceId,
++    sectors: usize,
++    pub(crate) queue: SpinLock<VecDeque<SubmittedBio>, LocalIrqDisabled>,
++    partitions: PartitionManager,
++    /// Unplugged: requests fail at once.
++    gone: AtomicBool,
++}
++
++impl core::fmt::Debug for UsbDisk {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("UsbDisk").field("name", &self.name).field("sectors", &self.sectors).finish()
++    }
++}
++
++impl UsbDisk {
++    /// A disk of `sectors` 512-byte sectors, with the next name (sda, sdb, ...).
++    pub(crate) fn new(sectors: usize) -> Option<Arc<Self>> {
++        // SCSI disks' major number on Linux (8), or any free one.
++        let major = MAJOR
++            .call_once(|| aster_block::acquire_major(MajorId::new(SCSI_DISK_MAJOR)).or_else(|_| aster_block::allocate_major()).ok())
++            .as_ref()?
++            .get();
++        let index = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
++        let name = disk_name(index);
++        Some(Arc::new(Self {
++            name,
++            id: DeviceId::new(major, MinorId::new(index * aster_block::DEVICE_MINORS)),
++            sectors,
++            queue: SpinLock::new(VecDeque::new()),
++            partitions: PartitionManager::new(),
++            gone: AtomicBool::new(false),
++        }))
++    }
++
++    pub(crate) fn name(&self) -> &str {
++        &self.name
++    }
++
++    /// The disk was unplugged: what waits fails, and it leaves the system
++    /// with its partitions.
++    pub(crate) fn remove(self: &Arc<Self>) {
++        self.gone.store(true, Ordering::Release);
++        while let Some(bio) = self.queue.lock().pop_front() {
++            bio.complete(BioStatus::IoError);
++        }
++        self.partitions.remove_all();
++        let _ = aster_block::unregister(self.id);
++    }
++}
++
++/// sda .. sdz, then sdaa, as Linux names them.
++fn disk_name(index: u32) -> String {
++    let mut letters = alloc::vec::Vec::new();
++    let mut n = index + 1;
++    while n > 0 {
++        n -= 1;
++        letters.push(b'a' + (n % 26) as u8);
++        n /= 26;
++    }
++    letters.reverse();
++    alloc::format!("sd{}", String::from_utf8(letters).unwrap_or_default())
++}
++
++impl BlockDevice for UsbDisk {
++    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
++        if self.gone.load(Ordering::Acquire) {
++            bio.complete(BioStatus::IoError);
++            return Ok(());
++        }
++        self.queue.lock().push_back(bio);
++        crate::wake();
++        Ok(())
++    }
++
++    fn metadata(&self) -> BlockDeviceMeta {
++        BlockDeviceMeta { max_nr_segments_per_bio: 64, nr_sectors: self.sectors }
++    }
++
++    fn name(&self) -> &str {
++        &self.name
++    }
++
++    fn id(&self) -> DeviceId {
++        self.id
++    }
++
++    fn partition_manager(&self) -> Option<&PartitionManager> {
++        Some(&self.partitions)
++    }
++}
+diff --git a/kernel/comps/usb/src/lib.rs b/kernel/comps/usb/src/lib.rs
+index 3b8b151..4c2db45 100755
+--- a/kernel/comps/usb/src/lib.rs
++++ b/kernel/comps/usb/src/lib.rs
+@@ -20,9 +20,13 @@ macro_rules! __log_prefix {
+ }
+ 
+ mod desc;
++mod disk;
+ mod hid;
+ mod input;
++mod netframe;
+ mod ring;
++mod scsi;
++mod usbnet;
+ mod xhci;
+ 
+ use alloc::{format, string::String, sync::Arc, vec::Vec};
+@@ -51,11 +55,19 @@ pub(crate) static BUSY: AtomicUsize = AtomicUsize::new(0);
+ static INTERRUPTS: AtomicBool = AtomicBool::new(true);
+ static TICKS: AtomicU64 = AtomicU64::new(0);
+ 
++/// `usb.net=rndis`: a device's RNDIS configuration over its CDC one.
++static USB_NET: spin::Once<String> = spin::Once::new();
++aster_cmdline::define_kv_param!("usb.net", USB_NET);
++
++pub(crate) fn prefer_rndis() -> bool {
++    USB_NET.get().is_some_and(|value| value == "rndis")
++}
++
+ pub(crate) fn now_ms() -> u64 {
+     Jiffies::elapsed().as_duration().as_millis() as u64
+ }
+ 
+-fn wake() {
++pub(crate) fn wake() {
+     WOKEN.store(true, Ordering::Release);
+     WAKE.wake_all();
+ }
+diff --git a/kernel/comps/usb/src/netframe.rs b/kernel/comps/usb/src/netframe.rs
+new file mode 100755
+index 0000000..13b02ca
+--- /dev/null
++++ b/kernel/comps/usb/src/netframe.rs
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! How USB network devices carry Ethernet frames, whoever makes them:
++//!
++//! - CDC-ECM (USB-Ethernet adapters, iPhones and Macs sharing their network):
++//!   one frame per transfer, as it is.
++//! - CDC-NCM (recent Android phones, fast adapters): transfer blocks (NTB16)
++//!   of datagrams with their pointer tables.
++//! - RNDIS (Android tethering, Windows-era devices): each frame after a
++//!   44-byte message header; control messages on the default endpoint.
++//!
++//! No hardware access: its tests run on the host.
++//!
++//! References: USB CDC ECM 1.2, CDC NCM 1.0, Microsoft RNDIS 1.0 (and
++//! Linux's `cdc_ether.c`, `cdc_ncm.c`, `rndis_host.c`).
++
++use alloc::vec::Vec;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Framing {
++    Ecm,
++    Ncm,
++    Rndis,
++}
++
++const NTH16_SIGNATURE: &[u8; 4] = b"NCMH";
++const NDP16_SIGNATURE: &[u8; 4] = b"NCM0";
++const NDP16_CRC_SIGNATURE: &[u8; 4] = b"NCM1";
++/// Where a sent datagram starts in its block.
++const NCM_DATAGRAM_OFFSET: usize = 32;
++
++const RNDIS_PACKET_MSG: u32 = 1;
++const RNDIS_INITIALIZE_MSG: u32 = 2;
++const RNDIS_QUERY_MSG: u32 = 4;
++const RNDIS_SET_MSG: u32 = 5;
++pub(crate) const RNDIS_PACKET_HEADER: usize = 44;
++/// What the device may put in one transfer to us: a receive buffer.
++pub(crate) const RNDIS_MAX_TRANSFER: u32 = 0x1000;
++pub(crate) const OID_802_3_PERMANENT_ADDRESS: u32 = 0x0101_0101;
++pub(crate) const OID_GEN_CURRENT_PACKET_FILTER: u32 = 0x0001_010e;
++/// Directed, multicast, all multicast and broadcast frames.
++pub(crate) const RNDIS_PACKET_FILTER: u32 = 0x0000_000f;
++
++fn u16_at(b: &[u8], at: usize) -> Option<u16> {
++    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
++}
++
++fn u32_at(b: &[u8], at: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
++}
++
++fn push32(out: &mut Vec<u8>, value: u32) {
++    out.extend_from_slice(&value.to_le_bytes());
++}
++
++fn push16(out: &mut Vec<u8>, value: u16) {
++    out.extend_from_slice(&value.to_le_bytes());
++}
++
++/// A frame as a transfer to the device; `sequence` numbers NCM's blocks.
++pub(crate) fn wrap(framing: Framing, frame: &[u8], sequence: u16) -> Vec<u8> {
++    match framing {
++        Framing::Ecm => frame.to_vec(),
++        Framing::Rndis => {
++            let mut out = Vec::with_capacity(RNDIS_PACKET_HEADER + frame.len());
++            push32(&mut out, RNDIS_PACKET_MSG);
++            push32(&mut out, (RNDIS_PACKET_HEADER + frame.len()) as u32);
++            // The data's offset counts from the offset field itself.
++            push32(&mut out, (RNDIS_PACKET_HEADER - 8) as u32);
++            push32(&mut out, frame.len() as u32);
++            out.resize(RNDIS_PACKET_HEADER, 0);
++            out.extend_from_slice(frame);
++            out
++        }
++        Framing::Ncm => {
++            let total = NCM_DATAGRAM_OFFSET + frame.len();
++            let mut out = Vec::with_capacity(total);
++            out.extend_from_slice(NTH16_SIGNATURE);
++            push16(&mut out, 12);
++            push16(&mut out, sequence);
++            push16(&mut out, total as u16);
++            push16(&mut out, 12);
++            // One datagram, then the table's end.
++            out.extend_from_slice(NDP16_SIGNATURE);
++            push16(&mut out, 16);
++            push16(&mut out, 0);
++            push16(&mut out, NCM_DATAGRAM_OFFSET as u16);
++            push16(&mut out, frame.len() as u16);
++            push16(&mut out, 0);
++            push16(&mut out, 0);
++            out.resize(NCM_DATAGRAM_OFFSET, 0);
++            out.extend_from_slice(frame);
++            out
++        }
++    }
++}
++
++/// The frames of a transfer from the device.
++pub(crate) fn unwrap(framing: Framing, transfer: &[u8]) -> Vec<Vec<u8>> {
++    let mut frames = Vec::new();
++    match framing {
++        Framing::Ecm => {
++            if transfer.len() >= 14 {
++                frames.push(transfer.to_vec());
++            }
++        }
++        Framing::Rndis => {
++            // Several messages may share a transfer.
++            let mut at = 0;
++            while let (Some(kind), Some(length)) = (u32_at(transfer, at), u32_at(transfer, at + 4)) {
++                let length = length as usize;
++                if kind != RNDIS_PACKET_MSG || length < RNDIS_PACKET_HEADER || at + length > transfer.len() {
++                    break;
++                }
++                if let (Some(offset), Some(data)) = (u32_at(transfer, at + 8), u32_at(transfer, at + 12)) {
++                    let start = at + 8 + offset as usize;
++                    if let Some(frame) = transfer.get(start..start + data as usize) {
++                        frames.push(frame.to_vec());
++                    }
++                }
++                at += length;
++            }
++        }
++        Framing::Ncm => {
++            if transfer.get(..4) != Some(NTH16_SIGNATURE) {
++                return frames;
++            }
++            let block = usize::from(u16_at(transfer, 8).unwrap_or(0)).min(transfer.len());
++            let block = if block == 0 { transfer.len() } else { block };
++            let mut ndp = usize::from(u16_at(transfer, 10).unwrap_or(0));
++            let mut tables = 0;
++            while ndp != 0 && ndp + 8 <= block && tables < 32 {
++                tables += 1;
++                let signature = transfer.get(ndp..ndp + 4);
++                if signature != Some(NDP16_SIGNATURE) && signature != Some(NDP16_CRC_SIGNATURE) {
++                    break;
++                }
++                let length = usize::from(u16_at(transfer, ndp + 4).unwrap_or(0));
++                let mut entry = ndp + 8;
++                while entry + 4 <= (ndp + length).min(block) {
++                    let index = usize::from(u16_at(transfer, entry).unwrap_or(0));
++                    let size = usize::from(u16_at(transfer, entry + 2).unwrap_or(0));
++                    if index == 0 || size == 0 {
++                        break;
++                    }
++                    if let Some(frame) = transfer.get(index..index + size).filter(|_| index + size <= block) {
++                        frames.push(frame.to_vec());
++                    }
++                    entry += 4;
++                }
++                ndp = usize::from(u16_at(transfer, ndp + 6).unwrap_or(0));
++            }
++        }
++    }
++    frames
++}
++
++pub(crate) fn rndis_initialize(request: u32) -> Vec<u8> {
++    let mut out = Vec::new();
++    for value in [RNDIS_INITIALIZE_MSG, 24, request, 1, 0, RNDIS_MAX_TRANSFER] {
++        push32(&mut out, value);
++    }
++    out
++}
++
++/// The information buffer a query carries, as Linux's `rndis_query` sends
++/// it: devices reject a query without one.
++const RNDIS_QUERY_BUFFER: u32 = 48;
++
++pub(crate) fn rndis_query(request: u32, oid: u32) -> Vec<u8> {
++    let mut out = Vec::new();
++    for value in [RNDIS_QUERY_MSG, 28 + RNDIS_QUERY_BUFFER, request, oid, RNDIS_QUERY_BUFFER, 20, 0] {
++        push32(&mut out, value);
++    }
++    out.resize(28 + RNDIS_QUERY_BUFFER as usize, 0);
++    out
++}
++
++pub(crate) fn rndis_set(request: u32, oid: u32, value: u32) -> Vec<u8> {
++    let mut out = Vec::new();
++    for field in [RNDIS_SET_MSG, 32, request, oid, 4, 20, 0, value] {
++        push32(&mut out, field);
++    }
++    out
++}
++
++/// A completion: its request ID, status and information.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct RndisReply {
++    pub kind: u32,
++    pub request: u32,
++    pub status: u32,
++    pub information: Vec<u8>,
++}
++
++pub(crate) fn rndis_reply(b: &[u8]) -> Option<RndisReply> {
++    let kind = u32_at(b, 0)?;
++    if kind & 0x8000_0000 == 0 {
++        return None;
++    }
++    let mut reply = RndisReply { kind, request: u32_at(b, 8)?, status: u32_at(b, 12)?, information: Vec::new() };
++    // A query's completion carries the information buffer (its offset from the request ID).
++    if kind == 0x8000_0000 | RNDIS_QUERY_MSG {
++        let length = u32_at(b, 16)? as usize;
++        let offset = 8 + u32_at(b, 20)? as usize;
++        reply.information = b.get(offset..offset + length)?.to_vec();
++    }
++    Some(reply)
++}
++
++/// The MAC address in a string descriptor (CDC's iMACAddress: twelve hex digits).
++pub(crate) fn mac_from_string(descriptor: &[u8]) -> Option<[u8; 6]> {
++    let units: Vec<u8> = descriptor.get(2..)?.chunks_exact(2).map(|unit| unit[0]).collect();
++    if units.len() < 12 {
++        return None;
++    }
++    let digit = |c: u8| (c as char).to_digit(16);
++    let mut mac = [0u8; 6];
++    for (index, byte) in mac.iter_mut().enumerate() {
++        *byte = (digit(units[index * 2])? << 4 | digit(units[index * 2 + 1])?) as u8;
++    }
++    Some(mac)
++}
+diff --git a/kernel/comps/usb/src/ring.rs b/kernel/comps/usb/src/ring.rs
+index 92f90b3..14237e7 100755
+--- a/kernel/comps/usb/src/ring.rs
++++ b/kernel/comps/usb/src/ring.rs
+@@ -21,21 +21,22 @@ pub(crate) const TRB_SIZE: usize = 16;
+ pub(crate) const RING_TRBS: usize = 256;
+ 
+ pub(crate) mod trb_type {
+-    pub const NORMAL: u32 = 1;
+-    pub const SETUP: u32 = 2;
+-    pub const DATA: u32 = 3;
+-    pub const STATUS: u32 = 4;
+-    pub const LINK: u32 = 6;
+-    pub const ENABLE_SLOT: u32 = 9;
+-    pub const DISABLE_SLOT: u32 = 10;
+-    pub const ADDRESS_DEVICE: u32 = 11;
+-    pub const CONFIGURE_ENDPOINT: u32 = 12;
+-    pub const EVALUATE_CONTEXT: u32 = 13;
+-    pub const RESET_ENDPOINT: u32 = 14;
+-    pub const SET_TR_DEQUEUE: u32 = 16;
+-    pub const TRANSFER_EVENT: u32 = 32;
+-    pub const COMMAND_COMPLETION: u32 = 33;
+-    pub const PORT_STATUS_CHANGE: u32 = 34;
++    pub(crate) const NORMAL: u32 = 1;
++    pub(crate) const SETUP: u32 = 2;
++    pub(crate) const DATA: u32 = 3;
++    pub(crate) const STATUS: u32 = 4;
++    pub(crate) const LINK: u32 = 6;
++    pub(crate) const ENABLE_SLOT: u32 = 9;
++    pub(crate) const DISABLE_SLOT: u32 = 10;
++    pub(crate) const ADDRESS_DEVICE: u32 = 11;
++    pub(crate) const CONFIGURE_ENDPOINT: u32 = 12;
++    pub(crate) const EVALUATE_CONTEXT: u32 = 13;
++    pub(crate) const RESET_ENDPOINT: u32 = 14;
++    pub(crate) const STOP_ENDPOINT: u32 = 15;
++    pub(crate) const SET_TR_DEQUEUE: u32 = 16;
++    pub(crate) const TRANSFER_EVENT: u32 = 32;
++    pub(crate) const COMMAND_COMPLETION: u32 = 33;
++    pub(crate) const PORT_STATUS_CHANGE: u32 = 34;
+ }
+ 
+ pub(crate) const CYCLE: u32 = 1 << 0;
+@@ -43,6 +44,8 @@ pub(crate) const CYCLE: u32 = 1 << 0;
+ const TOGGLE_CYCLE: u32 = 1 << 1;
+ /// Interrupt on short packet.
+ pub(crate) const ISP: u32 = 1 << 2;
++/// The next TRB belongs to the same transfer.
++pub(crate) const CHAIN: u32 = 1 << 4;
+ /// Interrupt on completion.
+ pub(crate) const IOC: u32 = 1 << 5;
+ /// Immediate data (a setup packet in the TRB itself).
+@@ -125,9 +128,10 @@ impl ProducerRing {
+         write_trb(&self.dma, self.enqueue, trb);
+         self.enqueue += 1;
+         if self.enqueue == RING_TRBS - 1 {
+-            // Hand the link TRB over with the current cycle, then wrap.
++            // Hand the link TRB over with the current cycle, then wrap. Inside
++            // a chained transfer, the link is part of it (xHCI 1.2, 4.11.5.1).
+             let mut link = read_trb(&self.dma, RING_TRBS - 1);
+-            link.control = (link.control & !CYCLE) | u32::from(self.cycle);
++            link.control = (link.control & !(CYCLE | CHAIN)) | u32::from(self.cycle) | (trb.control & CHAIN);
+             write_trb(&self.dma, RING_TRBS - 1, link);
+             self.enqueue = 0;
+             self.cycle = !self.cycle;
+diff --git a/kernel/comps/usb/src/scsi.rs b/kernel/comps/usb/src/scsi.rs
+new file mode 100755
+index 0000000..0d8b939
+--- /dev/null
++++ b/kernel/comps/usb/src/scsi.rs
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! USB mass storage's Bulk-Only Transport and the SCSI commands a disk, a
++//! pendrive or a card reader answers: their wrappers and replies, without
++//! hardware access (its tests run on the host).
++//!
++//! References: USB Mass Storage Class Bulk-Only Transport 1.0; SCSI Primary
++//! Commands (SPC-4) and Block Commands (SBC-3); Linux's `drivers/usb/storage`.
++
++use alloc::{string::String, vec::Vec};
++
++pub(crate) const CBW_LENGTH: usize = 31;
++pub(crate) const CSW_LENGTH: usize = 13;
++const CBW_SIGNATURE: u32 = 0x4342_5355;
++const CSW_SIGNATURE: u32 = 0x5342_5355;
++
++pub(crate) mod op {
++    pub(crate) const TEST_UNIT_READY: u8 = 0x00;
++    pub(crate) const REQUEST_SENSE: u8 = 0x03;
++    pub(crate) const INQUIRY: u8 = 0x12;
++    pub(crate) const START_STOP_UNIT: u8 = 0x1b;
++    pub(crate) const READ_CAPACITY_10: u8 = 0x25;
++    pub(crate) const READ_10: u8 = 0x28;
++    pub(crate) const WRITE_10: u8 = 0x2a;
++    pub(crate) const SYNCHRONIZE_CACHE_10: u8 = 0x35;
++    pub(crate) const READ_16: u8 = 0x88;
++    pub(crate) const WRITE_16: u8 = 0x8a;
++    pub(crate) const SERVICE_ACTION_IN_16: u8 = 0x9e;
++    pub(crate) const READ_CAPACITY_16: u8 = 0x10;
++}
++
++/// A Command Block Wrapper.
++pub(crate) fn cbw(tag: u32, length: u32, inward: bool, lun: u8, cdb: &[u8]) -> [u8; CBW_LENGTH] {
++    let mut wrapper = [0u8; CBW_LENGTH];
++    wrapper[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
++    wrapper[4..8].copy_from_slice(&tag.to_le_bytes());
++    wrapper[8..12].copy_from_slice(&length.to_le_bytes());
++    wrapper[12] = if inward { 0x80 } else { 0 };
++    wrapper[13] = lun & 0x0f;
++    let length = cdb.len().min(16);
++    wrapper[14] = length as u8;
++    wrapper[15..15 + length].copy_from_slice(&cdb[..length]);
++    wrapper
++}
++
++/// A Command Status Wrapper: its residue and status (0 passed, 1 failed,
++/// 2 phase error), if it is one and answers `tag`.
++pub(crate) fn csw(status: &[u8], tag: u32) -> Option<(u32, u8)> {
++    if status.len() < CSW_LENGTH
++        || u32::from_le_bytes(status[0..4].try_into().ok()?) != CSW_SIGNATURE
++        || u32::from_le_bytes(status[4..8].try_into().ok()?) != tag
++    {
++        return None;
++    }
++    Some((u32::from_le_bytes(status[8..12].try_into().ok()?), status[12]))
++}
++
++pub(crate) fn inquiry() -> [u8; 6] {
++    [op::INQUIRY, 0, 0, 0, 36, 0]
++}
++
++/// What INQUIRY says: a disk (direct access, or the simplified one of some
++/// card readers), whether removable, and its names.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct Inquiry {
++    pub disk: bool,
++    pub removable: bool,
++    pub vendor: String,
++    pub product: String,
++}
++
++pub(crate) fn parse_inquiry(data: &[u8]) -> Option<Inquiry> {
++    if data.len() < 32 {
++        return None;
++    }
++    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().into();
++    Some(Inquiry {
++        disk: matches!(data[0] & 0x1f, 0x00 | 0x0e) && data[0] >> 5 == 0,
++        removable: data[1] & 0x80 != 0,
++        vendor: text(&data[8..16]),
++        product: text(&data[16..32]),
++    })
++}
++
++pub(crate) fn test_unit_ready() -> [u8; 6] {
++    [op::TEST_UNIT_READY, 0, 0, 0, 0, 0]
++}
++
++pub(crate) fn request_sense() -> [u8; 6] {
++    [op::REQUEST_SENSE, 0, 0, 0, 18, 0]
++}
++
++/// A fixed-format sense: key, additional sense code and qualifier.
++pub(crate) fn parse_sense(data: &[u8]) -> Option<(u8, u8, u8)> {
++    if data.len() < 14 || data[0] & 0x7e != 0x70 {
++        return None;
++    }
++    Some((data[2] & 0x0f, data[12], data[13]))
++}
++
++/// No medium in the drive (a card reader without a card).
++pub(crate) fn no_medium(sense: (u8, u8, u8)) -> bool {
++    sense.0 == 0x02 && sense.1 == 0x3a
++}
++
++/// START STOP UNIT: spin a disk up (or down), for the ones that wait to be told.
++pub(crate) fn start_stop_unit(start: bool) -> [u8; 6] {
++    [op::START_STOP_UNIT, 0, 0, 0, u8::from(start), 0]
++}
++
++pub(crate) fn read_capacity_10() -> [u8; 10] {
++    [op::READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
++}
++
++pub(crate) fn read_capacity_16() -> [u8; 16] {
++    let mut cdb = [0u8; 16];
++    cdb[0] = op::SERVICE_ACTION_IN_16;
++    cdb[1] = op::READ_CAPACITY_16;
++    cdb[13] = 32;
++    cdb
++}
++
++/// READ CAPACITY: the number of blocks and their size. A 10-byte reply of
++/// 0xffffffff blocks means: ask READ CAPACITY(16).
++pub(crate) fn parse_capacity(data: &[u8]) -> Option<(u64, u32)> {
++    match data.len() {
++        8..=31 => {
++            let last = u32::from_be_bytes(data[0..4].try_into().ok()?);
++            let size = u32::from_be_bytes(data[4..8].try_into().ok()?);
++            Some((u64::from(last) + 1, size))
++        }
++        32.. => {
++            let last = u64::from_be_bytes(data[0..8].try_into().ok()?);
++            let size = u32::from_be_bytes(data[8..12].try_into().ok()?);
++            Some((last + 1, size))
++        }
++        _ => None,
++    }
++}
++
++/// READ or WRITE of `blocks` blocks at `lba`: the 10-byte commands while they
++/// reach, the 16-byte ones beyond 2 TiB.
++pub(crate) fn read_write(write: bool, lba: u64, blocks: u32) -> Vec<u8> {
++    if lba + u64::from(blocks) <= u64::from(u32::MAX) && blocks <= u32::from(u16::MAX) {
++        let mut cdb = alloc::vec![if write { op::WRITE_10 } else { op::READ_10 }, 0];
++        cdb.extend_from_slice(&(lba as u32).to_be_bytes());
++        cdb.push(0);
++        cdb.extend_from_slice(&(blocks as u16).to_be_bytes());
++        cdb.push(0);
++        cdb
++    } else {
++        let mut cdb = alloc::vec![if write { op::WRITE_16 } else { op::READ_16 }, 0];
++        cdb.extend_from_slice(&lba.to_be_bytes());
++        cdb.extend_from_slice(&blocks.to_be_bytes());
++        cdb.extend_from_slice(&[0, 0]);
++        cdb
++    }
++}
++
++pub(crate) fn synchronize_cache() -> [u8; 10] {
++    [op::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
++}
++
++/// The pieces of a DMA buffer, split where it would cross a 64 KiB boundary
++/// (xHCI 1.2, 4.11.7.1).
++pub(crate) fn split_64k(address: u64, length: usize) -> Vec<(u64, usize)> {
++    let mut pieces = Vec::new();
++    let (mut address, mut left) = (address, length);
++    while left > 0 {
++        let to_boundary = (0x1_0000 - (address & 0xffff)) as usize;
++        let piece = left.min(to_boundary);
++        pieces.push((address, piece));
++        address += piece as u64;
++        left -= piece;
++    }
++    pieces
++}
+diff --git a/kernel/comps/usb/src/usbnet.rs b/kernel/comps/usb/src/usbnet.rs
+new file mode 100755
+index 0000000..7fa4fe5
+--- /dev/null
++++ b/kernel/comps/usb/src/usbnet.rs
+@@ -0,0 +1,119 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A USB network device as the kernel's network stack sees it: frames go
++//! through two queues between the stack and the controller's thread, which
++//! moves them over the device's bulk endpoints (`crate::xhci`) in its framing
++//! (`crate::netframe`). The stack gives it an interface, which asks a DHCP
++//! server for its address (the kernel's `net::iface`).
++
++use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
++
++use aster_bigtcp::{
++    device::{AnyNetworkDevice, ChecksumCapabilities, DeviceCapabilities, EthernetAddress, Medium, NetError},
++    packet::{FreshTxPacket, LinkLayer, RxPacket, TxPacket},
++};
++use aster_softirq::BottomHalfDisabled;
++use ostd::{
++    mm::{VmReader, VmWriter},
++    sync::{LocalIrqDisabled, SpinLock},
++};
++
++/// Frames waiting either way.
++const QUEUE: usize = 256;
++
++/// The queues between the network stack and the controller's thread.
++#[derive(Debug)]
++pub(crate) struct Shared {
++    pub rx: SpinLock<VecDeque<Vec<u8>>, LocalIrqDisabled>,
++    pub tx: SpinLock<VecDeque<Vec<u8>>, LocalIrqDisabled>,
++}
++
++impl Shared {
++    pub(crate) fn new() -> Arc<Self> {
++        Arc::new(Self { rx: SpinLock::new(VecDeque::new()), tx: SpinLock::new(VecDeque::new()) })
++    }
++
++    /// A frame from the device, for the stack.
++    pub(crate) fn received(&self, frame: Vec<u8>) {
++        let mut rx = self.rx.lock();
++        if rx.len() < QUEUE {
++            rx.push_back(frame);
++        }
++    }
++}
++
++#[derive(Debug)]
++struct UsbNetDevice {
++    mac: EthernetAddress,
++    shared: Arc<Shared>,
++}
++
++impl AnyNetworkDevice for UsbNetDevice {
++    fn mac_addr(&self) -> EthernetAddress {
++        self.mac
++    }
++
++    fn capabilities(&self) -> DeviceCapabilities {
++        let mut capabilities = DeviceCapabilities::default();
++        capabilities.max_transmission_unit = 1514;
++        capabilities.medium = Medium::Ethernet;
++        capabilities.checksum = ChecksumCapabilities::default();
++        capabilities
++    }
++
++    fn can_receive(&self) -> bool {
++        !self.shared.rx.lock().is_empty()
++    }
++
++    fn can_send(&self) -> bool {
++        self.shared.tx.lock().len() < QUEUE
++    }
++
++    fn receive(&mut self) -> Result<RxPacket<LinkLayer>, NetError> {
++        let frame = self.shared.rx.lock().pop_front().ok_or(NetError::NotReady)?;
++        let fresh = FreshTxPacket::<LinkLayer>::alloc(frame.len()).map_err(|_| NetError::NoMemory)?;
++        let mut builder = fresh.to_builder();
++        let written = builder.append_writer().write(&mut VmReader::from(frame.as_slice()));
++        builder.commit(written);
++        builder.build().to_rx_packet().ok_or(NetError::NoMemory)
++    }
++
++    fn send(&mut self, packet: TxPacket<LinkLayer>) -> Result<(), NetError> {
++        let mut frame = alloc::vec![0u8; packet.len()];
++        let length = packet.reader().read(&mut VmWriter::from(frame.as_mut_slice()));
++        frame.truncate(length);
++        {
++            let mut tx = self.shared.tx.lock();
++            if tx.len() >= QUEUE {
++                return Err(NetError::Busy);
++            }
++            tx.push_back(frame);
++        }
++        crate::wake();
++        Ok(())
++    }
++
++    fn alloc_tx_buffer(payload_len: usize) -> Result<FreshTxPacket, ostd::Error> {
++        FreshTxPacket::alloc(payload_len)
++    }
++
++    fn free_processed_tx_buffers(&mut self) {}
++
++    fn notify_poll_end(&mut self) {}
++}
++
++/// Offers the device to the network stack as `name`.
++pub(crate) fn register(name: String, mac: [u8; 6], shared: Arc<Shared>) {
++    let device: Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>> =
++        Arc::new(SpinLock::new(UsbNetDevice { mac: EthernetAddress(mac), shared }));
++    aster_network::register_device(name, device);
++}
++
++pub(crate) fn unregister(name: &str) {
++    aster_network::unregister_device(name);
++}
++
++/// The stack has frames to read.
++pub(crate) fn notify_received() {
++    aster_network::raise_receive_softirq();
++}
+diff --git a/kernel/comps/usb/src/xhci.rs b/kernel/comps/usb/src/xhci.rs
+index 4bbffa0..f9a4d0c 100755
+--- a/kernel/comps/usb/src/xhci.rs
++++ b/kernel/comps/usb/src/xhci.rs
+@@ -17,12 +17,17 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
+ use core::sync::atomic::Ordering;
+ 
+ use aster_pci::{cfg_space::BarAccess, common_device::PciCommonDevice};
+-use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
++use ostd::mm::{HasDaddr, HasSize, VmIo, dma::DmaCoherent};
++
++use aster_block::bio::{BioStatus, BioType, SubmittedBio};
+ 
+ use crate::{
+-    desc::{self, Configuration, Endpoint, Interface, TRANSFER_INTERRUPT},
++    desc::{self, Configuration, Endpoint, Interface, TRANSFER_BULK, TRANSFER_INTERRUPT},
++    disk::UsbDisk,
+     hid::{self, ReportDescriptor},
+-    ring::{EventRing, IDT, IOC, ISP, ProducerRing, Trb, trb_type},
++    netframe::{self, Framing},
++    ring::{CHAIN, EventRing, IDT, IOC, ISP, ProducerRing, Trb, trb_type},
++    scsi, usbnet,
+ };
+ 
+ /// Completion codes.
+@@ -68,20 +73,66 @@ const IMAN_ENABLE: u32 = 1 << 1;
+ const ERDP_BUSY: u64 = 1 << 3;
+ 
+ /// Endpoint context types.
++const EP_BULK_OUT: u32 = 2;
+ const EP_CONTROL: u32 = 4;
++const EP_BULK_IN: u32 = 6;
+ const EP_INTERRUPT_IN: u32 = 7;
+ 
++/// A network device's receive and send buffers: one page each, which never
++/// crosses a 64 KiB boundary (xHCI 1.2, 4.11.7.1).
++const NET_RX_BUFFERS: usize = 8;
++const NET_TX_BUFFERS: usize = 32;
++const NET_BUFFER: usize = 4096;
++/// What RNDIS and NCM devices may put in one transfer to us.
++const NET_MAX_TRANSFER: u32 = NET_BUFFER as u32;
++
+ /// Port speeds (PORTSC bits 13:10).
+ const SPEED_FULL: u32 = 1;
+ const SPEED_LOW: u32 = 2;
+ const SPEED_HIGH: u32 = 3;
++const SPEED_SUPER: u32 = 4;
++
++/// Hubs below hubs: USB allows five tiers.
++const MAX_HUB_DEPTH: u8 = 5;
++/// Hub class requests and features (USB 2.0, 11.24; USB 3.2, 10.16).
++const GET_STATUS: u8 = 0x00;
++const CLEAR_FEATURE: u8 = 0x01;
++const SET_FEATURE: u8 = 0x03;
++const SET_HUB_DEPTH: u8 = 0x0c;
++const PORT_RESET_FEATURE: u16 = 4;
++const PORT_POWER_FEATURE: u16 = 8;
++const C_PORT_RESET: u16 = 20;
++const C_BH_PORT_RESET: u16 = 29;
++const HUB_PORT_CONNECTION: u16 = 1 << 0;
++const HUB_PORT_ENABLE: u16 = 1 << 1;
++/// wPortChange bits and the features that clear them: connection, enable,
++/// suspend, over-current, reset, and USB 3's warm reset, link state and
++/// configuration error.
++const HUB_CHANGE_FEATURES: [(u16, u16); 8] = [(0, 16), (1, 17), (2, 18), (3, 19), (4, 20), (5, 29), (6, 25), (7, 26)];
+ 
+ /// Standard requests.
+ const GET_DESCRIPTOR: u8 = 6;
+ const SET_CONFIGURATION: u8 = 9;
++const SET_INTERFACE: u8 = 0x0b;
+ /// HID class requests.
+ const SET_IDLE: u8 = 0x0a;
+ const SET_PROTOCOL: u8 = 0x0b;
++/// CDC class requests.
++const SEND_ENCAPSULATED_COMMAND: u8 = 0x00;
++const GET_ENCAPSULATED_RESPONSE: u8 = 0x01;
++const SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
++const GET_NTB_PARAMETERS: u8 = 0x80;
++const SET_NTB_INPUT_SIZE: u8 = 0x86;
++/// Mass storage (Bulk-Only Transport) requests.
++const GET_MAX_LUN: u8 = 0xfe;
++const BULK_ONLY_RESET: u8 = 0xff;
++/// What one SCSI READ or WRITE moves at most, and in how many pieces: the
++/// size Linux's usb-storage uses (240 sectors), well inside a ring.
++const MAX_COMMAND_BYTES: usize = 120 * 1024;
++const MAX_COMMAND_PIECES: usize = 64;
++/// How often removable media are looked at (a card put in a reader, taken
++/// out), as Linux polls them.
++const MEDIA_CHECK_MS: u64 = 2_000;
+ 
+ const COMMAND_TIMEOUT_MS: u64 = 3_000;
+ const TRANSFER_TIMEOUT_MS: u64 = 5_000;
+@@ -94,6 +145,7 @@ pub(crate) enum Error {
+     Completion(u8),
+     NoMemory,
+     Descriptor,
++    NoMedium,
+ }
+ 
+ type Result<T> = core::result::Result<T, Error>;
+@@ -118,19 +170,137 @@ struct HidEndpoint {
+     pressed: BTreeMap<u8, Vec<u32>>,
+ }
+ 
++/// A network interface's bulk endpoints and buffers.
++struct NetEndpoints {
++    name: alloc::string::String,
++    framing: Framing,
++    shared: alloc::sync::Arc<usbnet::Shared>,
++    rx_dci: u8,
++    rx_ring: ProducerRing,
++    rx_buffers: DmaCoherent,
++    rx_in_flight: Vec<(u64, usize)>,
++    tx_dci: u8,
++    tx_ring: ProducerRing,
++    tx_buffers: DmaCoherent,
++    tx_free: Vec<usize>,
++    tx_in_flight: Vec<(u64, usize)>,
++    tx_max_packet: usize,
++    sequence: u16,
++}
++
++/// A hub's ports and what is on them.
++struct Hub {
++    ports: u8,
++    superspeed: bool,
++    /// The slot on each port.
++    children: BTreeMap<u8, u8>,
++    dci: u8,
++    ring: ProducerRing,
++    buffer: DmaCoherent,
++    in_flight: Option<u64>,
++}
++
++/// A mass storage interface: its bulk endpoints, a buffer for its
++/// wrappers (the CBW at 0, the CSW at 512, small replies at 2048) and its
++/// disks.
++struct Storage {
++    interface: u8,
++    in_address: u8,
++    out_address: u8,
++    in_dci: u8,
++    out_dci: u8,
++    in_max_packet: usize,
++    out_max_packet: usize,
++    in_ring: ProducerRing,
++    out_ring: ProducerRing,
++    buffer: DmaCoherent,
++    tag: u32,
++    luns: Vec<Lun>,
++    /// LUNs without a medium (a card reader's empty slots), looked at again.
++    empty: Vec<u8>,
++    /// Commands padded to 12 bytes (the ATAPI and UFI command sets).
++    pad12: bool,
++}
++
++/// A logical unit with its medium: a disk.
++struct Lun {
++    number: u8,
++    disk: alloc::sync::Arc<UsbDisk>,
++    block_size: u32,
++    blocks: u64,
++    removable: bool,
++}
++
+ /// A device in a slot.
+ struct Slot {
++    /// The root port it hangs from (itself or through hubs).
+     port: u8,
+     speed: u32,
++    /// Its route string and its tier below the root ports (0: on one).
++    route: u32,
++    depth: u8,
++    /// The high-speed hub port that translates for a full- or low-speed
++    /// device: (hub slot, port), or (0, 0).
++    tt: (u8, u8),
++    /// The hub and port it is on, if not a root port.
++    parent: Option<(u8, u8)>,
++    /// Slot context fields of a hub: ports, multiple TTs, TT think time.
++    hub_fields: Option<(u8, bool, u8)>,
++    hub: Option<Hub>,
+     output: DmaCoherent,
+     input: DmaCoherent,
+     ep0: ProducerRing,
+     buffer: DmaCoherent,
+     hid: Vec<HidEndpoint>,
++    net: Vec<NetEndpoints>,
++    storage: Vec<Storage>,
+     /// The highest device context index configured.
+     last_dci: u8,
+ }
+ 
++/// Network interfaces' names: usb0, usb1, ...
++static NET_NAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++
++/// Which configuration of a device to use: the one with a CDC network
++/// function (ECM or NCM) over one with only RNDIS, as Linux chooses, then
++/// any other, unless `usb.net=rndis` asks otherwise.
++fn configuration_rank(configuration: &Configuration) -> u8 {
++    let rndis_first = crate::prefer_rndis();
++    let mut rank = 1;
++    for interface in &configuration.interfaces {
++        match net_framing(interface) {
++            Some(Framing::Ecm | Framing::Ncm) => rank = rank.max(if rndis_first { 2 } else { 3 }),
++            Some(Framing::Rndis) => rank = rank.max(if rndis_first { 3 } else { 2 }),
++            None => {}
++        }
++    }
++    rank
++}
++
++/// The network framing of a CDC or RNDIS control interface.
++fn net_framing(interface: &Interface) -> Option<Framing> {
++    match (interface.class, interface.subclass, interface.protocol) {
++        (0x02, 0x06, _) => Some(Framing::Ecm),
++        (0x02, 0x0d, _) => Some(Framing::Ncm),
++        (0x02, 0x02, 0xff) | (0xe0, 0x01, 0x03) | (0xef, 0x04, 0x01) => Some(Framing::Rndis),
++        _ => None,
++    }
++}
++
++/// A transfer TRB's TD Size: the packets of its TD still to come after it
++/// (Linux's `xhci_td_remainder`; xHCI 1.2, 4.11.2.4). Controllers before
++/// 1.0 count the bytes left, in KiB, with this TRB.
++fn td_remainder(version: u16, transferred: usize, length: usize, total: usize, max_packet: usize, more: bool) -> u32 {
++    if version < 0x100 {
++        return ((total - transferred) >> 10) as u32;
++    }
++    if !more || length == total {
++        return 0;
++    }
++    let packets = total.div_ceil(max_packet);
++    packets.saturating_sub((transferred + length) / max_packet) as u32
++}
++
+ pub(crate) struct Controller {
+     mmio: BarAccess,
+     op: usize,
+@@ -138,6 +308,8 @@ pub(crate) struct Controller {
+     doorbells: usize,
+     max_slots: u8,
+     max_ports: u8,
++    /// The interface version (0x0100: 1.0).
++    version: u16,
+     context_size: usize,
+     dcbaa: DmaCoherent,
+     _scratchpad: Vec<DmaCoherent>,
+@@ -148,6 +320,10 @@ pub(crate) struct Controller {
+     ports: Vec<Option<u8>>,
+     /// Port numbers whose status changed, to look at.
+     changed: Vec<u8>,
++    /// Hub ports whose status changed: (hub slot, port).
++    hub_changed: Vec<(u8, u8)>,
++    /// When removable media are next looked at.
++    next_media_check: u64,
+     name: alloc::string::String,
+     _device: PciCommonDevice,
+ }
+@@ -193,6 +369,7 @@ impl Controller {
+         let mmio = device.bar_manager_mut().bar_mut(0)?.acquire().ok()?;
+         let read = |offset: usize| mmio.read_once::<u32>(offset).unwrap_or(u32::MAX);
+         let cap_length = (read(0) & 0xff) as usize;
++        let version = (read(0) >> 16) as u16;
+         let hcs1 = read(0x04);
+         let hcs2 = read(0x08);
+         let hcc1 = read(0x10);
+@@ -254,6 +431,7 @@ impl Controller {
+             doorbells,
+             max_slots,
+             max_ports,
++            version,
+             context_size,
+             dcbaa,
+             _scratchpad: scratchpad,
+@@ -262,6 +440,8 @@ impl Controller {
+             slots: BTreeMap::new(),
+             ports: vec![None; usize::from(max_ports)],
+             changed: Vec::new(),
++            hub_changed: Vec::new(),
++            next_media_check: 0,
+             name,
+             _device: device,
+         };
+@@ -314,6 +494,16 @@ impl Controller {
+         true
+     }
+ 
++    /// Waits `ms` while handling what the controller reports (input goes
++    /// on during a long wait).
++    fn pause_ms(&mut self, ms: u64) {
++        let deadline = crate::now_ms() + ms;
++        while crate::now_ms() < deadline {
++            self.process_events(&mut |_| false);
++            crate::sleep();
++        }
++    }
++
+     fn sleep_ms(&self, ms: u64) {
+         let deadline = crate::now_ms() + ms;
+         while crate::now_ms() < deadline {
+@@ -342,6 +532,12 @@ impl Controller {
+             while let Some(port) = self.changed.pop() {
+                 self.port_changed(port);
+             }
++            while let Some((hub, port)) = self.hub_changed.pop() {
++                self.hub_port_changed(hub, port);
++            }
++            self.send_frames();
++            self.serve_disks();
++            self.check_media();
+             crate::sleep_idle();
+         }
+     }
+@@ -459,17 +655,48 @@ impl Controller {
+ 
+     fn detach(&mut self, port: u8, slot_id: u8) {
+         self.ports[usize::from(port - 1)] = None;
++        self.detach_slot(slot_id);
++        ostd::notice!("{}: port {}: device removed", self.name, port);
++    }
++
++    /// A device went away, with whatever hangs from it.
++    fn detach_slot(&mut self, slot_id: u8) {
++        let children: Vec<u8> = self
++            .slots
++            .get(&slot_id)
++            .and_then(|slot| slot.hub.as_ref())
++            .map(|hub| hub.children.values().copied().collect())
++            .unwrap_or_default();
++        for child in children {
++            self.detach_slot(child);
++        }
+         if let Some(slot) = self.slots.remove(&slot_id) {
++            // Its hub no longer has it.
++            if let Some((hub_slot, hub_port)) = slot.parent {
++                if let Some(hub) = self.slots.get_mut(&hub_slot).and_then(|hub| hub.hub.as_mut()) {
++                    hub.children.retain(|port, child| !(*port == hub_port && *child == slot_id));
++                }
++            }
+             // Whatever the device held is let go.
+             for endpoint in &slot.hid {
+                 for held in endpoint.pressed.values() {
+                     crate::input::report(held, &[], &[]);
+                 }
+             }
++            // Its network interfaces go away.
++            for net in &slot.net {
++                usbnet::unregister(&net.name);
++            }
++            // Its disks too: what they were asked fails.
++            for unit in &slot.storage {
++                for lun in &unit.luns {
++                    ostd::notice!("{}: {}: removed", self.name, lun.disk.name());
++                    lun.disk.remove();
++                }
++            }
+         }
+         let _ = self.command(Trb { control: Trb::with_type(trb_type::DISABLE_SLOT) | u32::from(slot_id) << 24, ..Trb::default() });
+         let _ = self.dcbaa.write_val(usize::from(slot_id) * 8, &0u64);
+-        ostd::notice!("{}: port {}: device removed", self.name, port);
+     }
+ 
+     fn attach(&mut self, port: u8) -> Result<()> {
+@@ -489,7 +716,12 @@ impl Controller {
+             return Err(Error::Timeout);
+         }
+         let speed = (status >> 10) & 0xf;
++        self.enable_device(port, speed, 0, 0, (0, 0), None).map(|_| ())
++    }
+ 
++    /// Gives a device that a port (a root port, or a hub's) just enabled a
++    /// slot and an address, and starts its drivers.
++    fn enable_device(&mut self, port: u8, speed: u32, route: u32, depth: u8, tt: (u8, u8), parent: Option<(u8, u8)>) -> Result<u8> {
+         let event = self.command(Trb { control: Trb::with_type(trb_type::ENABLE_SLOT), ..Trb::default() })?;
+         let slot_id = event.slot();
+         let slot = Slot {
+@@ -499,23 +731,34 @@ impl Controller {
+             input: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
+             ep0: ProducerRing::new().ok_or(Error::NoMemory)?,
+             buffer: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            route,
++            depth,
++            tt,
++            parent,
++            hub_fields: None,
++            hub: None,
+             hid: Vec::new(),
++            net: Vec::new(),
++            storage: Vec::new(),
+             last_dci: 1,
+         };
+         let _ = self.dcbaa.write_val(usize::from(slot_id) * 8, &(slot.output.daddr() as u64));
+         self.slots.insert(slot_id, slot);
+-        self.ports[usize::from(port - 1)] = Some(slot_id);
++        if parent.is_none() {
++            self.ports[usize::from(port - 1)] = Some(slot_id);
++        }
+         let result = self.address_and_configure(slot_id);
+-        if result.is_err() {
+-            self.detach(port, slot_id);
++        if let Err(error) = result {
++            self.detach_slot(slot_id);
++            return Err(error);
+         }
+-        result
++        Ok(slot_id)
+     }
+ 
+     fn address_and_configure(&mut self, slot_id: u8) -> Result<()> {
+-        let (port, speed) = {
++        let (port, speed, route, tt) = {
+             let slot = &self.slots[&slot_id];
+-            (slot.port, slot.speed)
++            (slot.port, slot.speed, slot.route, slot.tt)
+         };
+         let max_packet = Self::default_max_packet(speed);
+         {
+@@ -523,8 +766,9 @@ impl Controller {
+             self.clear_input(slot);
+             // Add the slot and the default control endpoint.
+             self.input_write(slot, 0, 1, 0b11);
+-            self.input_write(slot, 1, 0, speed << 20 | 1 << 27);
++            self.input_write(slot, 1, 0, route & 0xf_ffff | speed << 20 | 1 << 27);
+             self.input_write(slot, 1, 1, u32::from(port) << 16);
++            self.input_write(slot, 1, 2, u32::from(tt.0) | u32::from(tt.1) << 8);
+             self.input_write(slot, 2, 1, 3 << 1 | EP_CONTROL << 3 | max_packet << 16);
+             let dequeue = slot.ep0.dequeue_pointer();
+             self.input_write(slot, 2, 2, dequeue as u32);
+@@ -553,10 +797,18 @@ impl Controller {
+             })?;
+         }
+         let device = desc::parse_device(&self.get_descriptor(slot_id, 0x80, desc::kind::DEVICE, 0, 18)?).ok_or(Error::Descriptor)?;
+-        let head = self.get_descriptor(slot_id, 0x80, desc::kind::CONFIGURATION, 0, 9)?;
+-        let total = usize::from(u16::from_le_bytes([*head.get(2).ok_or(Error::Descriptor)?, *head.get(3).ok_or(Error::Descriptor)?]));
+-        let full = self.get_descriptor(slot_id, 0x80, desc::kind::CONFIGURATION, 0, total.min(4096))?;
+-        let configuration = desc::parse_configuration(&full).ok_or(Error::Descriptor)?;
++        // Each configuration (phones and network adapters offer several).
++        let mut configuration: Option<Configuration> = None;
++        for index in 0..device.configurations.clamp(1, 8) {
++            let Ok(head) = self.get_config(slot_id, index, 9) else { continue };
++            let Some(total) = head.get(2..4).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]]))) else { continue };
++            let Ok(full) = self.get_config(slot_id, index, total.min(4096)) else { continue };
++            let Some(parsed) = desc::parse_configuration(&full) else { continue };
++            if configuration.as_ref().is_none_or(|best| configuration_rank(&parsed) > configuration_rank(best)) {
++                configuration = Some(parsed);
++            }
++        }
++        let configuration = configuration.ok_or(Error::Descriptor)?;
+         self.control(slot_id, 0x00, SET_CONFIGURATION, u16::from(configuration.value), 0, Data::None)?;
+         ostd::notice!(
+             "{}: port {}: USB {:x}.{:02x} device {:04x}:{:04x}, class {:02x}, {} interface(s)",
+@@ -567,11 +819,28 @@ impl Controller {
+         Ok(())
+     }
+ 
++    /// A configuration descriptor by index (GET_DESCRIPTOR's index is in wValue's low byte).
++    fn get_config(&mut self, slot_id: u8, index: u8, length: usize) -> Result<Vec<u8>> {
++        let value = u16::from(desc::kind::CONFIGURATION) << 8 | u16::from(index);
++        let length = self.control(slot_id, 0x80, GET_DESCRIPTOR, value, 0, Data::In(length))?;
++        let mut data = vec![0u8; length];
++        self.slots[&slot_id].buffer.read_bytes(0, &mut data).map_err(|_| Error::NoMemory)?;
++        Ok(data)
++    }
++
+     /// Hands each interface (its first alternate setting) to its driver.
+     fn start_drivers(&mut self, slot_id: u8, configuration: &Configuration) {
++        // The data interfaces a network function took.
++        let mut claimed: Vec<u8> = Vec::new();
+         for interface in configuration.interfaces.iter().filter(|interface| interface.alternate == 0) {
++            if claimed.contains(&interface.number) {
++                continue;
++            }
+             let started = match interface.class {
+                 3 => self.start_hid(slot_id, interface),
++                8 => self.start_storage(slot_id, interface),
++                9 => self.start_hub(slot_id, interface),
++                _ if net_framing(interface).is_some() => self.start_net(slot_id, interface, configuration).map(|data| claimed.push(data)),
+                 _ => Err(Error::Descriptor),
+             };
+             match started {
+@@ -629,17 +898,31 @@ impl Controller {
+         let status_trb = slot.ep0.push(Trb { control: Trb::with_type(trb_type::STATUS) | IOC | u32::from(status_in) << 16, ..Trb::default() });
+         self.ring(slot_id, 1);
+         let mut received = length;
++        let mut short = false;
+         loop {
+-            let event = self.wait_event(
++            // After a short data stage, some controllers (QEMU's) report no
++            // status stage: the transfer is done once it has been quiet.
++            let waited = self.wait_event(
+                 &mut |event| event.kind() == trb_type::TRANSFER_EVENT && event.slot() == slot_id && event.endpoint() == 1,
+-                TRANSFER_TIMEOUT_MS,
+-            )?;
++                if short { 100 } else { TRANSFER_TIMEOUT_MS },
++            );
++            let event = match waited {
++                Ok(event) => event,
++                Err(Error::Timeout) if short => return Ok(received),
++                Err(error) => return Err(error),
++            };
+             let code = event.completion_code();
+             if Some(event.parameter) == data_trb && code == SHORT_PACKET {
+                 received = length - (event.status & 0xff_ffff) as usize;
++                short = true;
+                 continue;
+             }
+             if code != SUCCESS && code != SHORT_PACKET {
++                let stage = if Some(event.parameter) == data_trb { "data" } else if event.parameter == status_trb { "status" } else { "setup" };
++                ostd::notice!(
++                    "{}: slot {} request {:02x}/{:02x} value {:04x} index {:04x} length {}: code {} in the {} stage",
++                    self.name, slot_id, request_type, request, value, index, length, code, stage
++                );
+                 if code == STALL {
+                     self.recover_control(slot_id);
+                 }
+@@ -685,12 +968,21 @@ impl Controller {
+         let slot = &self.slots[&slot_id];
+         self.clear_input(slot);
+         self.input_write(slot, 0, 1, 1 | 1 << dci);
+-        // The slot as it is, with its context entries reaching this endpoint.
++        // The slot as it is, with its context entries reaching this endpoint
++        // (and, for a hub, its ports and translators).
+         for dword in 0..4 {
+             let mut value = self.output_read(slot, 0, dword);
+             if dword == 0 {
+                 value = (value & !(0x1f << 27)) | u32::from(last_dci) << 27;
+             }
++            if let Some((ports, mtt, think)) = slot.hub_fields {
++                match dword {
++                    0 => value |= 1 << 26 | u32::from(mtt) << 25,
++                    1 => value = (value & 0x00ff_ffff) | u32::from(ports) << 24,
++                    2 => value = (value & !(3 << 16)) | u32::from(think) << 16,
++                    _ => {}
++                }
++            }
+             if dword == 3 {
+                 value = 0;
+             }
+@@ -783,10 +1075,19 @@ impl Controller {
+         hid.in_flight.push((address, index));
+     }
+ 
+-    /// A transfer on an endpoint other than the default one: a HID report.
++    /// A transfer on an endpoint other than the default one: a HID report,
++    /// or a network device's frames.
+     fn transfer_done(&mut self, event: &Trb) {
+         let (slot_id, dci) = (event.slot(), event.endpoint());
+         let code = event.completion_code();
++        if self.slots.get(&slot_id).is_some_and(|slot| slot.net.iter().any(|net| net.rx_dci == dci || net.tx_dci == dci)) {
++            self.net_transfer_done(slot_id, dci, event);
++            return;
++        }
++        if self.slots.get(&slot_id).and_then(|slot| slot.hub.as_ref()).is_some_and(|hub| hub.dci == dci) {
++            self.hub_status_done(slot_id, event);
++            return;
++        }
+         {
+             let Some(slot) = self.slots.get_mut(&slot_id) else { return };
+             let Some(hid) = slot.hid.iter_mut().find(|hid| hid.dci == dci) else { return };
+@@ -812,4 +1113,823 @@ impl Controller {
+         }
+         self.ring(slot_id, dci);
+     }
++
++    // ── Network ──────────────────────────────────────────────────────────
++
++    /// A string descriptor, in English (US).
++    fn get_string(&mut self, slot_id: u8, index: u8) -> Result<Vec<u8>> {
++        let value = 3 << 8 | u16::from(index);
++        let length = self.control(slot_id, 0x80, GET_DESCRIPTOR, value, 0x0409, Data::In(255))?;
++        let mut data = vec![0u8; length];
++        self.slots[&slot_id].buffer.read_bytes(0, &mut data).map_err(|_| Error::NoMemory)?;
++        Ok(data)
++    }
++
++    /// Starts a network function: its data interface's bulk endpoints, the
++    /// device's MAC address and the setup its protocol needs; returns the data
++    /// interface it took.
++    fn start_net(&mut self, slot_id: u8, control: &Interface, configuration: &Configuration) -> Result<u8> {
++        let framing = net_framing(control).ok_or(Error::Descriptor)?;
++        // The data interface: the union's subordinate, or the next one.
++        let data_number = control.functional(0x06).and_then(|d| d.get(4).copied()).unwrap_or(control.number + 1);
++        let bulk = |interface: &Interface, inward: bool| {
++            interface.endpoints.iter().find(|e| e.transfer_type() == TRANSFER_BULK && e.is_in() == inward).copied()
++        };
++        let data = configuration
++            .interfaces
++            .iter()
++            .find(|interface| interface.number == data_number && bulk(interface, true).is_some() && bulk(interface, false).is_some())
++            .ok_or(Error::Descriptor)?;
++        let (rx_endpoint, tx_endpoint) = (bulk(data, true).ok_or(Error::Descriptor)?, bulk(data, false).ok_or(Error::Descriptor)?);
++        let control_number = u16::from(control.number);
++        // ECM and NCM move frames on the data interface's second setting.
++        if data.alternate != 0 {
++            self.control(slot_id, 0x01, SET_INTERFACE, u16::from(data.alternate), u16::from(data_number), Data::None)?;
++        }
++        let mut mac = None;
++        match framing {
++            Framing::Rndis => mac = self.rndis_start(slot_id, control_number),
++            Framing::Ecm | Framing::Ncm => {
++                if let Some(index) = control.functional(0x0f).and_then(|d| d.get(3).copied()).filter(|&index| index != 0) {
++                    mac = self.get_string(slot_id, index).ok().and_then(|string| netframe::mac_from_string(&string));
++                }
++                if framing == Framing::Ncm {
++                    self.ncm_start(slot_id, control_number);
++                }
++                // Directed, broadcast and all multicast frames.
++                let _ = self.control(slot_id, 0x21, SET_ETHERNET_PACKET_FILTER, 0x000e, control_number, Data::None);
++            }
++        }
++        let rx_ring = ProducerRing::new().ok_or(Error::NoMemory)?;
++        let tx_ring = ProducerRing::new().ok_or(Error::NoMemory)?;
++        self.configure_endpoint(slot_id, &rx_endpoint, EP_BULK_IN, &rx_ring)?;
++        self.configure_endpoint(slot_id, &tx_endpoint, EP_BULK_OUT, &tx_ring)?;
++        // A locally administered address where the device gave none.
++        let mac = mac.unwrap_or_else(|| {
++            let seed = (crate::now_ms() as u32) ^ u32::from(slot_id) << 24;
++            let b = seed.to_le_bytes();
++            [0x02, 0x4f, b[0], b[1], b[2], b[3]]
++        });
++        let name = alloc::format!("usb{}", NET_NAMES.fetch_add(1, Ordering::Relaxed));
++        let shared = usbnet::Shared::new();
++        let mut net = NetEndpoints {
++            name: name.clone(),
++            framing,
++            shared: shared.clone(),
++            rx_dci: rx_endpoint.dci(),
++            rx_ring,
++            rx_buffers: DmaCoherent::alloc(NET_RX_BUFFERS, true).map_err(|_| Error::NoMemory)?,
++            rx_in_flight: Vec::new(),
++            tx_dci: tx_endpoint.dci(),
++            tx_ring,
++            tx_buffers: DmaCoherent::alloc(NET_TX_BUFFERS, true).map_err(|_| Error::NoMemory)?,
++            tx_free: (0..NET_TX_BUFFERS).collect(),
++            tx_in_flight: Vec::new(),
++            tx_max_packet: usize::from(tx_endpoint.max_packet & 0x7ff).max(8),
++            sequence: 0,
++        };
++        for index in 0..NET_RX_BUFFERS {
++            Self::queue_rx(&mut net, index);
++        }
++        let rx_dci = net.rx_dci;
++        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.net.push(net);
++        self.ring(slot_id, rx_dci);
++        ostd::notice!("{}: {} ({:?}), MAC {:02x?}", self.name, name, framing, mac);
++        usbnet::register(name, mac, shared);
++        Ok(data_number)
++    }
++
++    /// An RNDIS command and its completion (polled: the notification
++    /// endpoint only says that one is ready).
++    fn rndis_command(&mut self, slot_id: u8, interface: u16, message: &[u8]) -> Option<netframe::RndisReply> {
++        if let Err(error) = self.control(slot_id, 0x21, SEND_ENCAPSULATED_COMMAND, 0, interface, Data::Out(message)) {
++            ostd::notice!("{}: RNDIS command not sent: {:?}", self.name, error);
++            return None;
++        }
++        let request = u32::from_le_bytes(message.get(8..12)?.try_into().ok()?);
++        let mut last = None;
++        for _ in 0..100 {
++            match self.control(slot_id, 0xa1, GET_ENCAPSULATED_RESPONSE, 0, interface, Data::In(1025)) {
++                Ok(length) if length > 0 => {
++                    let mut data = vec![0u8; length];
++                    self.slots[&slot_id].buffer.read_bytes(0, &mut data).ok()?;
++                    match netframe::rndis_reply(&data) {
++                        Some(reply) if reply.request == request => return Some(reply),
++                        other => last = Some((length, other.map(|reply| (reply.kind, reply.request)))),
++                    }
++                }
++                Ok(_) => {}
++                Err(error) => last = Some((0, None)).filter(|_| !matches!(error, Error::Completion(STALL))),
++            }
++            self.sleep_ms(10);
++        }
++        ostd::notice!("{}: no RNDIS completion for request {} (last: {:?})", self.name, request, last);
++        None
++    }
++
++    /// RNDIS: initialize, read the permanent MAC address, accept frames.
++    fn rndis_start(&mut self, slot_id: u8, interface: u16) -> Option<[u8; 6]> {
++        let initialized = self.rndis_command(slot_id, interface, &netframe::rndis_initialize(1))?;
++        if initialized.status != 0 {
++            ostd::notice!("{}: RNDIS initialization failed: {:#x}", self.name, initialized.status);
++            return None;
++        }
++        let mac = self
++            .rndis_command(slot_id, interface, &netframe::rndis_query(2, netframe::OID_802_3_PERMANENT_ADDRESS))
++            .and_then(|reply| reply.information.get(..6)?.try_into().ok());
++        let _ = self.rndis_command(
++            slot_id,
++            interface,
++            &netframe::rndis_set(3, netframe::OID_GEN_CURRENT_PACKET_FILTER, netframe::RNDIS_PACKET_FILTER),
++        );
++        mac
++    }
++
++    /// NCM: blocks from the device no larger than a receive buffer.
++    fn ncm_start(&mut self, slot_id: u8, interface: u16) {
++        if let Ok(length) = self.control(slot_id, 0xa1, GET_NTB_PARAMETERS, 0, interface, Data::In(28))
++            && length >= 8
++        {
++            let mut data = [0u8; 8];
++            if self.slots[&slot_id].buffer.read_bytes(0, &mut data).is_ok() {
++                let in_max = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
++                if in_max > NET_MAX_TRANSFER {
++                    let size = NET_MAX_TRANSFER.to_le_bytes();
++                    let _ = self.control(slot_id, 0x21, SET_NTB_INPUT_SIZE, 0, interface, Data::Out(&size));
++                }
++            }
++        }
++    }
++
++    fn queue_rx(net: &mut NetEndpoints, index: usize) {
++        let address = net.rx_ring.push(Trb {
++            parameter: net.rx_buffers.daddr() as u64 + (index * NET_BUFFER) as u64,
++            status: NET_BUFFER as u32,
++            control: Trb::with_type(trb_type::NORMAL) | IOC | ISP,
++        });
++        net.rx_in_flight.push((address, index));
++    }
++
++    fn net_transfer_done(&mut self, slot_id: u8, dci: u8, event: &Trb) {
++        let code = event.completion_code();
++        let Some(slot) = self.slots.get_mut(&slot_id) else { return };
++        let Some(net) = slot.net.iter_mut().find(|net| net.rx_dci == dci || net.tx_dci == dci) else { return };
++        if dci == net.tx_dci {
++            if let Some(position) = net.tx_in_flight.iter().position(|(address, _)| *address == event.parameter) {
++                let (_, index) = net.tx_in_flight.remove(position);
++                net.tx_free.push(index);
++            }
++            return;
++        }
++        let Some(position) = net.rx_in_flight.iter().position(|(address, _)| *address == event.parameter) else { return };
++        let (_, index) = net.rx_in_flight.remove(position);
++        if code == SUCCESS || code == SHORT_PACKET {
++            let length = NET_BUFFER.saturating_sub((event.status & 0xff_ffff) as usize);
++            let mut data = vec![0u8; length];
++            if net.rx_buffers.read_bytes(index * NET_BUFFER, &mut data).is_ok() {
++                let frames = netframe::unwrap(net.framing, &data);
++                let any = !frames.is_empty();
++                for frame in frames {
++                    net.shared.received(frame);
++                }
++                if any {
++                    usbnet::notify_received();
++                }
++            }
++        }
++        if code == STALL {
++            ostd::notice!("{}: {}: the receive endpoint stalled", self.name, net.name);
++            return;
++        }
++        Self::queue_rx(net, index);
++        let rx_dci = net.rx_dci;
++        self.ring(slot_id, rx_dci);
++    }
++
++    /// Moves the frames the network stack queued to the devices.
++    fn send_frames(&mut self) {
++        let mut doorbells = Vec::new();
++        for (slot_id, slot) in self.slots.iter_mut() {
++            for net in slot.net.iter_mut() {
++                let mut queued = false;
++                while let Some(&index) = net.tx_free.last() {
++                    let Some(frame) = net.shared.tx.lock().pop_front() else { break };
++                    net.tx_free.pop();
++                    let wrapped = netframe::wrap(net.framing, &frame, net.sequence);
++                    net.sequence = net.sequence.wrapping_add(1);
++                    let length = wrapped.len().min(NET_BUFFER);
++                    if net.tx_buffers.write_bytes(index * NET_BUFFER, &wrapped[..length]).is_err() {
++                        net.tx_free.push(index);
++                        continue;
++                    }
++                    let address = net.tx_ring.push(Trb {
++                        parameter: net.tx_buffers.daddr() as u64 + (index * NET_BUFFER) as u64,
++                        status: length as u32,
++                        control: Trb::with_type(trb_type::NORMAL) | IOC,
++                    });
++                    net.tx_in_flight.push((address, index));
++                    // A transfer that fills its last packet ends with a zero-length one.
++                    if length % net.tx_max_packet == 0 {
++                        net.tx_ring.push(Trb { control: Trb::with_type(trb_type::NORMAL), ..Trb::default() });
++                    }
++                    queued = true;
++                }
++                if queued {
++                    doorbells.push((*slot_id, net.tx_dci));
++                }
++            }
++        }
++        for (slot_id, dci) in doorbells {
++            self.ring(slot_id, dci);
++        }
++    }
++
++    // ── Hubs ─────────────────────────────────────────────────────────────
++
++    /// A hub: its descriptor, its slot fields, its ports powered, and its
++    /// status endpoint, which says which ports changed.
++    fn start_hub(&mut self, slot_id: u8, interface: &Interface) -> Result<()> {
++        let endpoint = *interface
++            .endpoints
++            .iter()
++            .find(|endpoint| endpoint.is_in() && endpoint.transfer_type() == TRANSFER_INTERRUPT)
++            .ok_or(Error::Descriptor)?;
++        let (speed, depth) = {
++            let slot = self.slots.get(&slot_id).ok_or(Error::Descriptor)?;
++            (slot.speed, slot.depth)
++        };
++        if depth >= MAX_HUB_DEPTH {
++            return Err(Error::Descriptor);
++        }
++        let superspeed = speed >= SPEED_SUPER;
++        let kind: u16 = if superspeed { 0x2a } else { 0x29 };
++        let length = self.control(slot_id, 0xa0, GET_DESCRIPTOR, kind << 8, 0, Data::In(16))?;
++        let mut descriptor = vec![0u8; length];
++        self.slots[&slot_id].buffer.read_bytes(0, &mut descriptor).map_err(|_| Error::NoMemory)?;
++        let ports = *descriptor.get(2).ok_or(Error::Descriptor)?;
++        let characteristics = u16::from_le_bytes([*descriptor.get(3).ok_or(Error::Descriptor)?, *descriptor.get(4).ok_or(Error::Descriptor)?]);
++        let power_good_ms = u64::from(*descriptor.get(5).unwrap_or(&50)) * 2;
++        let think = if superspeed { 0 } else { ((characteristics >> 5) & 3) as u8 };
++        let mtt = !superspeed && interface.protocol == 2;
++        if superspeed {
++            // A USB 3 hub needs its tier for the route strings.
++            self.control(slot_id, 0x20, SET_HUB_DEPTH, u16::from(depth), 0, Data::None)?;
++        }
++        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.hub_fields = Some((ports, mtt, think));
++        let ring = ProducerRing::new().ok_or(Error::NoMemory)?;
++        self.configure_endpoint(slot_id, &endpoint, EP_INTERRUPT_IN, &ring)?;
++        for port in 1..=ports {
++            let _ = self.control(slot_id, 0x23, SET_FEATURE, PORT_POWER_FEATURE, u16::from(port), Data::None);
++        }
++        self.sleep_ms(power_good_ms.max(100));
++        let hub = Hub {
++            ports,
++            superspeed,
++            children: BTreeMap::new(),
++            dci: endpoint.dci(),
++            ring,
++            buffer: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            in_flight: None,
++        };
++        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.hub = Some(hub);
++        self.queue_hub_status(slot_id);
++        // Whatever is plugged in already.
++        for port in 1..=ports {
++            self.hub_changed.push((slot_id, port));
++        }
++        ostd::notice!("{}: slot {}: hub with {} ports{}", self.name, slot_id, ports, if superspeed { " (USB 3)" } else { "" });
++        Ok(())
++    }
++
++    fn queue_hub_status(&mut self, slot_id: u8) {
++        let Some(hub) = self.slots.get_mut(&slot_id).and_then(|slot| slot.hub.as_mut()) else { return };
++        let address = hub.ring.push(Trb {
++            parameter: hub.buffer.daddr() as u64,
++            status: 8,
++            control: Trb::with_type(trb_type::NORMAL) | IOC | ISP,
++        });
++        hub.in_flight = Some(address);
++        let dci = hub.dci;
++        self.ring(slot_id, dci);
++    }
++
++    /// The hub's status endpoint: a bitmap of the ports that changed.
++    fn hub_status_done(&mut self, slot_id: u8, event: &Trb) {
++        let code = event.completion_code();
++        let Some(hub) = self.slots.get_mut(&slot_id).and_then(|slot| slot.hub.as_mut()) else { return };
++        if hub.in_flight != Some(event.parameter) {
++            return;
++        }
++        hub.in_flight = None;
++        if code == SUCCESS || code == SHORT_PACKET {
++            let mut bitmap = [0u8; 8];
++            if hub.buffer.read_bytes(0, &mut bitmap).is_ok() {
++                for port in 1..=hub.ports {
++                    if bitmap[usize::from(port / 8)] & (1 << (port % 8)) != 0 && !self.hub_changed.contains(&(slot_id, port)) {
++                        self.hub_changed.push((slot_id, port));
++                    }
++                }
++            }
++        }
++        if code == STALL {
++            return;
++        }
++        self.queue_hub_status(slot_id);
++    }
++
++    /// A hub port's status and changes: wPortStatus, wPortChange.
++    fn hub_port_status(&mut self, hub_slot: u8, port: u8) -> Result<(u16, u16)> {
++        self.control(hub_slot, 0xa3, GET_STATUS, 0, u16::from(port), Data::In(4))?;
++        let mut status = [0u8; 4];
++        self.slots[&hub_slot].buffer.read_bytes(0, &mut status).map_err(|_| Error::NoMemory)?;
++        Ok((u16::from_le_bytes([status[0], status[1]]), u16::from_le_bytes([status[2], status[3]])))
++    }
++
++    fn hub_port_changed(&mut self, hub_slot: u8, port: u8) {
++        if let Err(error) = self.try_hub_port_changed(hub_slot, port) {
++            ostd::notice!("{}: hub slot {} port {}: {:?}", self.name, hub_slot, port, error);
++        }
++    }
++
++    fn try_hub_port_changed(&mut self, hub_slot: u8, port: u8) -> Result<()> {
++        let Some(slot) = self.slots.get(&hub_slot) else { return Ok(()) };
++        let Some(hub) = slot.hub.as_ref() else { return Ok(()) };
++        let superspeed = hub.superspeed;
++        let child = hub.children.get(&port).copied();
++        let (status, change) = self.hub_port_status(hub_slot, port)?;
++        // Acknowledge each change.
++        for (bit, feature) in HUB_CHANGE_FEATURES {
++            if change & (1 << bit) != 0 {
++                let _ = self.control(hub_slot, 0x23, CLEAR_FEATURE, feature, u16::from(port), Data::None);
++            }
++        }
++        if status & HUB_PORT_CONNECTION == 0 {
++            if let Some(child) = child {
++                if let Some(hub) = self.slots.get_mut(&hub_slot).and_then(|slot| slot.hub.as_mut()) {
++                    hub.children.remove(&port);
++                }
++                self.detach_slot(child);
++                ostd::notice!("{}: hub slot {} port {}: device removed", self.name, hub_slot, port);
++            }
++            return Ok(());
++        }
++        if child.is_some() {
++            return Ok(());
++        }
++        // Let the connection settle, then reset the port.
++        self.sleep_ms(100);
++        self.control(hub_slot, 0x23, SET_FEATURE, PORT_RESET_FEATURE, u16::from(port), Data::None)?;
++        let deadline = crate::now_ms() + 500;
++        let status = loop {
++            self.sleep_ms(10);
++            let (status, change) = self.hub_port_status(hub_slot, port)?;
++            if change & (1 << 4) != 0 || (superspeed && change & (1 << 5) != 0) {
++                let _ = self.control(hub_slot, 0x23, CLEAR_FEATURE, C_PORT_RESET, u16::from(port), Data::None);
++                if superspeed {
++                    let _ = self.control(hub_slot, 0x23, CLEAR_FEATURE, C_BH_PORT_RESET, u16::from(port), Data::None);
++                }
++                break status;
++            }
++            if crate::now_ms() >= deadline {
++                return Err(Error::Timeout);
++            }
++        };
++        if status & HUB_PORT_ENABLE == 0 {
++            return Err(Error::Timeout);
++        }
++        self.sleep_ms(10);
++        let (hub_speed, hub_route, hub_depth, hub_tt, root_port) = {
++            let slot = &self.slots[&hub_slot];
++            (slot.speed, slot.route, slot.depth, slot.tt, slot.port)
++        };
++        let speed = if superspeed {
++            SPEED_SUPER
++        } else if status & (1 << 9) != 0 {
++            SPEED_LOW
++        } else if status & (1 << 10) != 0 {
++            SPEED_HIGH
++        } else {
++            SPEED_FULL
++        };
++        // The hub's route, with this port at its tier.
++        let route = hub_route | u32::from(port.min(15)) << (4 * u32::from(hub_depth));
++        // A full- or low-speed device below a high-speed hub: that hub's
++        // translator; further down, the one above.
++        let tt = if hub_speed == SPEED_HIGH && (speed == SPEED_FULL || speed == SPEED_LOW) { (hub_slot, port) } else { hub_tt };
++        let child = self.enable_device(root_port, speed, route, hub_depth + 1, tt, Some((hub_slot, port)))?;
++        if let Some(hub) = self.slots.get_mut(&hub_slot).and_then(|slot| slot.hub.as_mut()) {
++            hub.children.insert(port, child);
++        }
++        Ok(())
++    }
++
++    // ── Mass storage ─────────────────────────────────────────────────────
++
++    /// A Bulk-Only mass storage interface: its LUNs that hold a disk with a
++    /// medium become block devices.
++    fn start_storage(&mut self, slot_id: u8, interface: &Interface) -> Result<()> {
++        // Bulk-Only Transport with SCSI (nearly all), or with the ATAPI,
++        // UFI or SFF-8070i command sets of old drives and floppies.
++        if interface.protocol != 0x50 || !matches!(interface.subclass, 0x01 | 0x02 | 0x04 | 0x05 | 0x06) {
++            return Err(Error::Descriptor);
++        }
++        let bulk = |inward: bool| {
++            interface.endpoints.iter().find(|e| e.transfer_type() == TRANSFER_BULK && e.is_in() == inward).copied()
++        };
++        let (in_endpoint, out_endpoint) = (bulk(true).ok_or(Error::Descriptor)?, bulk(false).ok_or(Error::Descriptor)?);
++        let in_ring = ProducerRing::new().ok_or(Error::NoMemory)?;
++        let out_ring = ProducerRing::new().ok_or(Error::NoMemory)?;
++        self.configure_endpoint(slot_id, &in_endpoint, EP_BULK_IN, &in_ring)?;
++        self.configure_endpoint(slot_id, &out_endpoint, EP_BULK_OUT, &out_ring)?;
++        let number = u16::from(interface.number);
++        // Card readers have several units; most devices stall the question.
++        let max_lun = match self.control(slot_id, 0xa1, GET_MAX_LUN, 0, number, Data::In(1)) {
++            Ok(1) => {
++                let mut lun = [0u8; 1];
++                let _ = self.slots[&slot_id].buffer.read_bytes(0, &mut lun);
++                lun[0].min(15)
++            }
++            _ => 0,
++        };
++        let storage = Storage {
++            interface: interface.number,
++            in_address: in_endpoint.address,
++            out_address: out_endpoint.address,
++            in_dci: in_endpoint.dci(),
++            out_dci: out_endpoint.dci(),
++            in_max_packet: usize::from(in_endpoint.max_packet & 0x7ff).max(8),
++            out_max_packet: usize::from(out_endpoint.max_packet & 0x7ff).max(8),
++            in_ring,
++            out_ring,
++            buffer: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            tag: 1,
++            luns: Vec::new(),
++            empty: Vec::new(),
++            pad12: matches!(interface.subclass, 0x02 | 0x04 | 0x05),
++        };
++        let slot = self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?;
++        slot.storage.push(storage);
++        let index = slot.storage.len() - 1;
++        for lun in 0..=max_lun {
++            match self.start_lun(slot_id, index, lun) {
++                Ok(()) => {}
++                Err(error) => {
++                    ostd::notice!("{}: slot {} LUN {}: no disk ({:?})", self.name, slot_id, lun, error);
++                    if matches!(error, Error::NoMedium | Error::Timeout) {
++                        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.storage[index].empty.push(lun);
++                    }
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn start_lun(&mut self, slot_id: u8, storage: usize, lun: u8) -> Result<()> {
++        let data = self.scsi_in(slot_id, storage, lun, &scsi::inquiry(), 36)?;
++        let inquiry = scsi::parse_inquiry(&data).ok_or(Error::Descriptor)?;
++        if !inquiry.disk {
++            return Err(Error::Descriptor);
++        }
++        // A disk spinning up, a reader looking at its card (Linux's
++        // `sd_spinup_disk`).
++        let mut ready = false;
++        let mut started = false;
++        for _ in 0..100 {
++            if self.scsi_status(slot_id, storage, lun, &scsi::test_unit_ready(), &[], false)? == 0 {
++                ready = true;
++                break;
++            }
++            let sense = self.scsi_in(slot_id, storage, lun, &scsi::request_sense(), 18).ok().and_then(|data| scsi::parse_sense(&data));
++            match sense {
++                Some(sense) if scsi::no_medium(sense) => return Err(Error::NoMedium),
++                // Power on, reset, medium changed: ask again at once.
++                Some((0x06, _, _)) => continue,
++                // It waits to be told to start.
++                Some((0x02, 0x04, 0x02)) if !started => {
++                    started = true;
++                    let _ = self.scsi_status(slot_id, storage, lun, &scsi::start_stop_unit(true), &[], false);
++                }
++                _ => {}
++            }
++            self.pause_ms(100);
++        }
++        if !ready {
++            return Err(Error::Timeout);
++        }
++        let mut capacity = scsi::parse_capacity(&self.scsi_in(slot_id, storage, lun, &scsi::read_capacity_10(), 8)?).ok_or(Error::Descriptor)?;
++        if capacity.0 > u64::from(u32::MAX) {
++            capacity = scsi::parse_capacity(&self.scsi_in(slot_id, storage, lun, &scsi::read_capacity_16(), 32)?).ok_or(Error::Descriptor)?;
++        }
++        let (blocks, block_size) = capacity;
++        if !matches!(block_size, 512 | 1024 | 2048 | 4096) || blocks == 0 {
++            return Err(Error::Descriptor);
++        }
++        let sectors = (blocks * u64::from(block_size) / 512) as usize;
++        let disk = UsbDisk::new(sectors).ok_or(Error::NoMemory)?;
++        ostd::notice!(
++            "{}: {}: {} {} ({} MB, {}-byte blocks{})",
++            self.name, disk.name(), inquiry.vendor, inquiry.product, sectors / 2048, block_size,
++            if inquiry.removable { ", removable" } else { "" }
++        );
++        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.storage[storage].luns.push(Lun {
++            number: lun,
++            disk: disk.clone(),
++            block_size,
++            blocks,
++            removable: inquiry.removable,
++        });
++        let device: alloc::sync::Arc<dyn aster_block::BlockDevice> = disk;
++        if aster_block::register(device.clone()).is_ok() {
++            // Reading the partition table takes this thread's service.
++            aster_core::spawn_kernel_thread(move || aster_block::scan_device_partitions(&device));
++        }
++        Ok(())
++    }
++
++    /// A transfer on a storage bulk endpoint of `pieces` (address, length),
++    /// waited for; returns the bytes moved.
++    fn bulk(&mut self, slot_id: u8, storage: usize, inward: bool, pieces: &[(u64, usize)]) -> Result<usize> {
++        let version = self.version;
++        let (dci, addresses) = {
++            let unit = &mut self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.storage[storage];
++            let (ring, dci, max_packet) =
++                if inward { (&mut unit.in_ring, unit.in_dci, unit.in_max_packet) } else { (&mut unit.out_ring, unit.out_dci, unit.out_max_packet) };
++            let total: usize = pieces.iter().map(|(_, length)| length).sum();
++            let mut addresses = Vec::with_capacity(pieces.len());
++            let mut transferred = 0;
++            for (index, &(address, length)) in pieces.iter().enumerate() {
++                let last = index + 1 == pieces.len();
++                let control = Trb::with_type(trb_type::NORMAL)
++                    | if last { IOC } else { CHAIN }
++                    | if inward { ISP } else { 0 };
++                let remainder = td_remainder(version, transferred, length, total, max_packet, !last);
++                addresses.push((ring.push(Trb { parameter: address, status: length as u32 | remainder.min(31) << 17, control }), length));
++                transferred += length;
++            }
++            (dci, addresses)
++        };
++        self.ring(slot_id, dci);
++        let waited = self.wait_event(
++            &mut |event| {
++                event.kind() == trb_type::TRANSFER_EVENT
++                    && event.slot() == slot_id
++                    && event.endpoint() == dci
++                    && addresses.iter().any(|(address, _)| *address == event.parameter)
++            },
++            TRANSFER_TIMEOUT_MS * 2,
++        );
++        let event = match waited {
++            Ok(event) => event,
++            Err(error) => {
++                // What the controller still holds is taken back.
++                self.clear_halt(slot_id, storage, inward);
++                return Err(error);
++            }
++        };
++        let code = event.completion_code();
++        if code == SUCCESS || code == SHORT_PACKET {
++            let at = addresses.iter().position(|(address, _)| *address == event.parameter).unwrap_or(0);
++            let before: usize = addresses[..at].iter().map(|(_, length)| length).sum();
++            return Ok(before + addresses[at].1.saturating_sub((event.status & 0xff_ffff) as usize));
++        }
++        if code == STALL {
++            self.clear_halt(slot_id, storage, inward);
++        }
++        Err(Error::Completion(code))
++    }
++
++    /// After a stall: the controller's endpoint reset and moved on, and the
++    /// device's endpoint halt cleared.
++    fn clear_halt(&mut self, slot_id: u8, storage: usize, inward: bool) {
++        let Some(unit) = self.slots.get(&slot_id).and_then(|slot| slot.storage.get(storage)) else { return };
++        let (dci, address, dequeue) = if inward {
++            (unit.in_dci, unit.in_address, unit.in_ring.dequeue_pointer())
++        } else {
++            (unit.out_dci, unit.out_address, unit.out_ring.dequeue_pointer())
++        };
++        // A halted endpoint is reset; a running one (a transfer timed out)
++        // is stopped.
++        let target = u32::from(dci) << 16 | u32::from(slot_id) << 24;
++        if self.command(Trb { control: Trb::with_type(trb_type::RESET_ENDPOINT) | target, ..Trb::default() }).is_err() {
++            let _ = self.command(Trb { control: Trb::with_type(trb_type::STOP_ENDPOINT) | target, ..Trb::default() });
++        }
++        let _ = self.command(Trb {
++            parameter: dequeue,
++            control: Trb::with_type(trb_type::SET_TR_DEQUEUE) | u32::from(dci) << 16 | u32::from(slot_id) << 24,
++            ..Trb::default()
++        });
++        let _ = self.control(slot_id, 0x02, CLEAR_FEATURE, 0, u16::from(address), Data::None);
++    }
++
++    /// A SCSI command with its data: the CBW, the data, the CSW. Returns the
++    /// command's status (0: good) and the bytes of data moved.
++    fn scsi(&mut self, slot_id: u8, storage: usize, lun: u8, cdb: &[u8], data: &[(u64, usize)], inward: bool) -> Result<(u8, usize)> {
++        let (tag, buffer) = {
++            let unit = &mut self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.storage[storage];
++            unit.tag = unit.tag.wrapping_add(1);
++            (unit.tag, unit.buffer.daddr() as u64)
++        };
++        let length: usize = data.iter().map(|(_, length)| length).sum();
++        let mut padded = [0u8; 12];
++        let cdb = if self.slots[&slot_id].storage[storage].pad12 && cdb.len() < 12 {
++            padded[..cdb.len()].copy_from_slice(cdb);
++            &padded[..]
++        } else {
++            cdb
++        };
++        let wrapper = scsi::cbw(tag, length as u32, inward, lun, cdb);
++        self.slots[&slot_id].storage[storage].buffer.write_bytes(0, &wrapper).map_err(|_| Error::NoMemory)?;
++        if let Err(error) = self.bulk(slot_id, storage, false, &[(buffer, scsi::CBW_LENGTH)]) {
++            self.reset_recovery(slot_id, storage);
++            return Err(error);
++        }
++        let mut moved = 0;
++        if length > 0 {
++            match self.bulk(slot_id, storage, inward, data) {
++                Ok(bytes) => moved = bytes,
++                // A stalled data phase still ends with a status.
++                Err(Error::Completion(STALL)) => {}
++                Err(error) => {
++                    self.reset_recovery(slot_id, storage);
++                    return Err(error);
++                }
++            }
++        }
++        let status_at = buffer + 512;
++        let mut status = self.bulk(slot_id, storage, true, &[(status_at, scsi::CSW_LENGTH)]);
++        if matches!(status, Err(Error::Completion(STALL))) {
++            status = self.bulk(slot_id, storage, true, &[(status_at, scsi::CSW_LENGTH)]);
++        }
++        status?;
++        let mut csw = [0u8; scsi::CSW_LENGTH];
++        self.slots[&slot_id].storage[storage].buffer.read_bytes(512, &mut csw).map_err(|_| Error::NoMemory)?;
++        match scsi::csw(&csw, tag) {
++            Some((_, 2)) | None => {
++                self.reset_recovery(slot_id, storage);
++                Err(Error::Descriptor)
++            }
++            Some((_, status)) => Ok((status, moved)),
++        }
++    }
++
++    /// A command without data: its status.
++    fn scsi_status(&mut self, slot_id: u8, storage: usize, lun: u8, cdb: &[u8], data: &[(u64, usize)], inward: bool) -> Result<u8> {
++        self.scsi(slot_id, storage, lun, cdb, data, inward).map(|(status, _)| status)
++    }
++
++    /// A command that reads a little (into the storage buffer's second half).
++    fn scsi_in(&mut self, slot_id: u8, storage: usize, lun: u8, cdb: &[u8], length: usize) -> Result<Vec<u8>> {
++        let buffer = self.slots[&slot_id].storage[storage].buffer.daddr() as u64;
++        let (status, moved) = self.scsi(slot_id, storage, lun, cdb, &[(buffer + 2048, length)], true)?;
++        if status != 0 {
++            return Err(Error::Completion(status));
++        }
++        let mut data = vec![0u8; moved];
++        self.slots[&slot_id].storage[storage].buffer.read_bytes(2048, &mut data).map_err(|_| Error::NoMemory)?;
++        Ok(data)
++    }
++
++    /// Bulk-Only Mass Storage Reset, then both endpoints' halts cleared.
++    fn reset_recovery(&mut self, slot_id: u8, storage: usize) {
++        let Some(interface) = self.slots.get(&slot_id).and_then(|slot| slot.storage.get(storage)).map(|unit| unit.interface) else { return };
++        let _ = self.control(slot_id, 0x21, BULK_ONLY_RESET, 0, u16::from(interface), Data::None);
++        self.clear_halt(slot_id, storage, true);
++        self.clear_halt(slot_id, storage, false);
++    }
++
++    /// Every two seconds: a medium put in an empty LUN becomes a disk; one
++    /// taken out of (or changed in) a removable LUN takes its disk away.
++    fn check_media(&mut self) {
++        let now = crate::now_ms();
++        if now < self.next_media_check {
++            return;
++        }
++        self.next_media_check = now + MEDIA_CHECK_MS;
++        let mut work = Vec::new();
++        for (&slot_id, slot) in &self.slots {
++            for (index, unit) in slot.storage.iter().enumerate() {
++                work.extend(unit.empty.iter().map(|&lun| (slot_id, index, lun, false)));
++                work.extend(unit.luns.iter().filter(|lun| lun.removable).map(|lun| (slot_id, index, lun.number, true)));
++            }
++        }
++        for (slot_id, storage, lun, present) in work {
++            let ready = matches!(self.scsi_status(slot_id, storage, lun, &scsi::test_unit_ready(), &[], false), Ok(0));
++            if present && ready {
++                continue;
++            }
++            let sense = if ready {
++                None
++            } else {
++                self.scsi_in(slot_id, storage, lun, &scsi::request_sense(), 18).ok().and_then(|data| scsi::parse_sense(&data))
++            };
++            if present {
++                // Gone (no medium) or changed (unit attention: medium changed).
++                let gone = sense.is_some_and(|sense| scsi::no_medium(sense) || (sense.0 == 0x06 && sense.1 == 0x28));
++                if gone {
++                    self.remove_lun(slot_id, storage, lun);
++                }
++            } else if ready || sense.is_some_and(|sense| sense.0 == 0x06 && sense.1 == 0x28) {
++                let Some(unit) = self.slots.get_mut(&slot_id).map(|slot| &mut slot.storage[storage]) else { continue };
++                unit.empty.retain(|&empty| empty != lun);
++                if let Err(error) = self.start_lun(slot_id, storage, lun) {
++                    if matches!(error, Error::NoMedium | Error::Timeout) {
++                        if let Some(slot) = self.slots.get_mut(&slot_id) {
++                            slot.storage[storage].empty.push(lun);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    /// A LUN's medium went away: its disk too, and the LUN waits for another.
++    fn remove_lun(&mut self, slot_id: u8, storage: usize, lun: u8) {
++        let Some(unit) = self.slots.get_mut(&slot_id).map(|slot| &mut slot.storage[storage]) else { return };
++        let Some(position) = unit.luns.iter().position(|unit_lun| unit_lun.number == lun) else { return };
++        let removed = unit.luns.remove(position);
++        unit.empty.push(lun);
++        ostd::notice!("{}: {}: medium removed", self.name, removed.disk.name());
++        removed.disk.remove();
++    }
++
++    /// Serves what the disks were asked.
++    fn serve_disks(&mut self) {
++        let mut work = Vec::new();
++        for (&slot_id, slot) in &self.slots {
++            for (storage, unit) in slot.storage.iter().enumerate() {
++                for (lun, unit_lun) in unit.luns.iter().enumerate() {
++                    while let Some(bio) = unit_lun.disk.queue.lock().pop_front() {
++                        work.push((slot_id, storage, lun, bio));
++                    }
++                }
++            }
++        }
++        for (slot_id, storage, lun, bio) in work {
++            let status = self.serve_bio(slot_id, storage, lun, &bio);
++            bio.complete(status);
++        }
++    }
++
++    fn serve_bio(&mut self, slot_id: u8, storage: usize, lun: usize, bio: &SubmittedBio) -> BioStatus {
++        let Some((number, block_size, blocks)) = self
++            .slots
++            .get(&slot_id)
++            .and_then(|slot| slot.storage.get(storage))
++            .and_then(|unit| unit.luns.get(lun))
++            .map(|lun| (lun.number, lun.block_size, lun.blocks))
++        else {
++            return BioStatus::IoError;
++        };
++        let write = match bio.type_() {
++            BioType::Read => false,
++            BioType::Write => true,
++            BioType::Flush => {
++                return match self.scsi_status(slot_id, storage, number, &scsi::synchronize_cache(), &[], false) {
++                    Ok(_) => BioStatus::Complete,
++                    Err(_) => BioStatus::IoError,
++                };
++            }
++        };
++        let mut pieces = Vec::new();
++        for segment in bio.segments() {
++            let slice = segment.dma_slice();
++            pieces.extend(scsi::split_64k(slice.daddr() as u64, slice.size()));
++        }
++        // A partition's requests carry its start (`sid_offset`).
++        let mut byte = (bio.sid_range().start.to_raw() + bio.sid_offset()) * 512;
++        let mut command: Vec<(u64, usize)> = Vec::new();
++        let mut command_bytes = 0;
++        let run = |this: &mut Self, command: &mut Vec<(u64, usize)>, bytes: &mut usize, at: &mut u64| -> bool {
++            if command.is_empty() {
++                return true;
++            }
++            let size = u64::from(block_size);
++            if *at % size != 0 || *bytes as u64 % size != 0 {
++                return false;
++            }
++            let (lba, count) = (*at / size, *bytes as u64 / size);
++            if lba + count > blocks {
++                return false;
++            }
++            let cdb = scsi::read_write(write, lba, count as u32);
++            let done = matches!(this.scsi(slot_id, storage, number, &cdb, command, !write), Ok((0, moved)) if moved == *bytes);
++            *at += *bytes as u64;
++            command.clear();
++            *bytes = 0;
++            done
++        };
++        for piece in pieces {
++            if command_bytes + piece.1 > MAX_COMMAND_BYTES || command.len() >= MAX_COMMAND_PIECES {
++                if !run(self, &mut command, &mut command_bytes, &mut byte) {
++                    return BioStatus::IoError;
++                }
++            }
++            command.push(piece);
++            command_bytes += piece.1;
++        }
++        if !run(self, &mut command, &mut command_bytes, &mut byte) {
++            return BioStatus::IoError;
++        }
++        BioStatus::Complete
++    }
+ }
+diff --git a/kernel/core/comps/block/src/lib.rs b/kernel/core/comps/block/src/lib.rs
+index 31d4485..66cb96e 100644
+--- a/kernel/core/comps/block/src/lib.rs
++++ b/kernel/core/comps/block/src/lib.rs
+@@ -129,24 +129,43 @@ pub enum Error {
+     IdExhausted,
+ }
+ 
++/// Told of each device registered (`true`) or unregistered (`false`) once
++/// set: devices that come and go while the system runs (USB disks, their
++/// partitions) get and lose their `/dev` nodes through it.
++static DEVICE_HOOK: spin::Once<fn(&Arc<dyn BlockDevice>, bool)> = spin::Once::new();
++
++/// Sets the hook told of devices that come and go.
++pub fn set_device_hook(hook: fn(&Arc<dyn BlockDevice>, bool)) {
++    DEVICE_HOOK.call_once(|| hook);
++}
++
+ /// Registers a new block device.
+ pub fn register(device: Arc<dyn BlockDevice>) -> Result<(), Error> {
+-    let mut registry = DEVICE_REGISTRY.lock();
+-    let id = device.id().to_raw();
+-    if registry.contains_key(&id) {
+-        return Err(Error::Registered);
++    {
++        let mut registry = DEVICE_REGISTRY.lock();
++        let id = device.id().to_raw();
++        if registry.contains_key(&id) {
++            return Err(Error::Registered);
++        }
++        registry.insert(id, device.clone());
++    }
++    if let Some(hook) = DEVICE_HOOK.get() {
++        hook(&device, true);
+     }
+-    registry.insert(id, device);
+ 
+     Ok(())
+ }
+ 
+ /// Unregisters an existing block device, returning the device if found.
+ pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
+-    DEVICE_REGISTRY
++    let device = DEVICE_REGISTRY
+         .lock()
+         .remove(&id.to_raw())
+-        .ok_or(Error::NotFound)
++        .ok_or(Error::NotFound)?;
++    if let Some(hook) = DEVICE_HOOK.get() {
++        hook(&device, false);
++    }
++    Ok(device)
+ }
+ 
+ /// Collects all block devices.
+@@ -188,6 +207,22 @@ pub fn scan_partitions() {
+     }
+ }
+ 
++/// Reads the partition table of one whole disk (one just plugged in) and
++/// registers its partitions. It does block I/O: the caller must not be the
++/// thread that serves the disk.
++pub fn scan_device_partitions(device: &Arc<dyn BlockDevice>) {
++    if device.is_partition() {
++        return;
++    }
++    let Some(partition_manager) = device.partition_manager() else {
++        return;
++    };
++    let Some(partition_infos) = partition::parse(device) else {
++        return;
++    };
++    partition_manager.update(device, partition_infos);
++}
++
+ static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn BlockDevice>>> = Mutex::new(BTreeMap::new());
+ 
+ #[init_component]
+diff --git a/kernel/core/comps/block/src/partition.rs b/kernel/core/comps/block/src/partition.rs
+index 98428c0..31de2fb 100644
+--- a/kernel/core/comps/block/src/partition.rs
++++ b/kernel/core/comps/block/src/partition.rs
+@@ -351,6 +351,16 @@ impl PartitionManager {
+ 
+         *partitions = Some(new_partitions);
+     }
++
++    /// Unregisters every partition: the disk went away.
++    pub fn remove_all(&self) {
++        let mut partitions = self.inner.lock();
++        if let Some(old_partitions) = partitions.take() {
++            for partition in old_partitions {
++                let _ = unregister(partition.id());
++            }
++        }
++    }
+ }
+ 
+ /// Formats the name of a partition.
+diff --git a/kernel/core/comps/network/src/lib.rs b/kernel/core/comps/network/src/lib.rs
+index 0299516..6c61ddc 100644
+--- a/kernel/core/comps/network/src/lib.rs
++++ b/kernel/core/comps/network/src/lib.rs
+@@ -28,9 +28,30 @@ pub fn register_device(
+         .unwrap()
+         .network_device_table
+         .lock()
+-        .insert(name, NetworkDeviceIrqCallbackSet::new(device));
++        .insert(name.clone(), NetworkDeviceIrqCallbackSet::new(device));
++    if let Some(hook) = DEVICE_HOOK.get() {
++        hook(&name, true);
++    }
++}
++
++/// Removes a device that went away (a USB adapter unplugged).
++pub fn unregister_device(name: &str) {
++    let removed = COMPONENT.get().unwrap().network_device_table.lock().remove(name);
++    if removed.is_some()
++        && let Some(hook) = DEVICE_HOOK.get()
++    {
++        hook(name, false);
++    }
+ }
+ 
++/// Tells the kernel's network stack of each device registered or removed
++/// from now on (`true`: registered), so that it gives it an interface.
++pub fn set_device_hook(hook: fn(&str, bool)) {
++    DEVICE_HOOK.call_once(|| hook);
++}
++
++static DEVICE_HOOK: Once<fn(&str, bool)> = Once::new();
++
+ pub fn get_device(str: &str) -> Option<Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>>> {
+     let table = COMPONENT.get().unwrap().network_device_table.lock();
+     let callbacks = table.get(str)?;
+diff --git a/kernel/core/src/device/mod.rs b/kernel/core/src/device/mod.rs
+index e62d157..bd570e2 100644
+--- a/kernel/core/src/device/mod.rs
++++ b/kernel/core/src/device/mod.rs
+@@ -12,7 +12,7 @@ pub(crate) mod tty;
+ use device_id::DeviceId;
+ pub(crate) use mem::{getrandom, geturandom};
+ pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
+-pub(crate) use registry::lookup;
++pub(crate) use registry::{lookup, partitions_text};
+ 
+ use crate::{
+     fs::{devtmpfs::DevtmpfsNodeMeta, file::PerOpenFileOps},
+diff --git a/kernel/core/src/device/registry/block.rs b/kernel/core/src/device/registry/block.rs
+index 88919b0..a17f9a9 100644
+--- a/kernel/core/src/device/registry/block.rs
++++ b/kernel/core/src/device/registry/block.rs
+@@ -62,16 +62,70 @@ pub(super) fn init_in_first_kthread() {
+ }
+ 
+ pub(super) fn init_in_first_process() -> Result<()> {
++    // From here on, devices that come and go (USB disks and their
++    // partitions) get and lose their nodes as they do; the ones already
++    // there get theirs now (once, whichever comes first).
++    aster_block::set_device_hook(device_changed);
+     for device in aster_block::collect_all() {
+-        let device: Arc<dyn Device> = Arc::new(BlockFile::new(device));
+-        if let Some(meta) = device.devtmpfs_meta() {
+-            devtmpfs::create_node(DevtmpfsNode::new(device.type_(), device.id(), meta))?;
+-        }
++        add_node(&device)?;
+     }
+ 
+     Ok(())
+ }
+ 
++/// The devices whose `/dev` node exists.
++static NODES: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
++
++fn add_node(device: &Arc<dyn BlockDevice>) -> Result<()> {
++    if !NODES.lock().insert(device.id().to_raw()) {
++        return Ok(());
++    }
++    let file = BlockFile::new(device.clone());
++    if let Some(meta) = file.devtmpfs_meta() {
++        devtmpfs::create_node(DevtmpfsNode::new(file.type_(), file.id(), meta))?;
++    }
++    Ok(())
++}
++
++/// A block device registered or unregistered while the system runs.
++fn device_changed(device: &Arc<dyn BlockDevice>, added: bool) {
++    if added {
++        if let Err(error) = add_node(device) {
++            warn!("block: no /dev node for {}: {:?}", device.name(), error);
++        }
++        return;
++    }
++    let id = device.id();
++    DEVICE_REGISTRY.lock().remove(&id.to_raw());
++    if NODES.lock().remove(&id.to_raw()) {
++        let file = BlockFile::new(device.clone());
++        if let Some(meta) = file.devtmpfs_meta() {
++            let _ = devtmpfs::delete_node(DevtmpfsNode::new(file.type_(), id, meta));
++        }
++    }
++}
++
++/// `/proc/partitions`: each block device's numbers, size in KiB and name.
++pub(crate) fn partitions_text() -> String {
++    use core::fmt::Write as _;
++
++    let mut devices = aster_block::collect_all();
++    devices.sort_by_key(|device| (device.id().major().get(), device.id().minor().get()));
++    let mut text = String::from("major minor  #blocks  name\n\n");
++    for device in devices {
++        let id = device.id();
++        let _ = writeln!(
++            text,
++            "{:4} {:7} {:10} {}",
++            id.major().get(),
++            id.minor().get(),
++            device.metadata().nr_sectors / 2,
++            device.name()
++        );
++    }
++    text
++}
++
+ mod ioctl_defs {
+     use crate::{
+         ioc,
+diff --git a/kernel/core/src/device/registry/mod.rs b/kernel/core/src/device/registry/mod.rs
+index 48d1ab4..347b3e0 100644
+--- a/kernel/core/src/device/registry/mod.rs
++++ b/kernel/core/src/device/registry/mod.rs
+@@ -10,6 +10,8 @@ use crate::{
+ mod block;
+ pub mod char;
+ 
++pub(crate) use block::partitions_text;
++
+ pub(super) fn init_in_first_kthread() {
+     block::init_in_first_kthread();
+ }
+diff --git a/kernel/core/src/fs/fs_impls/procfs/mod.rs b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+index 0c2201a..8d68554 100644
+--- a/kernel/core/src/fs/fs_impls/procfs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+@@ -14,6 +14,8 @@ use self::{
+     loadavg::LoadAvgFileOps,
+     meminfo::MemInfoFileOps,
+     mounts::MountsSymOps,
++    net::NetDirOps,
++    partitions::PartitionsFileOps,
+     pid::{PidDirOps, TidDirOps},
+     self_::SelfSymOps,
+     sys::SysDirOps,
+@@ -44,6 +46,8 @@ mod cmdline;
+ mod cpuinfo;
+ mod filesystems;
+ mod loadavg;
++mod net;
++mod partitions;
+ mod meminfo;
+ mod mounts;
+ mod pid;
+@@ -161,6 +165,8 @@ impl RootDirOps {
+         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
+         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),
+         ("mounts", InodeType::SymLink, MountsSymOps::new_inode),
++        ("net", InodeType::Dir, NetDirOps::new_inode),
++        ("partitions", InodeType::File, PartitionsFileOps::new_inode),
+         ("self", InodeType::SymLink, SelfSymOps::new_inode),
+         ("stat", InodeType::File, StatFileOps::new_inode),
+         ("sys", InodeType::Dir, SysDirOps::new_inode),
+diff --git a/kernel/core/src/fs/fs_impls/procfs/net.rs b/kernel/core/src/fs/fs_impls/procfs/net.rs
+new file mode 100644
+index 0000000..ce5f67e
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/procfs/net.rs
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `/proc/net`: `pnp`, the DNS servers of the kernel's DHCP leases in
++//! resolv.conf's format, as Linux's autoconfiguration gives them.
++
++use aster_util::printer::VmPrinter;
++
++use super::{
++    StaticEntry,
++    template::{
++        ProcDir, ProcDirOps, ProcFile, ProcFileOps, ReaddirEntry, listed_entries_from_table,
++        lookup_child_from_table, visit_listed_entries,
++    },
++};
++use crate::{
++    fs::{
++        file::{InodeType, mkmod},
++        vfs::inode::Inode,
++    },
++    prelude::*,
++};
++
++pub(super) struct NetDirOps;
++
++impl NetDirOps {
++    pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcDir::new(Self, parent, mkmod!(a+rx))
++    }
++
++    const STATIC_ENTRIES: &'static [StaticEntry] = &[("pnp", InodeType::File, PnpFileOps::new_inode)];
++}
++
++impl ProcDirOps for NetDirOps {
++    fn lookup_child(&self, this_dir: &ProcDir<Self>, name: &str) -> Result<Arc<dyn Inode>> {
++        if let Some(child) = lookup_child_from_table(name, Self::STATIC_ENTRIES, |f| {
++            (f)(this_dir.this_weak().clone())
++        }) {
++            return Ok(child);
++        }
++        return_errno_with_message!(Errno::ENOENT, "the file does not exist");
++    }
++
++    fn visit_entries_from_offset<'a, F>(&'a self, offset: usize, visit_fn: F) -> Result<()>
++    where
++        F: FnMut(ReaddirEntry<'a>) -> Result<()>,
++    {
++        visit_listed_entries(offset, listed_entries_from_table(Self::STATIC_ENTRIES), visit_fn)
++    }
++}
++
++struct PnpFileOps;
++
++impl PnpFileOps {
++    fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(a+r))
++    }
++}
++
++impl ProcFileOps for PnpFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        let text = crate::net::resolv_conf();
++        write!(printer, "{}", core::str::from_utf8(&text).unwrap_or(""))?;
++        Ok(printer.bytes_written())
++    }
++}
+diff --git a/kernel/core/src/fs/fs_impls/procfs/partitions.rs b/kernel/core/src/fs/fs_impls/procfs/partitions.rs
+new file mode 100755
+index 0000000..bd4ae37
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/procfs/partitions.rs
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `/proc/partitions`: the block devices (disks and their partitions), with
++//! their device numbers and sizes, as Linux lists them.
++
++use aster_util::printer::VmPrinter;
++
++use crate::{
++    fs::{
++        file::mkmod,
++        procfs::template::{ProcFile, ProcFileOps},
++        vfs::inode::Inode,
++    },
++    prelude::*,
++};
++
++pub(super) struct PartitionsFileOps;
++
++impl PartitionsFileOps {
++    pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(a+r))
++    }
++}
++
++impl ProcFileOps for PartitionsFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        write!(printer, "{}", crate::device::partitions_text())?;
++        Ok(printer.bytes_written())
++    }
++}
+diff --git a/kernel/core/src/net/iface/init.rs b/kernel/core/src/net/iface/init.rs
+index 1f4ff43..39528c3 100644
+--- a/kernel/core/src/net/iface/init.rs
++++ b/kernel/core/src/net/iface/init.rs
+@@ -27,7 +27,98 @@ pub(in crate::net) fn iter_init_ifaces() -> Iter<'static, Arc<Iface>> {
+ 
+ /// Returns the interfaces of the network namespace of the current thread.
+ pub(in crate::net) fn iter_all_ifaces() -> vec::IntoIter<Arc<Iface>> {
+-    crate::net::net_ns::current_net_ns().ifaces().to_vec().into_iter()
++    crate::net::net_ns::current_net_ns().ifaces().into_iter()
++}
++
++/// The host name the DHCP client gives the server.
++const DHCP_HOST_NAME: &[u8] = b"openshell";
++
++/// Gives an interface to each network device other than the VirtIO one,
++/// present at boot or added later (a USB adapter, a phone's tethering): an
++/// Ethernet interface named as the device, which asks a DHCP server for its
++/// address.
++pub(in crate::net) fn init_in_first_kthread() {
++    aster_network::set_device_hook(device_changed);
++    for (name, _) in aster_network::all_devices() {
++        device_changed(&name, true);
++    }
++}
++
++fn device_changed(name: &str, added: bool) {
++    if name == VIRTIO_DEVICE_NAME {
++        return;
++    }
++    let namespace = crate::net::net_ns::NetNamespace::get_init_singleton();
++    if !added {
++        if namespace.remove_iface(name).is_some() {
++            ostd::notice!("{}: removed", name);
++        }
++        return;
++    }
++    if namespace.ifaces().iter().any(|iface| iface.name().as_str() == Ok(name)) {
++        return;
++    }
++    let Some(device) = aster_network::get_device(name) else { return };
++    let iface = new_dhcp_ether(name, device);
++    let callback = {
++        let iface = iface.clone();
++        move || iface.poll()
++    };
++    aster_network::register_recv_callback(name, callback.clone());
++    aster_network::register_send_callback(name, callback);
++    namespace.add_iface(iface.clone());
++    super::poll::spawn_background_poll_thread(iface.clone());
++    iface.poll();
++    ostd::notice!("{}: asking for an address (DHCP)", name);
++}
++
++fn new_dhcp_ether(name: &str, device: Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>>) -> Arc<Iface> {
++    use aster_bigtcp::{device::Loopback, iface::EtherIface};
++
++    struct Wrapper(Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>>);
++
++    impl WithDevice for Wrapper {
++        // Its packets are allocated as the loopback's: plain buffers, which
++        // every driver takes.
++        type Device = Loopback;
++
++        fn with<F, R>(&self, f: F) -> R
++        where
++            F: FnOnce(&mut dyn AnyNetworkDevice) -> R,
++        {
++            let mut device = self.0.lock();
++            f(&mut *device)
++        }
++    }
++
++    let ether_addr = device.lock().mac_addr();
++    let flags = InterfaceFlags::UP
++        | InterfaceFlags::BROADCAST
++        | InterfaceFlags::RUNNING
++        | InterfaceFlags::MULTICAST
++        | InterfaceFlags::LOWER_UP;
++    EtherIface::new_dhcp(
++        Wrapper(device),
++        ether_addr,
++        InterfaceName::from_str_truncated(name),
++        PollScheduler::new(),
++        flags,
++        DHCP_HOST_NAME,
++    ) as Arc<Iface>
++}
++
++/// The DNS servers the DHCP leases gave, in resolv.conf's format (Linux's
++/// `/proc/net/pnp`, where /etc/resolv.conf points). QEMU's user network
++/// answers DNS on 10.0.2.3 for the VirtIO interface's fixed address.
++pub(in crate::net) fn resolv_conf() -> Vec<u8> {
++    let ifaces = crate::net::net_ns::NetNamespace::get_init_singleton().ifaces();
++    let leases: Vec<_> = ifaces.iter().filter_map(|iface| iface.dhcp_lease()).collect();
++    let mut text = aster_bigtcp::iface::resolv_conf(&leases);
++    if leases.iter().all(|lease| lease.dns.is_empty()) && virtio_iface().is_some() {
++        text.extend_from_slice(b"nameserver 10.0.2.3
++");
++    }
++    text
+ }
+ 
+ // TODO: Support multiple network devices and avoid the hardcoded device name.
+diff --git a/kernel/core/src/net/iface/mod.rs b/kernel/core/src/net/iface/mod.rs
+index 75e5497..274db7f 100644
+--- a/kernel/core/src/net/iface/mod.rs
++++ b/kernel/core/src/net/iface/mod.rs
+@@ -5,7 +5,7 @@ mod init;
+ mod poll;
+ mod sched;
+ 
+-pub(super) use init::{init, iter_all_ifaces, iter_init_ifaces, new_loopback};
++pub(super) use init::{init, iter_all_ifaces, iter_init_ifaces, new_loopback, resolv_conf};
+ pub(super) use poll::{init_in_first_kthread, spawn_background_poll_thread};
+ 
+ pub(super) type Iface = dyn aster_bigtcp::iface::Iface<ext::BigtcpExt>;
+diff --git a/kernel/core/src/net/iface/poll.rs b/kernel/core/src/net/iface/poll.rs
+index def868c..d97a278 100644
+--- a/kernel/core/src/net/iface/poll.rs
++++ b/kernel/core/src/net/iface/poll.rs
+@@ -16,6 +16,8 @@ pub(in crate::net) fn init_in_first_kthread() {
+     for iface in iter_init_ifaces() {
+         spawn_background_poll_thread(iface.clone());
+     }
++    // Devices other than the boot ones get their interfaces from here on.
++    super::init::init_in_first_kthread();
+ }
+ 
+ pub(super) fn poll_ifaces() {
+diff --git a/kernel/core/src/net/mod.rs b/kernel/core/src/net/mod.rs
+index 826f144..bd01976 100644
+--- a/kernel/core/src/net/mod.rs
++++ b/kernel/core/src/net/mod.rs
+@@ -17,3 +17,8 @@ pub(crate) fn init() {
+ pub(crate) fn init_in_first_kthread() {
+     iface::init_in_first_kthread();
+ }
++
++/// DNS servers, as `/proc/net/pnp` gives them.
++pub(crate) fn resolv_conf() -> alloc::vec::Vec<u8> {
++    iface::resolv_conf()
++}
+diff --git a/kernel/core/src/net/net_ns.rs b/kernel/core/src/net/net_ns.rs
+index 281cdf2..46437cb 100755
+--- a/kernel/core/src/net/net_ns.rs
++++ b/kernel/core/src/net/net_ns.rs
+@@ -9,7 +9,10 @@
+ 
+ use core::sync::atomic::{AtomicU64, Ordering};
+ 
+-use ostd::task::Task;
++use ostd::{
++    sync::{PreemptDisabled, RwLockReadGuard},
++    task::Task,
++};
+ use spin::Once;
+ 
+ use super::{
+@@ -26,13 +29,17 @@ use crate::{
+ /// The network namespace.
+ pub(crate) struct NetNamespace {
+     id: u64,
+-    ifaces: Vec<Arc<Iface>>,
+-    routes: RouteTables,
++    /// The interfaces, which devices plugged in later join.
++    ifaces: RwLock<Vec<Arc<Iface>>>,
++    /// The routes derived from them, with the configuration they reflect.
++    routes: RwLock<(RouteTables, u64)>,
+     owner: Arc<UserNamespace>,
+     stashed_dentry: StashedDentry,
+ }
+ 
+ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
++/// Changes when a namespace gains or loses an interface.
++static ROUTES_GENERATION: AtomicU64 = AtomicU64::new(0);
+ 
+ impl NetNamespace {
+     /// Returns a reference to the singleton initial network namespace.
+@@ -51,8 +58,8 @@ impl NetNamespace {
+         let routes = RouteTables::new(&ifaces);
+         Arc::new(Self {
+             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+-            ifaces,
+-            routes,
++            ifaces: RwLock::new(ifaces),
++            routes: RwLock::new((routes, Self::generation())),
+             owner,
+             stashed_dentry: StashedDentry::new(),
+         })
+@@ -88,13 +95,46 @@ impl NetNamespace {
+     }
+ 
+     /// Returns the interfaces of the namespace.
+-    pub(in crate::net) fn ifaces(&self) -> &[Arc<Iface>] {
+-        &self.ifaces
++    pub(in crate::net) fn ifaces(&self) -> Vec<Arc<Iface>> {
++        self.ifaces.read().clone()
++    }
++
++    /// Adds an interface (a device plugged in after boot).
++    pub(in crate::net) fn add_iface(&self, iface: Arc<Iface>) {
++        self.ifaces.write().push(iface);
++        ROUTES_GENERATION.fetch_add(1, Ordering::AcqRel);
++    }
++
++    /// Removes the interface with this name (its device went away).
++    pub(in crate::net) fn remove_iface(&self, name: &str) -> Option<Arc<Iface>> {
++        let mut ifaces = self.ifaces.write();
++        let position = ifaces.iter().position(|iface| iface.name().as_str() == Ok(name))?;
++        let iface = ifaces.remove(position);
++        drop(ifaces);
++        ROUTES_GENERATION.fetch_add(1, Ordering::AcqRel);
++        Some(iface)
++    }
++
++    /// Returns the routing tables of the namespace, derived again when an
++    /// interface or its configuration changed (a DHCP lease).
++    pub(in crate::net) fn routes(&self) -> RwLockReadGuard<'_, (RouteTables, u64), PreemptDisabled> {
++        let current = Self::generation();
++        {
++            let routes = self.routes.read();
++            if routes.1 == current {
++                return routes;
++            }
++        }
++        let ifaces = self.ifaces();
++        *self.routes.write() = (RouteTables::new(&ifaces), current);
++        self.routes.read()
+     }
+ 
+-    /// Returns the routing tables of the namespace.
+-    pub(in crate::net) fn routes(&self) -> &RouteTables {
+-        &self.routes
++    /// Changes with the interfaces of any namespace and their configuration.
++    fn generation() -> u64 {
++        ROUTES_GENERATION
++            .load(Ordering::Acquire)
++            .wrapping_add(aster_bigtcp::iface::config_generation() << 32)
+     }
+ }
+ 
+diff --git a/kernel/core/src/net/route/mod.rs b/kernel/core/src/net/route/mod.rs
+index dda48ba..215060d 100644
+--- a/kernel/core/src/net/route/mod.rs
++++ b/kernel/core/src/net/route/mod.rs
+@@ -206,11 +206,11 @@ fn iface_ipv6_routes(iface: &Arc<Iface>) -> Vec<RouteEntry<Ipv6Address>> {
+ pub(super) fn lookup_iface(dst: IpAddress) -> Result<Arc<Iface>> {
+     let net_ns = super::net_ns::current_net_ns();
+     let iface = match dst {
+-        IpAddress::Ipv4(dst) => net_ns.routes().ipv4
++        IpAddress::Ipv4(dst) => net_ns.routes().0.ipv4
+             .lookup_entry(&RouteLookupKey::new(dst))?
+             .output_iface()
+             .clone(),
+-        IpAddress::Ipv6(dst) => net_ns.routes().ipv6
++        IpAddress::Ipv6(dst) => net_ns.routes().0.ipv6
+             .lookup_entry(&RouteLookupKey::new(dst))?
+             .output_iface()
+             .clone(),
+@@ -223,7 +223,7 @@ pub(super) fn lookup_local_iface(address: IpAddress) -> Result<Arc<Iface>> {
+     let net_ns = super::net_ns::current_net_ns();
+     let (type_, iface) = match address {
+         IpAddress::Ipv4(address) => {
+-            let entry = net_ns.routes().ipv4
++            let entry = net_ns.routes().0.ipv4
+                 .lookup_in_local_table(&RouteLookupKey::new(address))
+                 .ok_or_else(|| {
+                     Error::with_message(
+@@ -234,7 +234,7 @@ pub(super) fn lookup_local_iface(address: IpAddress) -> Result<Arc<Iface>> {
+             (entry.type_(), entry.output_iface().clone())
+         }
+         IpAddress::Ipv6(address) => {
+-            let entry = net_ns.routes().ipv6
++            let entry = net_ns.routes().0.ipv6
+                 .lookup_in_local_table(&RouteLookupKey::new(address))
+                 .ok_or_else(|| {
+                     Error::with_message(
+@@ -269,7 +269,7 @@ pub(super) fn is_broadcast_endpoint(endpoint: &IpEndpoint) -> bool {
+     };
+ 
+     address.is_broadcast()
+-        || net_ns.routes().ipv4
++        || net_ns.routes().0.ipv4
+             .lookup_entry(&RouteLookupKey::new(address))
+             .is_ok_and(|entry| entry.type_() == RouteType::Broadcast)
+ }
+diff --git a/kernel/libs/aster-bigtcp/src/iface/common.rs b/kernel/libs/aster-bigtcp/src/iface/common.rs
+index b7ca4f1..5bfdf18 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/common.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/common.rs
+@@ -7,7 +7,7 @@ use alloc::{
+ };
+ use core::{
+     ops::Deref,
+-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
++    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+ };
+ 
+ use aster_softirq::BottomHalfDisabled;
+@@ -46,6 +46,8 @@ pub struct IfaceCommon<E: Ext> {
+     used_ports: SpinLock<PortTable, BottomHalfDisabled>,
+     sockets: SpinLock<SocketTable<E>, BottomHalfDisabled>,
+     sched_poll: E::ScheduleNextPoll,
++    /// When the physical layer (its DHCP client) wants a poll; 0: never.
++    phy_next_poll_ms: AtomicU64,
+ }
+ 
+ pub(super) struct TxPacketWithDst {
+@@ -121,6 +123,7 @@ impl<E: Ext> IfaceCommon<E> {
+             used_ports: SpinLock::new(PortTable::new()),
+             sockets: SpinLock::new(SocketTable::new()),
+             sched_poll,
++            phy_next_poll_ms: AtomicU64::new(0),
+         }
+     }
+ 
+@@ -155,6 +158,10 @@ impl<E: Ext> IfaceCommon<E> {
+     pub(super) fn sched_poll(&self) -> &E::ScheduleNextPoll {
+         &self.sched_poll
+     }
++
++    pub(super) fn set_phy_next_poll(&self, at_ms: Option<u64>) {
++        self.phy_next_poll_ms.store(at_ms.unwrap_or(0), Ordering::Relaxed);
++    }
+ }
+ 
+ /// An allocator that allocates a unique index for each interface.
+@@ -249,6 +256,12 @@ impl<E: Ext> IfaceCommon<E> {
+     fn do_poll_and_notify(&self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) {
+         let next_poll = self.do_poll(device, phy);
+         device.notify_poll_end();
++        let phy_next = self.phy_next_poll_ms.load(Ordering::Relaxed);
++        let next_poll = match (next_poll, phy_next) {
++            (next, 0) => next,
++            (None, phy) => Some(phy),
++            (Some(next), phy) => Some(next.min(phy)),
++        };
+         self.sched_poll.schedule_next_poll(next_poll);
+     }
+ 
+diff --git a/kernel/libs/aster-bigtcp/src/iface/dhcp.rs b/kernel/libs/aster-bigtcp/src/iface/dhcp.rs
+new file mode 100755
+index 0000000..7c11ae4
+--- /dev/null
++++ b/kernel/libs/aster-bigtcp/src/iface/dhcp.rs
+@@ -0,0 +1,362 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A DHCPv4 client for an Ethernet interface, as Linux's `ip=dhcp` and the
++//! clients of a desktop system configure one: it asks for an address, takes
++//! the router and the DNS servers, renews the lease and starts over when the
++//! server refuses it.
++//!
++//! It works below IP: the interface has no address while it asks, so the
++//! client writes and reads whole Ethernet frames (IPv4 broadcast, UDP 68 to
++//! 67) itself. No hardware access: its tests run on the host.
++//!
++//! Reference: RFC 2131 (DHCP), RFC 2132 (options).
++
++use alloc::{vec, vec::Vec};
++
++const CLIENT_PORT: u16 = 68;
++const SERVER_PORT: u16 = 67;
++const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
++/// Between attempts while asking.
++const RETRY_MS: u64 = 4_000;
++/// After this many unanswered requests, start over with a discover.
++const MAX_REQUESTS: u32 = 4;
++
++mod option {
++    pub(crate) const PAD: u8 = 0;
++    pub(crate) const SUBNET_MASK: u8 = 1;
++    pub(crate) const ROUTER: u8 = 3;
++    pub(crate) const DNS: u8 = 6;
++    pub(crate) const HOST_NAME: u8 = 12;
++    pub(crate) const DOMAIN_NAME: u8 = 15;
++    pub(crate) const REQUESTED_IP: u8 = 50;
++    pub(crate) const LEASE_TIME: u8 = 51;
++    pub(crate) const MESSAGE_TYPE: u8 = 53;
++    pub(crate) const SERVER_ID: u8 = 54;
++    pub(crate) const PARAMETERS: u8 = 55;
++    pub(crate) const RENEWAL_TIME: u8 = 58;
++    pub(crate) const REBINDING_TIME: u8 = 59;
++    pub(crate) const CLIENT_ID: u8 = 61;
++    pub(crate) const END: u8 = 255;
++}
++
++mod message {
++    pub(crate) const DISCOVER: u8 = 1;
++    pub(crate) const OFFER: u8 = 2;
++    pub(crate) const REQUEST: u8 = 3;
++    pub(crate) const ACK: u8 = 5;
++    pub(crate) const NAK: u8 = 6;
++}
++
++/// What the server gave.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Lease {
++    pub address: [u8; 4],
++    pub prefix_len: u8,
++    pub router: Option<[u8; 4]>,
++    pub dns: Vec<[u8; 4]>,
++    pub domain: Vec<u8>,
++    pub server: [u8; 4],
++    pub lease_secs: u32,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum State {
++    /// Sending discovers.
++    Selecting,
++    /// Requesting an offer.
++    Requesting { offer: Lease, attempts: u32 },
++    /// Holding a lease; renewing at `renew_ms`, rebinding at `rebind_ms`.
++    Bound { lease: Lease, renew_ms: u64, rebind_ms: u64, expire_ms: u64 },
++}
++
++/// What the interface should do with the client's news.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Event {
++    /// Use this address, router and DNS servers.
++    Configure(Lease),
++    /// The address is gone: unconfigure it.
++    Deconfigure,
++}
++
++pub(crate) struct DhcpClient {
++    mac: [u8; 6],
++    xid: u32,
++    state: State,
++    /// When to send next.
++    next_ms: u64,
++    host_name: Vec<u8>,
++}
++
++/// A view of the options of a DHCP message.
++struct Options<'a>(&'a [u8]);
++
++impl<'a> Options<'a> {
++    fn get(&self, code: u8) -> Option<&'a [u8]> {
++        let mut at = 0;
++        while at < self.0.len() {
++            match self.0[at] {
++                option::PAD => at += 1,
++                option::END => return None,
++                found => {
++                    let length = usize::from(*self.0.get(at + 1)?);
++                    let value = self.0.get(at + 2..at + 2 + length)?;
++                    if found == code {
++                        return Some(value);
++                    }
++                    at += 2 + length;
++                }
++            }
++        }
++        None
++    }
++
++    fn address(&self, code: u8) -> Option<[u8; 4]> {
++        self.get(code)?.get(..4)?.try_into().ok()
++    }
++
++    fn seconds(&self, code: u8) -> Option<u32> {
++        Some(u32::from_be_bytes(self.get(code)?.get(..4)?.try_into().ok()?))
++    }
++}
++
++fn checksum(data: &[u8]) -> u16 {
++    let mut sum = 0u32;
++    for pair in data.chunks(2) {
++        let word = u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]);
++        sum += u32::from(word);
++    }
++    while sum >> 16 != 0 {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    !(sum as u16)
++}
++
++impl DhcpClient {
++    /// A client for the interface with this MAC; `seed` makes its
++    /// transaction IDs differ from boot to boot.
++    pub(crate) fn new(mac: [u8; 6], seed: u32, host_name: &[u8]) -> Self {
++        let xid = u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]) ^ seed.rotate_left(13) ^ 0x5a5a_0000;
++        Self { mac, xid, state: State::Selecting, next_ms: 0, host_name: host_name.to_vec() }
++    }
++
++    /// The lease held, if any.
++    pub(crate) fn lease(&self) -> Option<&Lease> {
++        match &self.state {
++            State::Bound { lease, .. } => Some(lease),
++            _ => None,
++        }
++    }
++
++    /// When the client wants to be polled next.
++    pub(crate) fn next_ms(&self) -> u64 {
++        self.next_ms
++    }
++
++    /// At `now_ms`: a frame to send, and news for the interface.
++    pub(crate) fn poll(&mut self, now_ms: u64) -> (Option<Vec<u8>>, Option<Event>) {
++        if now_ms < self.next_ms {
++            return (None, None);
++        }
++        match self.state.clone() {
++            State::Selecting => {
++                self.next_ms = now_ms + RETRY_MS;
++                (Some(self.frame(message::DISCOVER, None, None, [0; 4])), None)
++            }
++            State::Requesting { offer, attempts } => {
++                if attempts >= MAX_REQUESTS {
++                    self.restart(now_ms);
++                    return (Some(self.frame(message::DISCOVER, None, None, [0; 4])), None);
++                }
++                self.state = State::Requesting { offer: offer.clone(), attempts: attempts + 1 };
++                self.next_ms = now_ms + RETRY_MS;
++                (Some(self.frame(message::REQUEST, Some(offer.address), Some(offer.server), [0; 4])), None)
++            }
++            State::Bound { lease, renew_ms, rebind_ms, expire_ms } => {
++                if now_ms >= expire_ms {
++                    self.restart(now_ms);
++                    return (Some(self.frame(message::DISCOVER, None, None, [0; 4])), Some(Event::Deconfigure));
++                }
++                if now_ms >= renew_ms {
++                    // Renewing, then rebinding: ask again, every few seconds,
++                    // with the address in ciaddr (RFC 2131, 4.4.5).
++                    let _ = rebind_ms;
++                    self.next_ms = (now_ms + RETRY_MS).min(expire_ms);
++                    return (Some(self.frame(message::REQUEST, None, None, lease.address)), None);
++                }
++                self.next_ms = renew_ms;
++                (None, None)
++            }
++        }
++    }
++
++    fn restart(&mut self, now_ms: u64) {
++        self.xid = self.xid.wrapping_mul(1_103_515_245).wrapping_add(12_345);
++        self.state = State::Selecting;
++        self.next_ms = now_ms + RETRY_MS;
++    }
++
++    /// A UDP datagram (an IPv4 packet's payload, from its UDP header) that
++    /// arrived for port 68: a reply to send at once, and news.
++    pub(crate) fn receive(&mut self, udp: &[u8], now_ms: u64) -> (Option<Vec<u8>>, Option<Event>) {
++        let Some(reply) = self.parse(udp) else { return (None, None) };
++        let (kind, lease) = reply;
++        match (&self.state, kind) {
++            (State::Selecting, message::OFFER) => {
++                self.state = State::Requesting { offer: lease.clone(), attempts: 1 };
++                self.next_ms = now_ms + RETRY_MS;
++                (Some(self.frame(message::REQUEST, Some(lease.address), Some(lease.server), [0; 4])), None)
++            }
++            (State::Requesting { .. }, message::ACK) | (State::Bound { .. }, message::ACK) => {
++                let lease_ms = u64::from(lease.lease_secs.max(60)) * 1000;
++                let renew_ms = now_ms + lease_ms / 2;
++                let rebind_ms = now_ms + lease_ms / 8 * 7;
++                let changed = self.lease() != Some(&lease);
++                self.state = State::Bound { lease: lease.clone(), renew_ms, rebind_ms, expire_ms: now_ms + lease_ms };
++                self.next_ms = renew_ms;
++                (None, changed.then_some(Event::Configure(lease)))
++            }
++            (State::Requesting { .. }, message::NAK) | (State::Bound { .. }, message::NAK) => {
++                let was_bound = self.lease().is_some();
++                self.restart(now_ms);
++                self.next_ms = now_ms;
++                (None, was_bound.then_some(Event::Deconfigure))
++            }
++            _ => (None, None),
++        }
++    }
++
++    /// A reply for this client: its type and what it offers.
++    fn parse(&self, udp: &[u8]) -> Option<(u8, Lease)> {
++        if udp.len() < 8 + 240 || u16::from_be_bytes([udp[2], udp[3]]) != CLIENT_PORT {
++            return None;
++        }
++        let bootp = &udp[8..];
++        // A reply (op 2) to our transaction, for our hardware address.
++        if bootp[0] != 2 || bootp[4..8] != self.xid.to_be_bytes() || bootp[28..34] != self.mac {
++            return None;
++        }
++        if bootp[236..240] != MAGIC_COOKIE {
++            return None;
++        }
++        let options = Options(&bootp[240..]);
++        let kind = *options.get(option::MESSAGE_TYPE)?.first()?;
++        let mask = options.address(option::SUBNET_MASK).unwrap_or([255, 255, 255, 0]);
++        let lease = Lease {
++            address: bootp[16..20].try_into().ok()?,
++            prefix_len: u32::from_be_bytes(mask).leading_ones() as u8,
++            router: options.address(option::ROUTER),
++            dns: options
++                .get(option::DNS)
++                .map(|servers| servers.chunks_exact(4).filter_map(|server| server.try_into().ok()).collect())
++                .unwrap_or_default(),
++            domain: options.get(option::DOMAIN_NAME).map(<[u8]>::to_vec).unwrap_or_default(),
++            server: options.address(option::SERVER_ID).unwrap_or(bootp[20..24].try_into().ok()?),
++            lease_secs: options.seconds(option::LEASE_TIME).unwrap_or(3600),
++        };
++        if kind != message::NAK && lease.address == [0; 4] {
++            return None;
++        }
++        Some((kind, lease))
++    }
++
++    /// A broadcast Ethernet frame with a DHCP message from this client.
++    fn frame(&self, kind: u8, requested: Option<[u8; 4]>, server: Option<[u8; 4]>, ciaddr: [u8; 4]) -> Vec<u8> {
++        let mut dhcp = vec![0u8; 240];
++        dhcp[0] = 1; // BOOTREQUEST
++        dhcp[1] = 1; // Ethernet
++        dhcp[2] = 6;
++        dhcp[4..8].copy_from_slice(&self.xid.to_be_bytes());
++        // Broadcast replies: there is no address to unicast to yet.
++        if ciaddr == [0; 4] {
++            dhcp[10] = 0x80;
++        }
++        dhcp[12..16].copy_from_slice(&ciaddr);
++        dhcp[28..34].copy_from_slice(&self.mac);
++        dhcp[236..240].copy_from_slice(&MAGIC_COOKIE);
++        dhcp.extend_from_slice(&[option::MESSAGE_TYPE, 1, kind]);
++        dhcp.extend_from_slice(&[option::CLIENT_ID, 7, 1]);
++        dhcp.extend_from_slice(&self.mac);
++        if let Some(address) = requested {
++            dhcp.extend_from_slice(&[option::REQUESTED_IP, 4]);
++            dhcp.extend_from_slice(&address);
++        }
++        if let Some(server) = server {
++            dhcp.extend_from_slice(&[option::SERVER_ID, 4]);
++            dhcp.extend_from_slice(&server);
++        }
++        if !self.host_name.is_empty() && self.host_name.len() < 64 {
++            dhcp.extend_from_slice(&[option::HOST_NAME, self.host_name.len() as u8]);
++            dhcp.extend_from_slice(&self.host_name);
++        }
++        dhcp.extend_from_slice(&[
++            option::PARAMETERS,
++            6,
++            option::SUBNET_MASK,
++            option::ROUTER,
++            option::DNS,
++            option::DOMAIN_NAME,
++            option::RENEWAL_TIME,
++            option::REBINDING_TIME,
++        ]);
++        dhcp.push(option::END);
++        // Some servers ignore messages shorter than a BOOTP one (300 bytes).
++        while dhcp.len() < 300 {
++            dhcp.push(option::PAD);
++        }
++
++        let udp_len = 8 + dhcp.len();
++        let ip_len = 20 + udp_len;
++        let mut frame = Vec::with_capacity(14 + ip_len);
++        frame.extend_from_slice(&[0xff; 6]);
++        frame.extend_from_slice(&self.mac);
++        frame.extend_from_slice(&[0x08, 0x00]);
++        let mut ip = [0u8; 20];
++        ip[0] = 0x45;
++        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
++        ip[4..6].copy_from_slice(&((self.xid & 0xffff) as u16).to_be_bytes());
++        ip[8] = 64;
++        ip[9] = 17;
++        ip[12..16].copy_from_slice(&ciaddr);
++        ip[16..20].copy_from_slice(&[255; 4]);
++        let sum = checksum(&ip);
++        ip[10..12].copy_from_slice(&sum.to_be_bytes());
++        frame.extend_from_slice(&ip);
++        frame.extend_from_slice(&CLIENT_PORT.to_be_bytes());
++        frame.extend_from_slice(&SERVER_PORT.to_be_bytes());
++        frame.extend_from_slice(&(udp_len as u16).to_be_bytes());
++        // A zero UDP checksum: none (allowed over IPv4).
++        frame.extend_from_slice(&[0, 0]);
++        frame.extend_from_slice(&dhcp);
++        frame
++    }
++}
++
++/// Whether an IPv4 packet (from its header) is UDP to the DHCP client port;
++/// returns the UDP datagram.
++pub(crate) fn dhcp_datagram(ipv4: &[u8]) -> Option<&[u8]> {
++    let header_len = usize::from(*ipv4.first()? & 0x0f) * 4;
++    if *ipv4.first()? >> 4 != 4 || *ipv4.get(9)? != 17 || ipv4.len() < header_len + 8 {
++        return None;
++    }
++    let total = usize::from(u16::from_be_bytes([ipv4[2], ipv4[3]])).min(ipv4.len());
++    let udp = ipv4.get(header_len..total)?;
++    (u16::from_be_bytes([udp[2], udp[3]]) == CLIENT_PORT).then_some(udp)
++}
++
++/// The DNS servers and domain of the leases, in resolv.conf's format (Linux's
++/// `/proc/net/pnp`).
++pub fn resolv_conf(leases: &[Lease]) -> Vec<u8> {
++    let mut text = Vec::new();
++    for lease in leases {
++        if !lease.domain.is_empty() {
++            text.extend_from_slice(b"domain ");
++            text.extend_from_slice(&lease.domain);
++            text.push(b'\n');
++        }
++    }
++    for server in leases.iter().flat_map(|lease| &lease.dns) {
++        let line = alloc::format!("nameserver {}.{}.{}.{}\n", server[0], server[1], server[2], server[3]);
++        text.extend_from_slice(line.as_bytes());
++    }
++    text
++}
+diff --git a/kernel/libs/aster-bigtcp/src/iface/iface.rs b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+index 8787f0a..11686c3 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/iface.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+@@ -27,6 +27,11 @@ pub trait Iface<E>: internal::IfaceInternal<E> + Send + Sync {
+ 
+     /// Returns the maximum transmission unit.
+     fn mtu(&self) -> usize;
++
++    /// The DHCP lease of an interface that asks for one.
++    fn dhcp_lease(&self) -> Option<crate::iface::DhcpLease> {
++        None
++    }
+ }
+ 
+ impl<E: Ext> dyn Iface<E> {
+diff --git a/kernel/libs/aster-bigtcp/src/iface/mod.rs b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+index 9dafea9..066572a 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/mod.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ mod common;
++mod dhcp;
+ #[expect(clippy::module_inception)]
+ mod iface;
+ mod packet_slice;
+@@ -16,6 +17,19 @@ const IFNAMESIZE: usize = 16;
+ pub type InterfaceName = aster_util::fixed_str::FixedCStr<IFNAMESIZE>;
+ 
+ pub use common::{BoundPort, BoundTcpPort, BoundUdpPort, InterfaceFlags, InterfaceType};
++pub use dhcp::{Lease as DhcpLease, resolv_conf};
++
++/// Changes whenever an interface's address or routes change (a DHCP lease),
++/// so that routing tables derived from them are rebuilt.
++pub fn config_generation() -> u64 {
++    CONFIG_GENERATION.load(core::sync::atomic::Ordering::Acquire)
++}
++
++pub(crate) fn bump_config_generation() {
++    CONFIG_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
++}
++
++static CONFIG_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+ pub use iface::Iface;
+ pub(crate) use packet_slice::PacketSlice;
+ pub use phy::{EtherIface, IpIface};
+diff --git a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+index 4aefbc2..1ca4893 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+@@ -1,9 +1,12 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use alloc::{collections::btree_map::BTreeMap, sync::Arc};
++use alloc::{collections::btree_map::BTreeMap, sync::Arc, vec, vec::Vec};
+ 
+ use aster_softirq::BottomHalfDisabled;
+-use ostd::sync::SpinLock;
++use ostd::{
++    mm::{VmReader, VmWriter},
++    sync::SpinLock,
++};
+ use smoltcp::{
+     iface::{Config, Context},
+     wire::{
+@@ -21,6 +24,8 @@ use crate::{
+         iface::internal::IfaceInternal,
+         time::get_network_timestamp,
+         wire::{arp, ether},
++        DhcpLease,
++        dhcp::{DhcpClient, Event as DhcpEvent, dhcp_datagram},
+     },
+     packet::{FreshTxPacket, LinkLayer, RxPacket, TransportLayer, TxPacket},
+ };
+@@ -30,6 +35,15 @@ pub struct EtherIface<D, E: Ext> {
+     common: IfaceCommon<E>,
+     ether_addr: EthernetAddress,
+     arp_table: SpinLock<BTreeMap<Ipv4Address, EthernetAddress>, BottomHalfDisabled>,
++    /// Asking for an address (an interface without a fixed one).
++    dhcp: Option<SpinLock<DhcpClient, BottomHalfDisabled>>,
++    lease: SpinLock<Option<DhcpLease>, BottomHalfDisabled>,
++    /// News of the DHCP client, applied outside the poll's locks.
++    pending: SpinLock<Vec<DhcpEvent>, BottomHalfDisabled>,
++}
++
++fn now_ms() -> u64 {
++    get_network_timestamp().total_millis() as u64
+ }
+ 
+ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+@@ -65,8 +79,81 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+             common,
+             ether_addr,
+             arp_table: SpinLock::new(BTreeMap::new()),
++            dhcp: None,
++            lease: SpinLock::new(None),
++            pending: SpinLock::new(Vec::new()),
+         })
+     }
++
++    /// An interface that asks a DHCP server for its address, router and DNS
++    /// servers, as a desktop system's interfaces do.
++    pub fn new_dhcp(
++        driver: D,
++        ether_addr: EthernetAddress,
++        name: InterfaceName,
++        sched_poll: E::ScheduleNextPoll,
++        flags: InterfaceFlags,
++        host_name: &[u8],
++    ) -> Arc<Self> {
++        let interface = driver.with(|device| {
++            let config = Config::new(wire::HardwareAddress::Ethernet(ether_addr));
++            new_interface(config, device.capabilities(), get_network_timestamp())
++        });
++        let common = IfaceCommon::new(name, InterfaceType::ETHER, flags, interface, sched_poll);
++        let seed = ostd::timer::Jiffies::elapsed().as_u64() as u32;
++        Arc::new(Self {
++            driver,
++            common,
++            ether_addr,
++            arp_table: SpinLock::new(BTreeMap::new()),
++            dhcp: Some(SpinLock::new(DhcpClient::new(ether_addr.0, seed, host_name))),
++            lease: SpinLock::new(None),
++            pending: SpinLock::new(Vec::new()),
++        })
++    }
++
++    /// A whole Ethernet frame as a packet for the device.
++    fn frame_packet(&self, frame: &[u8]) -> Option<TxPacket<LinkLayer>>
++    where
++        D: WithDevice,
++    {
++        let fresh = D::Device::alloc_tx_buffer(frame.len()).ok()?;
++        let mut builder = fresh.to_builder_at_layer::<LinkLayer>();
++        let written = builder.append_writer().write(&mut VmReader::from(frame));
++        builder.commit(written);
++        Some(builder.build())
++    }
++
++    /// Applies what the DHCP client said: the address and routes change.
++    fn apply_dhcp_events(&self) {
++        let events = core::mem::take(&mut *self.pending.lock());
++        for event in events {
++            let mut interface = self.common.interface();
++            match event {
++                DhcpEvent::Configure(lease) => {
++                    interface.set_ipv4(Some(Ipv4Cidr::new(Ipv4Address::from(lease.address), lease.prefix_len)));
++                    interface.set_ipv4_gateway(lease.router.map(Ipv4Address::from));
++                    drop(interface);
++                    ostd::notice!(
++                        "{}: DHCP lease {:?}/{} via {:?}, DNS {:?}",
++                        self.common.name().as_str().unwrap_or("?"),
++                        Ipv4Address::from(lease.address),
++                        lease.prefix_len,
++                        lease.router.map(Ipv4Address::from),
++                        lease.dns.iter().map(|dns| Ipv4Address::from(*dns)).collect::<Vec<_>>()
++                    );
++                    *self.lease.lock() = Some(lease);
++                }
++                DhcpEvent::Deconfigure => {
++                    interface.set_ipv4(None);
++                    interface.set_ipv4_gateway(None);
++                    drop(interface);
++                    *self.lease.lock() = None;
++                }
++            }
++            crate::iface::bump_config_generation();
++        }
++    }
+ }
+ 
+ impl<D, E: Ext> IfaceInternal<E> for EtherIface<D, E> {
+@@ -81,7 +168,26 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for EtherIface<D, E> {
+     }
+ 
+     fn poll(&self) {
++        if let Some(dhcp) = &self.dhcp {
++            let (frame, event) = dhcp.lock().poll(now_ms());
++            if let Some(event) = event {
++                self.pending.lock().push(event);
++            }
++            if let Some(packet) = frame.and_then(|frame| self.frame_packet(&frame)) {
++                self.driver.with(|device| {
++                    let _ = device.send(packet);
++                    device.notify_poll_end();
++                });
++            }
++            let next = dhcp.lock().next_ms();
++            self.common.set_phy_next_poll(Some(next));
++        }
+         self.common.poll(&self.driver, self);
++        self.apply_dhcp_events();
++    }
++
++    fn dhcp_lease(&self) -> Option<DhcpLease> {
++        self.lease.lock().clone()
+     }
+ 
+     fn mtu(&self) -> usize {
+@@ -106,7 +212,30 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
+ 
+         // Ignore the Ethernet frame if the protocol is not supported.
+         match repr.ethertype {
+-            EthernetProtocol::Ipv4 => Some(PhyProcessResult::Ipv4(packet)),
++            EthernetProtocol::Ipv4 => {
++                // A reply to the DHCP client: it never reaches IP, which has
++                // no address yet.
++                if let Some(dhcp) = &self.dhcp {
++                    let mut head = [0u8; 24];
++                    let peeked = packet.reader().read(&mut VmWriter::from(&mut head[..]));
++                    if peeked == head.len()
++                        && head[0] == 0x45
++                        && head[9] == 17
++                        && u16::from_be_bytes([head[22], head[23]]) == 68
++                    {
++                        let mut bytes = vec![0u8; packet.len().min(1600)];
++                        let length = packet.reader().read(&mut VmWriter::from(&mut bytes[..]));
++                        if let Some(udp) = dhcp_datagram(&bytes[..length]) {
++                            let (reply, event) = dhcp.lock().receive(udp, now_ms());
++                            if let Some(event) = event {
++                                self.pending.lock().push(event);
++                            }
++                            return reply.and_then(|frame| self.frame_packet(&frame)).map(PhyProcessResult::Tx);
++                        }
++                    }
++                }
++                Some(PhyProcessResult::Ipv4(packet))
++            }
+             EthernetProtocol::Ipv6 => Some(PhyProcessResult::Ipv6(packet)),
+             EthernetProtocol::Arp => {
+                 let (_, arp_repr) = arp::parse(packet)?;
+diff --git a/kernel/libs/aster-bigtcp/src/iface/poll_iface.rs b/kernel/libs/aster-bigtcp/src/iface/poll_iface.rs
+index 5c9c197..47022b1 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/poll_iface.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/poll_iface.rs
+@@ -57,6 +57,25 @@ impl<E: Ext> PollableIface<E> {
+         })
+     }
+ 
++    /// Replaces the IPv4 address (a DHCP lease, or none).
++    pub(super) fn set_ipv4(&mut self, cidr: Option<smoltcp::wire::Ipv4Cidr>) {
++        self.interface.update_ip_addrs(|addrs| {
++            addrs.retain(|addr| !matches!(addr, smoltcp::wire::IpCidr::Ipv4(_)));
++            if let Some(cidr) = cidr {
++                let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(cidr));
++            }
++        });
++    }
++
++    /// Replaces the default IPv4 route.
++    pub(super) fn set_ipv4_gateway(&mut self, gateway: Option<smoltcp::wire::Ipv4Address>) {
++        let routes = self.interface.routes_mut();
++        routes.remove_default_ipv4_route();
++        if let Some(gateway) = gateway {
++            let _ = routes.add_default_ipv4_route(gateway);
++        }
++    }
++
+     pub(super) fn routes(&mut self) -> Vec<Route> {
+         let mut routes = Vec::new();
+         self.interface.routes_mut().update(|route_entries| {

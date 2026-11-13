@@ -1,0 +1,26 @@
+#!/usr/bin/env -S pulseaudio -nF
+# The session's sound server (shell/src/main.rs starts it): PulseAudio over
+# the kernel's ALSA devices (/dev/snd), as OpenShell Live's PipeWire serves
+# the PulseAudio protocol. No udev and no D-Bus: the first card is opened by
+# number. hostd's mixer (pactl) and the session's programs (libpulse, or
+# ALSA's default through the pulse plugin, /etc/asound.conf) reach it on its
+# socket, $XDG_RUNTIME_DIR/pulse/native.
+
+# The card, with its profiles and ports (speakers, headphones, which the
+# "Headphone Jack" control says are in); none on a computer without one.
+.nofail
+load-module module-alsa-card device_id=0 tsched=1
+.fail
+
+load-module module-native-protocol-unix auth-anonymous=1
+load-module module-default-device-restore
+load-module module-device-restore
+load-module module-stream-restore
+load-module module-card-restore
+# Headphones plugged in: their port, as on OpenShell Live.
+load-module module-switch-on-port-available
+# A silent output when there is no card, so that programs still play.
+load-module module-always-sink
+# The card is let go when nothing plays.
+load-module module-suspend-on-idle timeout=5
+load-module module-position-event-sounds

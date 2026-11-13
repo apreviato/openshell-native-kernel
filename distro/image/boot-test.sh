@@ -70,6 +70,9 @@ qemu() {
     local disk_device=(virtio-blk-pci,bus=pcie.0,addr=0x6,drive=disk,bootindex=0,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off)
     if [[ "$bus" == nvme ]]; then
         disk_device=(nvme,bus=pcie.0,addr=0x6,drive=disk,serial=osn-nvme-test,bootindex=0)
+    elif [[ "$bus" == sata ]]; then
+        # The q35's own AHCI controller (Intel ICH9).
+        disk_device=(ide-hd,bus=ide.0,drive=disk,bootindex=0)
     fi
     if [[ "$profile" == desktop ]]; then memory=12G cpus=4 deadline=15m; fi
     # Secure Boot (SECURE_VARS, see secure_boot below): OVMF enforcing it from these variables.
@@ -184,4 +187,8 @@ grep -Fxq 'OPENSHELL_IMAGE_UPDATE_OK' "$output/update-1.log.txt"
 cp -R "$work/update-data" "$work/nvme-data"
 run nvme "$work/update" "b: Good 2026.12.0 (confirmed)" nvme
 grep -Fxq 'OPENSHELL_IMAGE_UPDATE_OK' "$output/nvme-1.log.txt"
+# The same system on a SATA disk (kernel/patches/0037).
+cp -R "$work/update-data" "$work/sata-data"
+run sata "$work/update" "b: Good 2026.12.0 (confirmed)" sata
+grep -Fxq 'OPENSHELL_IMAGE_UPDATE_OK' "$output/sata-1.log.txt"
 echo OPENSHELL_NATIVE_IMAGE_OK

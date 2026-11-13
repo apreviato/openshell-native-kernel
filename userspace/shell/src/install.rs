@@ -81,7 +81,8 @@ impl InstallState {
     }
 }
 
-/// A device the installer may be asked to write: /dev/nvme…n… or /dev/vd…, nothing else.
+/// A device the installer may be asked to write: a whole disk, /dev/nvme…n…,
+/// /dev/sd… (SATA and USB) or /dev/vd…, nothing else (never a partition).
 pub fn valid_device(device: &str) -> bool {
     let Some(name) = device.strip_prefix("/dev/") else { return false };
     let nvme = name.strip_prefix("nvme").is_some_and(|rest| {
@@ -92,7 +93,11 @@ pub fn valid_device(device: &str) -> bool {
             && namespace.bytes().all(|byte| byte.is_ascii_digit())
     });
     let virtio = name.len() == 3 && name.starts_with("vd") && name.as_bytes()[2].is_ascii_lowercase();
-    nvme || virtio
+    // sda .. sdz, sdaa ..: letters only, as Linux names whole SCSI disks.
+    let scsi = name.strip_prefix("sd").is_some_and(|letters| {
+        (1..=3).contains(&letters.len()) && letters.bytes().all(|byte| byte.is_ascii_lowercase())
+    });
+    nvme || virtio || scsi
 }
 
 /// The disks line from `installer list` ("<device> <bytes>" per line).
@@ -228,11 +233,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_whole_nvme_and_virtio_disks_only() {
-        for good in ["/dev/nvme0n1", "/dev/nvme12n3", "/dev/vda", "/dev/vdz"] {
+    fn accepts_whole_nvme_sata_usb_and_virtio_disks_only() {
+        for good in ["/dev/nvme0n1", "/dev/nvme12n3", "/dev/vda", "/dev/vdz", "/dev/sda", "/dev/sdab"] {
             assert!(valid_device(good), "{good}");
         }
-        for bad in ["/dev/nvme0n1p1", "/dev/vda1", "/dev/sda", "/dev/nvme0", "/dev/vd", "vda", "/dev/../dev/vda", "/dev/nvmexn1"] {
+        for bad in ["/dev/nvme0n1p1", "/dev/vda1", "/dev/sda1", "/dev/sd", "/dev/sdA", "/dev/sdabcd", "/dev/nvme0", "/dev/vd", "vda", "/dev/../dev/vda", "/dev/nvmexn1"] {
             assert!(!valid_device(bad), "{bad}");
         }
     }
@@ -266,7 +271,7 @@ mod tests {
             vec!["/bin/sh".into(), tool.to_string_lossy().into_owned()],
         );
         assert_eq!(installer.answer("install-list"), "disks /dev/vdb=20000000000");
-        assert_eq!(installer.answer("install /dev/sda"), "invalid");
+        assert_eq!(installer.answer("install /dev/sda1"), "invalid");
         assert_eq!(installer.answer("install /dev/vdb"), "needs-password");
         assert_eq!(installer.answer("install-name Ana Souza"), "ok");
         assert_eq!(installer.answer("install-name a:b"), "invalid");

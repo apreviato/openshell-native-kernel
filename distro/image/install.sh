@@ -35,13 +35,24 @@ MIN_DISK=$((16 * 1024 * MIB))
 progress() { echo "PROGRESS $1 $2"; }
 fail() { echo "FAILED $*" >&2; exit 1; }
 
-# Whole disks the kernel offers (NVMe and VirtIO), never their partitions.
+# Whether a disk is a live medium of OpenShell Native (an ISO 9660 volume
+# named OPENSHELL_NATIVE, build-media.sh), such as the stick this system
+# started from: never offered.
+live_medium() {
+    [ "$(dd if="$1" bs=1 skip=32769 count=5 2>/dev/null)" = CD001 ] &&
+        [ "$(dd if="$1" bs=1 skip=32808 count=16 2>/dev/null)" = OPENSHELL_NATIVE ]
+}
+
+# Whole disks the kernel offers (NVMe, SATA and USB, VirtIO), never their
+# partitions, nor a live medium.
 disks() {
-    for device in /dev/nvme[0-9]*n[0-9]* /dev/vd[a-z]; do
+    for device in /dev/nvme[0-9]*n[0-9]* /dev/sd[a-z] /dev/sd[a-z][a-z] /dev/vd[a-z]; do
         case "$device" in *p[0-9]*) continue ;; esac
         [ -b "$device" ] || continue
         size=$(blockdev --getsize64 "$device" 2>/dev/null) || continue
-        [ "$size" -ge "$MIN_DISK" ] && echo "$device $size"
+        [ "$size" -ge "$MIN_DISK" ] || continue
+        live_medium "$device" && continue
+        echo "$device $size"
     done
     return 0
 }

@@ -66,6 +66,22 @@ let
         ];
         # Xvfb and libglvnd find the drivers where NixOS installs them.
         mesa = pkgs.mesa;
+        # Sound: the session's PulseAudio (probes/openshell-sound.pa, which
+        # the launcher starts) over the kernel's ALSA devices, its pactl for
+        # hostd's mixer, and ALSA's default sent to it through the pulse
+        # plugin, as NixOS sets it up (without the server: the card through
+        # plughw, as ALSA's dmix does not run on this kernel yet); alsa-utils
+        # to check.
+        sound = {
+          pulseaudio = pkgs.pulseaudio;
+          alsaUtils = pkgs.alsa-utils;
+          asoundConf = pkgs.writeText "asound.conf" ''
+            pcm_type.pulse { libs.native = ${pkgs.alsa-plugins}/lib/alsa-lib/libasound_module_pcm_pulse.so; }
+            ctl_type.pulse { libs.native = ${pkgs.alsa-plugins}/lib/alsa-lib/libasound_module_ctl_pulse.so; }
+            pcm.!default { type pulse fallback "plughw:0" hint { show on description "Default ALSA Output (PulseAudio)" } }
+            ctl.!default { type pulse fallback "sysdefault" }
+          '';
+        };
         # The session's X server (probes/openshell-x.sh): Xorg with the
         # modesetting driver on the kernel's DRM device, the evdev driver,
         # and Xvfb where there is no screen.
@@ -304,6 +320,60 @@ let
   };
   # The Desktop Terminal integrates with bash, as on OpenShell Live.
   shell = if bundle != null then pkgs.bashInteractive else null;
+  # The Desktop's local models (Models ▸ On-Device, Settings ▸ Local models):
+  # llama.cpp's server at the commit OpenShell Live builds
+  # (apps/desktop/scripts/install-native.sh, b11960, the first that loads
+  # LFM3), whose version nixpkgs does not have yet. It runs on the CPU, as
+  # Native has no GPU driver: one library per instruction set (SSE4.2 to
+  # AVX-512 and AMX), the best chosen when it starts. hostd finds it next to
+  # its own folder, in /opt/openshell/llama/bin, as on Live; the libraries
+  # sit beside it ($ORIGIN), where llama.cpp looks for its CPU backends.
+  llama =
+    if bundle != null then
+      pkgs.stdenv.mkDerivation {
+        pname = "openshell-llama-server";
+        version = "b11960";
+        src = pkgs.fetchurl {
+          name = "llama.cpp-8642541b.tar.gz";
+          url = "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/8642541b255bfb5dc39cd351a178be09013a55d6";
+          sha256 = "1688a167a8edd9499cdd0c19b8bd044f0fa184b466981977bbf2222d884953a4";
+        };
+        nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.patchelf ];
+        cmakeFlags = [
+          "-DGGML_NATIVE=OFF"
+          "-DGGML_BACKEND_DL=ON"
+          "-DGGML_CPU_ALL_VARIANTS=ON"
+          "-DLLAMA_BUILD_TESTS=OFF"
+          "-DLLAMA_BUILD_EXAMPLES=OFF"
+          "-DLLAMA_BUILD_SERVER=ON"
+          "-DLLAMA_OPENSSL=OFF"
+          "-DLLAMA_CURL=OFF"
+          "-DLLAMA_USE_PREBUILT_UI=OFF"
+        ];
+        ninjaFlags = [ "llama-server" ];
+        installPhase = ''
+          runHook preInstall
+          mkdir -p "$out/bin"
+          install -m 0755 bin/llama-server "$out/bin/"
+          find bin -maxdepth 1 -name '*.so*' -exec cp -P '{}' "$out/bin/" ';'
+          # The libraries beside the server, and the store's (libstdc++,
+          # libgomp), never the build folder.
+          for file in "$out"/bin/*; do
+            [ -L "$file" ] && continue
+            rpath=$(patchelf --print-rpath "$file" | tr ':' '\n' | grep -v -e '^$' -e "^$NIX_BUILD_TOP" | paste -sd: -)
+            patchelf --set-rpath "\$ORIGIN''${rpath:+:$rpath}" "$file"
+          done
+          install -m 0644 ../LICENSE "$out/LICENSE"
+          echo 8642541b255bfb5dc39cd351a178be09013a55d6 > "$out/VERSION"
+          runHook postInstall
+        '';
+        doInstallCheck = true;
+        installCheckPhase = ''
+          "$out/bin/llama-server" --version
+        '';
+      }
+    else
+      null;
   # The A/B release transaction, exercised on the guest's VirtIO disk.
   ab =
     if builtins.pathExists ./openshell-ab then
@@ -368,6 +438,7 @@ let
       # its own SwiftShader for WebGL.
       ++ lib.optional (!media) graphics.mesa
       ++ graphics.tools
+      ++ [ graphics.sound.pulseaudio graphics.sound.alsaUtils graphics.sound.asoundConf ]
     )
     ++ lib.optionals (apps != null) apps.packages
     ++ lib.optionals (wine != null) ([ wine.package wine.runner ] ++ lib.optional (!media) wine.probe)
@@ -375,6 +446,7 @@ let
     # /usr/share/applications links to it.
     ++ lib.optional (apps != null) applications
     ++ lib.optional (shell != null) shell
+    ++ lib.optional (llama != null) llama
     ++ lib.optional (ab != null) ab
     ++ lib.optional (installer != null) installer
   );
@@ -382,6 +454,10 @@ let
     mkdir -p "$out"
     cp -R ${upstream.initramfs}/. "$out/"
     chmod u+w "$out" "$out/nix/store" "$out/opt" "$out/test"
+    # The DNS servers the kernel's DHCP client got (/proc/net/pnp, in
+    # resolv.conf's format), as Linux's IP autoconfiguration offers them.
+    chmod u+w "$out/etc"
+    ln -sfn /proc/net/pnp "$out/etc/resolv.conf"
     while IFS= read -r dependency; do
       name="$(basename "$dependency")"
       if [ ! -e "$out/nix/store/$name" ]; then
@@ -412,6 +488,13 @@ let
       cp -R ${bundle}/. "$out/opt/openshell/"
       chmod u+w "$out/bin"
       ln -s ${shell}/bin/bash "$out/bin/bash"
+      # llama.cpp built for this system: a runtime a Debian bundle carries
+      # would look for Debian's libraries.
+      chmod -R u+w "$out/opt/openshell"
+      rm -rf "$out/opt/openshell/llama"
+      mkdir -p "$out/opt/openshell/llama"
+      ln -s ${llama}/bin "$out/opt/openshell/llama/bin"
+      ln -s ${llama}/LICENSE ${llama}/VERSION "$out/opt/openshell/llama/"
     ''}
     ${lib.optionalString (graphics != null) ''
       for tool in ${lib.concatMapStringsSep " " (tool: "${tool}/bin") graphics.tools}; do
@@ -433,6 +516,13 @@ let
       mkdir -p "$out/etc/fonts"
       chmod u+w "$out/etc/fonts"
       ln -sfn ${graphics.fonts} "$out/etc/fonts/fonts.conf"
+      # Sound (graphics.sound): the server, its configuration, ALSA's default.
+      for program in ${graphics.sound.pulseaudio}/bin/pulseaudio ${graphics.sound.pulseaudio}/bin/pactl \
+          ${graphics.sound.alsaUtils}/bin/aplay ${graphics.sound.alsaUtils}/bin/arecord ${graphics.sound.alsaUtils}/bin/amixer; do
+        ln -s "$program" "$out/opt/openshell-compat/bin/"
+      done
+      install -m 0644 ${probes}/openshell-sound.pa "$out/opt/openshell-compat/sound.pa"
+      ln -sfn ${graphics.sound.asoundConf} "$out/etc/asound.conf"
       ln -s /etc/fonts/fonts.conf "$out/opt/openshell-compat/fonts.conf"
       ln -s ${pkgs.openbox}/etc/xdg "$out/opt/openshell-compat/xdg"
       install -m 0644 ${probes}/cef-smoke.mjs ${probes}/shell-smoke.mjs ${probes}/session-smoke.mjs ${probes}/linux-sandbox.mjs "$out/opt/openshell-compat/"

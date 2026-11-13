@@ -107,6 +107,52 @@ fn start_cursor_watcher(bundle: &Path, home: &Path, runtime: &Path, state: &Path
     Some(watcher)
 }
 
+/// The session's sound server configuration (probes/openshell-sound.pa in
+/// the image), unless OPENSHELL_SOUND_SCRIPT names another.
+const SOUND_SCRIPT: &str = "/opt/openshell-compat/sound.pa";
+const SOUND_SCRIPT_ENV: &str = "OPENSHELL_SOUND_SCRIPT";
+/// How long the session waits for the sound server's socket.
+const SOUND_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts the session's sound server: PulseAudio over the kernel's ALSA
+/// devices (as OpenShell Live's PipeWire serves the PulseAudio protocol),
+/// for hostd's mixer (pactl) and the CEF host. Returns it with the address
+/// its clients are given (PULSE_SERVER). The session goes on without it.
+fn start_sound_server(home: &Path, runtime: &Path, state: &Path) -> Option<(SessionProcess, OsString)> {
+    let script = env::var_os(SOUND_SCRIPT_ENV).map(PathBuf::from).unwrap_or_else(|| SOUND_SCRIPT.into());
+    if !script.is_file() {
+        return None;
+    }
+    let socket = runtime.join("pulse/native");
+    let _ = fs::remove_file(&socket);
+    let log = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600)
+        .open(state.join("sound.log")).ok()?;
+    // No shared memory between it and its clients (sockets carry the
+    // sound), no real-time priority, no exit when idle; its own script.
+    let child = session_command(OsStr::new("pulseaudio"))
+        .args(["--daemonize=no", "--use-pid-file=no", "--system=no", "--exit-idle-time=-1"])
+        .args(["--realtime=no", "--high-priority=no", "--disable-shm=yes", "--log-target=stderr", "-n", "-F"])
+        .arg(&script)
+        .env("HOME", home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().ok()?)
+        .stderr(log)
+        .spawn()
+        .ok()?;
+    let mut server = SessionProcess(child);
+    let deadline = Instant::now() + SOUND_READY_TIMEOUT;
+    while !socket.exists() {
+        if Instant::now() >= deadline || matches!(server.0.try_wait(), Ok(Some(_))) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let mut address = OsString::from("unix:");
+    address.push(&socket);
+    Some((server, address))
+}
+
 /// Restarts within RESTART_WINDOW, with an exponential delay between them.
 struct RestartBudget(Vec<Instant>);
 
@@ -229,6 +275,10 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     // draws and follows Settings ▸ Cursor; the session's programs find it as
     // the "OpenShell" theme among the account's icons.
     let _cursor = start_cursor_watcher(&bundle, &home, &runtime, &state);
+    // Sound for the Desktop and its programs (hostd's mixer, the CEF host).
+    let sound = start_sound_server(&home, &runtime, &state);
+    let pulse_server = sound.as_ref().map(|(_, address)| address.clone());
+    let _sound = sound.map(|(server, _)| server);
     let mut cursor_path = home.join(".icons").into_os_string();
     cursor_path.push(":");
     cursor_path.push(home.join(".local/share/icons"));
@@ -238,7 +288,11 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     // secret and is never logged.
     let log = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(state.join("hostd.log"))?;
     let start_hostd = || -> Result<(SessionProcess, Option<String>), Box<dyn Error>> {
-        let mut daemon = SessionProcess(session_command(&node)
+        let mut command = session_command(&node);
+        if let Some(address) = &pulse_server {
+            command.env("PULSE_SERVER", address);
+        }
+        let mut daemon = SessionProcess(command
             .arg(&hostd)
             .args(["--host", "127.0.0.1", "--port", &port.to_string(), "--offline"])
             .arg("--ui").arg(&ui)
@@ -259,6 +313,9 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let (mut daemon, Some(url)) = start_hostd()? else { return Ok(()) };
 
     let mut browser = session_command(cef.as_os_str());
+    if let Some(address) = &pulse_server {
+        browser.env("PULSE_SERVER", address);
+    }
     if env::var(DESKTOP_HEALTH_ENV).as_deref() == Ok("1") {
         browser.env(DESKTOP_HEALTH_ENV, "1");
     }

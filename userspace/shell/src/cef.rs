@@ -115,7 +115,9 @@ impl BrowserScope {
     }
 }
 
-/// Whether a Desktop request opens or navigates a Browser tab to this URL.
+/// Whether a Desktop request opens or navigates a Browser tab to this URL
+/// (the CEF host asks `Allows` itself; the tests ask here).
+#[cfg(test)]
 pub(super) fn browser_url(url: &str, hostd_port: u16) -> bool {
     url.len() < MAX_LINE && BrowserScope { hostd_port }.allows(MAIN_FRAME, url.as_bytes())
 }
@@ -350,7 +352,7 @@ mod tests {
         assert_eq!(control_url(&line, &config.origin), Some(second.as_str()));
         for invalid in [
             format!("bootstrap {}", second.replace("7788", "7789")),
-            format!("bootstrap http://127.0.0.1:7788/"),
+            "bootstrap http://127.0.0.1:7788/".to_string(),
             format!("navigate {second}"),
             second.clone(),
         ] {

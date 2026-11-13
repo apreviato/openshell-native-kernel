@@ -64,6 +64,11 @@ let
       # The SDK ships libcef.so with its debug information, about 1.3 GB.
       # --strip-unneeded keeps the dynamic symbol table and the RUNPATH.
       strip --strip-unneeded "$out/runtime/libcef.so"
+      # Chromium plays and records through PulseAudio when it can load
+      # libpulse (with dlopen, from libcef.so): the session's server then
+      # lists each page's stream by name in the mixer, and the microphones
+      # for dictation, as on Live. Without it, it falls back to ALSA.
+      patchelf --add-rpath ${lib.makeLibraryPath [ pkgs.libpulseaudio ]} "$out/runtime/libcef.so"
       # The GPU process loads ANGLE, SwiftShader and the Vulkan loader with dlopen.
       # Their own dependencies do not use the RUNPATH of libcef.so.
       for library in libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do

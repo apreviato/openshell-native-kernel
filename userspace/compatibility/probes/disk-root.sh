@@ -48,13 +48,18 @@ case "$slot" in a|b) ;; *) fail "no system slot on the command line" ;; esac
 # The data partition, by the ext2 UUID GRUB found it with (installed-storage.sh).
 uuid=$(printf '%s' "$data_uuid" | tr -d '-')
 device=
-for candidate in /dev/*5; do
-    [ -b "$candidate" ] || continue
-    actual=$(od -An -v -tx1 -j 1128 -N 16 "$candidate" 2> /dev/null | tr -d ' \n')
-    if [ -n "$uuid" ] && [ "$actual" = "$uuid" ]; then
-        device=$candidate
-        break
-    fi
+# SATA and USB disks come up after the kernel starts (their controllers'
+# tasks find them): look again for up to 15 s.
+for attempt in $(seq 1 30); do
+    for candidate in /dev/*5; do
+        [ -b "$candidate" ] || continue
+        actual=$(od -An -v -tx1 -j 1128 -N 16 "$candidate" 2> /dev/null | tr -d ' \n')
+        if [ -n "$uuid" ] && [ "$actual" = "$uuid" ]; then
+            device=$candidate
+            break 2
+        fi
+    done
+    sleep 0.5
 done
 [ -n "$device" ] || fail "no data partition with UUID $data_uuid"
 mount -t ext2 "$device" /data || fail "$device does not mount"

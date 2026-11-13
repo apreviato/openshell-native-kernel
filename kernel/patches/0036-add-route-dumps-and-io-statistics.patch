@@ -1,0 +1,1420 @@
+diff --git a/kernel/core/comps/block/src/bio.rs b/kernel/core/comps/block/src/bio.rs
+index 3fe6400..2a4097e 100644
+--- a/kernel/core/comps/block/src/bio.rs
++++ b/kernel/core/comps/block/src/bio.rs
+@@ -112,6 +112,8 @@ impl Bio {
+         block_device: &dyn BlockDevice,
+         io_batch: &mut IoBatch,
+     ) -> Result<(), BioEnqueueError> {
++        let type_ = self.type_();
++        let sectors = self.sid_range().end.to_raw() - self.sid_range().start.to_raw();
+         let Self {
+             metadata,
+             complete_fn,
+@@ -145,6 +147,7 @@ impl Bio {
+             assert!(result.is_ok());
+             return Err(e);
+         }
++        crate::stats::account(block_device.id(), type_, sectors);
+ 
+         io_batch.push(waiter_metadata);
+         Ok(())
+diff --git a/kernel/core/comps/block/src/lib.rs b/kernel/core/comps/block/src/lib.rs
+index 66cb96e..911648d 100644
+--- a/kernel/core/comps/block/src/lib.rs
++++ b/kernel/core/comps/block/src/lib.rs
+@@ -46,6 +46,7 @@ mod impl_block_device;
+ mod partition;
+ mod prelude;
+ pub mod request_queue;
++mod stats;
+ 
+ use ::device_id::DeviceId;
+ use component::{ComponentInitError, init_component};
+@@ -58,6 +59,7 @@ use self::{
+ pub use self::{
+     device_id::{MAX_MAJOR, MajorIdOwner, acquire_major, allocate_major},
+     partition::PartitionManager,
++    stats::{IoStats, io_stats},
+ };
+ 
+ pub const BLOCK_SIZE: usize = ostd::mm::PAGE_SIZE;
+@@ -162,6 +164,7 @@ pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
+         .lock()
+         .remove(&id.to_raw())
+         .ok_or(Error::NotFound)?;
++    stats::forget(id);
+     if let Some(hook) = DEVICE_HOOK.get() {
+         hook(&device, false);
+     }
+diff --git a/kernel/core/comps/block/src/partition.rs b/kernel/core/comps/block/src/partition.rs
+index 31de2fb..b5f1ce1 100644
+--- a/kernel/core/comps/block/src/partition.rs
++++ b/kernel/core/comps/block/src/partition.rs
+@@ -255,8 +255,12 @@ struct PartitionNode {
+ 
+ impl BlockDevice for PartitionNode {
+     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
++        let type_ = bio.type_();
++        let sectors = bio.sid_range().end.to_raw() - bio.sid_range().start.to_raw();
+         bio.set_sid_offset(self.info.start_sector());
+-        self.device.enqueue(bio)
++        self.device.enqueue(bio)?;
++        crate::stats::account(self.device.id(), type_, sectors);
++        Ok(())
+     }
+ 
+     fn metadata(&self) -> BlockDeviceMeta {
+diff --git a/kernel/core/comps/block/src/stats.rs b/kernel/core/comps/block/src/stats.rs
+new file mode 100755
+index 0000000..81a24cd
+--- /dev/null
++++ b/kernel/core/comps/block/src/stats.rs
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The I/O of each block device, as Linux's `/proc/diskstats` reports it:
++//! requests and sectors read and written, and cache flushes. A partition's
++//! requests count for the partition and for its disk, as in Linux.
++
++use core::sync::atomic::{AtomicU64, Ordering};
++
++use device_id::DeviceId;
++use ostd::sync::{LocalIrqDisabled, SpinLock};
++
++use crate::{bio::BioType, prelude::*};
++
++/// A block device's I/O since it was registered.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct IoStats {
++    /// Read requests.
++    pub reads: u64,
++    /// 512-byte sectors read.
++    pub read_sectors: u64,
++    /// Write requests.
++    pub writes: u64,
++    /// 512-byte sectors written.
++    pub write_sectors: u64,
++    /// Cache flushes.
++    pub flushes: u64,
++}
++
++#[derive(Default)]
++struct Counters {
++    reads: AtomicU64,
++    read_sectors: AtomicU64,
++    writes: AtomicU64,
++    write_sectors: AtomicU64,
++    flushes: AtomicU64,
++}
++
++static COUNTERS: SpinLock<BTreeMap<u32, Arc<Counters>>, LocalIrqDisabled> =
++    SpinLock::new(BTreeMap::new());
++
++fn counters(id: DeviceId) -> Arc<Counters> {
++    COUNTERS.lock().entry(id.to_raw()).or_default().clone()
++}
++
++/// Counts a request that the device `id` accepted.
++pub(crate) fn account(id: DeviceId, type_: BioType, sectors: u64) {
++    let counters = counters(id);
++    let (requests, sectors_counter) = match type_ {
++        BioType::Read => (&counters.reads, Some(&counters.read_sectors)),
++        BioType::Write => (&counters.writes, Some(&counters.write_sectors)),
++        BioType::Flush => (&counters.flushes, None),
++    };
++    requests.fetch_add(1, Ordering::Relaxed);
++    if let Some(sectors_counter) = sectors_counter {
++        sectors_counter.fetch_add(sectors, Ordering::Relaxed);
++    }
++}
++
++/// Forgets a device that went away, so that one registered again under its
++/// numbers starts from zero.
++pub(crate) fn forget(id: DeviceId) {
++    COUNTERS.lock().remove(&id.to_raw());
++}
++
++/// Returns the I/O of the device `id` so far.
++pub fn io_stats(id: DeviceId) -> IoStats {
++    let Some(counters) = COUNTERS.lock().get(&id.to_raw()).cloned() else {
++        return IoStats::default();
++    };
++    IoStats {
++        reads: counters.reads.load(Ordering::Relaxed),
++        read_sectors: counters.read_sectors.load(Ordering::Relaxed),
++        writes: counters.writes.load(Ordering::Relaxed),
++        write_sectors: counters.write_sectors.load(Ordering::Relaxed),
++        flushes: counters.flushes.load(Ordering::Relaxed),
++    }
++}
+diff --git a/kernel/core/src/device/mod.rs b/kernel/core/src/device/mod.rs
+index e1bc1b6..da1ef05 100644
+--- a/kernel/core/src/device/mod.rs
++++ b/kernel/core/src/device/mod.rs
+@@ -13,7 +13,7 @@ pub(crate) mod tty;
+ use device_id::DeviceId;
+ pub(crate) use mem::{getrandom, geturandom};
+ pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
+-pub(crate) use registry::{lookup, partitions_text};
++pub(crate) use registry::{diskstats_text, lookup, partitions_text};
+ 
+ use crate::{
+     fs::{devtmpfs::DevtmpfsNodeMeta, file::PerOpenFileOps},
+diff --git a/kernel/core/src/device/registry/block.rs b/kernel/core/src/device/registry/block.rs
+index a17f9a9..bffb62d 100644
+--- a/kernel/core/src/device/registry/block.rs
++++ b/kernel/core/src/device/registry/block.rs
+@@ -126,6 +126,35 @@ pub(crate) fn partitions_text() -> String {
+     text
+ }
+ 
++/// `/proc/diskstats`: each block device's I/O, in Linux's 17 columns (the
++/// times, merges, discards and requests in flight are not kept: zeros).
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.13/source/block/genhd.c#L1305>.
++pub(crate) fn diskstats_text() -> String {
++    use core::fmt::Write as _;
++
++    let mut devices = aster_block::collect_all();
++    devices.sort_by_key(|device| (device.id().major().get(), device.id().minor().get()));
++    let mut text = String::new();
++    for device in devices {
++        let id = device.id();
++        let stats = aster_block::io_stats(id);
++        let _ = writeln!(
++            text,
++            "{:4} {:7} {} {} 0 {} 0 {} 0 {} 0 0 0 0 0 0 0 0 {} 0",
++            id.major().get(),
++            id.minor().get(),
++            device.name(),
++            stats.reads,
++            stats.read_sectors,
++            stats.writes,
++            stats.write_sectors,
++            stats.flushes,
++        );
++    }
++    text
++}
++
+ mod ioctl_defs {
+     use crate::{
+         ioc,
+diff --git a/kernel/core/src/device/registry/mod.rs b/kernel/core/src/device/registry/mod.rs
+index 347b3e0..96af5d9 100644
+--- a/kernel/core/src/device/registry/mod.rs
++++ b/kernel/core/src/device/registry/mod.rs
+@@ -10,7 +10,7 @@ use crate::{
+ mod block;
+ pub mod char;
+ 
+-pub(crate) use block::partitions_text;
++pub(crate) use block::{diskstats_text, partitions_text};
+ 
+ pub(super) fn init_in_first_kthread() {
+     block::init_in_first_kthread();
+diff --git a/kernel/core/src/fs/fs_impls/procfs/mod.rs b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+index 8d68554..9e2249d 100644
+--- a/kernel/core/src/fs/fs_impls/procfs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+@@ -15,7 +15,7 @@ use self::{
+     meminfo::MemInfoFileOps,
+     mounts::MountsSymOps,
+     net::NetDirOps,
+-    partitions::PartitionsFileOps,
++    partitions::{DiskstatsFileOps, PartitionsFileOps},
+     pid::{PidDirOps, TidDirOps},
+     self_::SelfSymOps,
+     sys::SysDirOps,
+@@ -162,6 +162,7 @@ impl RootDirOps {
+             InodeType::File,
+             FileSystemsFileOps::new_inode,
+         ),
++        ("diskstats", InodeType::File, DiskstatsFileOps::new_inode),
+         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
+         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),
+         ("mounts", InodeType::SymLink, MountsSymOps::new_inode),
+diff --git a/kernel/core/src/fs/fs_impls/procfs/net.rs b/kernel/core/src/fs/fs_impls/procfs/net.rs
+index ce5f67e..686a934 100644
+--- a/kernel/core/src/fs/fs_impls/procfs/net.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/net.rs
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ //! `/proc/net`: `pnp`, the DNS servers of the kernel's DHCP leases in
+-//! resolv.conf's format, as Linux's autoconfiguration gives them.
++//! resolv.conf's format, as Linux's autoconfiguration gives them, `route`,
++//! the IPv4 routes, and `dev`, each interface's traffic, as Linux lists them.
+ 
+ use aster_util::printer::VmPrinter;
+ 
+@@ -27,7 +28,11 @@ impl NetDirOps {
+         ProcDir::new(Self, parent, mkmod!(a+rx))
+     }
+ 
+-    const STATIC_ENTRIES: &'static [StaticEntry] = &[("pnp", InodeType::File, PnpFileOps::new_inode)];
++    const STATIC_ENTRIES: &'static [StaticEntry] = &[
++        ("pnp", InodeType::File, PnpFileOps::new_inode),
++        ("route", InodeType::File, RouteFileOps::new_inode),
++        ("dev", InodeType::File, DevFileOps::new_inode),
++    ];
+ }
+ 
+ impl ProcDirOps for NetDirOps {
+@@ -64,3 +69,35 @@ impl ProcFileOps for PnpFileOps {
+         Ok(printer.bytes_written())
+     }
+ }
++
++struct RouteFileOps;
++
++impl RouteFileOps {
++    fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(a+r))
++    }
++}
++
++impl ProcFileOps for RouteFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        write!(printer, "{}", crate::net::proc_net_route())?;
++        Ok(printer.bytes_written())
++    }
++}
++
++struct DevFileOps;
++
++impl DevFileOps {
++    fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(a+r))
++    }
++}
++
++impl ProcFileOps for DevFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        write!(printer, "{}", crate::net::proc_net_dev())?;
++        Ok(printer.bytes_written())
++    }
++}
+diff --git a/kernel/core/src/fs/fs_impls/procfs/partitions.rs b/kernel/core/src/fs/fs_impls/procfs/partitions.rs
+index bd4ae37..65530b6 100755
+--- a/kernel/core/src/fs/fs_impls/procfs/partitions.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/partitions.rs
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ //! `/proc/partitions`: the block devices (disks and their partitions), with
+-//! their device numbers and sizes, as Linux lists them.
++//! their device numbers and sizes, as Linux lists them; `/proc/diskstats`:
++//! their I/O.
+ 
+ use aster_util::printer::VmPrinter;
+ 
+@@ -29,3 +30,19 @@ impl ProcFileOps for PartitionsFileOps {
+         Ok(printer.bytes_written())
+     }
+ }
++
++pub(super) struct DiskstatsFileOps;
++
++impl DiskstatsFileOps {
++    pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(a+r))
++    }
++}
++
++impl ProcFileOps for DiskstatsFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        write!(printer, "{}", crate::device::diskstats_text())?;
++        Ok(printer.bytes_written())
++    }
++}
+diff --git a/kernel/core/src/net/mod.rs b/kernel/core/src/net/mod.rs
+index bd01976..51c8b02 100644
+--- a/kernel/core/src/net/mod.rs
++++ b/kernel/core/src/net/mod.rs
+@@ -19,6 +19,49 @@ pub(crate) fn init_in_first_kthread() {
+ }
+ 
+ /// DNS servers, as `/proc/net/pnp` gives them.
++/// Linux's `/proc/net/dev`: each interface's traffic, in its columns.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.13/source/net/core/net-procfs.c#L77>.
++pub(crate) fn proc_net_dev() -> alloc::string::String {
++    use core::fmt::Write;
++
++    let mut text = alloc::string::String::from(concat!(
++        "Inter-|   Receive                                                |  Transmit\n",
++        " face |bytes    packets errs drop fifo frame compressed multicast",
++        "|bytes    packets errs drop fifo colls carrier compressed\n",
++    ));
++    for iface in iface::iter_all_ifaces() {
++        let stats = iface.stats();
++        let _ = writeln!(
++            text,
++            "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
++            iface.name().as_str().unwrap_or("?"),
++            stats.rx_bytes,
++            stats.rx_packets,
++            stats.rx_errors,
++            0,
++            0,
++            0,
++            0,
++            0,
++            stats.tx_bytes,
++            stats.tx_packets,
++            0,
++            stats.tx_dropped,
++            0,
++            0,
++            0,
++            0,
++        );
++    }
++    text
++}
++
++/// Linux's `/proc/net/route`.
++pub(crate) fn proc_net_route() -> alloc::string::String {
++    route::proc_net_route()
++}
++
+ pub(crate) fn resolv_conf() -> alloc::vec::Vec<u8> {
+     iface::resolv_conf()
+ }
+diff --git a/kernel/core/src/net/route/entry.rs b/kernel/core/src/net/route/entry.rs
+index ce21282..5d345b6 100644
+--- a/kernel/core/src/net/route/entry.rs
++++ b/kernel/core/src/net/route/entry.rs
+@@ -9,7 +9,6 @@ use crate::{net::iface::Iface, prelude::*};
+ #[derive(Clone)]
+ pub(super) struct RouteEntry<A: RouteAddressFamily> {
+     dst: A::Cidr,
+-    #[expect(dead_code)]
+     gateway: Option<A>,
+     output_iface: Arc<Iface>,
+     table_id: RouteTableId,
+@@ -47,8 +46,7 @@ impl<A: RouteAddressFamily> RouteEntry<A> {
+     }
+ 
+     /// Returns the next-hop gateway.
+-    #[expect(dead_code)]
+-    const fn gateway(&self) -> Option<A> {
++    pub(super) const fn gateway(&self) -> Option<A> {
+         self.gateway
+     }
+ 
+@@ -139,6 +137,11 @@ impl RouteTableId {
+     /// The table ID of the local table,
+     /// which manages routes for addresses assigned locally.
+     pub(super) const LOCAL: Self = Self(255);
++
++    /// Returns the table's number.
++    pub(super) const fn value(self) -> u32 {
++        self.0
++    }
+ }
+ 
+ /// A route metric used to prefer routes with equal prefix lengths;
+@@ -146,11 +149,18 @@ impl RouteTableId {
+ #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+ pub(super) struct RouteMetric(u32);
+ 
++impl RouteMetric {
++    /// Returns the metric's value.
++    pub(super) const fn value(self) -> u32 {
++        self.0
++    }
++}
++
+ /// The forwarding behavior of a route.
+ ///
+ /// Reference: <https://elixir.bootlin.com/linux/v7.1/source/include/uapi/linux/rtnetlink.h#L261>.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub(super) enum RouteType {
++pub(in crate::net) enum RouteType {
+     /// Forwards packets to a destination.
+     Unicast,
+     /// Delivers packets locally.
+diff --git a/kernel/core/src/net/route/manager.rs b/kernel/core/src/net/route/manager.rs
+index 67b010c..33059a3 100644
+--- a/kernel/core/src/net/route/manager.rs
++++ b/kernel/core/src/net/route/manager.rs
+@@ -67,6 +67,11 @@ impl<A: RouteAddressFamily> RouteManager<A> {
+         return_errno_with_message!(Errno::ENETUNREACH, "no route to the destination")
+     }
+ 
++    /// Returns the routes of all tables, ordered by table number.
++    pub(super) fn entries(&self) -> impl Iterator<Item = &RouteEntry<A>> {
++        self.tables.values().flat_map(|table| table.entries())
++    }
++
+     pub(super) fn lookup_in_local_table(&self, key: &RouteLookupKey<A>) -> Option<RouteEntry<A>> {
+         self.tables.get(&RouteTableId::LOCAL)?.lookup(key)
+     }
+diff --git a/kernel/core/src/net/route/mod.rs b/kernel/core/src/net/route/mod.rs
+index 215060d..de5f79d 100644
+--- a/kernel/core/src/net/route/mod.rs
++++ b/kernel/core/src/net/route/mod.rs
+@@ -6,6 +6,8 @@
+ //! Callers can look up the local interface that owns an address when binding a socket,
+ //! or select an output interface when connecting an unbound socket.
+ 
++use alloc::format;
++
+ use aster_bigtcp::{
+     iface::InterfaceType,
+     wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr},
+@@ -20,7 +22,124 @@ mod manager;
+ mod rule;
+ mod table;
+ 
+-use entry::{RouteAddressFamily, RouteEntry, RouteMetric, RouteTableId, RouteType};
++pub(in crate::net) use entry::RouteType;
++use entry::{RouteAddressFamily, RouteEntry, RouteMetric, RouteTableId};
++
++/// A route as the route netlink socket reports it (`ip route`).
++pub(in crate::net) struct RouteInfo {
++    /// The destination network.
++    pub(in crate::net) dst: IpCidr,
++    /// The next hop, if the destination is not on a connected network.
++    pub(in crate::net) gateway: Option<IpAddress>,
++    /// The output interface.
++    pub(in crate::net) iface: Arc<Iface>,
++    /// The number of the table holding the route.
++    pub(in crate::net) table: u32,
++    /// The route's metric (lower is preferred).
++    pub(in crate::net) metric: u32,
++    pub(in crate::net) type_: RouteType,
++}
++
++impl RouteInfo {
++    fn from_entry<A: RouteAddressFamily>(
++        entry: &RouteEntry<A>,
++        dst: impl Fn(&A::Cidr) -> IpCidr,
++        address: impl Fn(A) -> IpAddress,
++    ) -> Self {
++        Self {
++            dst: dst(entry.dst()),
++            gateway: entry.gateway().map(address),
++            iface: entry.output_iface().clone(),
++            table: entry.table_id().value(),
++            metric: entry.metric().value(),
++            type_: entry.type_(),
++        }
++    }
++}
++
++/// Returns the routes of the current namespace, IPv4 first, each family's
++/// ordered by table and destination.
++pub(in crate::net) fn dump_routes() -> Vec<RouteInfo> {
++    let net_ns = super::net_ns::current_net_ns();
++    let routes = net_ns.routes();
++    let ipv4 = routes
++        .0
++        .ipv4
++        .entries()
++        .map(|entry| RouteInfo::from_entry(entry, |cidr| IpCidr::Ipv4(*cidr), IpAddress::Ipv4));
++    let ipv6 = routes
++        .0
++        .ipv6
++        .entries()
++        .map(|entry| RouteInfo::from_entry(entry, |cidr| IpCidr::Ipv6(*cidr), IpAddress::Ipv6));
++    ipv4.chain(ipv6).collect()
++}
++
++/// Linux's `/proc/net/route`: the main table's IPv4 unicast routes, each
++/// address as the hexadecimal of its network-order word, lines padded to
++/// 127 columns.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.13/source/net/ipv4/fib_trie.c#L2963>.
++pub(in crate::net) fn proc_net_route() -> String {
++    const RTF_UP: u32 = 0x1;
++    const RTF_GATEWAY: u32 = 0x2;
++    const RTF_HOST: u32 = 0x4;
++    let word = |address: Ipv4Address| u32::from_le_bytes(address.octets());
++
++    let mut text = format!(
++        "{:<127}\n",
++        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
++    );
++    for route in dump_routes() {
++        let IpCidr::Ipv4(dst) = route.dst else {
++            continue;
++        };
++        if route.table != RouteTableId::MAIN.value() || route.type_ != RouteType::Unicast {
++            continue;
++        }
++        let gateway = match route.gateway {
++            Some(IpAddress::Ipv4(gateway)) => Some(gateway),
++            _ => None,
++        };
++        let mut flags = RTF_UP;
++        if gateway.is_some() {
++            flags |= RTF_GATEWAY;
++        }
++        if dst.prefix_len() == 32 {
++            flags |= RTF_HOST;
++        }
++        let line = format!(
++            "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
++            route.iface.name().as_str().unwrap_or("?"),
++            word(dst.address()),
++            word(gateway.unwrap_or(Ipv4Address::UNSPECIFIED)),
++            flags,
++            route.metric,
++            word(dst.netmask()),
++        );
++        text.push_str(&format!("{:<127}\n", line));
++    }
++    text
++}
++
++/// Returns the route that packets to `dst` take (`ip route get`).
++pub(in crate::net) fn lookup_route(dst: IpAddress) -> Result<RouteInfo> {
++    let net_ns = super::net_ns::current_net_ns();
++    let routes = net_ns.routes();
++    let route = match dst {
++        IpAddress::Ipv4(dst) => RouteInfo::from_entry(
++            &routes.0.ipv4.lookup_entry(&RouteLookupKey::new(dst))?,
++            |cidr| IpCidr::Ipv4(*cidr),
++            IpAddress::Ipv4,
++        ),
++        IpAddress::Ipv6(dst) => RouteInfo::from_entry(
++            &routes.0.ipv6.lookup_entry(&RouteLookupKey::new(dst))?,
++            |cidr| IpCidr::Ipv6(*cidr),
++            IpAddress::Ipv6,
++        ),
++    };
++    Ok(route)
++}
+ 
+ /// The routing tables of a network namespace.
+ pub(in crate::net) struct RouteTables {
+diff --git a/kernel/core/src/net/route/table.rs b/kernel/core/src/net/route/table.rs
+index 65b22d9..4399dd1 100644
+--- a/kernel/core/src/net/route/table.rs
++++ b/kernel/core/src/net/route/table.rs
+@@ -26,6 +26,11 @@ impl<A: RouteAddressFamily> RouteTable<A> {
+         self.entries.insert((*entry.dst(), entry.metric()), entry);
+     }
+ 
++    /// Returns the table's routes, ordered by destination.
++    pub(super) fn entries(&self) -> impl Iterator<Item = &RouteEntry<A>> {
++        self.entries.values()
++    }
++
+     pub(super) fn lookup(&self, key: &RouteLookupKey<A>) -> Option<RouteEntry<A>> {
+         let mut best: Option<&RouteEntry<A>> = None;
+ 
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/mod.rs b/kernel/core/src/net/socket/netlink/route/kernel/mod.rs
+index c914565..516c086 100644
+--- a/kernel/core/src/net/socket/netlink/route/kernel/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/kernel/mod.rs
+@@ -17,6 +17,7 @@ use crate::{
+ 
+ mod addr;
+ mod link;
++mod route;
+ mod util;
+ 
+ pub(super) struct NetlinkRouteKernelSocket {
+@@ -38,6 +39,7 @@ impl NetlinkRouteKernelSocket {
+         let response_segments = match request {
+             RtnlSegment::GetLink(request_segment) => link::do_get_link(request_segment),
+             RtnlSegment::GetAddr(request_segment) => addr::do_get_addr(request_segment),
++            RtnlSegment::GetRoute(request_segment) => route::do_get_route(request_segment),
+             _ => Err(Error::with_message(
+                 Errno::EOPNOTSUPP,
+                 "the netlink route request is not supported",
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/route.rs b/kernel/core/src/net/socket/netlink/route/kernel/route.rs
+new file mode 100755
+index 0000000..30f6ccc
+--- /dev/null
++++ b/kernel/core/src/net/socket/netlink/route/kernel/route.rs
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Handle route-related requests: dumps (`ip route`) and lookups
++//! (`ip route get`).
++
++use core::net::IpAddr;
++
++use aster_bigtcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
++
++use super::util::finish_response;
++use crate::{
++    net::{
++        route::{RouteInfo, RouteType, dump_routes, lookup_route},
++        socket::netlink::{
++            message::{CMsgSegHdr, CSegmentType, GetRequestFlags, SegHdrCommonFlags},
++            route::message::{
++                RT_TABLE_COMPAT, RouteAttr, RouteFlags, RouteKind, RouteProtocol, RouteSegment,
++                RouteSegmentBody, RtScope, RtnlSegment,
++            },
++        },
++    },
++    prelude::*,
++    util::net::CSocketAddrFamily,
++};
++
++pub(super) fn do_get_route(request_segment: &RouteSegment) -> Result<Vec<RtnlSegment>> {
++    let request_header = request_segment.header();
++    let dump_all =
++        GetRequestFlags::from_bits_truncate(request_header.flags).contains(GetRequestFlags::DUMP);
++    let family = request_segment.body().family;
++
++    let mut response_segments: Vec<RtnlSegment> = if dump_all {
++        // Linux dumps the requested family, or every family when it is
++        // neither AF_INET nor AF_INET6.
++        let dump_ipv4 = family != CSocketAddrFamily::AF_INET6 as i32;
++        let dump_ipv6 = family != CSocketAddrFamily::AF_INET as i32;
++        dump_routes()
++            .iter()
++            .filter(|route| match route.dst {
++                IpCidr::Ipv4(_) => dump_ipv4,
++                IpCidr::Ipv6(_) => dump_ipv6,
++            })
++            .map(|route| RtnlSegment::NewRoute(new_route(request_header, route, None)))
++            .collect()
++    } else {
++        // Without `RTA_DST`, Linux looks up the unspecified address.
++        let dst = request_segment.attrs().iter().find_map(|attr| match attr {
++            RouteAttr::Dst(address) => Some(*address),
++            _ => None,
++        });
++        let dst = match (dst, family) {
++            (Some(IpAddr::V4(address)), _) => IpAddress::Ipv4(address),
++            (Some(IpAddr::V6(address)), _) => IpAddress::Ipv6(address),
++            (None, family) if family == CSocketAddrFamily::AF_INET6 as i32 => {
++                IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
++            }
++            (None, _) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
++        };
++        let route = lookup_route(dst)?;
++        vec![RtnlSegment::NewRoute(new_route(
++            request_header,
++            &route,
++            Some(dst),
++        ))]
++    };
++
++    finish_response(request_header, dump_all, &mut response_segments);
++
++    Ok(response_segments)
++}
++
++/// Describes a route, or with `lookup` the route that a destination takes.
++fn new_route(
++    request_header: &CMsgSegHdr,
++    route: &RouteInfo,
++    lookup: Option<IpAddress>,
++) -> RouteSegment {
++    let header = CMsgSegHdr {
++        len: 0,
++        type_: CSegmentType::NEWROUTE as _,
++        flags: SegHdrCommonFlags::empty().bits(),
++        seq: request_header.seq,
++        pid: request_header.pid,
++    };
++
++    let (family, dst, dst_len) = match (lookup, route.dst) {
++        (Some(IpAddress::Ipv4(address)), _) => {
++            (CSocketAddrFamily::AF_INET, IpAddr::V4(address), 32)
++        }
++        (Some(IpAddress::Ipv6(address)), _) => {
++            (CSocketAddrFamily::AF_INET6, IpAddr::V6(address), 128)
++        }
++        (None, IpCidr::Ipv4(cidr)) => (
++            CSocketAddrFamily::AF_INET,
++            IpAddr::V4(cidr.address()),
++            cidr.prefix_len(),
++        ),
++        (None, IpCidr::Ipv6(cidr)) => (
++            CSocketAddrFamily::AF_INET6,
++            IpAddr::V6(cidr.address()),
++            cidr.prefix_len(),
++        ),
++    };
++    let gateway = route.gateway.map(|gateway| match gateway {
++        IpAddress::Ipv4(address) => IpAddr::V4(address),
++        IpAddress::Ipv6(address) => IpAddr::V6(address),
++    });
++
++    // The kernel's own routes come from the interfaces' addresses; a
++    // gateway came from DHCP or from the boot configuration.
++    let protocol = match (gateway, route.iface.dhcp_lease()) {
++        (None, _) => RouteProtocol::Kernel,
++        (Some(_), Some(_)) => RouteProtocol::Dhcp,
++        (Some(_), None) => RouteProtocol::Boot,
++    };
++    let (scope, kind) = match route.type_ {
++        RouteType::Local => (RtScope::HOST, RouteKind::Local),
++        RouteType::Broadcast => (RtScope::LINK, RouteKind::Broadcast),
++        RouteType::Unicast if gateway.is_none() => (RtScope::LINK, RouteKind::Unicast),
++        RouteType::Unicast => (RtScope::UNIVERSE, RouteKind::Unicast),
++    };
++    let body = RouteSegmentBody {
++        family: family as _,
++        dst_len,
++        table: u8::try_from(route.table).unwrap_or(RT_TABLE_COMPAT as u8),
++        protocol,
++        scope: scope as u8,
++        type_: kind,
++        flags: if lookup.is_some() {
++            RouteFlags::CLONED
++        } else {
++            RouteFlags::empty()
++        },
++    };
++
++    // The source address: the interface's, for the routes the kernel made
++    // from it and for a lookup (Linux's `src`).
++    let source = match route.iface.ipv4_cidr() {
++        Some(cidr) if dst.is_ipv4() && (gateway.is_none() || lookup.is_some()) => {
++            Some(IpAddr::V4(cidr.address()))
++        }
++        _ => None,
++    };
++
++    // In Linux's order: `RTA_TABLE`, `RTA_DST`, `RTA_PRIORITY`,
++    // `RTA_PREFSRC`, `RTA_GATEWAY`, `RTA_OIF` for a dump; `RTA_OIF` before
++    // `RTA_PREFSRC` and `RTA_GATEWAY` for a lookup.
++    // Reference: <https://elixir.bootlin.com/linux/v6.13/source/net/ipv4/fib_semantics.c#L1785>
++    // and <https://elixir.bootlin.com/linux/v6.13/source/net/ipv4/route.c#L2905>.
++    let mut attrs = vec![RouteAttr::Table(route.table)];
++    if dst_len > 0 {
++        attrs.push(RouteAttr::Dst(dst));
++    }
++    let oif = RouteAttr::Oif(route.iface.index());
++    if lookup.is_some() {
++        attrs.push(oif);
++        attrs.extend(source.map(RouteAttr::PrefSrc));
++        attrs.extend(gateway.map(RouteAttr::Gateway));
++    } else {
++        if route.metric != 0 {
++            attrs.push(RouteAttr::Priority(route.metric));
++        }
++        attrs.extend(source.map(RouteAttr::PrefSrc));
++        attrs.extend(gateway.map(RouteAttr::Gateway));
++        attrs.push(oif);
++    }
++
++    RouteSegment::new(header, body, attrs)
++}
+diff --git a/kernel/core/src/net/socket/netlink/route/message/attr/mod.rs b/kernel/core/src/net/socket/netlink/route/message/attr/mod.rs
+index b44fa3a..3af743f 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/attr/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/attr/mod.rs
+@@ -2,3 +2,4 @@
+ 
+ pub(crate) mod addr;
+ pub(crate) mod link;
++pub(crate) mod route;
+diff --git a/kernel/core/src/net/socket/netlink/route/message/attr/route.rs b/kernel/core/src/net/socket/netlink/route/message/attr/route.rs
+new file mode 100755
+index 0000000..96f427e
+--- /dev/null
++++ b/kernel/core/src/net/socket/netlink/route/message/attr/route.rs
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
++
++use crate::{
++    net::socket::netlink::message::{Attribute, CAttrHeader, ContinueRead},
++    prelude::*,
++    util::MultiRead,
++};
++
++/// Route attributes.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/rtnetlink.h#L365>.
++#[expect(non_camel_case_types)]
++#[expect(clippy::upper_case_acronyms)]
++#[repr(u16)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
++enum RouteAttrClass {
++    UNSPEC = 0,
++    DST = 1,
++    SRC = 2,
++    IIF = 3,
++    OIF = 4,
++    GATEWAY = 5,
++    PRIORITY = 6,
++    PREFSRC = 7,
++    METRICS = 8,
++    MULTIPATH = 9,
++    PROTOINFO = 10,
++    FLOW = 11,
++    CACHEINFO = 12,
++    SESSION = 13,
++    MP_ALGO = 14,
++    TABLE = 15,
++    MARK = 16,
++}
++
++#[derive(Debug)]
++pub(crate) enum RouteAttr {
++    /// The destination (a network's address, or the address looked up).
++    Dst(IpAddr),
++    /// The output interface's index.
++    Oif(u32),
++    Gateway(IpAddr),
++    /// The metric.
++    Priority(u32),
++    /// The source address that packets on the route use.
++    PrefSrc(IpAddr),
++    /// The table's number.
++    Table(u32),
++}
++
++impl RouteAttr {
++    fn class(&self) -> RouteAttrClass {
++        match self {
++            RouteAttr::Dst(_) => RouteAttrClass::DST,
++            RouteAttr::Oif(_) => RouteAttrClass::OIF,
++            RouteAttr::Gateway(_) => RouteAttrClass::GATEWAY,
++            RouteAttr::Priority(_) => RouteAttrClass::PRIORITY,
++            RouteAttr::PrefSrc(_) => RouteAttrClass::PREFSRC,
++            RouteAttr::Table(_) => RouteAttrClass::TABLE,
++        }
++    }
++}
++
++impl Attribute for RouteAttr {
++    fn type_(&self) -> u16 {
++        self.class() as u16
++    }
++
++    fn payload_as_bytes(&self) -> &[u8] {
++        match self {
++            RouteAttr::Dst(address) | RouteAttr::Gateway(address) | RouteAttr::PrefSrc(address) => {
++                address.as_octets()
++            }
++            RouteAttr::Oif(value) | RouteAttr::Priority(value) | RouteAttr::Table(value) => {
++                value.as_bytes()
++            }
++        }
++    }
++
++    fn read_from(header: &CAttrHeader, reader: &mut dyn MultiRead) -> Result<ContinueRead<Self>>
++    where
++        Self: Sized,
++    {
++        let payload_len = header.payload_len();
++
++        // A dump's request may carry filters (`RTA_TABLE`, `RTA_OIF`, ...)
++        // that Linux reads only in strict mode, and a lookup's request
++        // (`ip route get`) the destination. Other attributes are ignored.
++        let address = |reader: &mut dyn MultiRead| -> Result<Option<IpAddr>> {
++            Ok(match payload_len {
++                4 => reader
++                    .read_val_opt::<[u8; 4]>()?
++                    .map(|octets| IpAddr::V4(Ipv4Addr::from(octets))),
++                16 => reader
++                    .read_val_opt::<[u8; 16]>()?
++                    .map(|octets| IpAddr::V6(Ipv6Addr::from(octets))),
++                _ => {
++                    reader.skip_some(payload_len);
++                    None
++                }
++            })
++        };
++        let attr = match (RouteAttrClass::try_from(header.type_()), payload_len) {
++            (Ok(RouteAttrClass::DST), _) => address(reader)?.map(RouteAttr::Dst),
++            (Ok(RouteAttrClass::OIF), 4) => reader.read_val_opt::<u32>()?.map(RouteAttr::Oif),
++            (Ok(RouteAttrClass::TABLE), 4) => reader.read_val_opt::<u32>()?.map(RouteAttr::Table),
++            _ => {
++                reader.skip_some(payload_len);
++                None
++            }
++        };
++
++        Ok(match attr {
++            Some(attr) => ContinueRead::Parsed(attr),
++            None => ContinueRead::Skipped,
++        })
++    }
++}
+diff --git a/kernel/core/src/net/socket/netlink/route/message/mod.rs b/kernel/core/src/net/socket/netlink/route/message/mod.rs
+index 17726ad..6603d48 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/mod.rs
+@@ -13,11 +13,15 @@ mod segment;
+ pub(super) use attr::{
+     addr::{AddrAttr, AddrProtocol},
+     link::LinkAttr,
++    route::RouteAttr,
+ };
+ pub(super) use segment::{
+     RtnlSegment,
+     addr::{AddrMessageFlags, AddrSegment, AddrSegmentBody, RtScope},
+     link::{LinkSegment, LinkSegmentBody},
++    route::{
++        RT_TABLE_COMPAT, RouteFlags, RouteKind, RouteProtocol, RouteSegment, RouteSegmentBody,
++    },
+ };
+ 
+ use crate::net::socket::netlink::message::Message;
+diff --git a/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs b/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs
+index 142af30..249fd35 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs
+@@ -38,6 +38,7 @@ pub(crate) mod route;
+ 
+ use addr::AddrSegment;
+ use link::LinkSegment;
++use route::RouteSegment;
+ 
+ use crate::{
+     net::socket::netlink::message::{
+@@ -54,6 +55,8 @@ pub(crate) enum RtnlSegment {
+     GetLink(LinkSegment),
+     NewAddr(AddrSegment),
+     GetAddr(AddrSegment),
++    NewRoute(RouteSegment),
++    GetRoute(RouteSegment),
+     Done(DoneSegment),
+     Error(ErrorSegment),
+ }
+@@ -67,6 +70,9 @@ impl ProtocolSegment for RtnlSegment {
+             RtnlSegment::NewAddr(addr_segment) | RtnlSegment::GetAddr(addr_segment) => {
+                 addr_segment.header()
+             }
++            RtnlSegment::NewRoute(route_segment) | RtnlSegment::GetRoute(route_segment) => {
++                route_segment.header()
++            }
+             RtnlSegment::Done(done_segment) => done_segment.header(),
+             RtnlSegment::Error(error_segment) => error_segment.header(),
+         }
+@@ -80,6 +86,9 @@ impl ProtocolSegment for RtnlSegment {
+             RtnlSegment::NewAddr(addr_segment) | RtnlSegment::GetAddr(addr_segment) => {
+                 addr_segment.header_mut()
+             }
++            RtnlSegment::NewRoute(route_segment) | RtnlSegment::GetRoute(route_segment) => {
++                route_segment.header_mut()
++            }
+             RtnlSegment::Done(done_segment) => done_segment.header_mut(),
+             RtnlSegment::Error(error_segment) => error_segment.header_mut(),
+         }
+@@ -97,6 +106,9 @@ impl ProtocolSegment for RtnlSegment {
+             Ok(CSegmentType::GETADDR) => {
+                 AddrSegment::read_from(&header, reader)?.map(RtnlSegment::GetAddr)
+             }
++            Ok(CSegmentType::GETROUTE) => {
++                RouteSegment::read_from(&header, reader)?.map(RtnlSegment::GetRoute)
++            }
+             _ => {
+                 let payload_len = header.calc_payload_len_with_padding(reader)?;
+                 reader.skip_some(payload_len);
+@@ -114,9 +126,10 @@ impl ProtocolSegment for RtnlSegment {
+         match self {
+             RtnlSegment::NewLink(link_segment) => link_segment.write_to(writer)?,
+             RtnlSegment::NewAddr(addr_segment) => addr_segment.write_to(writer)?,
++            RtnlSegment::NewRoute(route_segment) => route_segment.write_to(writer)?,
+             RtnlSegment::Done(done_segment) => done_segment.write_to(writer)?,
+             RtnlSegment::Error(error_segment) => error_segment.write_to(writer)?,
+-            RtnlSegment::GetAddr(_) | RtnlSegment::GetLink(_) => {
++            RtnlSegment::GetAddr(_) | RtnlSegment::GetLink(_) | RtnlSegment::GetRoute(_) => {
+                 unreachable!("kernel should not write get requests to user space");
+             }
+         }
+diff --git a/kernel/core/src/net/socket/netlink/route/message/segment/route.rs b/kernel/core/src/net/socket/netlink/route/message/segment/route.rs
+index 5918474..e14cfa3 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/segment/route.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/segment/route.rs
+@@ -1,14 +1,27 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use crate::prelude::*;
++use super::legacy::CRtGenMsg;
++use crate::{
++    net::socket::netlink::{
++        message::{SegmentBody, SegmentCommon},
++        route::message::attr::route::RouteAttr,
++    },
++    prelude::*,
++};
++
++pub(crate) type RouteSegment = SegmentCommon<RouteSegmentBody, RouteAttr>;
++
++impl SegmentBody for RouteSegmentBody {
++    type CLegacyType = CRtGenMsg;
++    type CType = CRtMsg;
++}
+ 
+ /// `rtmsg` in Linux.
+ ///
+ /// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/rtnetlink.h#L237>.
+-#[expect(unused)]
+ #[repr(C)]
+ #[derive(Clone, Copy, Debug, Pod)]
+-pub(super) struct CRtMsg {
++pub(crate) struct CRtMsg {
+     family: u8,
+     dst_len: u8,
+     src_len: u8,
+@@ -19,3 +32,108 @@ pub(super) struct CRtMsg {
+     type_: u8,
+     flags: u32,
+ }
++
++impl From<CRtGenMsg> for CRtMsg {
++    fn from(value: CRtGenMsg) -> Self {
++        Self {
++            family: value.family,
++            dst_len: 0,
++            src_len: 0,
++            tos: 0,
++            table: 0,
++            protocol: 0,
++            scope: 0,
++            type_: 0,
++            flags: 0,
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct RouteSegmentBody {
++    pub family: i32,
++    /// The destination's prefix length.
++    pub dst_len: u8,
++    /// The table (`RT_TABLE_COMPAT` when its number needs the `RTA_TABLE`
++    /// attribute).
++    pub table: u8,
++    pub protocol: RouteProtocol,
++    /// An `rt_scope_t`.
++    pub scope: u8,
++    pub type_: RouteKind,
++    pub flags: RouteFlags,
++}
++
++impl TryFrom<CRtMsg> for RouteSegmentBody {
++    type Error = Error;
++
++    fn try_from(value: CRtMsg) -> Result<Self> {
++        Ok(Self {
++            family: value.family as i32,
++            dst_len: value.dst_len,
++            table: value.table,
++            // Requests (`ip route show proto ...`) may name protocols this
++            // kernel never sets; only dumps' filters use them.
++            protocol: RouteProtocol::try_from(value.protocol).unwrap_or(RouteProtocol::Unspec),
++            scope: value.scope,
++            type_: RouteKind::try_from(value.type_).unwrap_or(RouteKind::Unspec),
++            flags: RouteFlags::from_bits_truncate(value.flags),
++        })
++    }
++}
++
++impl From<RouteSegmentBody> for CRtMsg {
++    fn from(value: RouteSegmentBody) -> Self {
++        Self {
++            family: value.family as u8,
++            dst_len: value.dst_len,
++            src_len: 0,
++            tos: 0,
++            table: value.table,
++            protocol: value.protocol as u8,
++            scope: value.scope,
++            type_: value.type_ as u8,
++            flags: value.flags.bits(),
++        }
++    }
++}
++
++/// Where a route came from (`rtm_protocol`).
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/rtnetlink.h#L276>.
++#[repr(u8)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
++pub(crate) enum RouteProtocol {
++    Unspec = 0,
++    /// Added by the kernel for an interface's address.
++    Kernel = 2,
++    /// Configured at boot.
++    Boot = 3,
++    /// Learned from a DHCP server.
++    Dhcp = 16,
++}
++
++/// A route's type (`rtm_type`).
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/rtnetlink.h#L261>.
++#[repr(u8)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
++pub(crate) enum RouteKind {
++    Unspec = 0,
++    Unicast = 1,
++    Local = 2,
++    Broadcast = 3,
++}
++
++bitflags! {
++    /// Flags in [`CRtMsg`].
++    ///
++    /// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/uapi/linux/rtnetlink.h#L331>.
++    pub(crate) struct RouteFlags: u32 {
++        /// The route was resolved for a destination (`ip route get`).
++        const CLONED = 0x200;
++    }
++}
++
++/// The `rtm_table` of a route whose table number does not fit a byte.
++pub(crate) const RT_TABLE_COMPAT: u32 = 252;
+diff --git a/kernel/libs/aster-bigtcp/src/iface/common.rs b/kernel/libs/aster-bigtcp/src/iface/common.rs
+index 5bfdf18..bb0cbf4 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/common.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/common.rs
+@@ -27,7 +27,7 @@ use super::{
+     time::get_network_timestamp,
+ };
+ use crate::{
+-    device::{AnyNetworkDevice, WithDevice},
++    device::{AnyNetworkDevice, NetError, WithDevice},
+     errors::BindError,
+     ext::Ext,
+     iface::ScheduleNextPoll,
+@@ -48,6 +48,70 @@ pub struct IfaceCommon<E: Ext> {
+     sched_poll: E::ScheduleNextPoll,
+     /// When the physical layer (its DHCP client) wants a poll; 0: never.
+     phy_next_poll_ms: AtomicU64,
++    counters: IfaceCounters,
++}
++
++/// An interface's traffic, as Linux's `/proc/net/dev` reports it.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct IfaceStats {
++    pub rx_bytes: u64,
++    pub rx_packets: u64,
++    /// Frames the device failed to deliver.
++    pub rx_errors: u64,
++    pub tx_bytes: u64,
++    pub tx_packets: u64,
++    /// Frames the device refused (its ring full) or failed to send.
++    pub tx_dropped: u64,
++}
++
++/// The counters behind [`IfaceStats`], updated as frames pass the device.
++#[derive(Default)]
++pub(crate) struct IfaceCounters {
++    rx_bytes: AtomicU64,
++    rx_packets: AtomicU64,
++    rx_errors: AtomicU64,
++    tx_bytes: AtomicU64,
++    tx_packets: AtomicU64,
++    tx_dropped: AtomicU64,
++}
++
++impl IfaceCounters {
++    pub(crate) fn received(&self, len: usize) {
++        self.rx_packets.fetch_add(1, Ordering::Relaxed);
++        self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
++    }
++
++    pub(crate) fn receive_failed(&self) {
++        self.rx_errors.fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Sends a frame through `device`, counting it.
++    pub(crate) fn send(
++        &self,
++        device: &mut dyn AnyNetworkDevice,
++        packet: TxPacket<LinkLayer>,
++    ) -> Result<(), NetError> {
++        let len = packet.len();
++        let result = device.send(packet);
++        if result.is_ok() {
++            self.tx_packets.fetch_add(1, Ordering::Relaxed);
++            self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
++        } else {
++            self.tx_dropped.fetch_add(1, Ordering::Relaxed);
++        }
++        result
++    }
++
++    fn snapshot(&self) -> IfaceStats {
++        IfaceStats {
++            rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
++            rx_packets: self.rx_packets.load(Ordering::Relaxed),
++            rx_errors: self.rx_errors.load(Ordering::Relaxed),
++            tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
++            tx_packets: self.tx_packets.load(Ordering::Relaxed),
++            tx_dropped: self.tx_dropped.load(Ordering::Relaxed),
++        }
++    }
+ }
+ 
+ pub(super) struct TxPacketWithDst {
+@@ -124,6 +188,7 @@ impl<E: Ext> IfaceCommon<E> {
+             sockets: SpinLock::new(SocketTable::new()),
+             sched_poll,
+             phy_next_poll_ms: AtomicU64::new(0),
++            counters: IfaceCounters::default(),
+         }
+     }
+ 
+@@ -265,6 +330,16 @@ impl<E: Ext> IfaceCommon<E> {
+         self.sched_poll.schedule_next_poll(next_poll);
+     }
+ 
++    /// The interface's traffic counters.
++    pub(crate) fn counters(&self) -> &IfaceCounters {
++        &self.counters
++    }
++
++    /// The interface's traffic so far.
++    pub(super) fn stats(&self) -> IfaceStats {
++        self.counters.snapshot()
++    }
++
+     fn do_poll(&self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) -> Option<u64> {
+         let mut interface = self.interface();
+         interface.context_mut().now = get_network_timestamp();
+@@ -273,8 +348,8 @@ impl<E: Ext> IfaceCommon<E> {
+         let mut socket_actions = Vec::new();
+ 
+         let mut context = PollContext::new(interface.as_mut(), &sockets, &mut socket_actions);
+-        context.poll_ingress(device, phy);
+-        context.poll_egress(device, phy);
++        context.poll_ingress(device, phy, &self.counters);
++        context.poll_egress(device, phy, &self.counters);
+ 
+         // Insert new connections and remove dead connections.
+         for action in socket_actions.into_iter() {
+diff --git a/kernel/libs/aster-bigtcp/src/iface/iface.rs b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+index 11686c3..3f01330 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/iface.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+@@ -8,7 +8,8 @@ use smoltcp::{
+ };
+ 
+ use super::{
+-    BindPortConfig, BoundTcpPort, BoundUdpPort, InterfaceFlags, InterfaceName, InterfaceType,
++    BindPortConfig, BoundTcpPort, BoundUdpPort, IfaceStats, InterfaceFlags, InterfaceName,
++    InterfaceType,
+ };
+ use crate::{errors::BindError, ext::Ext};
+ 
+@@ -105,6 +106,11 @@ impl<E: Ext> dyn Iface<E> {
+         self.common().ipv4_cidr()?.broadcast()
+     }
+ 
++    /// Returns the interface's traffic so far.
++    pub fn stats(&self) -> IfaceStats {
++        self.common().stats()
++    }
++
+     /// Returns routes currently installed in the interface.
+     pub fn routes(&self) -> Vec<Route> {
+         self.common().routes()
+diff --git a/kernel/libs/aster-bigtcp/src/iface/mod.rs b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+index 066572a..c715802 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/mod.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+@@ -16,7 +16,9 @@ mod wire;
+ const IFNAMESIZE: usize = 16;
+ pub type InterfaceName = aster_util::fixed_str::FixedCStr<IFNAMESIZE>;
+ 
+-pub use common::{BoundPort, BoundTcpPort, BoundUdpPort, InterfaceFlags, InterfaceType};
++pub use common::{
++    BoundPort, BoundTcpPort, BoundUdpPort, IfaceStats, InterfaceFlags, InterfaceType,
++};
+ pub use dhcp::{Lease as DhcpLease, resolv_conf};
+ 
+ /// Changes whenever an interface's address or routes change (a DHCP lease),
+diff --git a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+index 1ca4893..b986829 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+@@ -175,7 +175,7 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for EtherIface<D, E> {
+             }
+             if let Some(packet) = frame.and_then(|frame| self.frame_packet(&frame)) {
+                 self.driver.with(|device| {
+-                    let _ = device.send(packet);
++                    let _ = self.common.counters().send(device, packet);
+                     device.notify_poll_end();
+                 });
+             }
+diff --git a/kernel/libs/aster-bigtcp/src/iface/poll.rs b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+index 95e0aac..fa57e09 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/poll.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+@@ -12,7 +12,7 @@ use smoltcp::{
+ };
+ 
+ use super::{
+-    common::{PhyProcessResult, PollPhy, TxPacketWithDst},
++    common::{IfaceCounters, PhyProcessResult, PollPhy, TxPacketWithDst},
+     packet_slice::PacketSlice,
+     poll_iface::PollableIfaceMut,
+     wire::{
+@@ -60,12 +60,21 @@ impl<'a, E: Ext> PollContext<'a, E> {
+ }
+ 
+ impl<E: Ext> PollContext<'_, E> {
+-    pub(super) fn poll_ingress(&mut self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) {
++    pub(super) fn poll_ingress(
++        &mut self,
++        device: &mut dyn AnyNetworkDevice,
++        phy: &dyn PollPhy,
++        counters: &IfaceCounters,
++    ) {
+         loop {
+             let rx_packet = match device.receive() {
+-                Ok(packet) => packet,
++                Ok(packet) => {
++                    counters.received(packet.len());
++                    packet
++                }
+                 Err(NetError::NotReady) => break,
+                 Err(err) => {
++                    counters.receive_failed();
+                     ostd::error!("failed to receive a network packet: {:?}", err);
+                     break;
+                 }
+@@ -79,7 +88,7 @@ impl<E: Ext> PollContext<'_, E> {
+                 PhyProcessResult::Ipv4(packet) => (packet, Some(ip::Version::V4)),
+                 PhyProcessResult::Ipv6(packet) => (packet, Some(ip::Version::V6)),
+                 PhyProcessResult::Tx(packet) => {
+-                    if let Err(err) = device.send(packet) {
++                    if let Err(err) = counters.send(device, packet) {
+                         ostd::error!("failed to send a network packet: {:?}", err);
+                     }
+                     continue;
+@@ -88,7 +97,7 @@ impl<E: Ext> PollContext<'_, E> {
+ 
+             if let Some(reply) = self.parse_and_process_ip(phy, packet, ip_version)
+                 && let Some(tx_packet) = phy.dispatch(reply, self.iface.context_mut())
+-                && let Err(err) = device.send(tx_packet)
++                && let Err(err) = counters.send(device, tx_packet)
+             {
+                 ostd::error!("failed to send a network packet: {:?}", err);
+             }
+@@ -447,13 +456,18 @@ impl<E: Ext> PollContext<'_, E> {
+ }
+ 
+ impl<E: Ext> PollContext<'_, E> {
+-    pub(super) fn poll_egress(&mut self, device: &mut dyn AnyNetworkDevice, phy: &dyn PollPhy) {
++    pub(super) fn poll_egress(
++        &mut self,
++        device: &mut dyn AnyNetworkDevice,
++        phy: &dyn PollPhy,
++        counters: &IfaceCounters,
++    ) {
+         while device.can_send() {
+             let (did_something, packet) = self.dispatch_ip(phy);
+ 
+             if let Some(packet) = packet
+                 && let Some(tx_packet) = phy.dispatch(packet, self.iface.context_mut())
+-                && let Err(err) = device.send(tx_packet)
++                && let Err(err) = counters.send(device, tx_packet)
+             {
+                 ostd::error!("failed to send a network packet: {:?}", err);
+                 break;

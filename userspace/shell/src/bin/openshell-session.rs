@@ -22,6 +22,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use openshell_shell::drives::{self, MountOps, SystemView};
 use openshell_shell::install::{Installer, INSTALL_PREFIX, SYSTEM_SOCKET_ENV};
 use openshell_shell::login::{parse_request, Phase, Request, GREETER_SOCKET_ENV, MAX_REQUEST};
 use openshell_shell::power::PowerAction;
@@ -53,6 +54,14 @@ extern "C" {
     fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
     fn capset(header: *mut CapHeader, data: *const CapData) -> i32;
     fn getsockopt(socket: i32, level: i32, name: i32, value: *mut std::ffi::c_void, length: *mut u32) -> i32;
+    fn mount(
+        source: *const std::ffi::c_char,
+        target: *const std::ffi::c_char,
+        fstype: *const std::ffi::c_char,
+        flags: u64,
+        data: *const std::ffi::c_void,
+    ) -> i32;
+    fn umount2(target: *const std::ffi::c_char, flags: i32) -> i32;
 }
 
 const SOL_SOCKET: i32 = 1;
@@ -97,19 +106,61 @@ const CAP_FOWNER: u32 = 3;
 const CAP_KILL: u32 = 5;
 const CAP_SETGID: u32 = 6;
 const CAP_SETUID: u32 = 7;
+const CAP_SYS_ADMIN: u32 = 21;
 /// What the supervisor keeps once the session's directories exist: starting
 /// the session as its user, signalling its processes and removing the stale
 /// socket of its display, which belongs to the user.
 pub const KEPT_CAPABILITIES: u32 = 1 << CAP_FOWNER | 1 << CAP_KILL | 1 << CAP_SETGID | 1 << CAP_SETUID;
+/// Kept but not in effect: mounting the session's drives (drives.rs) raises
+/// it for the mount alone.
+const HELD_CAPABILITIES: u32 = 1 << CAP_SYS_ADMIN;
 
-fn drop_capabilities() -> io::Result<()> {
+fn set_capabilities(effective: u32) -> io::Result<()> {
     let mut header = CapHeader { version: CAPABILITY_VERSION_3, pid: 0 };
-    let kept = CapData { effective: KEPT_CAPABILITIES, permitted: KEPT_CAPABILITIES, inheritable: 0 };
+    let kept = CapData { effective, permitted: KEPT_CAPABILITIES | HELD_CAPABILITIES, inheritable: 0 };
     let none = CapData { effective: 0, permitted: 0, inheritable: 0 };
     if unsafe { capset(&mut header, [kept, none].as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn drop_capabilities() -> io::Result<()> {
+    set_capabilities(KEPT_CAPABILITIES)
+}
+
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// Mounts and unmounts with CAP_SYS_ADMIN in effect for just that call.
+struct Mounter;
+
+impl Mounter {
+    fn with_admin(call: impl FnOnce() -> i32) -> io::Result<()> {
+        let raised = set_capabilities(KEPT_CAPABILITIES | HELD_CAPABILITIES).is_ok();
+        let result = if call() == 0 { Ok(()) } else { Err(io::Error::last_os_error()) };
+        if raised {
+            let _ = set_capabilities(KEPT_CAPABILITIES);
+        }
+        result
+    }
+}
+
+impl MountOps for Mounter {
+    fn mount(&mut self, source: &str, target: &Path, fstype: &str, flags: u64, data: &str) -> io::Result<()> {
+        let source = c_path(Path::new(source))?;
+        let target = c_path(target)?;
+        let fstype = std::ffi::CString::new(fstype).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let data = std::ffi::CString::new(data).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        Self::with_admin(|| unsafe { mount(source.as_ptr(), target.as_ptr(), fstype.as_ptr(), flags, data.as_ptr().cast()) })
+    }
+
+    fn unmount(&mut self, target: &Path) -> io::Result<()> {
+        let target = c_path(target)?;
+        Self::with_admin(|| unsafe { umount2(target.as_ptr(), 0) })
+    }
 }
 
 extern "C" fn request_stop(_: i32) {
@@ -429,6 +480,14 @@ impl Supervisor {
                     }
                     None => "unavailable".to_owned(),
                 }
+            } else if drives::is_request(line) {
+                // /media/<user>, as udisks2 mounts the session's drives.
+                let user = self.config.home.file_name().and_then(|name| name.to_str()).unwrap_or("user").to_owned();
+                let answer = SystemView::default().answer(line, &user, self.config.uid, self.config.gid, &mut Mounter);
+                if line != drives::DRIVES_REQUEST {
+                    self.journal.note(&format!("{line}: {answer}"));
+                }
+                answer
             } else if PowerAction::is_request(line) {
                 match PowerAction::from_request(line) {
                     Some(action) => {
