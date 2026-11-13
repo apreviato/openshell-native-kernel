@@ -1,0 +1,56 @@
+diff --git a/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs b/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs
+--- a/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs
++++ b/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs
+@@ -7,7 +7,20 @@ use crate::{prelude::*, vm::perms::VmPerms};
+ 
+ impl Vmar {
+     pub(crate) fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
+-        let inner = self.inner.read();
++        // A copy from or to user memory with a spinlock held faults in atomic
++        // mode, where waiting for the address space is not allowed: it is
++        // taken only if free, and the copy fails otherwise.
++        let inner = if ostd::task::atomic_mode::in_atomic_mode() {
++            match self.inner.try_read() {
++                Some(inner) => inner,
++                None => return_errno_with_message!(
++                    Errno::EAGAIN,
++                    "the address space is busy and the page fault cannot wait"
++                ),
++            }
++        } else {
++            self.inner.read()
++        };
+ 
+         let address = page_fault_info.address;
+         if let Some(vm_mapping) = inner.vm_mappings.find_one(&address) {
+diff --git a/ostd/src/task/atomic_mode.rs b/ostd/src/task/atomic_mode.rs
+--- a/ostd/src/task/atomic_mode.rs
++++ b/ostd/src/task/atomic_mode.rs
+@@ -29,16 +29,22 @@
+ 
+ use core::sync::atomic::Ordering;
+ 
++/// Returns whether the current task runs in atomic mode, where it must not sleep.
++pub fn in_atomic_mode() -> bool {
++    let preempt_count = super::preempt::cpu_local::get_guard_count();
++    let is_local_irq_enabled = crate::arch::irq::is_local_enabled();
++    (preempt_count != 0 || !is_local_irq_enabled)
++        && !crate::IN_BOOTSTRAP_CONTEXT.load(Ordering::Relaxed)
++}
++
+ /// Marks a function as one that might sleep.
+ ///
+ /// This function will panic if it is executed in atomic mode.
+ #[track_caller]
+ pub fn might_sleep() {
+-    let preempt_count = super::preempt::cpu_local::get_guard_count();
+-    let is_local_irq_enabled = crate::arch::irq::is_local_enabled();
+-    if (preempt_count != 0 || !is_local_irq_enabled)
+-        && !crate::IN_BOOTSTRAP_CONTEXT.load(Ordering::Relaxed)
+-    {
++    if in_atomic_mode() {
++        let preempt_count = super::preempt::cpu_local::get_guard_count();
++        let is_local_irq_enabled = crate::arch::irq::is_local_enabled();
+         panic!(
+             "This function might break atomic mode (preempt_count = {}, is_local_irq_enabled = {})",
+             preempt_count, is_local_irq_enabled

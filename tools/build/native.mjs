@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const lock = JSON.parse(readFileSync(join(root, "kernel", "config", "upstream.lock.json"), "utf8"));
-const bundleActions = ["desktop", "kiosk", "apps"];
-const shellActions = ["graphics", "kiosk", "apps"];
+const bundleActions = ["desktop", "kiosk", "apps", "wine"];
+const shellActions = ["graphics", "kiosk", "apps", "wine"];
 const actions = ["doctor", "build", "smoke", "compat", "control", "sandbox", "baseline", "graphics", ...bundleActions];
 const usage = `Usage: node tools/build/native.mjs <${actions.filter((name) => !bundleActions.includes(name)).join("|")}>
        node tools/build/native.mjs <${bundleActions.join("|")}> <openshell-desktop-bundle>`;
@@ -143,7 +143,8 @@ async function run(action, bundlePath) {
     docker(["cp", join(root, "tools", "qemu", "run.sh"), `${container}:/tmp/openshell-native-run.sh`]);
     docker(["cp", join(root, "userspace", "compatibility"), `${container}:/tmp/openshell-native-compat`]);
     docker(["cp", join(root, "distro", "ab"), `${container}:/tmp/openshell-native-ab`]);
-    for (const name of ["hostd-smoke.mjs", "cef-smoke.mjs", "shell-smoke.mjs", "session-smoke.mjs", "linux-sandbox.mjs", "apps-smoke.mjs"]) {
+    docker(["cp", join(root, "distro", "image"), `${container}:/tmp/openshell-native-image`]);
+    for (const name of ["hostd-smoke.mjs", "cef-smoke.mjs", "shell-smoke.mjs", "session-smoke.mjs", "linux-sandbox.mjs", "apps-smoke.mjs", "wine-smoke.mjs"]) {
       docker(["cp", join(root, "tools", "desktop", name), `${container}:/tmp/openshell-native-compat/probes/${name}`]);
     }
     if (shellActions.includes(action)) {

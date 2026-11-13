@@ -48,6 +48,24 @@ function descendants(root) {
   return found;
 }
 
+/** Every process, busiest first: what held the CPU when a check failed, inside the session or not. */
+function busiest(supervisorPid) {
+  const session = supervisorPid ? new Set(descendants(supervisorPid).keys()) : new Set();
+  const ticks = [];
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").filter(Boolean).slice(0, 3).join(" ");
+      ticks.push({ pid: Number(entry), state: fields[0], cpuTicks: Number(fields[11]) + Number(fields[12]), session: session.has(Number(entry)), cmdline });
+    } catch {
+      // Exited while the table was read.
+    }
+  }
+  return ticks.sort((a, b) => b.cpuTicks - a.cpuTicks).slice(0, 25);
+}
+
 function find(root, predicate) {
   for (const [pid, cmdline] of descendants(root)) {
     if (predicate(cmdline)) return pid;
@@ -57,8 +75,8 @@ function find(root, predicate) {
 
 function alive(pid) {
   try {
-    process.kill(pid, 0);
-    return true;
+    // A zombie has exited; only its parent's wait is missing.
+    return !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, "utf8"));
   } catch {
     return false;
   }
@@ -119,6 +137,10 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
   }
 
   try {
+    // The healthy session confirms the boot (the A/B transaction): here, it leaves a mark.
+    const confirmed = join(scratch, "confirmed");
+    const confirmScript = join(scratch, "confirm.sh");
+    writeFileSync(confirmScript, `#!/bin/sh\necho confirmed >> ${confirmed}\n`, { mode: 0o755 });
     const config = [
       `user=${USER}:${USER}`,
       `display=${DISPLAY}`,
@@ -128,6 +150,8 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
       `wm=${openbox}`,
       `shell=${launcher} ${bundle} ${host} ${state} ${process.execPath}`,
       `env=PATH=${process.env.PATH ?? "/usr/bin:/bin"}`,
+      `confirm=/bin/sh ${confirmScript}`,
+      "confirm_after=5",
       `env=OPENSHELL_NATIVE_PORT=${await freePort()}`,
       ...["FONTCONFIG_FILE", "XDG_CONFIG_DIRS"].filter((name) => process.env[name]).map((name) => `env=${name}=${process.env[name]}`),
     ].join("\n");
@@ -167,6 +191,13 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
       report.restarted = second;
     });
 
+    await check("confirm", async () => {
+      // Five seconds of the restarted shell without a failure, then once.
+      await waitFor("the boot to be confirmed", () => existsSync(confirmed));
+      await new Promise((done) => setTimeout(done, 7_000));
+      assert.equal(readFileSync(confirmed, "utf8"), "confirmed\n", "The boot was confirmed more than once");
+    });
+
     await check("shutdown", async () => {
       const members = [...descendants(supervisor.pid).keys()];
       supervisor.kill("SIGTERM");
@@ -179,6 +210,7 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
       assert.deepEqual(survivors, [], "Processes of the session survived it");
       const journal = readFileSync(join(logs, "0001", "session.log"), "utf8");
       assert.match(journal, /restarting the shell/, "The journal does not record the restart");
+      assert.match(journal, /confirmed the boot/, "The journal does not record the confirmation");
       for (const name of ["session.log", "x.log", "shell.log"]) {
         writeFileSync(join(output, name), readFileSync(join(logs, "0001", name)));
       }
@@ -186,6 +218,17 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
     report.ok = true;
   } catch (error) {
     report.error = error.message;
+    // The scratch folder goes away: what the session wrote, and what ran, stay in the report.
+    report.logsAtFailure = {};
+    const runs = existsSync(logs) ? readdirSync(logs, { withFileTypes: true }).filter((entry) => entry.isDirectory()) : [];
+    for (const run of runs) {
+      for (const name of readdirSync(join(logs, run.name))) {
+        const text = readFileSync(join(logs, run.name, name), "utf8");
+        report.logsAtFailure[`${run.name}/${name}`] = text.split("\n").slice(-60).join("\n");
+      }
+    }
+    report.processesAtFailure = busiest(supervisor?.pid);
+    console.error(JSON.stringify({ logsAtFailure: report.logsAtFailure, processesAtFailure: report.processesAtFailure }, null, 2));
     throw error;
   } finally {
     if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null) {

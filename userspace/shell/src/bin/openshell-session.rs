@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use openshell_shell::session::{boot_log_dir, CommandLine, RestartBudget, SessionConfig};
+use openshell_shell::session::{boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig};
 
 const USAGE: &str = "Usage: openshell-session <config>";
 const SIGINT: i32 = 2;
@@ -245,15 +245,32 @@ impl Supervisor {
         Ok(())
     }
 
+    /// The session is healthy: the release the computer booted is confirmed
+    /// (the A/B transaction, distro/ab), once per boot. A failure is recorded;
+    /// the release then stays on trial and the next boots fall back.
+    fn confirm_boot(&mut self) {
+        let Some(confirm) = self.config.confirm.clone() else { return };
+        match Command::new(&confirm[0]).args(&confirm[1..]).stdin(Stdio::null()).status() {
+            Ok(status) if status.success() => self.journal.note("the session is healthy; confirmed the boot"),
+            Ok(status) => self.journal.note(&format!("confirming the boot failed ({status})")),
+            Err(error) => self.journal.note(&format!("confirming the boot failed ({error})")),
+        }
+    }
+
     /// Runs the session until the shell ends it, a stop is requested or
     /// failures exceed the budget.
     fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let mut session_budget = RestartBudget::new(3, Duration::from_secs(300));
         let mut shell_budget = RestartBudget::new(5, Duration::from_secs(60));
         let mut wm_budget = RestartBudget::new(5, Duration::from_secs(60));
+        let mut health = HealthWatch::new(self.config.confirm_after);
         self.start()?;
+        health.started(Instant::now());
         while !STOP.load(Ordering::Relaxed) {
             self.reap();
+            if health.healthy(Instant::now()) {
+                self.confirm_boot();
+            }
             if let Some(status) = self.exited(Role::XServer) {
                 // Without X, the whole session starts over.
                 self.journal.note(&format!("x failed ({}); restarting the session", describe(status)));
@@ -261,6 +278,7 @@ impl Supervisor {
                 let delay = session_budget.next_delay(Instant::now()).ok_or("the X server keeps failing")?;
                 thread::sleep(delay);
                 self.start()?;
+                health.started(Instant::now());
                 continue;
             }
             if let Some(status) = self.exited(Role::Shell) {
@@ -274,6 +292,7 @@ impl Supervisor {
                 thread::sleep(delay);
                 let shell = self.config.shell.clone();
                 self.spawn(Role::Shell, &shell)?;
+                health.started(Instant::now());
             }
             if self.exited(Role::WindowManager).is_some() {
                 if let Some(delay) = wm_budget.next_delay(Instant::now()) {

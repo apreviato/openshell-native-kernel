@@ -1,7 +1,8 @@
 #!/bin/sh
 # The A/B transaction end to end on a scratch directory: install, a confirmed
-# update, an update that never confirms and falls back, a corrupted release
-# and a destroyed selector. POSIX sh, for the guest's BusyBox.
+# update, an update that never confirms and falls back, a corrupted release,
+# unsigned and wrongly signed manifests, and a destroyed selector. POSIX sh,
+# for the guest's BusyBox.
 # Usage: sh distro/ab/smoke.sh <openshell-ab>; TMPDIR chooses the disk.
 set -eu
 
@@ -9,6 +10,10 @@ ab=$1
 work=$(mktemp -d "${TMPDIR:-/tmp}/openshell-ab-XXXXXX")
 trap 'rm -rf "$work"' EXIT
 disk="$work/disk"
+keys="$work/keys"
+mkdir -p "$keys"
+"$ab" keygen "$work/release.key" "$keys/release.pem"
+"$ab" keygen "$work/other.key" "$work/other.pem"
 
 release() {
     name=$1
@@ -22,6 +27,7 @@ release() {
             printf 'file=%s %s %s\n' "$file" "$(stat -c %s "$dir/$file")" "$(sha256sum "$dir/$file" | cut -d' ' -f1)"
         done
     } > "$dir/MANIFEST"
+    "$ab" sign "$work/release.key" "$dir/MANIFEST"
 }
 
 expect() {
@@ -38,7 +44,7 @@ expect a
 
 # A confirmed update.
 release 2026.12.0
-"$ab" "$disk" stage "$work/2026.12.0" "$work/2026.12.0/MANIFEST" 2
+"$ab" "$disk" stage "$work/2026.12.0" "$work/2026.12.0/MANIFEST" 2 "$keys"
 "$ab" "$disk" trial
 expect b
 "$ab" "$disk" confirm b
@@ -46,7 +52,7 @@ expect b
 
 # An update that never confirms: three attempts, then the confirmed slot.
 release 2027.01.0
-"$ab" "$disk" stage "$work/2027.01.0" "$work/2027.01.0/MANIFEST" 2
+"$ab" "$disk" stage "$work/2027.01.0" "$work/2027.01.0/MANIFEST" 2 "$keys"
 "$ab" "$disk" trial
 expect a
 expect a
@@ -57,7 +63,7 @@ expect b
 # A release whose files do not match its manifest is never staged.
 release 2027.02.0
 printf 'tampered\n' >> "$work/2027.02.0/kernel"
-if "$ab" "$disk" stage "$work/2027.02.0" "$work/2027.02.0/MANIFEST" 2 2>/dev/null; then
+if "$ab" "$disk" stage "$work/2027.02.0" "$work/2027.02.0/MANIFEST" 2 "$keys" 2>/dev/null; then
     echo 'A tampered release was staged' >&2
     exit 1
 fi
@@ -66,15 +72,86 @@ expect b
 
 # A release for data the computer does not have is refused.
 release 2027.03.0
-if "$ab" "$disk" stage "$work/2027.03.0" "$work/2027.03.0/MANIFEST" 3 2>/dev/null; then
+if "$ab" "$disk" stage "$work/2027.03.0" "$work/2027.03.0/MANIFEST" 3 "$keys" 2>/dev/null; then
     echo 'An incompatible release was staged' >&2
     exit 1
 fi
 
+# A manifest changed after signing, or signed by a key the computer does not trust, is never read.
+release 2027.04.0
+printf 'release=2027.04.1\n' > "$work/2027.04.0/MANIFEST.tmp"
+tail -n +2 "$work/2027.04.0/MANIFEST" >> "$work/2027.04.0/MANIFEST.tmp"
+mv "$work/2027.04.0/MANIFEST.tmp" "$work/2027.04.0/MANIFEST"
+if "$ab" "$disk" stage "$work/2027.04.0" "$work/2027.04.0/MANIFEST" 2 "$keys" 2>/dev/null; then
+    echo 'A manifest changed after signing was staged' >&2
+    exit 1
+fi
+release 2027.05.0
+"$ab" sign "$work/other.key" "$work/2027.05.0/MANIFEST"
+if "$ab" "$disk" stage "$work/2027.05.0" "$work/2027.05.0/MANIFEST" 2 "$keys" 2>/dev/null; then
+    echo 'A manifest signed by an untrusted key was staged' >&2
+    exit 1
+fi
+rm "$work/2027.05.0/MANIFEST.sig"
+if "$ab" "$disk" stage "$work/2027.05.0" "$work/2027.05.0/MANIFEST" 2 "$keys" 2>/dev/null; then
+    echo 'An unsigned manifest was staged' >&2
+    exit 1
+fi
+"$ab" "$disk" status | grep -q '^a: Empty -$'
+
+# Through GRUB (distro/image/grub.cfg): it takes an attempt from the trial in
+# grubenv, and the booted system records it. What GRUB does, in sed.
+grub_boot() {
+    env="$disk/grubenv"
+    trial=$(sed -n 's/^openshell_trial=//p' "$env")
+    if [ -n "$trial" ] && grep -q '^openshell_tries=1' "$env"; then
+        sed -i 's/^openshell_tries=1/openshell_tries=/' "$env"
+        printf '#' >> "$env"
+        echo "$trial"
+    else
+        sed -n 's/^openshell_fallback=//p' "$env"
+    fi
+    if [ "$(wc -c < "$env")" -ne 1024 ]; then
+        echo 'grubenv is not a 1024-byte block' >&2
+        exit 1
+    fi
+}
+expect_grub() {
+    booted=$(grub_boot)
+    if [ "$booted" != "$1" ]; then
+        printf 'Expected GRUB to boot %s, got %s\n' "$1" "$booted" >&2
+        exit 1
+    fi
+    "$ab" "$disk" booted "$booted"
+}
+release 2027.06.0
+"$ab" "$disk" stage "$work/2027.06.0" "$work/2027.06.0/MANIFEST" 2 "$keys"
+"$ab" "$disk" trial
+grep -q '^openshell_trial=a$' "$disk/grubenv"
+for left in 2 1 0; do
+    expect_grub a
+    "$ab" "$disk" status | grep -q "^a: Trial($left) 2027.06.0$"
+done
+expect_grub b
+"$ab" "$disk" status | grep -q '^a: Bad 2027.06.0$'
+if grep -q '^openshell_trial=' "$disk/grubenv"; then
+    echo 'grubenv still offers the failed trial' >&2
+    exit 1
+fi
+release 2027.07.0
+"$ab" "$disk" stage "$work/2027.07.0" "$work/2027.07.0/MANIFEST" 2 "$keys"
+"$ab" "$disk" trial
+expect_grub a
+"$ab" "$disk" confirm a
+grep -q '^openshell_fallback=a$' "$disk/grubenv"
+expect_grub a
+expect a
+
 # One damaged selector copy is survived; two mean recovery.
 newest=$(ls -t "$disk"/selector.* | head -1)
 printf 'garbage' > "$newest"
-expect b
+# The older copy has slot a on trial, before its confirmation.
+expect a
 printf 'garbage' > "$disk/selector.0"
 printf 'garbage' > "$disk/selector.1"
 expect recovery

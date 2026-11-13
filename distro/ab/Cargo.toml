@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[dependencies]
+# The release manifest's Ed25519 signature (src/signature.rs).
+ed25519-dalek = "2.1"
+
 [[bin]]
 name = "openshell-ab"
 path = "src/main.rs"

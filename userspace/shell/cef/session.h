@@ -39,6 +39,8 @@ struct Tab {
   bool closing = false;
   bool visible = false;
   bool focus_on_show = false;
+  // The page is in HTML fullscreen: the Desktop gives it the whole screen.
+  bool fullscreen = false;
   // The page numbers its placements; requests may arrive out of order.
   int generation = -1;
   CefRect bounds;

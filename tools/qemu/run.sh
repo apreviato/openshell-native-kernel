@@ -38,16 +38,21 @@ boot_timeout=10m
 bundle=/tmp/openshell-native-bundle
 shell_sources=/tmp/openshell-native-shell
 ab_sources=/tmp/openshell-native-ab
+image_sources=/tmp/openshell-native-image
 
-# What each action builds and runs. apps is the kiosk with the Linux apps profile.
-uses_bundle() { [[ "$action" == desktop || "$action" == kiosk || "$action" == apps ]]; }
-uses_graphics() { [[ "$action" == graphics || "$action" == kiosk || "$action" == apps ]]; }
-drives_desktop() { [[ "$action" == kiosk || "$action" == apps ]]; }
+# What each action builds and runs. apps is the kiosk with the Linux apps
+# profile; wine adds the Windows apps profile (OPENSHELL_WINE.md) to it.
+uses_bundle() { [[ "$action" == desktop || "$action" == kiosk || "$action" == apps || "$action" == wine ]]; }
+uses_graphics() { [[ "$action" == graphics || "$action" == kiosk || "$action" == apps || "$action" == wine ]]; }
+drives_desktop() { [[ "$action" == kiosk || "$action" == apps || "$action" == wine ]]; }
+uses_apps() { [[ "$action" == apps || "$action" == wine ]]; }
+uses_wine() { [[ "$action" == wine ]]; }
 
 prepare_compat() {
     install -m 0644 "$compat/initramfs.nix" test/initramfs/nix/openshell-compat.nix
     rm -rf test/initramfs/nix/openshell-probes test/initramfs/nix/openshell-bundle \
-        test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab test/initramfs/nix/openshell-apps
+        test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab test/initramfs/nix/openshell-apps \
+        test/initramfs/nix/openshell-wine
     cp -R "$probes" test/initramfs/nix/openshell-probes
     cp -R "$ab_sources" test/initramfs/nix/openshell-ab
     # The Desktop profiles add the OpenShell bundle to the initramfs.
@@ -58,9 +63,13 @@ prepare_compat() {
     if uses_graphics; then
         cp -R "$shell_sources" test/initramfs/nix/openshell-shell
     fi
-    # The apps profile adds Xpra and the probe applications (initramfs.nix).
-    if [[ "$action" == apps ]]; then
+    # The apps profile adds Xpra and the probe applications, and the wine
+    # profile Wine (initramfs.nix).
+    if uses_apps; then
         mkdir test/initramfs/nix/openshell-apps
+    fi
+    if uses_wine; then
+        cp -R "$compat/wine" test/initramfs/nix/openshell-wine
     fi
 }
 
@@ -110,7 +119,7 @@ run_control_graphics() {
     local host="$work/control-cefHost/runtime/openshell-cef-host"
     control_smoke control-cef "$probes/cef-smoke.mjs" host "$host"
     control_smoke control-cef-isolation "$probes/cef-smoke.mjs" isolation "$host"
-    if [[ "$action" == apps ]]; then
+    if uses_apps; then
         if ! timeout --kill-after=15s 60m nix-build test/initramfs/nix/openshell-compat.nix \
             -A appsTools -o "$work/control-appsTools" >> "$artifacts/control-graphics-build.log" 2>&1; then
             record_check control-apps failed
@@ -124,6 +133,17 @@ run_control_graphics() {
         path="$apps/bin:$path"
         apps_env=(XDG_DATA_DIRS="$apps/share" OPENSHELL_SMOKE_LINUX_APPS=1)
         control_smoke control-apps "$probes/apps-smoke.mjs" "$bundle"
+    fi
+    if uses_wine; then
+        if ! timeout --kill-after=15s 60m nix-build test/initramfs/nix/openshell-compat.nix \
+            -A wineTools -o "$work/control-wineTools" >> "$artifacts/control-graphics-build.log" 2>&1; then
+            record_check control-wine failed
+            return 1
+        fi
+        path="$work/control-wineTools/bin:$path"
+        apps_env+=(XDG_DATA_DIRS="$work/control-appsTools/share:$work/control-wineTools/share" OPENSHELL_SMOKE_WINE=1
+            OPENSHELL_WINE_PROBE_MSI="$work/control-wineTools/share/openshell/openshell-probe-setup.msi")
+        control_smoke control-wine "$probes/wine-smoke.mjs"
     fi
     if drives_desktop; then
         control_smoke control-shell "$probes/shell-smoke.mjs" \
@@ -341,10 +361,10 @@ run_compat() {
         memory=12G
         cpus=4
         boot_timeout=90m
-    elif [[ "$action" == apps ]]; then
+    elif uses_apps; then
         memory=12G
         cpus=4
-        boot_timeout=120m
+        boot_timeout=$(uses_wine && echo 150m || echo 120m)
     fi
     boot_args=("MEM=$memory" "SMP=$cpus" "CARGO_OSDK_INITRAMFS_OPTION=--initramfs=$work/compat-initramfs")
     local status=0 sandbox_status=0 console="$artifacts/native-compat-console.txt"
@@ -359,8 +379,11 @@ run_compat() {
     if drives_desktop; then
         workloads+=(shell session)
     fi
-    if [[ "$action" == apps ]]; then
+    if uses_apps; then
         workloads+=(apps)
+    fi
+    if uses_wine; then
+        workloads+=(wine)
     fi
     local workload
     for workload in "${workloads[@]}"; do
@@ -395,10 +418,33 @@ run_compat() {
     return "$status"
 }
 
+# The disk image (distro/image): GPT with the system slots, recovery and
+# data, GRUB choosing the slot from the A/B transaction's grubenv, booted in
+# QEMU once per step of each plan. Without the Desktop, the slots stay small.
+run_image() {
+    if ! timeout --kill-after=15s 25m nix-build test/initramfs/nix/openshell-compat.nix \
+        -A ab -o "$work/image-ab" >> "$artifacts/native-image.log" 2>&1; then
+        record_check native-image failed
+        return 1
+    fi
+    if OVMF_DIR="$ovmf_dir" timeout --kill-after=15s 150m bash "$image_sources/boot-test.sh" \
+        "$work/image-ab/bin/openshell-ab" "$CARGO_TARGET_DIR/osdk/asterinas-osdk-bin.elf" \
+        "$work/compat-initramfs" "$artifacts/native-image" >> "$artifacts/native-image.log" 2>&1; then
+        record_check native-image passed
+    else
+        tail -n 40 "$artifacts/native-image.log" >&2
+        record_check native-image failed
+        return 1
+    fi
+}
+
 if [[ "$action" == compat || "$action" == sandbox ]] || uses_bundle || uses_graphics; then
     prepare_compat
     compat_status=0
     run_compat || compat_status=1
+    if ! uses_graphics; then
+        run_image || compat_status=1
+    fi
     exit $((control_status || compat_status))
 fi
 
@@ -419,5 +465,6 @@ if [[ "$action" == baseline ]]; then
     git restore -- test/initramfs/src/boot_hello.sh
     rm -f -- test/initramfs/etc/openshell-native-static-exit
     run_compat || smoke_status=1
+    run_image || smoke_status=1
 fi
 exit $((control_status || smoke_status))

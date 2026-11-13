@@ -22,7 +22,15 @@ pub struct SessionConfig {
     pub window_manager: Option<CommandLine>,
     pub shell: CommandLine,
     pub env: Vec<(String, String)>,
+    /// Run once per boot, as root, when the session is healthy: it confirms
+    /// the release the computer booted (`openshell-ab <disk> confirm <slot>`).
+    pub confirm: Option<CommandLine>,
+    /// How long the shell runs without failing before the boot counts as healthy.
+    pub confirm_after: Duration,
 }
+
+/// By default, a minute of the shell without a failure makes a boot healthy.
+pub const DEFAULT_CONFIRM_AFTER: Duration = Duration::from_secs(60);
 
 fn command(value: &str, key: &str) -> Result<CommandLine, String> {
     let words: CommandLine = value.split_whitespace().map(str::to_owned).collect();
@@ -47,6 +55,7 @@ impl SessionConfig {
     pub fn parse(text: &str) -> Result<Self, String> {
         let (mut user, mut display, mut home, mut log_dir) = (None, None, None, None);
         let (mut x_server, mut window_manager, mut shell) = (None, None, None);
+        let (mut confirm, mut confirm_after) = (None, DEFAULT_CONFIRM_AFTER);
         let mut env = Vec::new();
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -75,6 +84,11 @@ impl SessionConfig {
                 "x" => x_server = Some(command(value, key)?),
                 "wm" => window_manager = Some(command(value, key)?),
                 "shell" => shell = Some(command(value, key)?),
+                "confirm" => confirm = Some(command(value, key)?),
+                "confirm_after" => {
+                    let seconds = value.parse::<u64>().map_err(|_| "confirm_after is a number of seconds")?;
+                    confirm_after = Duration::from_secs(seconds.max(1));
+                }
                 "env" => {
                     let (name, setting) = value.split_once('=').ok_or("env is NAME=value")?;
                     let reserved = ["DISPLAY", "HOME", "USER", "LOGNAME"];
@@ -103,12 +117,44 @@ impl SessionConfig {
             window_manager,
             shell: shell.ok_or("missing shell")?,
             env,
+            confirm,
+            confirm_after,
         })
     }
 
     /// The X server's socket, which appears once it accepts clients.
     pub fn x_socket(&self) -> PathBuf {
         PathBuf::from(format!("/tmp/.X11-unix/X{}", &self.display[1..]))
+    }
+}
+
+/// Whether the boot is healthy: the shell has run `after` without failing.
+/// It says so once; a failure starts the count again.
+pub struct HealthWatch {
+    after: Duration,
+    since: Option<Instant>,
+    reported: bool,
+}
+
+impl HealthWatch {
+    pub fn new(after: Duration) -> Self {
+        Self { after, since: None, reported: false }
+    }
+
+    /// The shell (re)started now.
+    pub fn started(&mut self, now: Instant) {
+        self.since = Some(now);
+    }
+
+    /// True once, when the shell has stayed up long enough.
+    pub fn healthy(&mut self, now: Instant) -> bool {
+        match self.since {
+            Some(since) if !self.reported && now.duration_since(since) >= self.after => {
+                self.reported = true;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -195,6 +241,31 @@ env=PATH=/usr/bin:/bin
         ] {
             assert!(SessionConfig::parse(&CONFIG.replace(from, to)).is_err(), "{to}");
         }
+    }
+
+    #[test]
+    fn reads_the_confirmation_of_the_boot() {
+        let config = SessionConfig::parse(CONFIG).unwrap();
+        assert_eq!((config.confirm, config.confirm_after), (None, DEFAULT_CONFIRM_AFTER));
+        let text = format!("{CONFIG}confirm=/usr/bin/openshell-ab /var/lib/openshell/disk confirm a\nconfirm_after=30\n");
+        let config = SessionConfig::parse(&text).unwrap();
+        assert_eq!(config.confirm.unwrap()[2], "confirm");
+        assert_eq!(config.confirm_after, Duration::from_secs(30));
+        assert!(SessionConfig::parse(&format!("{CONFIG}confirm=openshell-ab\n")).is_err());
+    }
+
+    #[test]
+    fn a_boot_is_healthy_once_the_shell_stays_up() {
+        let start = Instant::now();
+        let mut watch = HealthWatch::new(Duration::from_secs(60));
+        assert!(!watch.healthy(start + Duration::from_secs(120)), "not before the shell starts");
+        watch.started(start);
+        assert!(!watch.healthy(start + Duration::from_secs(30)));
+        // The shell failed and started again: the count starts over.
+        watch.started(start + Duration::from_secs(40));
+        assert!(!watch.healthy(start + Duration::from_secs(90)));
+        assert!(watch.healthy(start + Duration::from_secs(100)));
+        assert!(!watch.healthy(start + Duration::from_secs(200)), "said once");
     }
 
     #[test]

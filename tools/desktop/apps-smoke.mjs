@@ -25,10 +25,15 @@ const ready = /^OPENSHELL_HOSTD_READY (http:\/\/127\.0\.0\.1:[1-9]\d{0,4})\/\?to
 // Emulated guests run everything many times slower than the control: the
 // same budget as the Desktop smoke (shell-smoke.mjs).
 const scale = Math.max(1, Number(process.env.OPENSHELL_CEF_SMOKE_TIMEOUT_MS ?? 45_000) / 45_000);
+// How each session ends: closed from the Desktop, by the application itself,
+// or by Xpra dying under it.
 const PROBES = [
   { id: "probe-gtk.desktop", app: "gtk", close: "session" },
   { id: "probe-qt.desktop", app: "qt", close: "application" },
+  { id: "probe-gtk.desktop", app: "gtk-xpra-killed", close: "xpra" },
 ];
+/** What cursorTheme.py says when the application does not get the OpenShell cursor: anything but a file it leaves alone. */
+const NO_CURSOR = /^OpenShell cursor: (?!.*(kept as it is|unchanged)).*/m;
 
 async function waitFor(label, check, ms = 60_000) {
   const deadline = Date.now() + ms * scale;
@@ -175,6 +180,9 @@ async function smoke(bundleArg, outputArg) {
       report.apps[probe.app] = result;
       const started = Date.now();
       const xServersBefore = new Set(processesWith("Xvfb"));
+      // The probes of earlier sessions are in the same log.
+      const toolkit = probe.app.split("-")[0];
+      const seen = new Set(events(probeLog, toolkit).map((entry) => entry.pid));
       const launch = await api("/_native/apps/launch", { method: "POST", body: JSON.stringify({ id: probe.id }) });
       assert.equal(launch.status, 200, `Launch failed: ${JSON.stringify(launch.body)}`);
       const session = launch.body;
@@ -205,7 +213,7 @@ async function smoke(bundleArg, outputArg) {
       result.checks.client = "passed";
 
       const start = await waitFor(`the ${probe.app} window`, async () => {
-        const event = events(probeLog, probe.app).find((entry) => entry.event === "start");
+        const event = events(probeLog, toolkit).find((entry) => entry.event === "start" && !seen.has(entry.pid));
         if (event) return event;
         // hostd keeps the end of Xpra's log when the application closes.
         const status = await api(`${path}_status`);
@@ -216,12 +224,25 @@ async function smoke(bundleArg, outputArg) {
       const xServers = processesWith("Xvfb").filter((pid) => !xServersBefore.has(pid));
       assert.ok(xServers.length, "Xpra runs no X server of its own");
       result.timings.window = Date.now() - started;
+      // The application has the OpenShell cursor theme (cursorTheme.py loads the X libraries).
+      const directory = readFileSync(`/proc/${servers[0]}/cmdline`, "utf8").split("\0")
+        .map((arg) => /^--socket-dir=(.+)$/.exec(arg)?.[1]).find(Boolean);
+      const serverLog = directory && existsSync(join(directory, "server.log")) ? readFileSync(join(directory, "server.log"), "utf8") : "";
+      assert.ok(!NO_CURSOR.test(serverLog), `The ${probe.app} application has the default cursor: ${serverLog.split("\n").find((line) => NO_CURSOR.test(line))}`);
+      result.checks.cursor = "passed";
       // Closing the window in the Desktop ends the session, and an
       // application that exits ends it too: no process stays behind.
       await keepLogs();
       if (probe.close === "session") {
         const closed = await api(`${path}`, { method: "DELETE" });
         assert.equal(closed.status, 200);
+      } else if (probe.close === "xpra") {
+        // Xpra dies: hostd ends the session and nothing of it stays behind.
+        for (const pid of servers) process.kill(pid, "SIGKILL");
+        await waitFor("hostd to report the session gone", async () => {
+          const status = await api(`${path}_status`);
+          return status.status === 404 || status.body.exited !== undefined || Boolean(status.body.error);
+        });
       } else {
         process.kill(start.pid, "SIGTERM");
         await waitFor("hostd to report the application closed", async () => {

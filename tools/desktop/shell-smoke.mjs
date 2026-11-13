@@ -8,7 +8,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, r
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { arch, release, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { crc32, deflateSync, inflateSync } from "node:zlib";
 import { sandboxSample } from "./linux-sandbox.mjs";
@@ -22,6 +22,11 @@ const WINDOW_TITLE = "^OpenShell Native$";
 const X11_F12_KEYCODE = "96";
 // Print has the same kind of map (Alt gives Sys_Req): its keycode, 107, too.
 const X11_PRINT_KEYCODE = "107";
+// F2 and F3 too (their other levels switch virtual terminals).
+const X11_F2_KEYCODE = "68";
+const X11_F3_KEYCODE = "69";
+// The key that types y on a US keyboard and z on a German one.
+const X11_Y_KEYCODE = "29";
 
 // The color of a pixel of a PNG that a canvas wrote (8-bit RGB or RGBA,
 // not interlaced), as 0xRRGGBB.
@@ -148,8 +153,8 @@ function resourceUse(root) {
 
 function alive(pid) {
   try {
-    process.kill(pid, 0);
-    return true;
+    // A zombie has exited; only its parent's wait is missing.
+    return !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, "utf8"));
   } catch {
     return false;
   }
@@ -166,7 +171,7 @@ async function freePort() {
 // A site for the Desktop's Browser: it reports what the page saw and did,
 // and tries to reach hostd, which the shell must prevent.
 async function startSite(hostdPort) {
-  const evidence = { page: false, worker: false, webgl: null, clicks: 0, addressNavigation: false, addressReady: false, key: false, popup: false, widths: [], heights: [], devtools: false, chooser: null, pasted: null, generated: null, downloaded: false, reachedHostd: false, blocked: { fetch: false, socket: false } };
+  const evidence = { page: false, worker: false, webgl: null, clicks: 0, addressNavigation: false, addressReady: false, key: false, popup: false, widths: [], heights: [], devtools: false, chooser: null, pasted: null, generated: null, fullscreen: [], downloaded: false, reachedHostd: false, blocked: { fetch: false, socket: false } };
   const page = `<!doctype html><meta charset="utf-8"><title>OpenShell Browser Probe</title>
 <style>html, body { margin: 0; height: 100%; background: #284; color: #fff; font: 24px sans-serif; }</style>
 <body><h1>OpenShell Browser Probe</h1><script src="probe.js"></script></body>`;
@@ -229,6 +234,11 @@ addEventListener("keydown", (event) => {
   }
 });
 secret.addEventListener("input", () => post("generated?length=" + secret.value.length));
+// f puts the page in fullscreen, as a video player does.
+addEventListener("keydown", (event) => {
+  if (event.isTrusted && event.key === "f" && document.activeElement !== secret) document.documentElement.requestFullscreen().catch(() => post("fullscreen?state=refused"));
+});
+document.addEventListener("fullscreenchange", () => post("fullscreen?state=" + (document.fullscreenElement ? "on" : "off")));
 let opened = false;
 window.addEventListener("keydown", (event) => {
   if (!event.isTrusted || event.key !== "k" || opened) return;
@@ -262,6 +272,7 @@ if (location.pathname === "/address-focus") post("addressReady");`;
         else if (name === "chooser") evidence.chooser = url.searchParams.get("result");
         else if (name === "pasted") evidence.pasted = url.searchParams.get("value");
         else if (name === "generated") evidence.generated = Number(url.searchParams.get("length"));
+        else if (name === "fullscreen") evidence.fullscreen.push(url.searchParams.get("state"));
         else if (name === "webgl") evidence.webgl = body;
         else if (name === "click") evidence.clicks++;
         else if (["page", "worker", "key", "devtools", "addressReady"].includes(name)) evidence[name] = true;
@@ -314,8 +325,8 @@ async function smoke(launcher, bundle, host, outputArg) {
     return tool("xwd", ["-root", "-silent", "-out", path], { optional: true }) === null ? null : path;
   }
 
-  /** The screen at a quarter of its size, as a PNG: printed when a run fails where its artifacts stay behind (the guest). */
-  function screenPng(path, step = 4) {
+  /** The screen at half its size, as a PNG: printed when a run fails where its artifacts stay behind (the guest). */
+  function screenPng(path, step = 2) {
     const data = readFileSync(path);
     const field = index => data.readUInt32BE(index * 4);
     if (field(2) !== 2 || field(11) !== 32) return null;
@@ -466,8 +477,27 @@ async function smoke(launcher, bundle, host, outputArg) {
     } catch (error) {
       report.checks[name] = "failed";
       screenshot(`${name}-failure`);
+      report.windowsAtFailure = visibleWindows();
       throw error;
     }
+  }
+
+  /** The visible X windows, with their place: what covers the screen when a check fails. */
+  function visibleWindows() {
+    const ids = (tool("xdotool", ["search", "--onlyvisible", "--name", ".*"], { optional: true }) ?? "").split("\n").filter(Boolean);
+    return ids.slice(0, 40).map((id) => {
+      const pid = Number(tool("xdotool", ["getwindowpid", id], { optional: true }) ?? 0);
+      const geometry = (tool("xdotool", ["getwindowgeometry", id], { optional: true }) ?? "").replace(/\s+/g, " ").trim();
+      // A picture of each window, by itself: which one covers the screen.
+      tool("xwd", ["-id", id, "-silent", "-out", join(output, `failure-window-${id}.xwd`)], { optional: true });
+      return {
+        id,
+        name: tool("xdotool", ["getwindowname", id], { optional: true }) ?? "",
+        geometry,
+        pid: pid || null,
+        command: pid ? (processes().get(pid)?.cmdline ?? []).slice(0, 3).join(" ") : null,
+      };
+    });
   }
 
   try {
@@ -573,12 +603,20 @@ async function smoke(launcher, bundle, host, outputArg) {
         tool("xdotool", ["key", X11_F12_KEYCODE]);
         await waitFor("F12 to open docked DevTools", () => evidence.heights.at(-1) < height, 30_000);
         tool("xdotool", ["mousemove", String(pageX), String(Math.floor(display[1] / 4)), "click", "1"]);
-        tool("xdotool", ["key", "ctrl+shift+j"]);
-        await pause(2);
-        screenshot("browser-devtools");
-        await type(`fetch('/devtools', {method:'POST'})`);
-        tool("xdotool", ["key", "Return"]);
-        await waitFor("console input to reach the inspected page", () => evidence.devtools, 30_000);
+        // The frontend may still be loading in a slow guest: the console
+        // shortcut and the typing are tried again until the page hears them.
+        for (let attempt = 1; !evidence.devtools; attempt++) {
+          tool("xdotool", ["key", "ctrl+shift+j"]);
+          await pause(2);
+          screenshot(`browser-devtools-${attempt}`);
+          await type(`fetch('/devtools', {method:'POST'})`);
+          tool("xdotool", ["key", "Return"]);
+          const reached = await waitFor("console input to reach the inspected page", () => evidence.devtools, 30_000).catch((error) => {
+            if (attempt >= 3) throw error;
+            return false;
+          });
+          if (reached) break;
+        }
         tool("xdotool", ["key", X11_F12_KEYCODE]);
         await waitFor("F12 to close DevTools from its frontend", () => evidence.heights.at(-1) === height, 30_000);
         // The notification's left corner overlaps the tab, clear of the
@@ -673,9 +711,25 @@ async function smoke(launcher, bundle, host, outputArg) {
         await pause(2);
         screenshot("browser-password-list");
         tool("xdotool", ["key", "Down"]);
-        await pause(1);
+        // The list tells the page's script that an entry is selected before Enter picks it.
+        await pause(2);
         tool("xdotool", ["key", "Return"]);
         await waitFor("the suggested password in the page", () => evidence.generated >= 16, 30_000);
+        // A page in fullscreen covers the whole screen, the Desktop included; Escape ends it.
+        clickPage();
+        tool("xdotool", ["key", "f"]);
+        await waitFor("the page in fullscreen", () => evidence.fullscreen.includes("on"), 30_000);
+        await waitFor("the fullscreen page over the whole screen", () => {
+          const pixel = screenPixel(screenshot("browser-fullscreen"), 2, 2);
+          return pixel === null || (pixel & 0xffffff) === 0x228844;
+        }, 30_000);
+        tool("xdotool", ["key", "Escape"]);
+        await waitFor("Escape to end the fullscreen", () => evidence.fullscreen.at(-1) === "off", 30_000);
+        await waitFor("the page back in its window", () => {
+          const pixel = screenPixel(screenshot("browser-fullscreen-left"), 2, 2);
+          return pixel === null || (pixel & 0xffffff) !== 0x228844;
+        }, 30_000);
+        clickPage();
         tool("xdotool", ["key", "k"]);
         await waitFor("a key in the page", () => evidence.key, 30_000);
         await waitFor("the page's popup in a new tab", () => evidence.popup, 30_000);
@@ -693,10 +747,54 @@ async function smoke(launcher, bundle, host, outputArg) {
       }
     });
 
+    // The keyboard in the Terminal: Alt+S opens the search and types nothing
+    // there, and the layout the X server has (hostd's keyboard service sets
+    // it with setxkbmap) is the one the pages get.
+    await check("keyboard", async () => {
+      const typed = join(output, "keyboard.txt");
+      await terminal("keyboard-terminal", `setxkbmap -layout de && cat > ${typed}`);
+      try {
+        tool("xdotool", ["key", "alt+s"]);
+        await pause(2);
+        tool("xdotool", ["key", "Escape"]);
+        await pause(2);
+        // Back in the Terminal, the newest window, in the middle of the screen.
+        const [width, height] = tool("xdotool", ["getdisplaygeometry"]).split(" ").map(Number);
+        tool("xdotool", ["mousemove", String(Math.floor(width / 2)), String(Math.floor(height / 2)), "click", "1"]);
+        await pause(1);
+        tool("xdotool", ["key", X11_Y_KEYCODE]);
+        tool("xdotool", ["key", "Return"]);
+        tool("xdotool", ["key", "ctrl+d"]);
+        await waitFor("the line typed with the German layout", () => existsSync(typed) && readFileSync(typed, "utf8") === "z\n", 30_000)
+          .catch((error) => { throw new Error(`${error.message}: ${JSON.stringify(existsSync(typed) ? readFileSync(typed, "utf8") : null)}`); });
+      } finally {
+        await terminal("keyboard-restore", "setxkbmap -layout us");
+      }
+    });
+
+    // Super+Shift+R records an area of the screen into Videos, as on Live.
+    await check("recording", async () => {
+      const folder = join(home, "Videos", "Screen recordings");
+      await keys("Escape", "super+shift+r");
+      await pause(2);
+      tool("xdotool", ["mousemove", "200", "150", "mousedown", "1", "mousemove", "520", "390", "mouseup", "1"]);
+      await pause(1);
+      tool("xdotool", ["key", "Return"]);
+      await pause(5);
+      screenshot("recording");
+      tool("xdotool", ["key", "super+shift+r"]);
+      const file = await waitFor("the screen recording in Videos", () => {
+        const name = existsSync(folder) && readdirSync(folder).find((entry) => entry.endsWith(".webm"));
+        return name && statSync(join(folder, name)).size > 10_000 ? join(folder, name) : null;
+      }, 60_000);
+      report.recording = { bytes: statSync(file).size };
+    });
+
     // With the Linux apps profile (OPENSHELL_SMOKE_LINUX_APPS=1): a GTK and a
     // Qt application open from the Desktop's search in Desktop windows, through
-    // Xpra and its HTML5 client, take the keyboard and the window's size, and
-    // close with their window or by themselves, leaving no process behind.
+    // Xpra and its HTML5 client, take the keyboard and the window's size, show
+    // the GTK one's dialog and share its copy with the Desktop's clipboard
+    // history, and close with their window or by themselves, leaving no process behind.
     if (process.env.OPENSHELL_SMOKE_LINUX_APPS === "1") {
       await check("linux-apps", async () => {
         const log = join(home, "openshell-app-probe.log");
@@ -712,7 +810,7 @@ async function smoke(launcher, bundle, host, outputArg) {
         report.linuxApps = {};
         for (const probe of [
           // Alt+F4 closes the Desktop window, which ends the application.
-          { app: "gtk", title: "OpenShell GTK Probe", close: "alt+F4" },
+          { app: "gtk", title: "OpenShell GTK Probe", close: "alt+F4", dialogs: true },
           // Escape makes the application close itself, which closes its window.
           { app: "qt", title: "OpenShell Qt Probe", close: "Escape" },
         ]) {
@@ -723,6 +821,8 @@ async function smoke(launcher, bundle, host, outputArg) {
           const start = await waitFor(`the ${probe.app} application`, () => events(probe.app).find((event) => event.event === "start"), 120_000);
           await waitFor(`the ${probe.app} window in the Desktop`, () => shownBy(start, probe.title), 120_000);
           const shown = Math.round(performance.now() - began);
+          // Xpra maps the window when the client connects; the Desktop shows it once its first frame is drawn.
+          await pause(2);
           screenshot(`linux-${probe.app}`);
           // The new window is in the middle of the screen, above the others.
           tool("xdotool", ["mousemove", String(Math.floor(width / 2)), String(Math.floor(height / 2)), "click", "1"]);
@@ -730,6 +830,30 @@ async function smoke(launcher, bundle, host, outputArg) {
           await type(`native ${probe.app}`);
           tool("xdotool", ["key", "Return"]);
           await waitFor(`text typed into the ${probe.app} window`, () => events(probe.app).some((event) => event.event === "text" && event.value === `native ${probe.app}`), 60_000);
+          if (probe.dialogs) {
+            // A dialog of the application shows in the Desktop window and takes the keyboard.
+            tool("xdotool", ["key", X11_F2_KEYCODE]);
+            await waitFor(`the ${probe.app} dialog in the Desktop`, () => shownBy(start, `${probe.title} Dialog`), 60_000);
+            await pause(1);
+            screenshot(`linux-${probe.app}-dialog`);
+            await type("native dialog");
+            tool("xdotool", ["key", "Return"]);
+            await waitFor(`text typed into the ${probe.app} dialog`, () => events(probe.app).some((event) => event.event === "dialog-text" && event.value === "native dialog"), 60_000);
+            await pause(1);
+            // A copy in the application reaches the Desktop's clipboard history,
+            // and Super+V pastes it back where the keyboard was: into the application.
+            tool("xdotool", ["key", X11_F3_KEYCODE]);
+            const copied = await waitFor(`the ${probe.app} copy`, () => events(probe.app).find((event) => event.event === "copied"), 30_000);
+            await pause(2);
+            tool("xdotool", ["key", "ctrl+a"]);
+            tool("xdotool", ["key", "super+v"]);
+            await pause(2);
+            screenshot(`linux-${probe.app}-clipboard-history`);
+            tool("xdotool", ["key", "Return"]);
+            await pause(2);
+            tool("xdotool", ["key", "Return"]);
+            await waitFor(`the ${probe.app} copy pasted back from the clipboard history`, () => events(probe.app).some((event) => event.event === "text" && event.value === copied.value), 60_000);
+          }
           // The Desktop's shortcut maximizes the window, and the application takes its size.
           const before = sizes(probe.app).at(-1);
           tool("xdotool", ["key", "super+Up"]);
@@ -738,9 +862,92 @@ async function smoke(launcher, bundle, host, outputArg) {
             return last && before && last.width > before.width && last.height > before.height;
           }, 60_000);
           screenshot(`linux-${probe.app}-maximized`);
+          // Its window is the active one again (the clipboard history had the keyboard), as a click makes it.
+          tool("xdotool", ["mousemove", String(Math.floor(width / 2)), String(Math.floor(height / 2)), "click", "1"]);
+          await pause(1);
           tool("xdotool", ["key", probe.close]);
           await waitFor(`the ${probe.app} application and its Xpra to exit`, () => !alive(start.pid) && xpraServers().length === 0, 60_000);
           report.linuxApps[probe.app] = { toolkit: start.toolkit, shownMs: shown, size: sizes(probe.app).at(-1), totalMs: Math.round(performance.now() - began) };
+        }
+        // A document of a type only the GTK application declares: open in the
+        // Terminal and Enter in Files offer it, and it opens with the file.
+        const folder = join(home, "openwith");
+        mkdirSync(folder, { recursive: true });
+        const documentPath = join(folder, "probe.odt");
+        writeFileSync(documentPath, "OpenShell Native\n");
+        report.linuxApps.openWith = {};
+        for (const via of ["terminal", "files"]) {
+          const before = new Set(events("gtk").map((event) => event.pid));
+          if (via === "terminal") {
+            await terminal("open-with-terminal", `open ${documentPath}`);
+          } else {
+            await terminal("open-with-files", `files ${folder}`);
+            await pause(3);
+            tool("xdotool", ["key", "ctrl+a"]);
+            await pause(1);
+            tool("xdotool", ["key", "Return"]);
+          }
+          // The Desktop asks which application opens the file, the GTK one
+          // recommended: past the "Always" switch and Cancel, Open opens it.
+          await pause(3);
+          screenshot(`linux-open-with-${via}`);
+          for (const key of ["Tab", "Tab", "Tab", "Return"]) {
+            tool("xdotool", ["key", key]);
+            await pause(0.5);
+          }
+          const opened = await waitFor(`the GTK application opened from ${via === "terminal" ? "the Terminal" : "Files"}`, () =>
+            events("gtk").find((event) => event.event === "start" && !before.has(event.pid)), 120_000);
+          assert.ok(opened.files?.some((file) => file.endsWith("openwith/probe.odt")), `The GTK application did not get the document: ${JSON.stringify(opened.files)}`);
+          await waitFor(`the GTK window opened from ${via}`, () => shownBy(opened, "OpenShell GTK Probe"), 120_000);
+          // Its window opens in the middle of the screen: a click makes it the active one.
+          await pause(2);
+          tool("xdotool", ["mousemove", String(Math.floor(width / 2)), String(Math.floor(height / 2)), "click", "1"]);
+          await pause(1);
+          tool("xdotool", ["key", "alt+F4"]);
+          await waitFor(`the GTK application opened from ${via} to exit`, () => !alive(opened.pid) && xpraServers().length === 0, 60_000);
+          report.linuxApps.openWith[via] = "passed";
+        }
+        // With the Windows apps profile (OPENSHELL_SMOKE_WINE=1): a Windows
+        // program (Wine's own Notepad) opens with Wine from the Terminal, in a
+        // Desktop window through Xpra, and closing it ends Wine.
+        if (process.env.OPENSHELL_SMOKE_WINE === "1") {
+          const wine = realpathSync(tool("sh", ["-c", "command -v wine"]));
+          const program = join(dirname(dirname(wine)), "lib", "wine", "x86_64-windows", "notepad.exe");
+          assert.ok(existsSync(program), `Wine has no ${program}`);
+          const exe = join(folder, "notepad.exe");
+          writeFileSync(exe, readFileSync(program));
+          const wineProcesses = () => [...processes()].filter(([, { cmdline }]) => cmdline.some((arg) => /wineserver|\.exe$|wine64?-preloader/i.test(arg)));
+          await terminal("open-with-wine", `open ${exe}`);
+          await pause(3);
+          screenshot("linux-open-with-wine");
+          for (const key of ["Tab", "Tab", "Tab", "Return"]) {
+            tool("xdotool", ["key", key]);
+            await pause(0.5);
+          }
+          // The program's window, on the X server Xpra runs for it (Wine sets its prefix up the first time).
+          const notepad = await waitFor("Notepad in a Desktop window", () => {
+            for (const [, { cmdline }] of processes()) {
+              if (!cmdline[0]?.includes("Xvfb-for-Xpra")) continue;
+              // Xpra starts it with -displayfd: each X socket is tried with its -auth.
+              const auth = cmdline[cmdline.indexOf("-auth") + 1];
+              for (const socket of existsSync("/tmp/.X11-unix") ? readdirSync("/tmp/.X11-unix") : []) {
+                const display = /^X(\d+)$/.exec(socket)?.[1];
+                if (display && auth && shownBy({ display: `:${display}`, xauthority: auth }, "Untitled - Notepad")) return { display: `:${display}`, auth };
+              }
+            }
+            return null;
+          }, 300_000);
+          await pause(2);
+          screenshot("linux-wine-notepad");
+          // OpenShell's prefix, without drive Z: (the whole filesystem).
+          const prefix = join(home, ".local", "share", "openshell", "wine", "prefixes", "default");
+          assert.ok(existsSync(join(prefix, "system.reg")), "Wine did not use OpenShell's prefix");
+          assert.ok(!readdirSync(join(prefix, "dosdevices")).includes("z:"), "The prefix maps drive Z: to the whole filesystem");
+          tool("xdotool", ["mousemove", String(Math.floor(width / 2)), String(Math.floor(height / 2)), "click", "1"]);
+          await pause(1);
+          tool("xdotool", ["key", "alt+F4"]);
+          await waitFor("Wine to end with its window", () => wineProcesses().length === 0 && xpraServers().length === 0, 120_000);
+          report.linuxApps.wine = { display: notepad.display };
         }
       });
     }

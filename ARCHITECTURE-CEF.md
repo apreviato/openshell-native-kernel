@@ -222,12 +222,13 @@ Limites conhecidos desta composição:
 
 - **WebSocket.** A API de recursos do CEF não intercepta o handshake de WebSocket. O `hostd` recusa a origem estrangeira sem cookie e fecha o socket antes da primeira mensagem, e o smoke exige esse resultado.
 - **DNS rebinding.** O bloqueio do host compara o endereço literal da URL. Um domínio que resolve para o loopback na porta do `hostd` passa pelo CEF. Quando escuta em loopback, o `hostd` responde 421 a qualquer `Host` que não seja `127.0.0.1`, `localhost` ou `[::1]` na sua porta, e recusa o upgrade de WebSocket nesse caso.
-- **Sobreposição.** Menus, diálogos e janelas que cruzam a aba podem ocultar a view CEF inteira. Falta recorte parcial, e elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
+- **Sobreposição.** Menus, diálogos e janelas que cruzam a aba ocultam a view CEF inteira, sem recorte parcial. No lugar dela, o Desktop mostra a captura da página tirada antes de ocultá-la, e a página continua visível, parada, sob o que a cobre; a view volta, ao vivo, quando nada a cobre. Elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
 - **Atalhos.** A entrega depende das teclas que chegam ao CEF pelo X11. Sessões com outro gerenciador de janelas podem capturar teclas antes do CEF. Outros layouts de teclado e IME ainda precisam de validação.
-- **Recursos de Browser.** O cofre de senhas usa um script no renderer das abas e o serviço de senhas do `hostd`. A persistência das decisões de permissão entre sessões segue pendente. O indicador de áudio da aba também falta, porque o CEF 147 não expõe se uma aba toca som. O mute funciona. A pergunta de câmera e microfone não tem prova no smoke, porque a VM não tem dispositivos.
+- **Recursos de Browser.** As respostas de câmera e microfone valem até a sessão terminar, como no Live, que também as esquece ao reiniciar. O indicador de áudio da aba também falta, porque o CEF 147 não expõe se uma aba toca som. O mute funciona. A pergunta de câmera e microfone não tem prova no smoke, porque a VM não tem dispositivos.
 - **Miniaturas do dock.** Não há miniaturas das janelas no dock (`captureRect`). Capturar a página do Desktop a cada poucos segundos deixava a tela preta durante a captura.
 - **Sobreposições transparentes.** O OSD, o pop-up de senhas e as notificações são desenhados em imagens PNG com transparência sobre as abas. A composição preserva os cantos CSS. O recorte ainda termina no retângulo do elemento, e o desfoque do fundo da aba não faz parte da imagem.
-- **Uma tela, sem bloqueio e sem gravação.** O Native mostra uma única tela, e sem `screens` o Desktop mantém esse comportamento. O bloqueio de tela do Live (`onScreenLocked`) depende da autenticação nativa. A gravação de tela (`recordSource`) depende de uma fonte de captura do X para `getUserMedia`.
+- **Uma tela, sem bloqueio.** O Native mostra uma única tela, e sem `screens` o Desktop mantém esse comportamento. O bloqueio de tela do Live (`onScreenLocked`) depende da autenticação nativa.
+- **Fullscreen e gravação.** Uma página em fullscreen cobre a tela inteira, como no Live: o host avisa o Desktop (`OnFullscreenModeChange`), que leva a aba à tela toda, e Escape ou a troca de janelas a encerram. Enquanto a aba cobre a página do Desktop, o Chromium a conta como oculta e não lhe dá quadros: o layout segue por um temporizador. A gravação de tela usa a tela X inteira como fonte (`screen:-1:0`), que a janela do kiosk ocupa, e a página do Desktop recebe câmera, microfone e tela sem perguntar, como no Live.
 
 A composição off-screen continua sendo a alternativa se a sobreposição de elementos se mostrar insuficiente.
 
@@ -240,9 +241,12 @@ Fazer o caminho funcionar com essas versões exigiu correções no `hostd` e na 
 - o lançador do app nomeia o `python3` e o `dbus-run-session` do `hostd`, porque o wrapper do Xpra no Nix põe o próprio Python no PATH dos filhos;
 - a UI lê o tipo das janelas do cliente nas duas formas, lista ou valor único (o cliente 17 removeu `has_windowtype`), e dá o teclado à janela do app quando ela aparece e quando é clicada, porque o cliente só foca uma janela pela barra de título, que o OpenShell esconde;
 - os atalhos do Desktop pressionados dentro do app vão para o Desktop, pelas mesmas definições de `shellKeys`, quando não há Electron para encaminhá-los;
-- o launcher repassa `XDG_DATA_DIRS` ao `hostd`.
+- o launcher repassa `XDG_DATA_DIRS` ao `hostd`;
+- o `cursorTheme.py` carrega as bibliotecas X das pastas de `OPENSHELL_X11_LIBRARY_PATH`, que o wrapper do Python do perfil define, e procura os temas de ícones também nas pastas `icons` de `XDG_DATA_DIRS`. O perfil inclui o Adwaita, de onde o script desenha o cursor do OpenShell, e o `xsettingsd` e o `xrdb`, com que ele o entrega aos toolkits;
+- quando o Xpra morre, o `hostd` encerra a sessão inteira do app (todos os processos com o mesmo identificador de sessão), porque o Xpra põe o seu Xvfb num grupo de processos próprio, que sobrevivia a ele;
+- na página do Desktop, os atalhos de Alt do shell (busca, troca e fechamento de janelas) chegam aos ouvintes do shell antes dos campos, como no Live, em que o Electron os desvia. Antes, o Terminal recebia o "s" de Alt+S enquanto a busca abria.
 
-O [smoke de apps](tools/desktop/apps-smoke.mjs) prova pela API do `hostd` o catálogo, o lançamento, a página do cliente, o WebSocket até o Xpra e a senha que a UI recebe, e o encerramento sem órfãos (app, Xpra e Xvfb), tanto pelo Desktop quanto pelo próprio app. A fase `linux-apps` do smoke do Desktop abre os dois apps pela busca, digita na janela do OpenShell, maximiza com Super+↑ e exige que o app assuma o tamanho, e fecha o GTK com Alt+F4 e o Qt pelo próprio app.
+O [smoke de apps](tools/desktop/apps-smoke.mjs) prova pela API do `hostd` o catálogo, o lançamento, a página do cliente, o WebSocket até o Xpra e a senha que a UI recebe, o cursor do OpenShell no app e o encerramento sem órfãos (app, Xpra e Xvfb) pelo Desktop, pelo próprio app e quando o Xpra é morto. A fase `linux-apps` do smoke do Desktop abre os dois apps pela busca, digita na janela do OpenShell, maximiza com Super+↑ e exige que o app assuma o tamanho, e fecha o GTK com Alt+F4 e o Qt pelo próprio app. No GTK, um diálogo aparece na janela do OpenShell e recebe o teclado, e um texto copiado no app chega ao histórico do clipboard e volta ao app com Super+V. Por fim, um documento de um tipo que só o GTK declara abre nele pelo `open` do Terminal e pelo Enter no Files, com o arquivo como argumento.
 
 **Gráficos.** O image inclui o Mesa do nixpkgs fixado em `/run/opengl-driver`, como no NixOS. O Xvfb oferece GLX, e o ANGLE renderiza com llvmpipe. O host passa `ignore-gpu-blocklist`, porque o blocklist do Chromium, feito para drivers desconhecidos, recusa WebGL no llvmpipe e o image fixa o driver. Os smokes registram o renderer efetivo e conferem um pixel lido de volta.
 
@@ -258,6 +262,18 @@ O [smoke de apps](tools/desktop/apps-smoke.mjs) prova pela API do `hostd` o cat�
 - guarda os logs de cada boot num diretório próprio e mantém os 5 mais recentes.
 
 O [smoke da sessão](tools/desktop/session-smoke.mjs) confere as capabilities do supervisor, mata o host CEF e exige uma sessão nova, sem processos da anterior. Depois, exige que o SIGTERM encerre todos os processos da sessão. O smoke do shell registra memória (soma de RSS e PSS, quando o kernel informa) e tempo de CPU do CEF e do `hostd` com o Desktop pronto, com o Browser aberto e em repouso.
+
+**Contratos e linha de base.** Os testes de contrato do `@openshell/host-api` ficam em `apps/desktop/hostd/contract.test.ts`, no repositório `openshell`, e falam com o hostd pelo mesmo `HostClient` da UI, num WebSocket real: arquivos (escrita, leitura por faixas, listagem, cópia, renomeação, remoção e códigos de erro), `exec` com cwd, stdin, timeout e cancelamento, terminal, observação de pastas, o serviço de senhas, métricas, métodos desconhecidos, a recusa do socket sem token ou de outra origem e as rotas HTTP com o cookie de sessão. Por padrão sobem o hostd Node no processo; com `OPENSHELL_CONTRACT_URL`, `OPENSHELL_CONTRACT_TOKEN` e `OPENSHELL_CONTRACT_ROOT` rodam contra outra implementação, como um porte de serviço para Rust, iniciada com `--home <root>/home --ui <root>/ui` em modo dev.
+
+No Linux de controle (Xvfb 1280×800, llvmpipe), o smoke do shell mede o lado CEF:
+
+| Momento | CEF: processos, RSS/PSS | hostd: RSS/PSS |
+| --- | --- | --- |
+| Desktop pronto (janela em 316 ms, UI em 566 ms) | 9 processos, 1110/649 MiB | 108/79 MiB |
+| Com o Browser aberto | 12 processos, 1733/974 MiB | 144/96 MiB |
+| Em repouso, ao fim das fases | 10 processos, 1710/1173 MiB | 111/74 MiB |
+
+A mesma medida do Electron 44.5.1 do `BUILD.json`, no mesmo controle, falta: o bundle Linux não traz o executável do Electron, e o controle não o tem.
 
 ## 11. Decisões e próximos passos
 
@@ -276,9 +292,9 @@ A proposta de evolução de 12/11/2026 (*OpenShell Native — Arquitetura final 
 
 Próximos passos, em ordem:
 
-1. Apps Linux: completar a prova com a abertura pelo Terminal e pelo Files, a recuperação depois que o Xpra ou o app morrem, apps com várias janelas e diálogos, clipboard e o cursor do app, que hoje usa o padrão porque o script de tema não encontra a libX11 fora do Debian.
-2. Contrato de superfícies comum às abas do Browser e às janelas Xpra: recorte, escala, z-order, foco e região de entrada, com a matriz de foco e menus da proposta (drag and drop, clipboard, IME, fullscreen e dois monitores).
-3. Paridade do Browser: cofre de senhas (detecção de campos no renderer das abas e cofre no `hostd`), permissões persistidas por origem, gravação de tela, OSD sobre as abas, mais a matriz de atalhos, layouts de teclado e IME.
-4. Testes de contrato do `host-api` e baseline de desempenho do Electron no mesmo Linux de controle, antes de portar serviços do `hostd`.
+1. ~~Apps Linux~~: concluído. Abertura pelo Terminal e pelo Files, recuperação quando o Xpra morre, diálogos, clipboard e cursor do app têm prova no smoke (seção 10).
+2. ~~Contrato de superfícies~~: concluído. As janelas Xpra fazem parte do DOM do Desktop e seguem seu z-order e recorte. Nas abas, o que cobre a view mostra a captura da página no lugar, as partes do Desktop que ficam acima delas (OSD, lista de logins, notificações) são imagens acima das views com cliques devolvidos ao Desktop, e o fullscreen leva a aba à tela toda. O clipboard passa pelo histórico nos dois sentidos. O arrastar do Files leva só dados internos do OpenShell, como no Live. Fica fora: dois monitores (o Native tem uma tela) e IME (a sessão não tem um).
+3. Paridade do Browser: a matriz de atalhos e os layouts de teclado. Cofre de senhas, OSD e notificações sobre as abas, fullscreen e gravação de tela estão feitos; as permissões seguem o Live, que não as guarda entre sessões.
+4. Testes de contrato do `host-api` (feitos, seção 10) e a medida do Electron no mesmo Linux de controle, que depende do executável Linux do Electron 44.5.1, antes de portar serviços do `hostd`.
 5. Autenticação nativa antes da sessão e Xorg sobre DRM.
-6. Imagem com partições `system_a`, `system_b`, `recovery` e `data`, seleção de slot no boot, manifesto assinado e confirmação do slot pelo supervisor.
+6. Imagem com partições `system_a`, `system_b`, `recovery` e `data` e seleção de slot no boot. O manifesto assinado (Ed25519, o formato do atualizador do Desktop) e a confirmação do slot pelo supervisor estão feitos ([README](README.md#atualização-ab)).

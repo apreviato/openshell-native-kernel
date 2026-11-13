@@ -163,6 +163,8 @@ struct State {
   std::string guest_binding;
   std::string guest_receiver;
   std::set<std::string> guest_tabs;
+  // The script's world in each tab's current document: one call reaches it.
+  std::map<std::string, int> guest_contexts;
 };
 
 std::shared_ptr<State> CreateState() { return std::make_shared<State>(); }
@@ -597,6 +599,7 @@ void RunGuest(Session& session, const std::string& id, const std::string& frame)
                    }
                    auto& state = StateOf(*session);
                    const int context = created->GetInt("executionContextId");
+                   state.guest_contexts[id] = context;
                    auto binding = CefDictionaryValue::Create();
                    binding->SetString("name", state.guest_binding);
                    binding->SetInt("executionContextId", context);
@@ -644,6 +647,7 @@ void GuestNavigated(Session& session, const std::string& id, const void* params,
   if (!frame || frame->HasKey("parentId")) {
     return;
   }
+  StateOf(session).guest_contexts.erase(id);
   RunGuest(session, id, frame->GetString("id").ToString());
 }
 
@@ -982,6 +986,7 @@ void TabCreated(Session& session, const std::string& id) {
 void TabClosing(Session& session, const std::string& id) {
   auto& state = StateOf(session);
   state.guest_tabs.erase(id);
+  state.guest_contexts.erase(id);
   if (auto entry = session.tabs.find(id); entry != session.tabs.end()) {
     CloseDevTools(session, id, entry->second);
   }
@@ -1261,31 +1266,63 @@ bool Run(Session& session, const std::string& command, CefRefPtr<CefDictionaryVa
     auto browser = tab->browser;
     const auto world = state.guest_world;
     std::weak_ptr<Session> weak = session.weak_from_this();
-    ProtocolThen(session, id, browser, "Page.getFrameTree", nullptr, respond,
-                 [weak, id, browser, world, expression, respond](CefRefPtr<CefDictionaryValue> tree) {
-                   auto session = weak.lock();
-                   auto root = tree->GetDictionary("frameTree");
-                   auto frame = root ? root->GetDictionary("frame") : nullptr;
-                   if (!session || !frame) {
-                     respond(Error(409, "The tab has no page"));
-                     return;
+    auto evaluate = [weak, id, browser, expression, respond](int context) {
+      auto session = weak.lock();
+      if (!session) {
+        return;
+      }
+      StateOf(*session).guest_contexts[id] = context;
+      auto call = CefDictionaryValue::Create();
+      call->SetString("expression", expression);
+      call->SetInt("contextId", context);
+      ProtocolThen(*session, id, browser, "Runtime.evaluate", call, respond,
+                   [respond](CefRefPtr<CefDictionaryValue>) { respond({}); });
+    };
+    // The world of the current document, found again: the top frame, then its world.
+    auto find = [weak, id, browser, world, respond, evaluate]() {
+      auto session = weak.lock();
+      if (!session) {
+        return;
+      }
+      ProtocolThen(*session, id, browser, "Page.getFrameTree", nullptr, respond,
+                   [weak, id, browser, world, respond, evaluate](CefRefPtr<CefDictionaryValue> tree) {
+                     auto session = weak.lock();
+                     auto root = tree->GetDictionary("frameTree");
+                     auto frame = root ? root->GetDictionary("frame") : nullptr;
+                     if (!session || !frame) {
+                       respond(Error(409, "The tab has no page"));
+                       return;
+                     }
+                     auto params = CefDictionaryValue::Create();
+                     params->SetString("frameId", frame->GetString("id"));
+                     params->SetString("worldName", world);
+                     ProtocolThen(*session, id, browser, "Page.createIsolatedWorld", params, respond,
+                                  [evaluate](CefRefPtr<CefDictionaryValue> created) {
+                                    evaluate(created->GetInt("executionContextId"));
+                                  });
+                   });
+    };
+    const auto known = state.guest_contexts.find(id);
+    if (known == state.guest_contexts.end()) {
+      find();
+      return true;
+    }
+    // The world the script runs in; a document that went away sends this the long way.
+    const int context = known->second;
+    auto call = CefDictionaryValue::Create();
+    call->SetString("expression", expression);
+    call->SetInt("contextId", context);
+    ProtocolThen(session, id, browser, "Runtime.evaluate", call,
+                 [weak, id, context, find](Reply) {
+                   if (auto session = weak.lock()) {
+                     auto& contexts = StateOf(*session).guest_contexts;
+                     if (auto stale = contexts.find(id); stale != contexts.end() && stale->second == context) {
+                       contexts.erase(stale);
+                     }
                    }
-                   auto params = CefDictionaryValue::Create();
-                   params->SetString("frameId", frame->GetString("id"));
-                   params->SetString("worldName", world);
-                   ProtocolThen(*session, id, browser, "Page.createIsolatedWorld", params, respond,
-                                [weak, id, browser, expression, respond](CefRefPtr<CefDictionaryValue> created) {
-                                  auto session = weak.lock();
-                                  if (!session) {
-                                    return;
-                                  }
-                                  auto call = CefDictionaryValue::Create();
-                                  call->SetString("expression", expression);
-                                  call->SetInt("contextId", created->GetInt("executionContextId"));
-                                  ProtocolThen(*session, id, browser, "Runtime.evaluate", call, respond,
-                                               [respond](CefRefPtr<CefDictionaryValue>) { respond({}); });
-                                });
-                 });
+                   find();
+                 },
+                 [respond](CefRefPtr<CefDictionaryValue>) { respond({}); });
     return true;
   }
   if (command == "browser/protocol") {

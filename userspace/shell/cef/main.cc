@@ -293,6 +293,30 @@ class ViewDelegate final : public CefBrowserViewDelegate {
   IMPLEMENT_REFCOUNTING(ViewDelegate);
 };
 
+// The text without the query or fragment of any address in it, at most `limit` bytes.
+std::string WithoutQueries(const std::string& text, std::size_t limit) {
+  std::string result;
+  bool skipping = false;
+  for (const char character : text) {
+    if (result.size() >= limit) {
+      result += "...";
+      break;
+    }
+    if (skipping) {
+      if (character != ' ' && character != '"' && character != '\'' && character != ')' && character != '\n') {
+        continue;
+      }
+      skipping = false;
+    } else if ((character == '?' || character == '#') && !result.empty() && result.back() != ' ') {
+      skipping = true;
+      result += "?...";
+      continue;
+    }
+    result += character;
+  }
+  return result;
+}
+
 class BrowserClient final : public CefClient,
                             public CefDialogHandler,
                             public CefDisplayHandler,
@@ -361,6 +385,23 @@ class BrowserClient final : public CefClient,
     if (!IsTab() || (event.modifiers & EVENTFLAG_ALTGR_DOWN) ||
         (event.type != KEYEVENT_RAWKEYDOWN && event.type != KEYEVENT_KEYUP)) {
       return false;
+    }
+    if (event.type == KEYEVENT_RAWKEYDOWN) {
+      const auto tab = session_->tabs.find(tab_);
+      if (tab != session_->tabs.end() && tab->second.fullscreen) {
+        // As on Live, Escape and switching windows end a page's fullscreen;
+        // the switch still goes to the Desktop.
+        const bool escape = event.windows_key_code == 0x1b && !(event.modifiers & kShortcutModifiers);
+        const bool switching = (event.modifiers & EVENTFLAG_ALT_DOWN) &&
+                               (event.windows_key_code == 0x09 || event.windows_key_code == 0xc0);
+        if (escape || switching) {
+          browser->GetMainFrame()->ExecuteJavaScript(
+              "if (document.fullscreenElement) document.exitFullscreen().catch(() => {});", "", 0);
+          if (escape) {
+            return true;
+          }
+        }
+      }
     }
     std::string key;
     std::string code;
@@ -488,6 +529,12 @@ class BrowserClient final : public CefClient,
   bool OnRequestMediaAccessPermission(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
                                       const CefString& origin, uint32_t permissions,
                                       CefRefPtr<CefMediaAccessCallback> callback) override {
+    if (IsDesktop()) {
+      // As on Live, the shell's own page has the microphone, the camera and
+      // the screen without asking: its screen recordings and its Settings.
+      callback->Continue(permissions);
+      return true;
+    }
     return IsTab() && features::MediaAccess(*session_, tab_, origin, permissions, callback);
   }
 
@@ -512,6 +559,38 @@ class BrowserClient final : public CefClient,
   bool OnCertificateError(CefRefPtr<CefBrowser>, cef_errorcode_t, const CefString& url,
                           CefRefPtr<CefSSLInfo> ssl, CefRefPtr<CefCallback> callback) override {
     return IsTab() && features::CertificateError(*session_, url, ssl, callback);
+  }
+
+  // A tab's page entered or left HTML fullscreen. With Alloy views the client
+  // sizes the view: the Desktop lays the tab over the whole screen meanwhile.
+  void OnFullscreenModeChange(CefRefPtr<CefBrowser>, bool fullscreen) override {
+    if (IsDesktop()) {
+      // An element of the Desktop's page (a video, an application's frame) covers the screen.
+      std::cerr << "desktop page fullscreen: " << (fullscreen ? "on" : "off") << std::endl;
+    }
+    if (!IsTab()) {
+      return;
+    }
+    const auto tab = session_->tabs.find(tab_);
+    if (tab == session_->tabs.end() || tab->second.closing || tab->second.fullscreen == fullscreen) {
+      return;
+    }
+    tab->second.fullscreen = fullscreen;
+    auto event = TabEvent(tab_, "fullscreen");
+    event->SetBool("fullscreen", fullscreen);
+    Emit(*session_, event);
+  }
+
+  // The Desktop page's errors go to the session log: when the UI does not
+  // come up, they say why. Addresses lose their query and fragment, where the
+  // bootstrap secret would be.
+  bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t level, const CefString& message,
+                        const CefString& source, int line) override {
+    if (IsDesktop() && level >= LOGSEVERITY_ERROR) {
+      std::cerr << "desktop console: " << WithoutQueries(message.ToString(), 500) << " ("
+                << WithoutQueries(source.ToString(), 200) << ":" << line << ")" << std::endl;
+    }
+    return false;
   }
 
   void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,

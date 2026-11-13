@@ -11,7 +11,9 @@
 //! Every change writes one selector copy, the older one, so that a torn
 //! write leaves the newer copy intact.
 
+pub mod bootenv;
 pub mod sha256;
+pub mod signature;
 
 use std::fmt;
 
@@ -80,7 +82,7 @@ pub struct Selector {
     pub confirmed: Option<Slot>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Boot {
     Slot(Slot),
     Recovery,
@@ -290,6 +292,36 @@ pub fn choose_boot(store: &mut impl Store) -> Result<Boot, Error> {
     })
 }
 
+/// The booted system records the boot GRUB chose (bootenv.rs): the attempt
+/// GRUB took from a trial, or a trial GRUB gave up on, which becomes bad. A
+/// boot of the trial counts even when GRUB could not save its environment.
+pub fn record_boot(store: &mut impl Store, booted: Boot, env: &bootenv::BootEnv) -> Result<(), Error> {
+    let mut selector = load(store).ok_or(Error::NoSelector)?;
+    let mut changed = false;
+    for slot in [Slot::A, Slot::B] {
+        let State::Trial(tries) = selector.slot(slot).state else { continue };
+        let left = match env.trial {
+            Some((trial, left)) if trial == slot => left.min(tries),
+            _ => tries,
+        };
+        let state = if booted == Boot::Slot(slot) {
+            State::Trial(left.min(tries.saturating_sub(1)))
+        } else if left == 0 {
+            State::Bad
+        } else {
+            continue;
+        };
+        if selector.slot(slot).state != state {
+            selector.slot_mut(slot).state = state;
+            changed = true;
+        }
+    }
+    if changed {
+        save(store, &mut selector)?;
+    }
+    Ok(())
+}
+
 /// Confirms the running slot after the health checks of the session.
 pub fn confirm(store: &mut impl Store, running: Slot) -> Result<(), Error> {
     let mut selector = load(store).ok_or(Error::NoSelector)?;
@@ -375,13 +407,13 @@ impl Manifest {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Storage whose writes fail after a budget, leaving the copy torn: a
     /// power cut at that write.
     #[derive(Clone, Default)]
-    struct Disk {
+    pub(crate) struct Disk {
         copies: [Option<Vec<u8>>; 2],
         writes_left: Option<usize>,
     }
@@ -405,9 +437,17 @@ mod tests {
         }
     }
 
-    fn installed() -> Disk {
+    pub(crate) fn installed() -> Disk {
         let mut disk = Disk::default();
         disk.copies[1] = Some(Selector::install("2026.11.0").unwrap().encode());
+        disk
+    }
+
+    /// A second release written and verified in slot B.
+    pub(crate) fn staged() -> Disk {
+        let mut disk = installed();
+        let slot = begin_update(&mut disk).unwrap();
+        finish_update(&mut disk, slot, "2026.12.0").unwrap();
         disk
     }
 

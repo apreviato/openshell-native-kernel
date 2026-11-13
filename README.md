@@ -18,6 +18,7 @@ node tools/build/native.mjs graphics
 node tools/build/native.mjs desktop <openshell-desktop-bundle>
 node tools/build/native.mjs kiosk <openshell-desktop-bundle>
 node tools/build/native.mjs apps <openshell-desktop-bundle>
+node tools/build/native.mjs wine <openshell-desktop-bundle>
 ```
 
 | Comando | Resultado esperado |
@@ -32,7 +33,8 @@ node tools/build/native.mjs apps <openshell-desktop-bundle>
 | `graphics` | Compila o shell Rust e o host CEF contra o CEF 147 do nixpkgs fixado e inicia um initramfs com Xvfb, Mesa, Openbox, xdotool e o host. Exige, além das sondas do `compat`, as checagens de sandbox do Chromium, o servidor X e o [smoke do CEF](tools/desktop/cef-smoke.mjs) com o sandbox ativo, nos modos `host` e `isolation`. Os mesmos smokes rodam antes no Linux do builder, com o sandbox. Usa 12 GB e 4 vCPUs no QEMU. |
 | `desktop` | Inclui no initramfs o bundle OpenShell Desktop indicado e executa o [smoke do hostd](tools/desktop/hostd-smoke.mjs) como usuário sem privilégios, primeiro no Linux do builder e depois no guest, além das sondas do `compat`. |
 | `kiosk` | Reúne `graphics` e `desktop` e abre o bundle indicado no shell. O [smoke do shell](tools/desktop/shell-smoke.mjs) dirige o Desktop real com entrada X11: Files, Terminal, atalhos e foco do Browser nativo, zoom, download, DevTools, seleção de arquivos, PDF, captura de tela com as abas, histórico do clipboard, recuperação do renderer e do hostd, encerramento e segunda sessão. O [smoke da sessão](tools/desktop/session-smoke.mjs) executa o supervisor `openshell-session` como root. Os dois rodam antes no Linux do builder. |
-| `apps` | A `kiosk` com o perfil de apps Linux: Xpra, seu cliente HTML5, D-Bus e um app de prova GTK e um Qt. O [smoke de apps](tools/desktop/apps-smoke.mjs) abre os apps pela API do `hostd` e exige o encerramento sem órfãos. O smoke do shell acrescenta a fase `linux-apps`: os apps abrem pela busca em janelas do OpenShell, recebem teclado e o tamanho da janela e fecham. Usa 12 GB e 4 vCPUs no QEMU, com até 120 minutos de boot. |
+| `apps` | A `kiosk` com o perfil de apps Linux: Xpra, seu cliente HTML5, D-Bus e um app de prova GTK e um Qt. O [smoke de apps](tools/desktop/apps-smoke.mjs) abre os apps pela API do `hostd` e exige o encerramento sem órfãos. O smoke do shell acrescenta a fase `linux-apps`: os apps abrem pela busca em janelas do OpenShell, recebem teclado e o tamanho da janela, mostram diálogos, trocam texto com o histórico do clipboard, abrem documentos pelo Terminal e pelo Files e fecham. Usa 12 GB e 4 vCPUs no QEMU, com até 120 minutos de boot. |
+| `wine` | A `apps` com o perfil de apps Windows ([plano](OPENSHELL_WINE.md)): Wine 11.0, de 64 bits com WoW64, e uma entrada que abre `.exe` e `.msi` em primeiro plano. O [smoke do Wine](tools/desktop/wine-smoke.mjs) cria um prefixo isolado com `wineboot`, abre e fecha o Notepad em X11 e exige que nada do prefixo fique para trás. O smoke do shell abre um `.exe` pelo Terminal, escolhe o Wine e exige a janela do programa no Desktop e o fim do Wine ao fechá-la. Usa 12 GB e 4 vCPUs no QEMU, com até 150 minutos de boot. |
 
 Cada execução de build ou teste salva os artefatos em `out/native-*/`. `run.json` registra o resultado, inclusive falhas de conexão com o Docker, o digest do builder e os resultados de `checks.tsv` quando disponíveis. Quando há build de kernel, `toolchain.txt` registra firmware e perfil QEMU, e `SHA256SUMS` cobre a ISO de diagnóstico. Consulte `native-compat-console.txt` para diagnosticar falhas de ABI ou de sandbox no guest. `native-seccomp` e `native-namespaces` ficam como `unverified` quando o console não comprova que a sonda chegou a executar.
 
@@ -101,10 +103,12 @@ O smoke usa um perfil descartável e testa a troca do token por cookie, o carreg
 [`distro/ab`](distro/ab) implementa a transação da seção 6 do [plano](ARCHITECTURE.md). Ela ainda não está ligada a um bootloader nem a partições reais:
 
 - **Seletor.** Grava o estado de cada slot (`empty`, `staged`, `trial:N`, `good`, `bad`) e o slot confirmado em duas cópias, com geração e CRC-32. Cada mudança grava a cópia mais antiga, então uma gravação interrompida deixa a mais nova intacta.
+- **Assinatura.** O manifesto vem com `<manifesto>.sig`: uma assinatura Ed25519, em base64, dos bytes exatos do manifesto, como o atualizador do OpenShell Desktop assina e confere seus releases. `stage` recebe a pasta das chaves confiáveis (PEM) e confere a assinatura antes de ler qualquer coisa do manifesto. `openshell-ab keygen` e `openshell-ab sign` servem às ferramentas de release e aos testes.
 - **Atualização.** Torna o slot inativo não inicializável antes de escrever nele. Depois confere tamanho e SHA-256 de cada arquivo contra o manifesto do release, junto com a arquitetura e a faixa de schema dos dados, e só então o marca como `staged`.
 - **Boot.** Registra cada tentativa de um release em teste antes da entrega. Depois de três tentativas sem confirmação, o slot vira `bad` e o boot volta ao slot confirmado. Sem cópia válida do seletor, o boot vai para o recovery.
+- **Confirmação.** O supervisor `openshell-session` confirma o boot uma vez, como root, quando a sessão está saudável: o shell rodou `confirm_after` segundos (60 por padrão) sem falhar, e cada reinício do shell ou do X recomeça a contagem. O comando vem da chave `confirm` da configuração, `openshell-ab <disco> confirm <slot>` na imagem. Uma falha fica no journal, e o release continua em teste.
 
-Os testes unitários simulam um corte de energia em cada gravação de uma atualização inteira. Em todos os casos, o boot seguinte escolhe um slot `good` ou em teste, nunca um slot incompleto. O [smoke](distro/ab/smoke.sh) repete o fluxo com o CLI sobre um diretório e roda no Linux, na CI e no guest, em `/ext2`.
+Os testes unitários simulam um corte de energia em cada gravação de uma atualização inteira. Em todos os casos, o boot seguinte escolhe um slot `good` ou em teste, nunca um slot incompleto. Também conferem a assinatura com o vetor 1 da RFC 8032. O [smoke](distro/ab/smoke.sh) repete o fluxo com o CLI sobre um diretório: recusa um manifesto alterado depois de assinado, um assinado por chave não confiável e um sem assinatura. Roda no Linux, na CI e no guest, em `/ext2`. O [smoke da sessão](tools/desktop/session-smoke.mjs) exige a confirmação do boot, uma única vez.
 
 ```bash
 cargo test --manifest-path distro/ab/Cargo.toml
@@ -112,7 +116,7 @@ cargo build --release --manifest-path distro/ab/Cargo.toml
 sh distro/ab/smoke.sh distro/ab/target/release/openshell-ab
 ```
 
-Faltam a assinatura do manifesto, a escolha do slot pelo bootloader, as partições `system_a`, `system_b`, `recovery` e `data`, e o serviço que confirma o slot depois das checagens de saúde da sessão.
+Faltam a escolha do slot pelo bootloader e as partições `system_a`, `system_b`, `recovery` e `data`.
 
 ## Integração com o OpenShell
 

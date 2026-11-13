@@ -20,6 +20,7 @@ Os patches aplicam em ordem de nome sobre a revisão do Asterinas fixada em [ups
 | `0014-lay-out-environment-like-linux` | Os filhos do zygote reescrevem o título sobre as strings de argumento e ambiente, que precisam estar contíguas e em ordem. A v0.19.0 gravava o ambiente em ordem inversa, e `/proc/[pid]/cmdline` não identificava os renderers. | `chromium-userns.c`, verificação `process_title`, e o `cef-smoke`, que encontra os renderers por esse título. | Não enviado. |
 | `0015-inherit-address-reuse-in-accepted-connections` | O launcher reinicia o hostd na mesma porta, que o perfil do Desktop exige. As conexões aceitas pelo hostd anterior não herdavam `SO_REUSEADDR` e, enquanto fechavam, o novo `listen` falhava com `EADDRINUSE`. | [python.py](../../userspace/compatibility/probes/python.py), sonda `server_restart`, e o [smoke do shell](../../tools/desktop/shell-smoke.mjs), verificação `hostd-restart`. | Não enviado. Correção de bug. |
 | `0016-ignore-wake-ups-of-finished-tasks` | Os processos do CEF criam e encerram muitas threads. Uma thread acordada enquanto terminava voltava a uma fila de execução depois de `exit_current` e, escolhida de novo, saía de `exit_current`: o kernel entrava em pânico com `unreachable!()` no meio da prova de isolamento do CEF. | Check `native-cef-isolation` e as fases seguintes da ação `apps`. A corrida é rara e não tem sonda própria. | Não enviado. Correção de bug, ligada ao problema 2 de [asterinas#1633](https://github.com/asterinas/asterinas/issues/1633). |
+| `0017-do-not-wait-for-the-address-space-in-atomic-page-faults` | Com o perfil de apps (Xpra, o tema de cursor, `xsettingsd`), o kernel entrou em pânico quando uma cópia de memória de usuário feita com spinlocks seguros faltou página enquanto outro processo segurava o espaço de endereços: o tratador esperou pelo `RwMutex`, e `might_sleep` derrubou o sistema. | Check `native-apps`, que deixou de rodar. A corrida não tem sonda própria. | Não enviado. Correção de bug. O chamador que copia com spinlocks seguros ainda não foi identificado. |
 
 ## 0002 · seccomp
 
@@ -110,6 +111,10 @@ Como no Linux, uma conexão aceita herda de quem escuta o `SO_REUSEADDR` no mome
 ## 0016 · fim de tarefa
 
 `Waker::wake_up` marca a tarefa como acordada e só depois a põe numa fila. Nesse intervalo, a tarefa pode seguir sem dormir até o fim da sua função, e `exit_current` a tira da fila e limpa a CPU dela. A fila recebia então uma tarefa terminada, e o escalonador voltava a ela. O patch marca a tarefa como terminada quando a função dela retorna, em `kernel_task_entry`, e o `enqueue` do escalonador recusa a tarefa marcada depois de obter a CPU dela. A marca não usa `Thread::is_exited`, porque a saída POSIX ainda pode dormir depois de marcar a thread, ao fechar arquivos e encerrar o processo.
+
+## 0017 · faltas de página em modo atômico
+
+Uma cópia de ou para a memória de um processo pode faltar página. O ostd chama então o tratador do kernel, que lê o espaço de endereços sob um `RwMutex`. Com spinlocks seguros (modo atômico), esperar é proibido: se outro processo segurava o mutex, a espera chamava `might_sleep`, e o kernel entrava em pânico (`This function might break atomic mode`). Livre, o mutex é tomado sem esperar, e a falta é tratada como sempre. O patch expõe `in_atomic_mode` do ostd e, em modo atômico, toma o espaço de endereços só se estiver livre (`try_read`); ocupado, a cópia falha e a chamada de sistema reporta o erro. Uma primeira versão recusava toda falta em modo atômico e quebrou o guest, porque esses acessos são comuns e quase sempre encontram o mutex livre. O chamador que copia com spinlocks seguros ainda precisa ser identificado e corrigido.
 
 ## Diagnóstico de falhas do Chromium
 

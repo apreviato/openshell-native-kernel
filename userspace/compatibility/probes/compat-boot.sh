@@ -116,10 +116,24 @@ if [ -e /opt/openshell-cef ]; then
                 cef_status=$apps_status
             fi
         fi
+        # The Windows apps profile: Wine sets a prefix up and runs Notepad.
+        if [ -f ./wine-smoke.mjs ]; then
+            wine_status=0
+            # Gate W4: the runner installs this into a prefix of its own.
+            export OPENSHELL_WINE_PROBE_MSI=/opt/openshell-compat/openshell-probe-setup.msi
+            cef_smoke wine ./wine-smoke.mjs || wine_status=$?
+            if [ "$wine_status" -eq 0 ]; then
+                echo OPENSHELL_NATIVE_WINE_OK
+            else
+                tail -n 40 "$scratch"/out-wine/wine-*/wineboot.log 2>/dev/null || true
+                cef_status=$wine_status
+            fi
+        fi
         # The kiosk: the Rust launcher with hostd and the real Desktop bundle.
         if [ -d /opt/openshell ] && [ -x /opt/openshell-compat/bin/openshell-shell ]; then
             shell_status=0
             export OPENSHELL_SMOKE_LINUX_APPS=$linux_apps
+            if [ -f ./wine-smoke.mjs ]; then export OPENSHELL_SMOKE_WINE=1; fi
             cef_smoke shell ./shell-smoke.mjs /opt/openshell-compat/bin/openshell-shell /opt/openshell \
                 /opt/openshell-cef/openshell-cef-host || shell_status=$?
             cat "$scratch"/out-shell/shell-*/shell-smoke.json 2>/dev/null || true

@@ -36,11 +36,13 @@ let
       {
         inherit (shell) cefHost;
         launcher = shell.shell;
+        # setxkbmap: hostd's keyboard service sets the session's layout with it (Settings ▸ Keyboard).
         tools = [
           pkgs.xvfb
           openbox
           pkgs.xdotool
           pkgs.xwd
+          pkgs.setxkbmap
         ];
         # Xvfb and libglvnd find the drivers where NixOS installs them.
         mesa = pkgs.mesa;
@@ -78,7 +80,8 @@ let
           '';
         };
         html5 = pkgs.xpra-html5;
-        # hostd runs its desktop portal (D-Bus and GLib) with the python3 of the PATH.
+        # hostd runs its desktop portal (D-Bus and GLib) and the cursor theme of
+        # the apps (cursorTheme.py, which loads the X libraries) with the python3 of the PATH.
         pythonEnv = pkgs.python3.withPackages (p: [ p.dbus-python p.pygobject3 ]);
         python = pkgs.symlinkJoin {
           name = "openshell-apps-python";
@@ -87,7 +90,8 @@ let
           postBuild = ''
             rm "$out/bin/python3"
             makeWrapper ${pythonEnv}/bin/python3 "$out/bin/python3" \
-              --prefix GI_TYPELIB_PATH : "${lib.makeSearchPath "lib/girepository-1.0" [ pkgs.glib.out pkgs.gobject-introspection ]}"
+              --prefix GI_TYPELIB_PATH : "${lib.makeSearchPath "lib/girepository-1.0" [ pkgs.glib.out pkgs.gobject-introspection ]}" \
+              --set OPENSHELL_X11_LIBRARY_PATH "${lib.makeLibraryPath [ pkgs.libx11 pkgs.libxcursor pkgs.libxfixes ]}"
           '';
         };
         gtkProbe = pkgs.stdenv.mkDerivation {
@@ -114,14 +118,17 @@ let
           '';
         };
         # The applications as the Desktop lists them. hostd hides entries named
-        # openshell-*, which belong to the system itself.
+        # openshell-*, which belong to the system itself. The GTK probe opens a
+        # document type OpenShell has no viewer for, so the Desktop offers it
+        # for those files ("Open with").
         entries = pkgs.runCommand "openshell-probe-applications" { } ''
           mkdir -p "$out/share/applications"
           for probe in gtk:GTK qt:Qt; do
             id="''${probe%%:*}" name="''${probe#*:}"
             printf '%s\n' "[Desktop Entry]" "Type=Application" "Name=OpenShell $name Probe" \
-              "Exec=openshell-$id-probe" "Categories=Utility;" > "$out/share/applications/probe-$id.desktop"
+              "Exec=openshell-$id-probe %f" "Categories=Utility;" > "$out/share/applications/probe-$id.desktop"
           done
+          echo "MimeType=application/vnd.oasis.opendocument.text;" >> "$out/share/applications/probe-gtk.desktop"
         '';
         # dbus-run-session reads /etc/dbus-1/session.conf, which the packaged
         # configuration includes in turn: the copy leaves that include out.
@@ -130,10 +137,51 @@ let
           sed '\|<include ignore_missing="yes">/etc/dbus-1/session.conf</include>|d' \
             ${pkgs.dbus}/share/dbus-1/session.conf > "$out/etc/dbus-1/session.conf"
         '';
-        packages = [ xpra html5 python gtkProbe qtProbe entries dbusSession pkgs.dbus ];
+        # cursorTheme.py draws the applications' OpenShell cursor from Adwaita's
+        # (share/icons, in XDG_DATA_DIRS) and tells the toolkits through xsettingsd and xrdb.
+        packages = [ xpra html5 python gtkProbe qtProbe entries dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb ];
       }
     else
       null;
+  # The Windows apps profile (OPENSHELL_WINE.md), over the Linux apps one: Wine
+  # 11.0, 64-bit with WoW64 for 32-bit programs, and OpenShell's runner
+  # (wine/openshell-wine.sh), which its entry opens Windows programs with: in
+  # the foreground (Wine's own entry uses `start /unix`, which returns at once),
+  # so the program's Xpra session lasts as long as it does.
+  wine =
+    if apps != null && builtins.pathExists ./openshell-wine then
+      rec {
+        package = pkgs.wineWow64Packages.stable;
+        runner = pkgs.writeShellScriptBin "openshell-wine" (builtins.readFile ./openshell-wine/openshell-wine.sh);
+        # Run a Windows program, install one into a prefix of its own (both
+        # offered for .exe and .msi), and Windows apps ▸ Configure. The
+        # Desktop names them by these ids (hostd/native/wine.ts).
+        entries = pkgs.runCommand "openshell-wine-applications" { } ''
+          mkdir -p "$out/share/applications"
+          entry() {
+            printf '%s\n' "[Desktop Entry]" "Type=Application" "Name=$2" "Exec=$3" "Icon=wine" \
+              "NoDisplay=true" "Categories=Utility;" ''${4:+"MimeType=$4"} > "$out/share/applications/$1.desktop"
+          }
+          windows="application/x-ms-dos-executable;application/x-msi;"
+          entry wine "Wine Windows Program Loader" "openshell-wine %f" "$windows"
+          entry wine-install "Install with Wine" "openshell-wine --install %f" "$windows"
+          entry wine-configure "Wine Configuration" "openshell-wine --configure %f"
+        '';
+        # The installer of the W4 test (wine-smoke.mjs): Wine's Notepad as a
+        # program, with a Start menu shortcut and a setting (probe.wxs).
+        probe = pkgs.runCommand "openshell-wine-probe" { nativeBuildInputs = [ pkgs.msitools ]; } ''
+          install -m 0644 ${package}/lib/wine/x86_64-windows/notepad.exe probe.exe
+          mkdir -p "$out/share/openshell"
+          wixl -a x64 -o "$out/share/openshell/openshell-probe-setup.msi" ${./openshell-wine/probe.wxs}
+        '';
+      }
+    else
+      null;
+  # The applications the Desktop finds where Debian has them (/usr/share/applications).
+  applications = pkgs.symlinkJoin {
+    name = "openshell-applications";
+    paths = lib.optional (apps != null) apps.entries ++ lib.optional (wine != null) wine.entries;
+  };
   # The Desktop Terminal integrates with bash, as on OpenShell Live.
   shell = if bundle != null then pkgs.bashInteractive else null;
   # The A/B release transaction, exercised on the guest's VirtIO disk.
@@ -171,6 +219,9 @@ let
       ++ graphics.tools
     )
     ++ lib.optionals (apps != null) apps.packages
+    ++ lib.optionals (wine != null) [ wine.package wine.runner wine.probe ]
+    # /usr/share/applications links to it.
+    ++ lib.optional (apps != null) applications
     ++ lib.optional (shell != null) shell
     ++ lib.optional (ab != null) ab
   );
@@ -196,6 +247,8 @@ let
     ${lib.optionalString (ab != null) ''
       ln -s ${ab}/bin/openshell-ab "$out/opt/openshell-compat/openshell-ab"
       install -m 0644 ${./openshell-ab/smoke.sh} "$out/opt/openshell-compat/ab-smoke.sh"
+      # One boot of the disk image test (distro/image/boot-test.sh).
+      install -m 0644 ${probes}/image-boot.sh "$out/opt/openshell-compat/image-boot.sh"
     ''}
     install -m 0644 ${probes}/hostd-smoke.mjs ${probes}/unprivileged.py ${probes}/node.mjs ${probes}/python.py ${probes}/inotify.py ${probes}/namespaces.py "$out/opt/openshell-compat/"
     ${lib.optionalString (bundle != null) ''
@@ -206,7 +259,7 @@ let
     ''}
     ${lib.optionalString (graphics != null) ''
       for tool in ${lib.concatMapStringsSep " " (tool: "${tool}/bin") graphics.tools}; do
-        for program in Xvfb openbox xdotool xwd; do
+        for program in Xvfb openbox xdotool xwd setxkbmap; do
           if [ -e "$tool/$program" ]; then
             ln -s "$tool/$program" "$out/opt/openshell-compat/bin/$program"
           fi
@@ -229,7 +282,8 @@ let
       # Where hostd looks for them, as on Debian.
       ln -sf ${apps.python}/bin/python3 "$out/opt/openshell-compat/bin/python3"
       for program in ${apps.xpra}/bin/xpra ${pkgs.dbus}/bin/dbus-run-session ${pkgs.dbus}/bin/dbus-daemon \
-          ${apps.gtkProbe}/bin/openshell-gtk-probe ${apps.qtProbe}/bin/openshell-qt-probe; do
+          ${apps.gtkProbe}/bin/openshell-gtk-probe ${apps.qtProbe}/bin/openshell-qt-probe \
+          ${pkgs.xsettingsd}/bin/xsettingsd ${pkgs.xrdb}/bin/xrdb; do
         ln -s "$program" "$out/opt/openshell-compat/bin/"
       done
       # The upstream root comes from the store, read-only.
@@ -240,8 +294,18 @@ let
       mkdir -p "$out/etc/dbus-1" "$out/usr/share/xpra"
       ln -s ${apps.dbusSession}/etc/dbus-1/session.conf "$out/etc/dbus-1/session.conf"
       ln -s ${apps.html5}/share/xpra/www "$out/usr/share/xpra/www"
-      ln -s ${apps.entries}/share/applications "$out/usr/share/applications"
+      ln -s ${applications}/share/applications "$out/usr/share/applications"
+      # The cursor theme of the applications draws from Adwaita, where Debian has it.
+      ln -s ${pkgs.adwaita-icon-theme}/share/icons "$out/usr/share/icons"
       install -m 0644 ${probes}/apps-smoke.mjs "$out/opt/openshell-compat/"
+    ''}
+    ${lib.optionalString (wine != null) ''
+      for program in wine wineboot wineserver; do
+        ln -s "${wine.package}/bin/$program" "$out/opt/openshell-compat/bin/"
+      done
+      ln -s ${wine.runner}/bin/openshell-wine "$out/opt/openshell-compat/bin/"
+      ln -s ${wine.probe}/share/openshell/openshell-probe-setup.msi "$out/opt/openshell-compat/openshell-probe-setup.msi"
+      install -m 0644 ${probes}/wine-smoke.mjs "$out/opt/openshell-compat/"
     ''}
     rm "$out/test/boot_hello.sh"
     install -m 0755 ${probes}/compat-boot.sh "$out/test/boot_hello.sh"
@@ -257,6 +321,11 @@ in
   graphicsTools = if graphics != null then pkgs.symlinkJoin {
     name = "openshell-graphics-tools";
     paths = graphics.tools;
+  } else null;
+  # The Windows apps profile, for the Linux control of the builder.
+  wineTools = if wine != null then pkgs.symlinkJoin {
+    name = "openshell-wine-tools";
+    paths = [ wine.package wine.runner wine.entries wine.probe ];
   } else null;
   # The Linux apps profile, for the Linux control of the builder.
   appsTools = if apps != null then pkgs.symlinkJoin {
