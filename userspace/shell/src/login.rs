@@ -31,7 +31,8 @@ use crate::session::CommandLine;
 pub const GREETER_SOCKET_ENV: &str = "OPENSHELL_GREETER_SOCKET";
 /// The longest password the greeter may send, and the longest request line.
 pub const MAX_PASSWORD: usize = 256;
-pub const MAX_REQUEST: usize = MAX_PASSWORD + 16;
+/// Room for the longest verb before a password ("install-password ").
+pub const MAX_REQUEST: usize = MAX_PASSWORD + 32;
 /// BusyBox's cryptpw where the system image installs BusyBox.
 pub const DEFAULT_PASSWORD_TOOL: &str = "/bin/cryptpw";
 /// What the password is for: signing in before the shell (the greeter), or
@@ -47,6 +48,10 @@ pub struct LoginConfig {
     pub greeter: CommandLine,
     pub password_file: PathBuf,
     pub password_tool: CommandLine,
+    /// The screen lock (openshell-lock: XSecureLock with Live's lock screen).
+    /// With a password, signing in is unlocking it, as on OpenShell Live; the
+    /// greeter remains for creating the first password.
+    pub lock: Option<CommandLine>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -102,6 +107,11 @@ fn crypt(tool: &CommandLine, password: &str, salt: Option<&str>) -> io::Result<S
         return Err(io::Error::other("the password tool gave no SHA-512 crypt hash"));
     }
     Ok(hash)
+}
+
+/// A new password's SHA-512 crypt hash, as the password file keeps it (the installer's).
+pub fn hash_password(tool: &CommandLine, password: &str) -> io::Result<String> {
+    crypt(tool, password, None)
 }
 
 /// Equal lengths and bytes, in time that does not depend on where they differ.
@@ -223,6 +233,7 @@ mod tests {
             greeter: vec!["/bin/true".into()],
             password_file: folder.join("account").join("password"),
             password_tool: fake_tool(&folder),
+            lock: None,
         };
         assert_eq!(config.answer_sign_in("state").unwrap(), "create");
         assert_eq!(config.answer_sign_in("login secret").unwrap(), "wrong");

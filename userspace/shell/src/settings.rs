@@ -1,17 +1,28 @@
-//! The computer's settings that belong to root: the time zone and the account's
-//! full name. On OpenShell Live, the Desktop changes them with `timedatectl` and
-//! `sudo chfn`; OpenShell Native has neither, and its root filesystem lives in
-//! memory. The session asks the supervisor on its system socket (install.rs):
+//! The computer's settings that belong to root: the time zone, the account's
+//! full name and the keyboard layout. On OpenShell Live, the Desktop changes
+//! them with `timedatectl`, `sudo chfn` and the system keyboard configuration;
+//! OpenShell Native has none of them, and its root filesystem lives in memory.
+//! The session asks the supervisor on its system socket (install.rs):
 //!
 //! ```text
-//! timezone <Area/City>   → "ok" or "invalid"
-//! name <full name>       → "ok" or "invalid"
+//! timezone <Area/City>          → "ok" or "invalid"
+//! name <full name>              → "ok" or "invalid"
+//! keyboard <layout> [variant]   → "ok" or "invalid"
+//! brightness <1-100>            → "ok", "invalid" or "failed …"
 //! ```
+//!
+//! The screen's brightness is the backlight's (`/sys/class/backlight`, which
+//! only root may write), kept and set again at every boot, as systemd-backlight
+//! does on OpenShell Live.
 //!
 //! The supervisor sets /etc/localtime and the session user's /etc/passwd entry
 //! at once, and keeps each value in its settings folder (`settings_dir`, on
 //! the data partition of an installed system), from which it sets them again
-//! at every boot, before the session starts.
+//! at every boot, before the session starts. The keyboard layout is the
+//! session's already (hostd sets it with setxkbmap); kept here, X starts with
+//! it (installed-session.sh, openshell-x.sh), so the sign-in and the lock
+//! screen read the password in it too. The installer writes the same files
+//! (distro/image/install.sh).
 
 use std::fs;
 use std::io::{self, Write};
@@ -20,16 +31,23 @@ use std::path::{Path, PathBuf};
 
 pub const TIMEZONE_REQUEST: &str = "timezone";
 pub const NAME_REQUEST: &str = "name";
+pub const KEYBOARD_REQUEST: &str = "keyboard";
+pub const BRIGHTNESS_REQUEST: &str = "brightness";
 /// Where the system's files are; tests use their own.
 pub const ZONEINFO: &str = "/usr/share/zoneinfo";
 pub const LOCALTIME: &str = "/etc/localtime";
 pub const PASSWD: &str = "/etc/passwd";
+pub const BACKLIGHT: &str = "/sys/class/backlight";
 const MAX_NAME: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Setting {
     TimeZone(String),
     Name(String),
+    /// "<layout>" or "<layout> <variant>", as xkb names them.
+    Keyboard(String),
+    /// The backlight, in percent (never 0: a dark screen looks dead).
+    Brightness(String),
 }
 
 impl Setting {
@@ -40,27 +58,45 @@ impl Setting {
         match verb {
             TIMEZONE_REQUEST if valid_timezone(value) => Some(Setting::TimeZone(value.to_owned())),
             NAME_REQUEST if valid_name(value) => Some(Setting::Name(value.to_owned())),
+            KEYBOARD_REQUEST if valid_keyboard(value) => Some(Setting::Keyboard(value.to_owned())),
+            BRIGHTNESS_REQUEST if brightness_percent(value).is_some() => Some(Setting::Brightness(value.to_owned())),
             _ => None,
         }
     }
 
     pub fn is_request(line: &str) -> bool {
         let verb = line.split(' ').next().unwrap_or("");
-        verb == TIMEZONE_REQUEST || verb == NAME_REQUEST
+        SETTINGS.contains(&verb)
     }
 
     fn file(&self) -> &'static str {
         match self {
             Setting::TimeZone(_) => TIMEZONE_REQUEST,
             Setting::Name(_) => NAME_REQUEST,
+            Setting::Keyboard(_) => KEYBOARD_REQUEST,
+            Setting::Brightness(_) => BRIGHTNESS_REQUEST,
         }
     }
 
     fn value(&self) -> &str {
         match self {
-            Setting::TimeZone(value) | Setting::Name(value) => value,
+            Setting::TimeZone(value) | Setting::Name(value) | Setting::Keyboard(value) | Setting::Brightness(value) => value,
         }
     }
+}
+
+/// Every setting's request verb, which is also its file in the settings folder.
+const SETTINGS: [&str; 4] = [TIMEZONE_REQUEST, NAME_REQUEST, KEYBOARD_REQUEST, BRIGHTNESS_REQUEST];
+
+/// A brightness of 1 to 100 percent.
+pub fn brightness_percent(value: &str) -> Option<u32> {
+    let percent: u32 = value.parse().ok()?;
+    (value.bytes().all(|byte| byte.is_ascii_digit()) && (1..=100).contains(&percent)).then_some(percent)
+}
+
+/// The backlight level for a percentage of `max`: at least 1.
+pub fn backlight_level(max: u32, percent: u32) -> u32 {
+    ((u64::from(max) * u64::from(percent) / 100) as u32).clamp(1, max.max(1))
 }
 
 /// An IANA zone name such as `America/Sao_Paulo` or `UTC`: no path tricks.
@@ -70,6 +106,16 @@ pub fn valid_timezone(zone: &str) -> bool {
         && !zone.starts_with('/')
         && zone.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
         && zone.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_+-/".contains(&byte))
+}
+
+/// An xkb layout and optional variant ("br", "br abnt2", "us intl"): xkb's
+/// own names, nothing that could become another xorg.conf line.
+pub fn valid_keyboard(value: &str) -> bool {
+    let words: Vec<&str> = value.split(' ').collect();
+    (1..=2).contains(&words.len())
+        && words.iter().all(|word| {
+            (1..=32).contains(&word.len()) && word.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        })
 }
 
 /// What chfn takes as a full name: no field separators or control characters.
@@ -82,11 +128,12 @@ pub struct SystemFiles {
     pub zoneinfo: PathBuf,
     pub localtime: PathBuf,
     pub passwd: PathBuf,
+    pub backlight: PathBuf,
 }
 
 impl Default for SystemFiles {
     fn default() -> Self {
-        Self { zoneinfo: ZONEINFO.into(), localtime: LOCALTIME.into(), passwd: PASSWD.into() }
+        Self { zoneinfo: ZONEINFO.into(), localtime: LOCALTIME.into(), passwd: PASSWD.into(), backlight: BACKLIGHT.into() }
     }
 }
 
@@ -109,6 +156,20 @@ impl SystemFiles {
                 let changed = with_full_name(&text, uid, name)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no account {uid}")))?;
                 write_atomically(&self.passwd, changed.as_bytes())
+            }
+            // The session sets it itself; X takes the kept one when it starts.
+            Setting::Keyboard(_) => Ok(()),
+            Setting::Brightness(value) => {
+                let percent = brightness_percent(value).unwrap_or(100);
+                // The first backlight, as brightnessctl takes it.
+                let mut panels: Vec<PathBuf> = fs::read_dir(&self.backlight)?.filter_map(|entry| Some(entry.ok()?.path())).collect();
+                panels.sort();
+                let panel = panels.first().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no backlight"))?;
+                let max: u32 = fs::read_to_string(panel.join("max_brightness"))?
+                    .trim()
+                    .parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "no maximum brightness"))?;
+                fs::write(panel.join("brightness"), format!("{}\n", backlight_level(max, percent)))
             }
         }
     }
@@ -164,7 +225,7 @@ impl Saved {
 
     /// The saved settings that are still valid.
     pub fn load(&self) -> Vec<Setting> {
-        [TIMEZONE_REQUEST, NAME_REQUEST]
+        SETTINGS
             .iter()
             .filter_map(|verb| {
                 let value = fs::read_to_string(self.0.join(verb)).ok()?;
@@ -183,6 +244,11 @@ mod tests {
         assert_eq!(Setting::from_request("timezone America/Sao_Paulo"), Some(Setting::TimeZone("America/Sao_Paulo".into())));
         assert_eq!(Setting::from_request("timezone UTC"), Some(Setting::TimeZone("UTC".into())));
         assert_eq!(Setting::from_request("name Ana Souza"), Some(Setting::Name("Ana Souza".into())));
+        assert_eq!(Setting::from_request("keyboard br abnt2"), Some(Setting::Keyboard("br abnt2".into())));
+        assert_eq!(Setting::from_request("keyboard us"), Some(Setting::Keyboard("us".into())));
+        for bad in ["keyboard br abnt2 extra", "keyboard br\"", "keyboard ", "keyboard br  abnt2"] {
+            assert_eq!(Setting::from_request(bad), None, "{bad}");
+        }
         for bad in ["timezone ../etc/passwd", "timezone /UTC", "timezone Europe//Rome", "timezone a b", "name a:b", "name x,y", "name  ", "timezone", "zone UTC"] {
             assert_eq!(Setting::from_request(bad), None, "{bad}");
         }
@@ -206,7 +272,7 @@ mod tests {
         fs::create_dir_all(root.join("zoneinfo/America")).unwrap();
         fs::write(root.join("zoneinfo/America/Sao_Paulo"), b"TZif").unwrap();
         fs::write(root.join("passwd"), "nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n").unwrap();
-        let files = SystemFiles { zoneinfo: root.join("zoneinfo"), localtime: root.join("localtime"), passwd: root.join("passwd") };
+        let files = SystemFiles { zoneinfo: root.join("zoneinfo"), localtime: root.join("localtime"), passwd: root.join("passwd"), backlight: root.join("backlight") };
         let zone = Setting::TimeZone("America/Sao_Paulo".into());
         files.apply(&zone, 65534).unwrap();
         assert_eq!(files.timezone().as_deref(), Some("America/Sao_Paulo"));
@@ -218,6 +284,32 @@ mod tests {
         saved.save(&zone).unwrap();
         saved.save(&name).unwrap();
         assert_eq!(saved.load(), vec![zone, name]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sets_and_keeps_the_backlight() {
+        for bad in ["brightness 0", "brightness 101", "brightness -5", "brightness 5x", "brightness +5", "brightness "] {
+            assert_eq!(Setting::from_request(bad), None, "{bad}");
+        }
+        assert!(Setting::is_request("brightness 0"));
+        assert_eq!(backlight_level(19200, 50), 9600);
+        assert_eq!(backlight_level(19200, 1), 192);
+        assert_eq!(backlight_level(50, 1), 1, "never dark");
+        let root = std::env::temp_dir().join(format!("openshell-backlight-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("backlight/intel_backlight")).unwrap();
+        fs::write(root.join("backlight/intel_backlight/max_brightness"), "19200\n").unwrap();
+        fs::write(root.join("backlight/intel_backlight/brightness"), "19200\n").unwrap();
+        let files = SystemFiles { backlight: root.join("backlight"), ..SystemFiles::default() };
+        let half = Setting::from_request("brightness 50").unwrap();
+        files.apply(&half, 65534).unwrap();
+        assert_eq!(fs::read_to_string(root.join("backlight/intel_backlight/brightness")).unwrap(), "9600\n");
+        let saved = Saved(root.join("saved"));
+        saved.save(&half).unwrap();
+        assert_eq!(saved.load(), vec![half]);
+        let none = SystemFiles { backlight: root.join("missing"), ..SystemFiles::default() };
+        assert!(none.apply(&Setting::Brightness("10".into()), 65534).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 }

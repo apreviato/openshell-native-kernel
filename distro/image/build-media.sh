@@ -40,8 +40,15 @@ case "$action" in
         cat > "$tree/boot/grub/grub.cfg" <<'EOF'
 set timeout=5
 set default=0
-serial --unit=0 --speed=115200
-terminal_output console serial
+# GRUB's lines also go to the first serial port, which the tests read, where
+# there is one: a computer without it (most notebooks) would otherwise show
+# "serial port 'com0' isn't found" and lose the splash.
+set openshell_serial=
+if serial --unit=0 --speed=115200; then
+    set openshell_serial=serial
+fi
+export openshell_serial
+terminal_output console $openshell_serial
 search --no-floppy --file --set=openshell_esp /EFI/BOOT/mmx64.efi
 export openshell_esp
 source ($openshell_esp)/EFI/BOOT/splash.cfg

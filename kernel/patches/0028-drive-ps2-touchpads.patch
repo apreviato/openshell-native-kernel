@@ -1,0 +1,1265 @@
+diff --git a/kernel/comps/i8042/src/keyboard.rs b/kernel/comps/i8042/src/keyboard.rs
+index cd51ec3..92f48c7 100644
+--- a/kernel/comps/i8042/src/keyboard.rs
++++ b/kernel/comps/i8042/src/keyboard.rs
+@@ -214,6 +214,8 @@ fn handle_keyboard_input(_trap_frame: &TrapFrame) {
+ 
+     // Dispatch the input event.
+     if let Some(key_code) = scancode_event.to_key_code() {
++        // The touchpad ignores a palm while typing (mouse.rs).
++        crate::mouse::note_key(key_code, scancode_event.key_status);
+         if let Some(registered_device) = REGISTERED_DEVICE.get() {
+             let events = [
+                 InputEvent::from_key_and_status(key_code, scancode_event.key_status),
+diff --git a/kernel/comps/i8042/src/lib.rs b/kernel/comps/i8042/src/lib.rs
+index 26a2d8a..9234385 100644
+--- a/kernel/comps/i8042/src/lib.rs
++++ b/kernel/comps/i8042/src/lib.rs
+@@ -24,6 +24,7 @@ mod controller;
+ mod keyboard;
+ mod mouse;
+ mod ps2;
++mod touchpad;
+ 
+ #[init_component]
+ fn init() -> Result<(), ComponentInitError> {
+diff --git a/kernel/comps/i8042/src/mouse.rs b/kernel/comps/i8042/src/mouse.rs
+index ef76b83..7183ab3 100644
+--- a/kernel/comps/i8042/src/mouse.rs
++++ b/kernel/comps/i8042/src/mouse.rs
+@@ -1,12 +1,20 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ //! The i8042 mouse driver.
++//!
++//! A PS/2 mouse, or a laptop's touchpad. Synaptics and ELAN (hardware versions
++//! 3 and 4) touchpads are switched to their absolute modes and read by
++//! [`crate::touchpad`], which gives them tap to click, natural two-finger
++//! scrolling and the clickpad buttons. Other touchpads stay in the mouse mode
++//! every PS/2 touchpad has; the log names them. `psmouse.proto=bare`, `imps`
++//! or `exps` keeps any touchpad in that mode, as on Linux.
+ 
+ use alloc::{
+     string::{String, ToString},
+     sync::Arc,
+     vec::Vec,
+ };
++use core::sync::atomic::{AtomicU64, Ordering};
+ 
+ use aster_input::{
+     event_type_codes::{KeyCode, KeyStatus, RelCode, SynEvent},
+@@ -19,12 +27,17 @@ use ostd::{
+     },
+     irq::IrqLine,
+     sync::{LocalIrqDisabled, SpinLock},
++    timer::Jiffies,
+ };
+ use spin::Once;
+ 
+ use crate::{
+     controller::{I8042_CONTROLLER, I8042Controller, I8042ControllerError},
+     ps2::{Command, CommandCtx},
++    touchpad::{
++        Button, Elan, Framer, Geometry, Gestures, Output, Packet, Synaptics, elan_hw_version,
++        elan_resolution, elan_signature_valid, standard_packet,
++    },
+ };
+ 
+ /// IRQ line for i8042 mouse.
+@@ -39,24 +52,74 @@ const ISA_INTR_NUM: u8 = 12;
+ /// Mouse packet state machine.
+ static PACKET_STATE: SpinLock<PacketState, LocalIrqDisabled> = SpinLock::new(PacketState::new());
+ 
++/// When a key was last typed, in milliseconds since boot (`u64::MAX`: never).
++static LAST_KEY_MS: AtomicU64 = AtomicU64::new(u64::MAX);
++
++/// Linux's `psmouse.proto`: `bare`, `imps` or `exps` keep touchpads in mouse mode.
++static PSMOUSE_PROTO: Once<String> = Once::new();
++aster_cmdline::define_kv_param!("psmouse.proto", PSMOUSE_PROTO);
++
++fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++/// Tells the touchpad that a key was typed, so that a palm resting on it
++/// while typing neither moves the pointer nor taps. Modifiers do not count:
++/// Ctrl+click and the like still work.
++pub(super) fn note_key(key: KeyCode, status: KeyStatus) {
++    let modifier = matches!(
++        key,
++        KeyCode::LeftCtrl
++            | KeyCode::RightCtrl
++            | KeyCode::LeftShift
++            | KeyCode::RightShift
++            | KeyCode::LeftAlt
++            | KeyCode::RightAlt
++            | KeyCode::LeftMeta
++            | KeyCode::RightMeta
++    );
++    if !modifier && matches!(status, KeyStatus::Pressed) {
++        LAST_KEY_MS.store(now_ms(), Ordering::Relaxed);
++    }
++}
++
+ pub(super) fn init(controller: &mut I8042Controller) -> Result<(), I8042ControllerError> {
+     let mut init_ctx = InitCtx(controller);
+ 
+     let device_id = init_ctx
+         .reset()?
+         .ok_or(I8042ControllerError::DeviceUnknown)?;
+-    ostd::info!("PS/2 mouse device ID: 0x{:02X}", device_id);
++    ostd::notice!("PS/2 mouse device ID: 0x{:02X}", device_id);
+ 
+-    // Determine the mouse's type.
+-    let mut mouse_type =
+-        MouseType::from_device_id(device_id).ok_or(I8042ControllerError::DeviceUnknown)?;
+-    if mouse_type == MouseType::Standard && init_ctx.enable_intellimouse().is_ok() {
+-        // Query the device ID again.
+-        let new_device_id = init_ctx.get_device_id()?;
+-        ostd::info!("PS/2 mouse upgraded device ID: 0x{:02X}", new_device_id);
+-        mouse_type =
+-            MouseType::from_device_id(new_device_id).ok_or(I8042ControllerError::DeviceUnknown)?;
+-    }
++    let proto = PSMOUSE_PROTO.get().map(String::as_str).unwrap_or("any");
++    let touchpad = match proto {
++        "bare" | "imps" | "exps" => None,
++        _ => init_ctx.probe_touchpad(),
++    };
++
++    let (protocol, name) = match touchpad {
++        Some(found) => found,
++        None => {
++            // The probes leave the device in an unknown state.
++            if !matches!(proto, "bare" | "imps" | "exps") {
++                init_ctx.reset()?;
++            }
++            // Determine the mouse's type.
++            let mut mouse_type =
++                MouseType::from_device_id(device_id).ok_or(I8042ControllerError::DeviceUnknown)?;
++            if mouse_type == MouseType::Standard
++                && proto != "bare"
++                && init_ctx.enable_intellimouse().is_ok()
++            {
++                // Query the device ID again.
++                let new_device_id = init_ctx.get_device_id()?;
++                ostd::notice!("PS/2 mouse upgraded device ID: 0x{:02X}", new_device_id);
++                mouse_type = MouseType::from_device_id(new_device_id)
++                    .ok_or(I8042ControllerError::DeviceUnknown)?;
++            }
++            (Protocol::Mouse(mouse_type), "i8042_mouse")
++        }
++    };
+ 
+     // Enable data reporting.
+     init_ctx.enable_data_reporting()?;
+@@ -73,19 +136,32 @@ pub(super) fn init(controller: &mut I8042Controller) -> Result<(), I8042Controll
+     IRQ_LINE.call_once(|| irq_line);
+ 
+     // Create and register the i8042 mouse device.
+-    let mouse_device = Arc::new(I8042Mouse::new());
++    let mouse_device = Arc::new(I8042Mouse::new(name));
+     let registered_device = aster_input::register_device(mouse_device);
+     REGISTERED_DEVICE.call_once(|| registered_device);
+ 
+-    // Configure the mouse's type based on its device ID.
++    // Configure the packet format.
+     let mut state = PACKET_STATE.lock();
+-    state.set_mouse_type(mouse_type);
++    state.set_protocol(protocol);
+ 
+     Ok(())
+ }
+ 
+ struct InitCtx<'a>(&'a mut I8042Controller);
+ 
++/// PS/2 mouse commands used to talk to touchpads.
++mod raw {
++    pub(super) const SET_SCALE_11: u8 = 0xE6;
++    pub(super) const SET_SCALE_21: u8 = 0xE7;
++    pub(super) const SET_RESOLUTION: u8 = 0xE8;
++    pub(super) const STATUS_REQUEST: u8 = 0xE9;
++    pub(super) const SET_SAMPLE_RATE: u8 = 0xF3;
++    pub(super) const DISABLE: u8 = 0xF5;
++    pub(super) const SET_DEFAULTS: u8 = 0xF6;
++    /// ELAN's prefix for its own commands.
++    pub(super) const ELAN_CUSTOM: u8 = 0xF8;
++}
++
+ impl InitCtx<'_> {
+     fn get_device_id(&mut self) -> Result<u8, I8042ControllerError> {
+         let mut buf = [0u8; cmd::GetDeviceId::RES_LEN];
+@@ -117,6 +193,272 @@ impl InitCtx<'_> {
+         self.command::<cmd::EnableDataReporting>(&[], &mut buf)?;
+         Ok(())
+     }
++
++    /// Sends one byte and waits for the device's acknowledgment, trying again
++    /// as Linux's elantech driver does.
++    fn byte(&mut self, byte: u8) -> Result<(), I8042ControllerError> {
++        let mut result = Err(I8042ControllerError::DeviceResetFailed);
++        for _ in 0..3 {
++            self.write_to_port(byte)?;
++            match self.0.wait_for_specific_data(&[0xFA, 0xFE, 0xFC]) {
++                Ok(0xFA) => return Ok(()),
++                Ok(_) => result = Err(I8042ControllerError::DeviceResetFailed),
++                Err(error) => result = Err(error),
++            }
++        }
++        result
++    }
++
++    /// The status request (`E9`): three bytes.
++    fn status(&mut self) -> Result<[u8; 3], I8042ControllerError> {
++        self.byte(raw::STATUS_REQUEST)?;
++        let mut answer = [0u8; 3];
++        for slot in answer.iter_mut() {
++            *slot = self.0.wait_and_recv_data()?;
++        }
++        Ok(answer)
++    }
++
++    /// A Synaptics "sliced" command: `E6`, then two bits at a time as resolutions.
++    fn sliced(&mut self, command: u8) -> Result<(), I8042ControllerError> {
++        self.byte(raw::SET_SCALE_11)?;
++        for shift in [6, 4, 2, 0] {
++            self.byte(raw::SET_RESOLUTION)?;
++            self.byte((command >> shift) & 3)?;
++        }
++        Ok(())
++    }
++
++    fn synaptics_query(&mut self, query: u8) -> Result<[u8; 3], I8042ControllerError> {
++        self.sliced(query)?;
++        self.status()
++    }
++
++    fn elan_query(&mut self, query: u8) -> Result<[u8; 3], I8042ControllerError> {
++        self.byte(raw::ELAN_CUSTOM)?;
++        self.byte(query)?;
++        self.status()
++    }
++
++    /// Writes an ELAN register (Linux `elantech_write_reg`, versions 3 and 4).
++    fn elan_write_register(&mut self, version: u8, register: u8, value: u8) -> Result<(), I8042ControllerError> {
++        const READ_WRITE: u8 = 0x00;
++        self.byte(raw::ELAN_CUSTOM)?;
++        self.byte(READ_WRITE)?;
++        self.byte(raw::ELAN_CUSTOM)?;
++        self.byte(register)?;
++        if version == 4 {
++            self.byte(raw::ELAN_CUSTOM)?;
++            self.byte(READ_WRITE)?;
++        }
++        self.byte(raw::ELAN_CUSTOM)?;
++        self.byte(value)?;
++        self.byte(raw::SET_SCALE_11)
++    }
++
++    /// Finds a Synaptics or ELAN touchpad and switches it to absolute mode.
++    fn probe_touchpad(&mut self) -> Option<(Protocol, &'static str)> {
++        if let Some(found) = self.probe_synaptics() {
++            return Some(found);
++        }
++        // Back to defaults before the next knock, as Linux does.
++        let _ = self.byte(raw::SET_DEFAULTS);
++        if let Some(found) = self.probe_elan() {
++            return Some(found);
++        }
++        self.name_other_touchpads();
++        None
++    }
++
++    fn probe_synaptics(&mut self) -> Option<(Protocol, &'static str)> {
++        // Identify: four resolutions of 0, then the status request.
++        for _ in 0..4 {
++            self.byte(raw::SET_RESOLUTION).ok()?;
++            self.byte(0).ok()?;
++        }
++        let identity = self.status().ok()?;
++        if identity[1] != 0x47 {
++            return None;
++        }
++        let major = identity[2] & 0x0f;
++        let to_u32 = |b: [u8; 3]| (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
++        let capabilities = match self.synaptics_query(0x02) {
++            Ok(answer) if answer[1] == 0x47 => to_u32(answer),
++            _ => 0,
++        };
++        let extended = capabilities & (1 << 23) != 0;
++        let queries = if extended { (capabilities >> 20) & 0x7 } else { 0 };
++        let ext_0c = if queries >= 4 {
++            self.synaptics_query(0x0c).map(to_u32).unwrap_or(0)
++        } else {
++            0
++        };
++        let mut geometry = Geometry {
++            x_min: 1472,
++            x_max: 5472,
++            y_min: 1408,
++            y_max: 4448,
++            x_res: 0,
++            y_res: 0,
++            clickpad: ext_0c & (1 << 20) != 0,
++        };
++        let coordinate = |high: u8, middle: u8, low_nibble: bool| {
++            let nibble = if low_nibble { (middle & 0x0f) << 1 } else { (middle & 0xf0) >> 3 };
++            ((high as i32) << 5) | nibble as i32
++        };
++        if queries >= 5
++            && ext_0c & (1 << 17) != 0
++            && let Ok(r) = self.synaptics_query(0x0d)
++        {
++            geometry.x_max = coordinate(r[0], r[1], true);
++            geometry.y_max = coordinate(r[2], r[1], false);
++        }
++        if queries >= 7
++            && ext_0c & (1 << 13) != 0
++            && let Ok(r) = self.synaptics_query(0x0f)
++        {
++            geometry.x_min = coordinate(r[0], r[1], true);
++            geometry.y_min = coordinate(r[2], r[1], false);
++        }
++        if geometry.x_max <= geometry.x_min + 100 || geometry.y_max <= geometry.y_min + 100 {
++            (geometry.x_min, geometry.x_max, geometry.y_min, geometry.y_max) = (1472, 5472, 1408, 4448);
++        }
++        if major >= 4
++            && let Ok(r) = self.synaptics_query(0x08)
++            && r[0] != 0
++            && r[1] & 0x80 != 0
++            && r[2] != 0
++        {
++            geometry.x_res = r[0] as i32;
++            geometry.y_res = r[2] as i32;
++        }
++
++        // Absolute, 80 packets a second, the pad's own taps off (from
++        // firmware 4), and W for the fingers and their width.
++        let mut mode = 0x80 | 0x40;
++        if major >= 4 {
++            mode |= 0x04;
++        }
++        if extended {
++            mode |= 0x01;
++        }
++        self.sliced(mode).ok()?;
++        self.byte(raw::SET_SAMPLE_RATE).ok()?;
++        self.byte(0x14).ok()?;
++
++        ostd::notice!(
++            "Synaptics touchpad: firmware {}.{}, capabilities 0x{:06x}, 0x0c 0x{:06x}, x {}..{} y {}..{}, {}x{} units/mm, {}",
++            major,
++            identity[0],
++            capabilities,
++            ext_0c,
++            geometry.x_min,
++            geometry.x_max,
++            geometry.y_min,
++            geometry.y_max,
++            geometry.x_res,
++            geometry.y_res,
++            if geometry.clickpad { "clickpad" } else { "buttons" }
++        );
++        let pad = Synaptics {
++            geometry,
++            multifinger: capabilities & (1 << 1) != 0,
++            width: extended,
++            middle: capabilities & (1 << 18) != 0,
++            pass_through: capabilities & (1 << 7) != 0,
++        };
++        Some((Protocol::Synaptics(pad), "SynPS/2 Synaptics TouchPad"))
++    }
++
++    fn probe_elan(&mut self) -> Option<(Protocol, &'static str)> {
++        // The knock: disable, three 1:1 scalings, the status request.
++        self.byte(raw::DISABLE).ok()?;
++        for _ in 0..3 {
++            self.byte(raw::SET_SCALE_11).ok()?;
++        }
++        let knock = self.status().ok()?;
++        if knock[0] != 0x3c || knock[1] != 0x03 || (knock[2] != 0xc8 && knock[2] != 0x00) {
++            return None;
++        }
++        let answer = self.synaptics_query(0x01).ok()?;
++        if !elan_signature_valid(answer) {
++            ostd::notice!("ELAN-like touchpad with firmware answer {:02x?}: mouse mode", answer);
++            return None;
++        }
++        let firmware = (answer[0] as u32) << 16 | (answer[1] as u32) << 8 | answer[2] as u32;
++        let version = elan_hw_version(firmware)?;
++        if version < 3 {
++            ostd::notice!("ELAN touchpad v{} (firmware 0x{:06x}): mouse mode", version, firmware);
++            return None;
++        }
++        let samples = self.elan_query(0x03).unwrap_or([0; 3]);
++        let range = self.elan_query(0x00).ok()?;
++        let x_max = ((range[0] & 0x0f) as i32) << 8 | range[1] as i32;
++        let y_max = ((range[0] & 0xf0) as i32) << 4 | range[2] as i32;
++        if x_max < 100 || y_max < 100 {
++            ostd::notice!("ELAN touchpad v{} with range {:02x?}: mouse mode", version, range);
++            return None;
++        }
++        // Linux's default resolution, or the one version 4 reports.
++        let (mut x_res, mut y_res) = (31, 31);
++        if version == 4
++            && let Ok(r) = self.elan_query(0x04)
++        {
++            (x_res, y_res) = (elan_resolution(r[1] & 0x0f), elan_resolution(r[1] >> 4));
++        }
++        let crc = firmware & 0x4000 != 0;
++        let ic7_2a = (firmware & 0x0f0000) >> 16 == 7 && samples[1] == 0x2A;
++        let clickpad = firmware & 0x001000 != 0;
++
++        // Absolute mode: register 0x10 = 0x0b (v3) or 0x07 = 0x01 (v4).
++        let (register, value) = if version == 3 { (0x10, 0x0b) } else { (0x07, 0x01) };
++        self.elan_write_register(version, register, value).ok()?;
++
++        ostd::notice!(
++            "ELAN touchpad v{}: firmware 0x{:06x}, x 0..{} y 0..{}, {}x{} units/mm{}{}",
++            version,
++            firmware,
++            x_max,
++            y_max,
++            x_res,
++            y_res,
++            if clickpad { ", clickpad" } else { "" },
++            if crc { ", checksums" } else { "" }
++        );
++        let geometry = Geometry {
++            x_min: 0,
++            x_max,
++            y_min: 0,
++            y_max,
++            x_res,
++            y_res,
++            clickpad,
++        };
++        Some((
++            Protocol::Elan(Elan::new(geometry, version, crc, ic7_2a)),
++            "ETPS/2 Elantech Touchpad",
++        ))
++    }
++
++    /// Three scalings and the status request: ALPS's E6 and E7 reports.
++    fn scaling_report(&mut self, scaling: u8) -> Option<[u8; 3]> {
++        self.byte(raw::DISABLE).ok()?;
++        for _ in 0..3 {
++            self.byte(scaling).ok()?;
++        }
++        self.status().ok()
++    }
++
++    /// Names touchpads this driver keeps in mouse mode, for the log.
++    fn name_other_touchpads(&mut self) {
++        // ALPS: its E6 and E7 reports (Linux `alps_identify`).
++        let (Some(e6), Some(e7)) = (self.scaling_report(raw::SET_SCALE_11), self.scaling_report(raw::SET_SCALE_21)) else {
++            return;
++        };
++        if e6[0] & 0xf8 == 0 && e6[1] == 0 && (e6[2] == 10 || e6[2] == 100) && e7[0] == 0x73 {
++            ostd::notice!("ALPS touchpad (E7 report {:02x?}): mouse mode, without taps or two-finger scrolling", e7);
++        }
++    }
+ }
+ 
+ impl CommandCtx for InitCtx<'_> {
+@@ -149,7 +491,7 @@ struct I8042Mouse {
+ }
+ 
+ impl I8042Mouse {
+-    fn new() -> Self {
++    fn new(name: &str) -> Self {
+         let mut capability = InputCapability::new();
+ 
+         // Mouse supports key events and relative movement events.
+@@ -162,14 +504,16 @@ impl I8042Mouse {
+         capability.set_supported_key(KeyCode::BtnRight);
+         capability.set_supported_key(KeyCode::BtnMiddle);
+ 
+-        // Add relative axes for movement.
++        // Add relative axes for movement and the wheels (a touchpad's
++        // two-finger scrolling turns both).
+         capability.set_supported_relative_axis(RelCode::X);
+         capability.set_supported_relative_axis(RelCode::Y);
+         capability.set_supported_relative_axis(RelCode::Wheel);
++        capability.set_supported_relative_axis(RelCode::HWheel);
+ 
+         Self {
+-            // Standard name for i8042 PS/2 mouse devices.
+-            name: "i8042_mouse".to_string(),
++            // Linux's names: i8042_mouse for a mouse, or the touchpad's.
++            name: name.to_string(),
+ 
+             // Physical path describing the device's connection topology
+             // isa0060: ISA bus port 0x60 (i8042 data port)
+@@ -266,35 +610,150 @@ impl MouseType {
+     }
+ }
+ 
+-/// Mouse packet state machine for handling 3-byte or 4-byte PS/2 mouse packets.
++/// What the device speaks.
++enum Protocol {
++    Mouse(MouseType),
++    Synaptics(Synaptics),
++    Elan(Elan),
++}
++
++/// Mouse packet state machine for handling 3-byte or 4-byte PS/2 mouse
++/// packets, or a touchpad's.
+ struct PacketState {
++    protocol: Protocol,
+     packet: [u8; MouseType::PACKET_LEN_MAX],
+     byte_index: usize,
+-    mouse_type: MouseType,
+     prev_left: bool,
+     prev_right: bool,
+     prev_middle: bool,
++    /// The touchpad's packets and gestures.
++    framer: Framer,
++    gestures: Option<Gestures>,
++    /// The buttons of a TrackPoint behind a Synaptics touchpad.
++    guest_buttons: (bool, bool, bool),
+ }
+ 
+ impl PacketState {
+     const fn new() -> Self {
+         Self {
++            protocol: Protocol::Mouse(MouseType::Standard),
+             packet: [0; MouseType::PACKET_LEN_MAX],
+             byte_index: 0,
+-            mouse_type: MouseType::Standard,
+             prev_left: false,
+             prev_right: false,
+             prev_middle: false,
++            framer: Framer::new(),
++            gestures: None,
++            guest_buttons: (false, false, false),
+         }
+     }
+ 
+-    fn set_mouse_type(&mut self, mouse_type: MouseType) {
+-        self.mouse_type = mouse_type;
++    fn set_protocol(&mut self, protocol: Protocol) {
++        self.gestures = match &protocol {
++            Protocol::Mouse(_) => None,
++            Protocol::Synaptics(pad) => Some(Gestures::new(pad.geometry)),
++            Protocol::Elan(pad) => Some(Gestures::new(pad.geometry)),
++        };
++        self.protocol = protocol;
++        self.framer.reset();
+         self.reset();
+     }
+ 
+     /// Processes a mouse data byte and returns input events if a complete packet is ready.
+     fn process_byte(&mut self, data: u8) -> Option<Vec<InputEvent>> {
++        let now = now_ms();
++        let packet = match &mut self.protocol {
++            Protocol::Mouse(mouse_type) => {
++                let packet_len = mouse_type.packet_len();
++                return self.process_mouse_byte(data, packet_len);
++            }
++            Protocol::Synaptics(pad) => {
++                let packet = self.framer.push(data, now, Synaptics::PACKET_SIZE, Synaptics::valid)?;
++                pad.decode(&packet)
++            }
++            Protocol::Elan(pad) => {
++                let packet = {
++                    let pad = &*pad;
++                    self.framer.push(data, now, Elan::PACKET_SIZE, |prefix| pad.valid(prefix))?
++                };
++                pad.decode(&packet)
++            }
++        };
++        self.touchpad_events(packet, now)
++    }
++
++    fn touchpad_events(&mut self, packet: Packet, now: u64) -> Option<Vec<InputEvent>> {
++        let mut outputs = Vec::new();
++        match packet {
++            Packet::Touch(frame) => {
++                let last_key = match LAST_KEY_MS.load(Ordering::Relaxed) {
++                    u64::MAX => None,
++                    time => Some(time),
++                };
++                self.gestures.as_mut()?.process(&frame, now, last_key, &mut outputs);
++            }
++            Packet::Guest(bytes) => {
++                let ((left, right, middle), dx, dy) = standard_packet(bytes)?;
++                let previous = self.guest_buttons;
++                self.guest_buttons = (left, right, middle);
++                for (button, now_down, was_down) in [
++                    (Button::Left, left, previous.0),
++                    (Button::Right, right, previous.1),
++                    (Button::Middle, middle, previous.2),
++                ] {
++                    if now_down != was_down {
++                        outputs.push(Output::Button { button, pressed: now_down });
++                    }
++                }
++                if dx != 0 || dy != 0 {
++                    outputs.push(Output::Motion { dx, dy });
++                }
++            }
++            Packet::Nothing => {}
++        }
++
++        let mut events = Vec::with_capacity(outputs.len() * 2 + 1);
++        for output in outputs {
++            match output {
++                Output::Motion { dx, dy } => {
++                    if dx != 0 {
++                        events.push(InputEvent::from_relative_move(RelCode::X, dx));
++                    }
++                    if dy != 0 {
++                        events.push(InputEvent::from_relative_move(RelCode::Y, dy));
++                    }
++                }
++                Output::Wheel { vertical, horizontal } => {
++                    if vertical != 0 {
++                        events.push(InputEvent::from_relative_move(RelCode::Wheel, vertical));
++                    }
++                    if horizontal != 0 {
++                        events.push(InputEvent::from_relative_move(RelCode::HWheel, horizontal));
++                    }
++                }
++                Output::Button { button, pressed } => {
++                    let key = match button {
++                        Button::Left => KeyCode::BtnLeft,
++                        Button::Right => KeyCode::BtnRight,
++                        Button::Middle => KeyCode::BtnMiddle,
++                    };
++                    let status = if pressed { KeyStatus::Pressed } else { KeyStatus::Released };
++                    events.push(InputEvent::from_key_and_status(key, status));
++                    // A tap presses and releases at once: one report each.
++                    events.push(InputEvent::from_sync_event(SynEvent::Report));
++                }
++            }
++        }
++        let synced = events
++            .last()
++            .is_some_and(|event| event.to_raw() == InputEvent::from_sync_event(SynEvent::Report).to_raw());
++        if !events.is_empty() && !synced {
++            events.push(InputEvent::from_sync_event(SynEvent::Report));
++        }
++        (!events.is_empty()).then_some(events)
++    }
++
++    fn process_mouse_byte(&mut self, data: u8, packet_len: usize) -> Option<Vec<InputEvent>> {
+         const PACKET_SYNC_MASK: u8 = 0x08;
+ 
+         // The first byte must have bit 3 set (always 1 in PS/2 mouse packets).
+@@ -305,7 +764,7 @@ impl PacketState {
+         // Collect the byte into the packet.
+         self.packet[self.byte_index] = data;
+         self.byte_index += 1;
+-        if self.byte_index < self.mouse_type.packet_len() {
++        if self.byte_index < packet_len {
+             return None;
+         }
+ 
+@@ -395,7 +854,7 @@ impl PacketState {
+             events.push(InputEvent::from_relative_move(RelCode::Y, -y_delta));
+         }
+ 
+-        if self.mouse_type == MouseType::IntelliMouse {
++        if matches!(self.protocol, Protocol::Mouse(MouseType::IntelliMouse)) {
+             let z_delta = self.packet[INDEX_WHEEL] as i8;
+             if z_delta != 0 {
+                 events.push(InputEvent::from_relative_move(
+diff --git a/kernel/comps/i8042/src/touchpad.rs b/kernel/comps/i8042/src/touchpad.rs
+new file mode 100755
+index 0000000..2b7d119
+--- /dev/null
++++ b/kernel/comps/i8042/src/touchpad.rs
+@@ -0,0 +1,593 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! PS/2 touchpads in their absolute modes, turned into a mouse.
++//!
++//! Synaptics and ELAN touchpads report finger positions once the driver
++//! switches them to absolute mode; in the plain PS/2 mode they fall back to,
++//! they only move the pointer. This module reads their packets and gives the
++//! laptop the gestures OpenShell Live's libinput gives it: the pointer, tap to
++//! click (one finger: left, two: right, three: middle), natural two-finger
++//! scrolling, the clickpad's right-button area and two-finger click, and no
++//! taps from touches that begin while typing. The result is a mouse with
++//! wheels, which the X evdev driver takes as it is.
++//!
++//! It has no hardware access, so its tests run on the host.
++//!
++//! References: Linux `drivers/input/mouse/synaptics.c` and `elantech.c`, and
++//! libinput's touchpad defaults.
++
++use alloc::vec::Vec;
++
++/// What a touchpad reports at one moment, in its own units with y growing down.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Frame {
++    /// Fingers on the pad (0 when none).
++    pub fingers: u8,
++    /// The position of the first finger, when there is one.
++    pub x: i32,
++    pub y: i32,
++    /// The pad's own buttons: on a clickpad, `left` is the pad being pressed.
++    pub left: bool,
++    pub right: bool,
++    pub middle: bool,
++    /// A palm rather than a finger: it neither moves the pointer nor taps.
++    pub palm: bool,
++}
++
++/// The pad's coordinates and resolution.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Geometry {
++    pub x_min: i32,
++    pub x_max: i32,
++    pub y_min: i32,
++    pub y_max: i32,
++    /// Units per millimetre.
++    pub x_res: i32,
++    pub y_res: i32,
++    /// One button under the whole pad: its bottom right is the right button.
++    pub clickpad: bool,
++}
++
++impl Geometry {
++    /// A resolution guessed from the range for pads that do not report one:
++    /// most laptop touchpads are about 100 mm wide and 60 mm high.
++    pub(crate) fn with_guessed_resolution(mut self) -> Self {
++        if self.x_res <= 0 {
++            self.x_res = ((self.x_max - self.x_min) / 100).max(1);
++        }
++        if self.y_res <= 0 {
++            self.y_res = ((self.y_max - self.y_min) / 60).max(1);
++        }
++        self
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Button {
++    Left,
++    Right,
++    Middle,
++}
++
++/// What the touchpad does, as a mouse.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Output {
++    /// Pointer motion in pixels, y growing down.
++    Motion { dx: i32, dy: i32 },
++    /// Wheel clicks: `vertical` > 0 scrolls up and `horizontal` > 0 right
++    /// (Linux's REL_WHEEL and REL_HWHEEL).
++    Wheel { vertical: i32, horizontal: i32 },
++    Button { button: Button, pressed: bool },
++}
++
++/// Pointer pixels per millimetre of finger travel; the X server accelerates fast motion.
++const PIXELS_PER_MM: i32 = 6;
++/// Finger travel per wheel click while scrolling, in tenths of a millimetre.
++const SCROLL_STEP_TENTHS_MM: i32 = 20;
++/// The longest touch that is still a tap (libinput's tap timeout).
++const TAP_TIMEOUT_MS: u64 = 180;
++/// The most a tap may move, in tenths of a millimetre.
++const TAP_TRAVEL_TENTHS_MM: i32 = 30;
++/// How long after a key a new touch is taken for the palm of a typing hand.
++pub(crate) const TYPING_TIMEOUT_MS: u64 = 500;
++/// The clickpad's button area: the bottom part of the pad, in percent of its height.
++const BUTTON_AREA_PERCENT: i32 = 18;
++
++/// One touch, from the first finger down to the last finger up.
++#[derive(Clone, Copy, Debug)]
++struct Touch {
++    start_ms: u64,
++    max_fingers: u8,
++    /// Travel in tenths of a millimetre.
++    travel: i32,
++    /// Began while typing: no tap.
++    typing: bool,
++    /// The pad was clicked or a palm seen: no tap.
++    no_tap: bool,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum ScrollAxis {
++    Undecided,
++    Vertical,
++    Horizontal,
++}
++
++/// Turns touchpad frames into mouse output.
++pub(crate) struct Gestures {
++    geometry: Geometry,
++    /// The previous frame's fingers and position.
++    last: Option<(u8, i32, i32)>,
++    /// What is left of a pixel or a wheel click, in units times the factor applied.
++    rem_x: i32,
++    rem_y: i32,
++    scroll_x: i32,
++    scroll_y: i32,
++    axis: ScrollAxis,
++    touch: Option<Touch>,
++    /// The button the pad's click is holding down.
++    click: Option<Button>,
++    right: bool,
++    middle: bool,
++}
++
++impl Gestures {
++    pub(crate) fn new(geometry: Geometry) -> Self {
++        Self {
++            geometry: geometry.with_guessed_resolution(),
++            last: None,
++            rem_x: 0,
++            rem_y: 0,
++            scroll_x: 0,
++            scroll_y: 0,
++            axis: ScrollAxis::Undecided,
++            touch: None,
++            click: None,
++            right: false,
++            middle: false,
++        }
++    }
++
++    /// Takes one frame at `now_ms`; `last_key_ms` is when a key was last typed.
++    pub(crate) fn process(&mut self, frame: &Frame, now_ms: u64, last_key_ms: Option<u64>, out: &mut Vec<Output>) {
++        let typing = last_key_ms.is_some_and(|key| now_ms.saturating_sub(key) < TYPING_TIMEOUT_MS);
++        let fingers = if frame.palm { 0 } else { frame.fingers };
++
++        // The touch: its start, its fingers and its travel decide a tap at its end.
++        if frame.fingers > 0 {
++            let touch = self.touch.get_or_insert(Touch {
++                start_ms: now_ms,
++                max_fingers: 0,
++                travel: 0,
++                typing,
++                no_tap: false,
++            });
++            touch.max_fingers = touch.max_fingers.max(frame.fingers);
++            touch.no_tap |= frame.palm || frame.left || frame.right || frame.middle;
++        }
++
++        let buttons_changed = self.buttons(frame, out);
++
++        // Motion: relative to the previous frame with the same fingers.
++        let previous = self.last;
++        self.last = (fingers > 0).then_some((fingers, frame.x, frame.y));
++        if let Some((last_fingers, last_x, last_y)) = previous
++            && last_fingers == fingers
++            && fingers > 0
++        {
++            let (dx, dy) = (frame.x - last_x, frame.y - last_y);
++            if let Some(touch) = self.touch.as_mut() {
++                touch.travel += (dx.abs() * 10) / self.geometry.x_res + (dy.abs() * 10) / self.geometry.y_res;
++            }
++            if buttons_changed {
++                // The finger rolls as it presses the pad: keep the pointer still.
++            } else if fingers >= 2 && self.click.is_none() {
++                self.scroll(dx, dy, out);
++            } else if !typing {
++                self.motion(dx, dy, out);
++            }
++        } else {
++            // A finger more or less: start again from here.
++            self.rem_x = 0;
++            self.rem_y = 0;
++            self.scroll_x = 0;
++            self.scroll_y = 0;
++            self.axis = ScrollAxis::Undecided;
++        }
++
++        if frame.fingers == 0
++            && let Some(touch) = self.touch.take()
++        {
++            let quick = now_ms.saturating_sub(touch.start_ms) <= TAP_TIMEOUT_MS;
++            if quick && !touch.typing && !touch.no_tap && touch.travel <= TAP_TRAVEL_TENTHS_MM && self.click.is_none() {
++                let button = match touch.max_fingers {
++                    1 => Button::Left,
++                    2 => Button::Right,
++                    _ => Button::Middle,
++                };
++                out.push(Output::Button { button, pressed: true });
++                out.push(Output::Button { button, pressed: false });
++            }
++        }
++    }
++
++    /// The pad's buttons; returns whether one changed.
++    fn buttons(&mut self, frame: &Frame, out: &mut Vec<Output>) -> bool {
++        let mut changed = false;
++        match (frame.left, self.click) {
++            (true, None) => {
++                let button = if !self.geometry.clickpad {
++                    Button::Left
++                } else if frame.fingers >= 2 {
++                    // Two fingers on a clickpad click right.
++                    Button::Right
++                } else if frame.fingers == 1 && self.in_right_button_area(frame.x, frame.y) {
++                    Button::Right
++                } else {
++                    Button::Left
++                };
++                self.click = Some(button);
++                out.push(Output::Button { button, pressed: true });
++                changed = true;
++            }
++            (false, Some(button)) => {
++                self.click = None;
++                out.push(Output::Button { button, pressed: false });
++                changed = true;
++            }
++            _ => {}
++        }
++        if frame.right != self.right {
++            self.right = frame.right;
++            out.push(Output::Button { button: Button::Right, pressed: frame.right });
++            changed = true;
++        }
++        if frame.middle != self.middle {
++            self.middle = frame.middle;
++            out.push(Output::Button { button: Button::Middle, pressed: frame.middle });
++            changed = true;
++        }
++        changed
++    }
++
++    fn in_right_button_area(&self, x: i32, y: i32) -> bool {
++        let g = &self.geometry;
++        let height = g.y_max - g.y_min;
++        let top_of_area = g.y_max - height * BUTTON_AREA_PERCENT / 100;
++        y >= top_of_area && x >= (g.x_min + g.x_max) / 2
++    }
++
++    fn motion(&mut self, dx: i32, dy: i32, out: &mut Vec<Output>) {
++        // Pixels = units * PIXELS_PER_MM / resolution, keeping the remainder.
++        let total_x = dx * PIXELS_PER_MM + self.rem_x;
++        let total_y = dy * PIXELS_PER_MM + self.rem_y;
++        let (px, py) = (total_x / self.geometry.x_res, total_y / self.geometry.y_res);
++        self.rem_x = total_x - px * self.geometry.x_res;
++        self.rem_y = total_y - py * self.geometry.y_res;
++        if px != 0 || py != 0 {
++            out.push(Output::Motion { dx: px, dy: py });
++        }
++    }
++
++    /// Natural scrolling: the content follows the fingers. One axis at a time,
++    /// as libinput locks it.
++    fn scroll(&mut self, dx: i32, dy: i32, out: &mut Vec<Output>) {
++        self.scroll_x += dx * 10;
++        self.scroll_y += dy * 10;
++        let step_x = SCROLL_STEP_TENTHS_MM * self.geometry.x_res;
++        let step_y = SCROLL_STEP_TENTHS_MM * self.geometry.y_res;
++        if self.axis == ScrollAxis::Undecided {
++            let (ax, ay) = (self.scroll_x.abs() * step_y, self.scroll_y.abs() * step_x);
++            if self.scroll_y.abs() >= step_y || self.scroll_x.abs() >= step_x {
++                self.axis = if ay >= ax { ScrollAxis::Vertical } else { ScrollAxis::Horizontal };
++            } else {
++                return;
++            }
++        }
++        match self.axis {
++            ScrollAxis::Vertical => {
++                self.scroll_x = 0;
++                // Fingers moving down show what is above: the wheel turns up.
++                let clicks = self.scroll_y / step_y;
++                if clicks != 0 {
++                    self.scroll_y -= clicks * step_y;
++                    out.push(Output::Wheel { vertical: clicks, horizontal: 0 });
++                }
++            }
++            ScrollAxis::Horizontal => {
++                self.scroll_y = 0;
++                // Fingers moving right show what is to the left.
++                let clicks = self.scroll_x / step_x;
++                if clicks != 0 {
++                    self.scroll_x -= clicks * step_x;
++                    out.push(Output::Wheel { vertical: 0, horizontal: -clicks });
++                }
++            }
++            ScrollAxis::Undecided => {}
++        }
++    }
++}
++
++/// Collects a touchpad's packets from the byte stream, finding the packet
++/// boundary again after a lost byte.
++pub(crate) struct Framer {
++    buf: [u8; 6],
++    len: usize,
++    last_ms: u64,
++}
++
++/// After this long without a byte, the next byte starts a packet.
++const PACKET_GAP_MS: u64 = 50;
++
++impl Framer {
++    pub(crate) const fn new() -> Self {
++        Self { buf: [0; 6], len: 0, last_ms: 0 }
++    }
++
++    pub(crate) fn reset(&mut self) {
++        self.len = 0;
++    }
++
++    /// Adds a byte; returns a packet of `size` bytes once `valid` accepts it
++    /// whole. `valid` checks a packet's first bytes, whatever their number.
++    pub(crate) fn push(&mut self, byte: u8, now_ms: u64, size: usize, valid: impl Fn(&[u8]) -> bool) -> Option<[u8; 6]> {
++        if self.len > 0 && now_ms.saturating_sub(self.last_ms) > PACKET_GAP_MS {
++            self.len = 0;
++        }
++        self.last_ms = now_ms;
++        self.buf[self.len] = byte;
++        self.len += 1;
++        // Drop bytes from the front until what is left could start a packet.
++        while self.len > 0 && !valid(&self.buf[..self.len]) {
++            self.buf.copy_within(1..self.len, 0);
++            self.len -= 1;
++        }
++        if self.len < size {
++            return None;
++        }
++        self.len = 0;
++        Some(self.buf)
++    }
++}
++
++/// Synaptics touchpads in absolute mode with W mode (6-byte packets).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Synaptics {
++    pub geometry: Geometry,
++    /// W reports two and three fingers.
++    pub multifinger: bool,
++    /// W tells a finger's width (extended capabilities).
++    pub width: bool,
++    /// A middle button, reported as the left bits disagreeing.
++    pub middle: bool,
++    /// A guest device such as a TrackPoint, whose packets come with W = 3.
++    pub pass_through: bool,
++}
++
++/// What one touchpad packet holds.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Packet {
++    Touch(Frame),
++    /// A standard 3-byte PS/2 packet from a guest device (TrackPoint).
++    Guest([u8; 3]),
++    /// Nothing to report (for example the first half of an ELAN v3 two-finger report).
++    Nothing,
++}
++
++/// Pressure below which nothing touches a Synaptics pad.
++const SYNAPTICS_TOUCH_Z: i32 = 25;
++
++impl Synaptics {
++    pub(crate) const PACKET_SIZE: usize = 6;
++
++    /// The constant bits of the new absolute format.
++    pub(crate) fn valid(prefix: &[u8]) -> bool {
++        prefix.iter().enumerate().all(|(index, &byte)| match index {
++            0 => byte & 0xC8 == 0x80,
++            3 => byte & 0xC8 == 0xC0,
++            _ => true,
++        })
++    }
++
++    pub(crate) fn decode(&self, p: &[u8; 6]) -> Packet {
++        let w = ((p[0] & 0x30) >> 2) | ((p[0] & 0x04) >> 1) | ((p[3] & 0x04) >> 2);
++        if self.width && self.pass_through && w == 3 {
++            return Packet::Guest([p[1], p[4], p[5]]);
++        }
++        let z = p[2] as i32;
++        let x = (((p[3] & 0x10) as i32) << 8) | (((p[1] & 0x0f) as i32) << 8) | p[4] as i32;
++        let y = (((p[3] & 0x20) as i32) << 7) | (((p[1] & 0xf0) as i32) << 4) | p[5] as i32;
++        let disagree = (p[0] ^ p[3]) & 0x01 != 0;
++        let g = &self.geometry;
++        let fingers = if z < SYNAPTICS_TOUCH_Z {
++            0
++        } else if self.width && self.multifinger && w == 0 {
++            2
++        } else if self.width && self.multifinger && w == 1 {
++            3
++        } else {
++            1
++        };
++        Packet::Touch(Frame {
++            fingers,
++            x: x.clamp(g.x_min, g.x_max),
++            // Synaptics counts y from the bottom.
++            y: (g.y_max + g.y_min - y).clamp(g.y_min, g.y_max),
++            left: p[0] & 0x01 != 0 || (disagree && (g.clickpad || !self.middle)),
++            right: p[0] & 0x02 != 0,
++            middle: disagree && self.middle && !g.clickpad,
++            // xf86-input-synaptics' palm: wide and pressing.
++            palm: self.width && fingers == 1 && w >= 11 && z >= 150,
++        })
++    }
++}
++
++/// ELAN touchpads of hardware versions 3 and 4 in absolute mode (6-byte packets).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Elan {
++    pub geometry: Geometry,
++    pub version: u8,
++    /// Firmware with packet checksums: other constant bits.
++    pub crc: bool,
++    /// IC body 7 with sample byte 0x2A: other constant bits.
++    pub ic7_2a: bool,
++    /// Fingers present (bit per slot) and their positions (version 4).
++    present: u8,
++    slots: [(i32, i32); 5],
++    /// The first finger of a version 3 two-finger report.
++    head: (i32, i32),
++}
++
++impl Elan {
++    pub(crate) const PACKET_SIZE: usize = 6;
++    const V3_DEBOUNCE: [u8; 6] = [0xc4, 0xff, 0xff, 0x02, 0xff, 0xff];
++
++    pub(crate) fn new(geometry: Geometry, version: u8, crc: bool, ic7_2a: bool) -> Self {
++        Self { geometry, version, crc, ic7_2a, present: 0, slots: [(0, 0); 5], head: (0, 0) }
++    }
++
++    /// The constant bits of each packet.
++    pub(crate) fn valid(&self, prefix: &[u8]) -> bool {
++        let byte = |index: usize| prefix.get(index).copied();
++        if self.version == 4 {
++            if let Some(b0) = byte(0)
++                && !self.crc
++                && !self.ic7_2a
++                && b0 & 0x08 != 0
++            {
++                return false;
++            }
++            match byte(3) {
++                None => true,
++                Some(b3) if self.crc => b3 & 0x08 == 0 && b3 & 0x03 != 3,
++                Some(b3) => b3 & 0x1c == 0x10 && b3 & 0x03 != 3,
++            }
++        } else {
++            // Head (one finger, or the first of two) and tail packets; the
++            // debounce packet passes as a head.
++            if self.crc {
++                return byte(3).is_none_or(|b3| b3 & 0x08 == 0x08);
++            }
++            let Some(b0) = byte(0) else { return true };
++            if b0 & 0x0c != 0x04 && b0 & 0x0c != 0x0c {
++                return false;
++            }
++            byte(3).is_none_or(|b3| match b0 & 0x0c {
++                0x04 => b3 & 0xcf == 0x02,
++                _ => b3 & 0xce == 0x0c,
++            })
++        }
++    }
++
++    fn position(&self, p: &[u8; 6]) -> (i32, i32) {
++        let x = (((p[1] & 0x0f) as i32) << 8) | p[2] as i32;
++        let y = (((p[4] & 0x0f) as i32) << 8) | p[5] as i32;
++        // ELAN counts y from the bottom.
++        (x, self.geometry.y_max - y)
++    }
++
++    pub(crate) fn decode(&mut self, p: &[u8; 6]) -> Packet {
++        // On a clickpad the whole pad is the left button.
++        let (left, right, middle) = (p[0] & 0x01 != 0, p[0] & 0x02 != 0, p[0] & 0x04 != 0);
++        let frame = |fingers: u8, (x, y): (i32, i32), g: &Geometry| Frame {
++            fingers,
++            x: x.clamp(g.x_min, g.x_max),
++            y: y.clamp(g.y_min, g.y_max),
++            left,
++            right: right && !g.clickpad,
++            middle: middle && !g.clickpad,
++            palm: false,
++        };
++        if self.version == 4 {
++            match p[3] & 0x03 {
++                0 => {
++                    // Status: which fingers are down.
++                    self.present = p[1] & 0x1f;
++                }
++                1 => {
++                    // Head: where one finger is.
++                    let id = ((p[3] & 0xe0) >> 5) as usize;
++                    if (1..=5).contains(&id) {
++                        self.slots[id - 1] = self.position(p);
++                        self.present |= 1 << (id - 1);
++                    }
++                }
++                _ => {
++                    // Motion: how far one or two fingers moved.
++                    let weight = if p[0] & 0x10 != 0 { 5 } else { 1 };
++                    for (id, dx, dy) in [((p[0] & 0xe0) >> 5, p[1], p[2]), ((p[3] & 0xe0) >> 5, p[4], p[5])] {
++                        let id = id as usize;
++                        if (1..=5).contains(&id) {
++                            let slot = &mut self.slots[id - 1];
++                            slot.0 += (dx as i8) as i32 * weight;
++                            slot.1 -= (dy as i8) as i32 * weight;
++                        }
++                    }
++                }
++            }
++            let fingers = self.present.count_ones() as u8;
++            let first = (0..5).find(|i| self.present & (1 << i) != 0).map_or((0, 0), |i| self.slots[i]);
++            return Packet::Touch(frame(fingers, first, &self.geometry));
++        }
++        if p == &Self::V3_DEBOUNCE {
++            return Packet::Nothing;
++        }
++        let fingers = (p[0] & 0xc0) >> 6;
++        let head = if self.crc { p[3] & 0x09 == 0x08 } else { p[0] & 0x0c == 0x04 };
++        let position = match fingers {
++            2 if head => {
++                // The first finger; the second comes in the next packet.
++                self.head = self.position(p);
++                return Packet::Nothing;
++            }
++            2 => self.head,
++            _ => self.position(p),
++        };
++        Packet::Touch(frame(fingers, position, &self.geometry))
++    }
++}
++
++/// Decodes a standard 3-byte PS/2 packet: buttons (left, right, middle) and motion (y down).
++pub(crate) fn standard_packet(p: [u8; 3]) -> Option<((bool, bool, bool), i32, i32)> {
++    let status = p[0];
++    if status & 0x08 == 0 || status & 0xC0 != 0 {
++        return None;
++    }
++    let sign = |byte: u8, negative: bool| if negative { byte as i32 - 256 } else { byte as i32 };
++    let dx = sign(p[1], status & 0x10 != 0);
++    let dy = sign(p[2], status & 0x20 != 0);
++    Some(((status & 0x01 != 0, status & 0x02 != 0, status & 0x04 != 0), dx, -dy))
++}
++
++/// ELAN's hardware version from its firmware version (Linux `elantech_set_properties`).
++pub(crate) fn elan_hw_version(fw: u32) -> Option<u8> {
++    if fw < 0x020030 || fw == 0x020600 {
++        return Some(1);
++    }
++    match (fw & 0x0f0000) >> 16 {
++        2 | 4 => Some(2),
++        5 => Some(3),
++        6..=15 => Some(4),
++        _ => None,
++    }
++}
++
++/// Whether ELAN's firmware version answer looks real (Linux `elantech_is_signature_valid`).
++pub(crate) fn elan_signature_valid(p: [u8; 3]) -> bool {
++    const RATES: [u8; 7] = [200, 100, 80, 60, 40, 20, 10];
++    if p[0] == 0 {
++        return false;
++    }
++    if p[1] == 0 {
++        return true;
++    }
++    if p[0] & 0x0f >= 0x06 && p[1] & 0xaf == 0x0f && p[2] < 40 {
++        return true;
++    }
++    !RATES.contains(&p[2])
++}
++
++/// ELAN's resolution code in units per millimetre (Linux `elantech_convert_res`).
++pub(crate) fn elan_resolution(code: u8) -> i32 {
++    (code as i32 * 10 + 790) * 10 / 254
++}

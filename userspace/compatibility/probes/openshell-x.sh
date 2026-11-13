@@ -12,7 +12,9 @@
 # are the session's. OPENSHELL_X=xvfb keeps Xvfb.
 #
 # initramfs.nix sets OPENSHELL_XORG, OPENSHELL_XORG_MODULES, OPENSHELL_XORG_FONTS
-# and OPENSHELL_XVFB to the store paths.
+# and OPENSHELL_XVFB to the store paths. OPENSHELL_X_KEYBOARD, "<layout>" or
+# "<layout> <variant>", is the computer's keyboard layout (the supervisor's
+# settings.rs): X starts with it, the sign-in and the lock screen included.
 set -eu
 
 card=/dev/dri/card0
@@ -70,10 +72,20 @@ EOF
     # emulation, both ways); a press without moving is still a right click.
     # A mouse with a wheel scrolls with it as well. Keyboards ignore these options.
     scrolling='    Option "EmulateWheel" "true"\n    Option "EmulateWheelButton" "3"\n    Option "EmulateWheelTimeout" "250"\n    Option "XAxisMapping" "6 7"\n    Option "YAxisMapping" "4 5"\n'
+    # The computer's keyboard layout (OPENSHELL_X_KEYBOARD, checked by the
+    # supervisor: xkb names only). Mice ignore it.
+    keyboard=
+    layout=${OPENSHELL_X_KEYBOARD:-}
+    if [ -n "$layout" ]; then
+        variant=
+        case "$layout" in *" "*) variant=${layout#* } layout=${layout%% *} ;; esac
+        keyboard="    Option \"XkbLayout\" \"$layout\"\n"
+        if [ -n "$variant" ]; then keyboard="$keyboard    Option \"XkbVariant\" \"$variant\"\n"; fi
+    fi
     for device in /dev/input/event*; do
         [ -r "$device" ] || continue
         index=$((index + 1))
-        printf 'Section "InputDevice"\n    Identifier "input%s"\n    Driver "evdev"\n    Option "Device" "%s"\n%bEndSection\n\n' "$index" "$device" "$scrolling"
+        printf 'Section "InputDevice"\n    Identifier "input%s"\n    Driver "evdev"\n    Option "Device" "%s"\n%b%bEndSection\n\n' "$index" "$device" "$scrolling" "$keyboard"
         inputs="$inputs    InputDevice \"input$index\"\n"
     done
     printf 'Section "ServerLayout"\n    Identifier "openshell"\n    Screen "screen"\n%b    Option "AllowEmptyInput" "true"\nEndSection\n' "$inputs"

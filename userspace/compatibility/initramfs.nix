@@ -50,6 +50,8 @@ let
       {
         inherit (shell) cefHost;
         launcher = shell.shell;
+        # Openbox with OpenShell's configuration (the session's window manager).
+        windowManager = openbox;
         # setxkbmap: hostd's keyboard service sets the session's layout with it
         # (Settings ▸ Keyboard); xset: its lock service, when the screen turns
         # off; xrandr: its display service (Settings ▸ Display).
@@ -182,8 +184,9 @@ let
         # cursorTheme.py draws the applications' OpenShell cursor from Adwaita's
         # (share/icons, in XDG_DATA_DIRS) and tells the toolkits through xsettingsd and xrdb.
         probeApps = lib.optionals (!media) [ gtkProbe qtProbe entries ];
-        # tzdata: the time zones of Settings ▸ Date & time (/usr/share/zoneinfo).
-        packages = [ xpra html5 python dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb pkgs.tzdata ] ++ probeApps;
+        # tzdata: the time zones of Settings ▸ Date & time (/usr/share/zoneinfo);
+        # xkeyboard-config: the layouts of Settings ▸ Keyboard (/usr/share/X11/xkb).
+        packages = [ xpra html5 python dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb pkgs.tzdata pkgs.xkeyboard-config ] ++ probeApps;
       }
     else
       null;
@@ -263,6 +266,21 @@ let
           '';
         };
         ready = pkgs.writeShellScript "openshell-lock-ready" (builtins.readFile ./openshell-lock/lock-ready.sh);
+        # Num Lock remembered across restarts, as on Live (numlock.py, Live's),
+        # started with the window manager (openshell-wm.sh).
+        numlock = pkgs.runCommand "openshell-numlock" { } ''
+          install -Dm0644 ${./openshell-lock/numlock.py} "$out/lib/numlock.py"
+          substituteInPlace "$out/lib/numlock.py" \
+            --replace-fail "C.CDLL('libX11.so.6')" "C.CDLL('${pkgs.libx11}/lib/libX11.so.6')"
+        '';
+        windowManager = pkgs.runCommand "openshell-wm" { } ''
+          mkdir -p "$out/bin"
+          substitute ${./openshell-lock/openshell-wm.sh} "$out/bin/openshell-wm" \
+            --replace-fail @python@ ${pkgs.python3}/bin/python3 \
+            --replace-fail @numlock@ ${numlock}/lib/numlock.py \
+            --replace-fail @openbox@ ${graphics.windowManager}/bin/openbox
+          chmod 0755 "$out/bin/openshell-wm"
+        '';
         command = pkgs.runCommand "openshell-lock" { } ''
           mkdir -p "$out/bin"
           substitute ${./openshell-lock/lock.sh} "$out/bin/openshell-lock" \
@@ -297,6 +315,33 @@ let
       }
     else
       null;
+  # The installed system's start from its copy on the data partition
+  # (probes/disk-root.sh): a few megabytes GRUB loads in place of the whole
+  # system, once a slot's first boot has copied it there (installed-session.sh).
+  # Nothing of the copy runs before it is the root: the image's BusyBox comes
+  # along with the loader and libraries it names, at their store paths.
+  bootRoot = pkgs.runCommand "openshell-boot-root.cpio" { nativeBuildInputs = [ pkgs.cpio pkgs.patchelf ]; } ''
+    mkdir -p root/bin root/dev root/proc root/sys root/data root/newroot
+    cp ${pkgs.busybox}/bin/busybox root/bin/busybox
+    interpreter=$(patchelf --print-interpreter root/bin/busybox)
+    libraries=$(patchelf --print-rpath root/bin/busybox)
+    mkdir -p "root$(dirname "$interpreter")"
+    cp -L "$interpreter" "root$interpreter"
+    for library in $(patchelf --print-needed root/bin/busybox); do
+      for folder in $(echo "$libraries" | tr : ' '); do
+        if [ -e "$folder/$library" ]; then
+          mkdir -p "root$folder"
+          cp -L "$folder/$library" "root$folder/$library"
+          break
+        fi
+      done
+      found=$(find root -name "$library" | head -n1)
+      [ -n "$found" ] || { echo "busybox needs $library" >&2; exit 1; }
+    done
+    install -m 0755 ${probes}/disk-root.sh root/init
+    cd root
+    find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort | cpio --quiet -o -H newc -R 0:0 > "$out"
+  '';
   # A throwaway authority and server certificate for the TLS probe.
   tls = pkgs.runCommand "openshell-probe-tls" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir -p "$out"
@@ -326,7 +371,7 @@ let
     )
     ++ lib.optionals (apps != null) apps.packages
     ++ lib.optionals (wine != null) ([ wine.package wine.runner ] ++ lib.optional (!media) wine.probe)
-    ++ lib.optional (lock != null) lock.command
+    ++ lib.optionals (lock != null) [ lock.command lock.windowManager ]
     # /usr/share/applications links to it.
     ++ lib.optional (apps != null) applications
     ++ lib.optional (shell != null) shell
@@ -359,6 +404,7 @@ let
       install -m 0644 ${probes}/image-boot.sh "$out/opt/openshell-compat/image-boot.sh"
       install -m 0644 ${probes}/installed-session.sh "$out/opt/openshell-compat/installed-session.sh"
       install -m 0644 ${probes}/installed-storage.sh "$out/opt/openshell-compat/installed-storage.sh"
+      install -m 0644 ${bootRoot} "$out/opt/openshell-compat/boot-root.cpio"
     ''}
     install -m 0644 ${probes}/hostd-smoke.mjs ${probes}/unprivileged.py ${probes}/node.mjs ${probes}/python.py ${probes}/inotify.py ${probes}/namespaces.py "$out/opt/openshell-compat/"
     ${lib.optionalString (bundle != null) ''
@@ -412,6 +458,10 @@ let
       ln -s ${pkgs.adwaita-icon-theme}/share/icons "$out/usr/share/icons"
       # The time zones, where /etc/localtime points (the supervisor's settings.rs).
       ln -s ${pkgs.tzdata}/share/zoneinfo "$out/usr/share/zoneinfo"
+      # The keyboard layouts and their names (Settings ▸ Keyboard reads
+      # rules/base.lst; setxkbmap and X compile from the same data).
+      mkdir -p "$out/usr/share/X11"
+      ln -s ${pkgs.xkeyboard-config}/share/X11/xkb "$out/usr/share/X11/xkb"
       install -m 0644 ${probes}/apps-smoke.mjs "$out/opt/openshell-compat/"
     ''}
     ${lib.optionalString (wine != null) ''
@@ -424,6 +474,7 @@ let
     ''}
     ${lib.optionalString (lock != null) ''
       ln -s ${lock.command}/bin/openshell-lock "$out/opt/openshell-compat/bin/"
+      ln -s ${lock.windowManager}/bin/openshell-wm "$out/opt/openshell-compat/bin/"
       ln -s ${graphics.launcher}/bin/openshell-power "$out/opt/openshell-compat/bin/"
     ''}
     ${lib.optionalString media ''

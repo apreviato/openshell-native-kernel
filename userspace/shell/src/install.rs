@@ -11,6 +11,21 @@
 //! install-status     → "idle", "running <percent> <message>", "done" or "failed <message>"
 //! ```
 //!
+//! Before `install`, the installer's questions, as Calamares asks them on
+//! OpenShell Live (each "ok" or "invalid"): the account's full name, its
+//! password, the keyboard layout and the time zone. The password is hashed at
+//! once (SHA-512 crypt, login.rs) and only its hash reaches the installer, which
+//! writes it with the other answers where the installed system reads them; its
+//! first boot then opens on the lock screen. `install` without a password is
+//! "needs-password".
+//!
+//! ```text
+//! install-name <full name>
+//! install-password <password>
+//! install-keyboard <layout> [variant]
+//! install-timezone <Area/City>
+//! ```
+//!
 //! The same socket checks the lock screen's password (login.rs, Phase::Unlock):
 //! `state` → "unlock" and `login <password>` → "ok" or "wrong", or
 //! "unavailable" without a sign-in, `power` (power.rs), `timezone` and
@@ -23,7 +38,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::login::{hash_password, valid_password};
 use crate::session::CommandLine;
+use crate::settings::{valid_keyboard, valid_name, valid_timezone};
 
 /// The environment variable that names the supervisor's system socket to the session.
 pub const SYSTEM_SOCKET_ENV: &str = "OPENSHELL_SYSTEM_SOCKET";
@@ -94,14 +111,39 @@ pub fn disks_line(listing: &str) -> String {
     }
 }
 
+/// The installer's answers, until `install` hands them over.
+#[derive(Default)]
+struct Setup {
+    name: Option<String>,
+    password_hash: Option<String>,
+    keyboard: Option<String>,
+    timezone: Option<String>,
+}
+
+/// What the installer reads its answers from.
+pub const INSTALL_NAME_ENV: &str = "OPENSHELL_INSTALL_NAME";
+pub const INSTALL_PASSWORD_HASH_ENV: &str = "OPENSHELL_INSTALL_PASSWORD_HASH";
+pub const INSTALL_KEYBOARD_ENV: &str = "OPENSHELL_INSTALL_KEYBOARD";
+pub const INSTALL_TIMEZONE_ENV: &str = "OPENSHELL_INSTALL_TIMEZONE";
+
 pub struct Installer {
     command: CommandLine,
+    password_tool: CommandLine,
     state: Arc<Mutex<InstallState>>,
+    setup: Mutex<Setup>,
 }
 
 impl Installer {
-    pub fn new(command: CommandLine) -> Self {
-        Self { command, state: Arc::new(Mutex::new(InstallState::Idle)) }
+    pub fn new(command: CommandLine, password_tool: CommandLine) -> Self {
+        Self { command, password_tool, state: Arc::new(Mutex::new(InstallState::Idle)), setup: Mutex::new(Setup::default()) }
+    }
+
+    fn remember(&self, value: &str, valid: fn(&str) -> bool, field: fn(&mut Setup) -> &mut Option<String>) -> String {
+        if !valid(value) {
+            return "invalid".into();
+        }
+        *field(&mut self.setup.lock().unwrap()) = Some(value.to_owned());
+        "ok".into()
     }
 
     fn run(&self, args: &[&str]) -> Command {
@@ -124,11 +166,36 @@ impl Installer {
                 Err(_) => "disks".into(),
             },
             ("install-status", "") => state.line(),
+            ("install-name", name) => self.remember(name, valid_name, |setup| &mut setup.name),
+            ("install-keyboard", keyboard) => self.remember(keyboard, valid_keyboard, |setup| &mut setup.keyboard),
+            ("install-timezone", zone) => self.remember(zone, valid_timezone, |setup| &mut setup.timezone),
+            ("install-password", password) if valid_password(password) => match hash_password(&self.password_tool, password) {
+                Ok(hash) => {
+                    self.setup.lock().unwrap().password_hash = Some(hash);
+                    "ok".into()
+                }
+                Err(_) => "failed the password could not be hashed".into(),
+            },
             ("install", device) if valid_device(device) => {
                 if matches!(state, InstallState::Running { .. }) {
                     return "busy".into();
                 }
-                let child = self.run(&["install", device]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+                let mut command = self.run(&["install", device]);
+                {
+                    let setup = self.setup.lock().unwrap();
+                    let Some(hash) = &setup.password_hash else { return "needs-password".into() };
+                    command.env(INSTALL_PASSWORD_HASH_ENV, hash);
+                    for (name, value) in [
+                        (INSTALL_NAME_ENV, &setup.name),
+                        (INSTALL_KEYBOARD_ENV, &setup.keyboard),
+                        (INSTALL_TIMEZONE_ENV, &setup.timezone),
+                    ] {
+                        if let Some(value) = value {
+                            command.env(name, value);
+                        }
+                    }
+                }
+                let child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
                 let Ok(mut child) = child else { return "failed the installer did not start".into() };
                 *self.state.lock().unwrap() = InstallState::Running { percent: 0, message: "Starting".into() };
                 let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
@@ -185,14 +252,28 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("openshell-install-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let script = folder.join("install.sh");
+        // The installer reports its answers: they arrive in its environment.
         std::fs::write(
             &script,
-            "case $1 in list) echo '/dev/vdb 20000000000';; install) echo 'PROGRESS 50 Half'; echo DONE;; esac\n",
+            "case $1 in list) echo '/dev/vdb 20000000000';; install) echo \"$OPENSHELL_INSTALL_PASSWORD_HASH|$OPENSHELL_INSTALL_NAME|$OPENSHELL_INSTALL_KEYBOARD|$OPENSHELL_INSTALL_TIMEZONE\" > \"$(dirname \"$0\")/answers\"; echo 'PROGRESS 50 Half'; echo DONE;; esac\n",
         )
         .unwrap();
-        let installer = Installer::new(vec!["/bin/sh".into(), script.to_string_lossy().into_owned()]);
+        // A stand-in for cryptpw: `$6$fixed$<password>`.
+        let tool = folder.join("cryptpw");
+        std::fs::write(&tool, "read -r password; printf '$6$fixed$%s\\n' \"$password\"\n").unwrap();
+        let installer = Installer::new(
+            vec!["/bin/sh".into(), script.to_string_lossy().into_owned()],
+            vec!["/bin/sh".into(), tool.to_string_lossy().into_owned()],
+        );
         assert_eq!(installer.answer("install-list"), "disks /dev/vdb=20000000000");
         assert_eq!(installer.answer("install /dev/sda"), "invalid");
+        assert_eq!(installer.answer("install /dev/vdb"), "needs-password");
+        assert_eq!(installer.answer("install-name Ana Souza"), "ok");
+        assert_eq!(installer.answer("install-name a:b"), "invalid");
+        assert_eq!(installer.answer("install-keyboard br abnt2"), "ok");
+        assert_eq!(installer.answer("install-timezone America/Sao_Paulo"), "ok");
+        assert_eq!(installer.answer("install-timezone ../x"), "invalid");
+        assert_eq!(installer.answer("install-password two words"), "ok");
         assert_eq!(installer.answer("install /dev/vdb"), "started");
         for _ in 0..100 {
             if installer.answer("install-status") == "done" {
@@ -201,6 +282,8 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(installer.answer("install-status"), "done");
+        let answers = std::fs::read_to_string(folder.join("answers")).unwrap();
+        assert_eq!(answers.trim(), "$6$fixed$two words|Ana Souza|br abnt2|America/Sao_Paulo");
         std::fs::remove_dir_all(&folder).unwrap();
     }
 }

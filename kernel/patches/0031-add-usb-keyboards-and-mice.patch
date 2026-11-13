@@ -1,0 +1,2028 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 9822778..0dd5915 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -443,6 +443,18 @@ dependencies = [
+  "spin",
+ ]
+ 
++[[package]]
++name = "aster-usb"
++version = "0.1.0"
++dependencies = [
++ "aster-core",
++ "aster-input",
++ "aster-pci",
++ "component",
++ "ostd",
++ "spin",
++]
++
+ [[package]]
+ name = "aster-util"
+ version = "0.1.0"
+@@ -501,6 +513,7 @@ dependencies = [
+  "aster-i8042",
+  "aster-simpledrm",
+  "aster-uart",
++ "aster-usb",
+  "ostd",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index b62ee7b..a138b30 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -32,6 +32,7 @@ members = [
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
+     "kernel/comps/uart",
++    "kernel/comps/usb",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -88,6 +89,7 @@ default-members = [
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
+     "kernel/comps/uart",
++    "kernel/comps/usb",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -173,6 +175,7 @@ aster-core = { path = "kernel/core", default-features = false }
+ aster-drm = { path = "kernel/comps/drm" }
+ aster-backlight = { path = "kernel/comps/backlight" }
+ aster-i8042 = { path = "kernel/comps/i8042" }
++aster-usb = { path = "kernel/comps/usb" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+ aster-uart = { path = "kernel/comps/uart" }
+ 
+diff --git a/Components.toml b/Components.toml
+index c87bba1..e1a8e5a 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -20,6 +20,7 @@ softirq = { name = "aster-softirq" }
+ systree = { name = "aster-systree" }
+ time = { name = "aster-time" }
+ uart = { name = "aster-uart" }
++usb = { name = "aster-usb" }
+ virtio = { name = "aster-virtio" }
+ 
+ [whitelist]
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index b0eb176..2186826 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -13,6 +13,7 @@ ostd.workspace = true
+ aster-drm.workspace = true
+ aster-simpledrm.workspace = true
+ aster-uart.workspace = true
++aster-usb.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+ aster-backlight.workspace = true
+diff --git a/kernel/comps/usb/Cargo.toml b/kernel/comps/usb/Cargo.toml
+new file mode 100755
+index 0000000..3f28bd3
+--- /dev/null
++++ b/kernel/comps/usb/Cargo.toml
+@@ -0,0 +1,15 @@
++[package]
++name = "aster-usb"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-core.workspace = true
++aster-input.workspace = true
++aster-pci.workspace = true
++component.workspace = true
++ostd.workspace = true
++spin.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/usb/src/desc.rs b/kernel/comps/usb/src/desc.rs
+new file mode 100755
+index 0000000..fae035b
+--- /dev/null
++++ b/kernel/comps/usb/src/desc.rs
+@@ -0,0 +1,157 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! USB descriptors: the device's, and a configuration's interfaces and
++//! endpoints, with the HID class descriptor's report length.
++//!
++//! Reference: USB 2.0, chapter 9.6; USB 3.2, 9.6.7; HID 1.11, 6.2.1.
++
++use alloc::vec::Vec;
++
++pub(crate) mod kind {
++    pub const DEVICE: u8 = 1;
++    pub const CONFIGURATION: u8 = 2;
++    pub const INTERFACE: u8 = 4;
++    pub const ENDPOINT: u8 = 5;
++    pub const HID: u8 = 0x21;
++    pub const HID_REPORT: u8 = 0x22;
++    pub const SS_ENDPOINT_COMPANION: u8 = 0x30;
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct DeviceDescriptor {
++    pub usb: u16,
++    pub class: u8,
++    pub subclass: u8,
++    pub protocol: u8,
++    pub max_packet0: u8,
++    pub vendor: u16,
++    pub product: u16,
++    pub configurations: u8,
++}
++
++pub(crate) fn parse_device(b: &[u8]) -> Option<DeviceDescriptor> {
++    if b.len() < 18 || b[1] != kind::DEVICE {
++        return None;
++    }
++    Some(DeviceDescriptor {
++        usb: u16::from_le_bytes([b[2], b[3]]),
++        class: b[4],
++        subclass: b[5],
++        protocol: b[6],
++        max_packet0: b[7],
++        vendor: u16::from_le_bytes([b[8], b[9]]),
++        product: u16::from_le_bytes([b[10], b[11]]),
++        configurations: b[17],
++    })
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Endpoint {
++    /// Number and direction (bit 7: IN).
++    pub address: u8,
++    /// Bits 1:0: control, isochronous, bulk, interrupt.
++    pub attributes: u8,
++    pub max_packet: u16,
++    pub interval: u8,
++    /// SuperSpeed bursts (from the companion descriptor).
++    pub max_burst: u8,
++}
++
++impl Endpoint {
++    pub(crate) fn is_in(&self) -> bool {
++        self.address & 0x80 != 0
++    }
++
++    pub(crate) fn number(&self) -> u8 {
++        self.address & 0x0f
++    }
++
++    pub(crate) fn transfer_type(&self) -> u8 {
++        self.attributes & 0x03
++    }
++
++    /// The xHCI device context index: 2 × number, plus 1 for IN.
++    pub(crate) fn dci(&self) -> u8 {
++        self.number() * 2 + u8::from(self.is_in())
++    }
++}
++
++pub(crate) const TRANSFER_BULK: u8 = 2;
++pub(crate) const TRANSFER_INTERRUPT: u8 = 3;
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Interface {
++    pub number: u8,
++    pub alternate: u8,
++    pub class: u8,
++    pub subclass: u8,
++    pub protocol: u8,
++    pub endpoints: Vec<Endpoint>,
++    /// The HID report descriptor's length, for a HID interface.
++    pub hid_report_length: Option<u16>,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Configuration {
++    pub value: u8,
++    pub interfaces: Vec<Interface>,
++}
++
++/// A whole configuration descriptor, with what follows it.
++pub(crate) fn parse_configuration(b: &[u8]) -> Option<Configuration> {
++    if b.len() < 9 || b[1] != kind::CONFIGURATION {
++        return None;
++    }
++    let total = usize::from(u16::from_le_bytes([b[2], b[3]])).min(b.len());
++    let mut configuration = Configuration { value: b[5], interfaces: Vec::new() };
++    let mut at = usize::from(b[0]);
++    while at + 2 <= total {
++        let length = usize::from(b[at]);
++        if length < 2 || at + length > total {
++            break;
++        }
++        let d = &b[at..at + length];
++        match d[1] {
++            kind::INTERFACE if length >= 9 => configuration.interfaces.push(Interface {
++                number: d[2],
++                alternate: d[3],
++                class: d[5],
++                subclass: d[6],
++                protocol: d[7],
++                endpoints: Vec::new(),
++                hid_report_length: None,
++            }),
++            kind::ENDPOINT if length >= 7 => {
++                if let Some(interface) = configuration.interfaces.last_mut() {
++                    interface.endpoints.push(Endpoint {
++                        address: d[2],
++                        attributes: d[3],
++                        max_packet: u16::from_le_bytes([d[4], d[5]]),
++                        interval: d[6],
++                        max_burst: 0,
++                    });
++                }
++            }
++            kind::SS_ENDPOINT_COMPANION if length >= 6 => {
++                if let Some(endpoint) = configuration.interfaces.last_mut().and_then(|i| i.endpoints.last_mut()) {
++                    endpoint.max_burst = d[2];
++                }
++            }
++            kind::HID if length >= 9 => {
++                // Its class descriptors: the report descriptor's type and length.
++                let count = usize::from(d[5]);
++                for index in 0..count {
++                    let at = 6 + index * 3;
++                    if at + 3 <= length && d[at] == kind::HID_REPORT {
++                        if let Some(interface) = configuration.interfaces.last_mut() {
++                            interface.hid_report_length = Some(u16::from_le_bytes([d[at + 1], d[at + 2]]));
++                        }
++                    }
++                }
++            }
++            _ => {}
++        }
++        at += length;
++    }
++    Some(configuration)
++}
+diff --git a/kernel/comps/usb/src/hid.rs b/kernel/comps/usb/src/hid.rs
+new file mode 100755
+index 0000000..9ef1d5d
+--- /dev/null
++++ b/kernel/comps/usb/src/hid.rs
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! HID report descriptors and the reports they describe: which controls are
++//! pressed and how far the pointer moved, as (usage page << 16 | usage).
++//!
++//! The parser keeps what keyboards, mice and their media keys need: the
++//! input fields, with their report IDs, sizes, counts, usages and flags.
++//! Collections, units and output or feature reports do not matter here.
++//!
++//! Reference: HID 1.11, chapter 6.2.2, and its appendix B (boot devices).
++
++use alloc::vec::Vec;
++
++pub(crate) const PAGE_GENERIC_DESKTOP: u32 = 0x01;
++pub(crate) const PAGE_KEYBOARD: u32 = 0x07;
++pub(crate) const PAGE_BUTTON: u32 = 0x09;
++pub(crate) const PAGE_CONSUMER: u32 = 0x0c;
++
++pub(crate) const fn usage(page: u32, id: u32) -> u32 {
++    page << 16 | id
++}
++
++pub(crate) const USAGE_X: u32 = usage(PAGE_GENERIC_DESKTOP, 0x30);
++pub(crate) const USAGE_Y: u32 = usage(PAGE_GENERIC_DESKTOP, 0x31);
++pub(crate) const USAGE_WHEEL: u32 = usage(PAGE_GENERIC_DESKTOP, 0x38);
++pub(crate) const USAGE_AC_PAN: u32 = usage(PAGE_CONSUMER, 0x238);
++
++/// One Input main item: `count` values of `size` bits each.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct Field {
++    pub report_id: u8,
++    /// From the start of the report's data (after its ID).
++    pub bit_offset: u32,
++    pub size: u32,
++    pub count: u32,
++    /// The usages of a variable field, one per value, or of an array's indices.
++    pub usages: Vec<u32>,
++    pub usage_min: u32,
++    pub usage_max: u32,
++    pub variable: bool,
++    pub relative: bool,
++    pub constant: bool,
++    pub logical_min: i32,
++    pub logical_max: i32,
++}
++
++impl Field {
++    /// The usage of value `index` (variable) or of array index `index`.
++    fn usage_at(&self, index: u32) -> Option<u32> {
++        if let Some(last) = self.usages.last() {
++            // Fewer usages than values: the last one repeats (HID 1.11, 6.2.2.8).
++            return Some(*self.usages.get(index as usize).unwrap_or(last));
++        }
++        if self.usage_min != 0 || self.usage_max != 0 {
++            let usage = self.usage_min.checked_add(index)?;
++            return (usage <= self.usage_max).then_some(usage);
++        }
++        None
++    }
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub(crate) struct ReportDescriptor {
++    pub fields: Vec<Field>,
++    pub uses_ids: bool,
++}
++
++#[derive(Clone, Copy, Default)]
++struct Globals {
++    page: u32,
++    logical_min: i32,
++    logical_max: i32,
++    size: u32,
++    count: u32,
++    report_id: u8,
++}
++
++fn signed(data: u32, bytes: usize) -> i32 {
++    match bytes {
++        1 => data as u8 as i8 as i32,
++        2 => data as u16 as i16 as i32,
++        _ => data as i32,
++    }
++}
++
++pub(crate) fn parse(descriptor: &[u8]) -> Option<ReportDescriptor> {
++    let mut result = ReportDescriptor::default();
++    let mut globals = Globals::default();
++    let mut stack: Vec<Globals> = Vec::new();
++    let mut usages: Vec<u32> = Vec::new();
++    let (mut usage_min, mut usage_max) = (0u32, 0u32);
++    // Bits per report ID so far.
++    let mut offsets: Vec<(u8, u32)> = Vec::new();
++    let mut at = 0;
++    while at < descriptor.len() {
++        let prefix = descriptor[at];
++        if prefix == 0xfe {
++            // A long item: skip it.
++            let size = usize::from(*descriptor.get(at + 1)?);
++            at += 3 + size;
++            continue;
++        }
++        let bytes = match prefix & 3 {
++            3 => 4,
++            n => usize::from(n),
++        };
++        let raw = descriptor.get(at + 1..at + 1 + bytes)?;
++        let mut data = 0u32;
++        for (index, byte) in raw.iter().enumerate() {
++            data |= u32::from(*byte) << (8 * index);
++        }
++        at += 1 + bytes;
++        let tag = prefix >> 4;
++        match (prefix >> 2) & 3 {
++            // Main items.
++            0 => {
++                if tag == 0x8 {
++                    // Input.
++                    let id = globals.report_id;
++                    let offset = match offsets.iter_mut().find(|(report, _)| *report == id) {
++                        Some((_, bits)) => bits,
++                        None => {
++                            offsets.push((id, 0));
++                            &mut offsets.last_mut().unwrap().1
++                        }
++                    };
++                    let page = globals.page;
++                    let with_page = |usage: u32| if usage > 0xffff { usage } else { page << 16 | usage };
++                    result.fields.push(Field {
++                        report_id: id,
++                        bit_offset: *offset,
++                        size: globals.size,
++                        count: globals.count,
++                        usages: usages.iter().map(|&usage| with_page(usage)).collect(),
++                        usage_min: if usage_min != 0 || usage_max != 0 { with_page(usage_min) } else { 0 },
++                        usage_max: if usage_min != 0 || usage_max != 0 { with_page(usage_max) } else { 0 },
++                        variable: data & 0x02 != 0,
++                        relative: data & 0x04 != 0,
++                        constant: data & 0x01 != 0,
++                        logical_min: globals.logical_min,
++                        logical_max: globals.logical_max,
++                    });
++                    *offset += globals.size.saturating_mul(globals.count);
++                }
++                // Every main item ends the local items.
++                usages.clear();
++                usage_min = 0;
++                usage_max = 0;
++            }
++            // Global items.
++            1 => match tag {
++                0x0 => globals.page = data,
++                0x1 => globals.logical_min = signed(data, bytes),
++                0x2 => {
++                    globals.logical_max = signed(data, bytes);
++                    // An unsigned maximum read as negative (0xff with a one-byte item).
++                    if globals.logical_max < globals.logical_min {
++                        globals.logical_max = data as i32;
++                    }
++                }
++                0x7 => globals.size = data,
++                0x8 => {
++                    globals.report_id = data as u8;
++                    result.uses_ids = true;
++                }
++                0x9 => globals.count = data,
++                0xa => stack.push(globals),
++                0xb => globals = stack.pop()?,
++                _ => {}
++            },
++            // Local items.
++            2 => match tag {
++                0x0 => usages.push(if bytes == 4 { data } else { data & 0xffff }),
++                0x1 => usage_min = if bytes == 4 { data } else { data & 0xffff },
++                0x2 => usage_max = if bytes == 4 { data } else { data & 0xffff },
++                _ => {}
++            },
++            _ => {}
++        }
++    }
++    (!result.fields.is_empty()).then_some(result)
++}
++
++/// What one report says.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Report {
++    pub report_id: u8,
++    /// Controls pressed now (buttons, keys, modifiers, media keys).
++    pub pressed: Vec<u32>,
++    /// Relative motion: X, Y, wheels.
++    pub relative: Vec<(u32, i32)>,
++}
++
++fn bits(data: &[u8], offset: u32, size: u32) -> Option<u32> {
++    if size == 0 || size > 32 {
++        return None;
++    }
++    let mut value = 0u64;
++    for bit in 0..size {
++        let at = offset + bit;
++        let byte = *data.get((at / 8) as usize)?;
++        value |= u64::from((byte >> (at % 8)) & 1) << bit;
++    }
++    Some(value as u32)
++}
++
++fn sign_extend(value: u32, size: u32) -> i32 {
++    if size >= 32 {
++        return value as i32;
++    }
++    let shift = 32 - size;
++    ((value << shift) as i32) >> shift
++}
++
++impl ReportDescriptor {
++    /// Decodes a report, which starts with its ID when the device uses IDs.
++    pub(crate) fn decode(&self, report: &[u8]) -> Option<Report> {
++        let (id, data) = if self.uses_ids {
++            (*report.first()?, &report[1..])
++        } else {
++            (0, report)
++        };
++        let mut decoded = Report { report_id: id, ..Report::default() };
++        let mut matched = false;
++        for field in self.fields.iter().filter(|field| field.report_id == id && !field.constant) {
++            matched = true;
++            for index in 0..field.count {
++                let Some(raw) = bits(data, field.bit_offset + index * field.size, field.size) else { break };
++                let value = if field.logical_min < 0 { sign_extend(raw, field.size) } else { raw as i32 };
++                if field.variable {
++                    let Some(usage) = field.usage_at(index) else { continue };
++                    if field.relative {
++                        if value != 0 {
++                            decoded.relative.push((usage, value));
++                        }
++                    } else if field.size == 1 || usage >> 16 == PAGE_BUTTON || usage >> 16 == PAGE_CONSUMER {
++                        // A button, a modifier or an on/off control.
++                        if value != 0 {
++                            decoded.pressed.push(usage);
++                        }
++                    }
++                } else {
++                    // An array: each value names a pressed control.
++                    if value < field.logical_min || value > field.logical_max {
++                        continue;
++                    }
++                    let Some(usage) = field.usage_at((value - field.logical_min) as u32) else { continue };
++                    // "No event" and the keyboard's error codes.
++                    let id = usage & 0xffff;
++                    if id == 0 || usage >> 16 == PAGE_KEYBOARD && id <= 3 {
++                        continue;
++                    }
++                    decoded.pressed.push(usage);
++                }
++            }
++        }
++        matched.then_some(decoded)
++    }
++}
++
++/// The boot keyboard's report descriptor (HID 1.11, appendix B.1): modifiers,
++/// a reserved byte and six keys.
++pub(crate) const BOOT_KEYBOARD: &[u8] = &[
++    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25, 0x01,
++    0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08,
++    0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xc0,
++];
++
++/// The boot mouse's (appendix B.2): three buttons, X and Y.
++pub(crate) const BOOT_MOUSE: &[u8] = &[
++    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
++    0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
++    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
++    0xc0, 0xc0,
++];
+diff --git a/kernel/comps/usb/src/input.rs b/kernel/comps/usb/src/input.rs
+new file mode 100755
+index 0000000..cb94332
+--- /dev/null
++++ b/kernel/comps/usb/src/input.rs
+@@ -0,0 +1,248 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! USB keyboards and mice as two input devices, `usb_keyboard` and
++//! `usb_mouse`, that exist as soon as there is a USB controller.
++//!
++//! The X server reads its input devices once, when it starts, and without
++//! udev it cannot add one later. So every USB keyboard and mouse, plugged in
++//! before or after X started, types and points through these two, as X's
++//! own core keyboard and pointer merge them.
++//!
++//! The usages are HID's (keyboard, button, consumer and generic desktop
++//! pages), mapped to Linux's codes as `drivers/hid/hid-input.c` does.
++
++use alloc::{string::String, sync::Arc, vec::Vec};
++
++use aster_input::{
++    event_type_codes::{EventTypes, KeyCode, KeyStatus, RelCode, SynEvent},
++    input_dev::{InputCapability, InputDevice, InputEvent, InputId, RegisteredInputDevice},
++};
++use spin::Once;
++
++use crate::hid::{PAGE_BUTTON, PAGE_CONSUMER, PAGE_GENERIC_DESKTOP, PAGE_KEYBOARD, USAGE_AC_PAN, USAGE_WHEEL, USAGE_X, USAGE_Y};
++
++static KEYBOARD: Once<RegisteredInputDevice> = Once::new();
++static MOUSE: Once<RegisteredInputDevice> = Once::new();
++
++const MOUSE_BUTTONS: [KeyCode; 7] = [
++    KeyCode::BtnLeft,
++    KeyCode::BtnRight,
++    KeyCode::BtnMiddle,
++    KeyCode::BtnSide,
++    KeyCode::BtnExtra,
++    KeyCode::BtnForward,
++    KeyCode::BtnBack,
++];
++
++#[derive(Debug)]
++struct UsbInput {
++    name: String,
++    phys: String,
++    id: InputId,
++    capability: InputCapability,
++}
++
++impl InputDevice for UsbInput {
++    fn name(&self) -> &str {
++        &self.name
++    }
++
++    fn phys(&self) -> &str {
++        &self.phys
++    }
++
++    fn uniq(&self) -> &str {
++        ""
++    }
++
++    fn id(&self) -> InputId {
++        self.id
++    }
++
++    fn capability(&self) -> &InputCapability {
++        &self.capability
++    }
++}
++
++pub(crate) fn init() {
++    let mut keyboard = InputCapability::new();
++    keyboard.set_supported_event_type(EventTypes::KEY);
++    keyboard.set_supported_event_type(EventTypes::SYN);
++    keyboard.add_standard_keyboard_keys();
++    KEYBOARD.call_once(|| {
++        aster_input::register_device(Arc::new(UsbInput {
++            name: "usb_keyboard".into(),
++            phys: "usb/input0".into(),
++            id: InputId::new(InputId::BUS_USB, 0, 0, 1),
++            capability: keyboard,
++        }))
++    });
++
++    let mut mouse = InputCapability::new();
++    mouse.set_supported_event_type(EventTypes::KEY);
++    mouse.set_supported_event_type(EventTypes::REL);
++    mouse.set_supported_event_type(EventTypes::SYN);
++    for button in MOUSE_BUTTONS {
++        mouse.set_supported_key(button);
++    }
++    for axis in [RelCode::X, RelCode::Y, RelCode::Wheel, RelCode::HWheel] {
++        mouse.set_supported_relative_axis(axis);
++    }
++    MOUSE.call_once(|| {
++        aster_input::register_device(Arc::new(UsbInput {
++            name: "usb_mouse".into(),
++            phys: "usb/input1".into(),
++            id: InputId::new(InputId::BUS_USB, 0, 0, 1),
++            capability: mouse,
++        }))
++    });
++}
++
++/// What a report changed: the controls released (held before, not now) and
++/// pressed, and the pointer's motion.
++pub(crate) fn report(before: &[u32], now: &[u32], relative: &[(u32, i32)]) {
++    let mut keys = Vec::new();
++    let mut pointer = Vec::new();
++    let mut press = |usage: u32, status: KeyStatus| {
++        let Some(key) = key_of(usage) else { return };
++        let event = InputEvent::from_key_and_status(key, status);
++        if usage >> 16 == PAGE_BUTTON { pointer.push(event) } else { keys.push(event) }
++    };
++    for &usage in before.iter().filter(|usage| !now.contains(usage)) {
++        press(usage, KeyStatus::Released);
++    }
++    for &usage in now.iter().filter(|usage| !before.contains(usage)) {
++        press(usage, KeyStatus::Pressed);
++    }
++    for &(usage, value) in relative {
++        let axis = match usage {
++            USAGE_X => RelCode::X,
++            USAGE_Y => RelCode::Y,
++            USAGE_WHEEL => RelCode::Wheel,
++            USAGE_AC_PAN => RelCode::HWheel,
++            _ => continue,
++        };
++        pointer.push(InputEvent::from_relative_move(axis, value));
++    }
++    for (events, device) in [(keys, &KEYBOARD), (pointer, &MOUSE)] {
++        if events.is_empty() {
++            continue;
++        }
++        if let Some(device) = device.get() {
++            let mut events = events;
++            events.push(InputEvent::from_sync_event(SynEvent::Report));
++            device.submit_events(&events);
++        }
++    }
++}
++
++fn key_of(usage: u32) -> Option<KeyCode> {
++    let id = usage & 0xffff;
++    match usage >> 16 {
++        PAGE_KEYBOARD => keyboard_key(id),
++        PAGE_BUTTON => MOUSE_BUTTONS.get(id.checked_sub(1)? as usize).copied(),
++        PAGE_CONSUMER => consumer_key(id),
++        PAGE_GENERIC_DESKTOP => match id {
++            0x81 => Some(KeyCode::Power),
++            0x82 => Some(KeyCode::Sleep),
++            0x83 => Some(KeyCode::WakeUp),
++            _ => None,
++        },
++        _ => None,
++    }
++}
++
++/// The keyboard page (HID usage tables, chapter 10).
++fn keyboard_key(id: u32) -> Option<KeyCode> {
++    use KeyCode::*;
++    const LETTERS: [KeyCode; 26] = [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z];
++    const DIGITS: [KeyCode; 10] = [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0];
++    const FUNCTIONS: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
++    const KEYPAD: [KeyCode; 10] = [Kp1, Kp2, Kp3, Kp4, Kp5, Kp6, Kp7, Kp8, Kp9, Kp0];
++    let key = match id {
++        0x04..=0x1d => LETTERS[(id - 0x04) as usize],
++        0x1e..=0x27 => DIGITS[(id - 0x1e) as usize],
++        0x28 => Enter,
++        0x29 => Esc,
++        0x2a => Backspace,
++        0x2b => Tab,
++        0x2c => Space,
++        0x2d => Minus,
++        0x2e => Equal,
++        0x2f => LeftBrace,
++        0x30 => RightBrace,
++        0x31 | 0x32 => Backslash,
++        0x33 => Semicolon,
++        0x34 => Apostrophe,
++        0x35 => Grave,
++        0x36 => Comma,
++        0x37 => Dot,
++        0x38 => Slash,
++        0x39 => CapsLock,
++        0x3a..=0x45 => FUNCTIONS[(id - 0x3a) as usize],
++        0x46 => Sysrq,
++        0x47 => ScrollLock,
++        0x48 => Pause,
++        0x49 => Insert,
++        0x4a => Home,
++        0x4b => PageUp,
++        0x4c => Delete,
++        0x4d => End,
++        0x4e => PageDown,
++        0x4f => Right,
++        0x50 => Left,
++        0x51 => Down,
++        0x52 => Up,
++        0x53 => NumLock,
++        0x54 => KpSlash,
++        0x55 => KpAsterisk,
++        0x56 => KpMinus,
++        0x57 => KpPlus,
++        0x58 => KpEnter,
++        0x59..=0x62 => KEYPAD[(id - 0x59) as usize],
++        0x63 => KpDot,
++        0x64 => Key102nd,
++        0x65 => Compose,
++        0x66 => Power,
++        0x7f => Mute,
++        0x80 => VolumeUp,
++        0x81 => VolumeDown,
++        0x85 => KpComma,
++        0x87 => Ro,
++        0xe0 => LeftCtrl,
++        0xe1 => LeftShift,
++        0xe2 => LeftAlt,
++        0xe3 => LeftMeta,
++        0xe4 => RightCtrl,
++        0xe5 => RightShift,
++        0xe6 => RightAlt,
++        0xe7 => RightMeta,
++        _ => return None,
++    };
++    Some(key)
++}
++
++/// The consumer page: media, volume, brightness and launch keys.
++fn consumer_key(id: u32) -> Option<KeyCode> {
++    use KeyCode::*;
++    let key = match id {
++        0x6f => BrightnessUp,
++        0x70 => BrightnessDown,
++        0xb5 => NextSong,
++        0xb6 => PreviousSong,
++        0xb7 => StopCd,
++        0xcd => PlayPause,
++        0xe2 => Mute,
++        0xe9 => VolumeUp,
++        0xea => VolumeDown,
++        0x18a => Mail,
++        0x192 => Calc,
++        0x194 => Computer,
++        0x221 => Search,
++        0x223 => HomePage,
++        0x224 => Back,
++        0x225 => Forward,
++        _ => return None,
++    };
++    Some(key)
++}
+diff --git a/kernel/comps/usb/src/lib.rs b/kernel/comps/usb/src/lib.rs
+new file mode 100755
+index 0000000..3b8b151
+--- /dev/null
++++ b/kernel/comps/usb/src/lib.rs
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! USB: xHCI host controllers and the devices on their root ports.
++//!
++//! Keyboards and mice of any maker work through the HID class (boot
++//! keyboards with the boot protocol, every other HID device with its report
++//! descriptor, wheels, extra buttons and media keys included); `xhci` says
++//! which controllers and how.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++// Set this crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "usb: "
++    };
++}
++
++mod desc;
++mod hid;
++mod input;
++mod ring;
++mod xhci;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    capability::msix::CapabilityMsixData,
++    common_device::PciCommonDevice,
++};
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    irq::IrqLine,
++    sync::{SpinLock, WaitQueue},
++    timer::Jiffies,
++};
++
++/// Wakes the controllers' tasks: their interrupts, and a timer.
++static WAKE: WaitQueue = WaitQueue::new();
++static WOKEN: AtomicBool = AtomicBool::new(false);
++/// Tasks waiting for a command or a transfer: the timer wakes them each tick.
++pub(crate) static BUSY: AtomicUsize = AtomicUsize::new(0);
++/// Whether every controller's interrupts reach the kernel.
++static INTERRUPTS: AtomicBool = AtomicBool::new(true);
++static TICKS: AtomicU64 = AtomicU64::new(0);
++
++pub(crate) fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++fn wake() {
++    WOKEN.store(true, Ordering::Release);
++    WAKE.wake_all();
++}
++
++/// Waits for an interrupt or the next timer wake-up.
++pub(crate) fn sleep() {
++    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
++}
++
++/// The same, between events.
++pub(crate) fn sleep_idle() {
++    sleep();
++}
++
++/// Each timer tick (1 ms): waiting tasks every tick; idle ones every 4 ms
++/// without interrupts (a mouse's reports), every 100 ms with them.
++fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    let period = if BUSY.load(Ordering::Relaxed) > 0 {
++        1
++    } else if INTERRUPTS.load(Ordering::Relaxed) {
++        100
++    } else {
++        4
++    };
++    if ticks % period == 0 {
++        wake();
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++/// Claims the xHCI controllers (serial bus, USB, programming interface 0x30).
++#[derive(Debug)]
++struct Driver {
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if (id.class, id.subclass, id.prog_if) != (0x0c, 0x03, 0x30) {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.found.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++/// The controllers found, with their interrupts, until their tasks start.
++static PENDING: SpinLock<Vec<(PciCommonDevice, Option<CapabilityMsixData>, String)>> = SpinLock::new(Vec::new());
++
++// Claims the controllers and offers the input devices before the X server
++// and evdev look for them.
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
++    PCI_BUS.lock().register_driver(driver.clone());
++    let controllers = core::mem::take(&mut *driver.found.lock());
++    if controllers.is_empty() {
++        return Ok(());
++    }
++    input::init();
++    ostd::timer::register_callback_on_cpu(tick);
++    for (index, mut device) in controllers.into_iter().enumerate() {
++        let location = *device.location();
++        let name = format!("xhci{} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
++        // Interrupter 0 on MSI-X vector 0; without MSI-X, the timer polls.
++        let msix = match device.acquire_msix_capability() {
++            Ok(Some(mut msix)) => match IrqLine::alloc() {
++                Ok(irq) => {
++                    msix.set_interrupt_vector(irq, 0);
++                    if let Some(irq) = msix.irq_mut(0) {
++                        irq.on_active(|_| wake());
++                    }
++                    Some(msix)
++                }
++                Err(_) => None,
++            },
++            _ => None,
++        };
++        if msix.is_none() {
++            INTERRUPTS.store(false, Ordering::Relaxed);
++            ostd::notice!("{}: no MSI-X; polling", name);
++        }
++        PENDING.lock().push((device, msix, name));
++    }
++    Ok(())
++}
++
++// One task per controller, once there is a scheduler.
++#[init_component(kthread)]
++fn start() -> Result<(), ComponentInitError> {
++    for (device, msix, name) in core::mem::take(&mut *PENDING.lock()) {
++        aster_core::spawn_kernel_thread(move || {
++            let _msix = msix;
++            match xhci::Controller::new(device, name) {
++                Some(controller) => controller.run(),
++                None => ostd::warn!("an xHCI controller did not start"),
++            }
++        });
++    }
++    Ok(())
++}
+diff --git a/kernel/comps/usb/src/ring.rs b/kernel/comps/usb/src/ring.rs
+new file mode 100755
+index 0000000..92f90b3
+--- /dev/null
++++ b/kernel/comps/usb/src/ring.rs
+@@ -0,0 +1,178 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! xHCI rings of TRBs (Transfer Request Blocks) in DMA memory: the command
++//! ring and the transfer rings, which software fills and the controller
++//! consumes, and the event ring, which the controller fills.
++//!
++//! Reference: xHCI 1.2, section 4.9.
++
++use ostd::mm::{HasDaddr, VmIo, VmIoOnce, dma::DmaCoherent};
++
++/// One TRB: a parameter, a status and a control word.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Trb {
++    pub parameter: u64,
++    pub status: u32,
++    pub control: u32,
++}
++
++pub(crate) const TRB_SIZE: usize = 16;
++/// TRBs per ring: one page.
++pub(crate) const RING_TRBS: usize = 256;
++
++pub(crate) mod trb_type {
++    pub const NORMAL: u32 = 1;
++    pub const SETUP: u32 = 2;
++    pub const DATA: u32 = 3;
++    pub const STATUS: u32 = 4;
++    pub const LINK: u32 = 6;
++    pub const ENABLE_SLOT: u32 = 9;
++    pub const DISABLE_SLOT: u32 = 10;
++    pub const ADDRESS_DEVICE: u32 = 11;
++    pub const CONFIGURE_ENDPOINT: u32 = 12;
++    pub const EVALUATE_CONTEXT: u32 = 13;
++    pub const RESET_ENDPOINT: u32 = 14;
++    pub const SET_TR_DEQUEUE: u32 = 16;
++    pub const TRANSFER_EVENT: u32 = 32;
++    pub const COMMAND_COMPLETION: u32 = 33;
++    pub const PORT_STATUS_CHANGE: u32 = 34;
++}
++
++pub(crate) const CYCLE: u32 = 1 << 0;
++/// Link TRB: toggle the cycle bit.
++const TOGGLE_CYCLE: u32 = 1 << 1;
++/// Interrupt on short packet.
++pub(crate) const ISP: u32 = 1 << 2;
++/// Interrupt on completion.
++pub(crate) const IOC: u32 = 1 << 5;
++/// Immediate data (a setup packet in the TRB itself).
++pub(crate) const IDT: u32 = 1 << 6;
++
++impl Trb {
++    pub(crate) fn kind(&self) -> u32 {
++        (self.control >> 10) & 0x3f
++    }
++
++    pub(crate) fn completion_code(&self) -> u8 {
++        (self.status >> 24) as u8
++    }
++
++    pub(crate) fn slot(&self) -> u8 {
++        (self.control >> 24) as u8
++    }
++
++    pub(crate) fn endpoint(&self) -> u8 {
++        ((self.control >> 16) & 0x1f) as u8
++    }
++
++    pub(crate) fn with_type(kind: u32) -> u32 {
++        kind << 10
++    }
++}
++
++fn write_trb(dma: &DmaCoherent, index: usize, trb: Trb) {
++    let offset = index * TRB_SIZE;
++    // The control word, with its cycle bit, goes last: the controller takes
++    // the TRB as its own when it sees that bit.
++    let _ = dma.write_once(offset, &trb.parameter);
++    let _ = dma.write_once(offset + 8, &trb.status);
++    let _ = dma.write_once(offset + 12, &trb.control);
++}
++
++fn read_trb(dma: &DmaCoherent, index: usize) -> Trb {
++    let offset = index * TRB_SIZE;
++    Trb {
++        parameter: dma.read_once(offset).unwrap_or(0),
++        status: dma.read_once(offset + 8).unwrap_or(0),
++        control: dma.read_once(offset + 12).unwrap_or(0),
++    }
++}
++
++/// A ring software produces: commands, or one endpoint's transfers.
++pub(crate) struct ProducerRing {
++    dma: DmaCoherent,
++    enqueue: usize,
++    cycle: bool,
++}
++
++impl ProducerRing {
++    pub(crate) fn new() -> Option<Self> {
++        let dma = DmaCoherent::alloc(1, true).ok()?;
++        let ring = Self { dma, enqueue: 0, cycle: true };
++        // The last TRB links back to the first and toggles the cycle.
++        let link = Trb {
++            parameter: ring.dma.daddr() as u64,
++            status: 0,
++            control: Trb::with_type(trb_type::LINK) | TOGGLE_CYCLE,
++        };
++        write_trb(&ring.dma, RING_TRBS - 1, link);
++        Some(ring)
++    }
++
++    pub(crate) fn base(&self) -> u64 {
++        self.dma.daddr() as u64
++    }
++
++    /// The address of the next TRB to fill, and the cycle state it will carry.
++    pub(crate) fn dequeue_pointer(&self) -> u64 {
++        (self.dma.daddr() + self.enqueue * TRB_SIZE) as u64 | u64::from(self.cycle)
++    }
++
++    /// Adds a TRB (its cycle bit set here); returns its address.
++    pub(crate) fn push(&mut self, mut trb: Trb) -> u64 {
++        trb.control = (trb.control & !CYCLE) | u32::from(self.cycle);
++        let address = (self.dma.daddr() + self.enqueue * TRB_SIZE) as u64;
++        write_trb(&self.dma, self.enqueue, trb);
++        self.enqueue += 1;
++        if self.enqueue == RING_TRBS - 1 {
++            // Hand the link TRB over with the current cycle, then wrap.
++            let mut link = read_trb(&self.dma, RING_TRBS - 1);
++            link.control = (link.control & !CYCLE) | u32::from(self.cycle);
++            write_trb(&self.dma, RING_TRBS - 1, link);
++            self.enqueue = 0;
++            self.cycle = !self.cycle;
++        }
++        address
++    }
++}
++
++/// The event ring the controller produces, with its one-segment table.
++pub(crate) struct EventRing {
++    dma: DmaCoherent,
++    table: DmaCoherent,
++    dequeue: usize,
++    cycle: bool,
++}
++
++impl EventRing {
++    pub(crate) fn new() -> Option<Self> {
++        let dma = DmaCoherent::alloc(1, true).ok()?;
++        let table = DmaCoherent::alloc(1, true).ok()?;
++        // Segment table entry: base address and size in TRBs.
++        table.write_val(0, &(dma.daddr() as u64)).ok()?;
++        table.write_val(8, &(RING_TRBS as u32)).ok()?;
++        Some(Self { dma, table, dequeue: 0, cycle: true })
++    }
++
++    pub(crate) fn table_base(&self) -> u64 {
++        self.table.daddr() as u64
++    }
++
++    pub(crate) fn dequeue_pointer(&self) -> u64 {
++        (self.dma.daddr() + self.dequeue * TRB_SIZE) as u64
++    }
++
++    /// The next event, if the controller has written one.
++    pub(crate) fn pop(&mut self) -> Option<Trb> {
++        let trb = read_trb(&self.dma, self.dequeue);
++        if (trb.control & CYCLE != 0) != self.cycle {
++            return None;
++        }
++        self.dequeue += 1;
++        if self.dequeue == RING_TRBS {
++            self.dequeue = 0;
++            self.cycle = !self.cycle;
++        }
++        Some(trb)
++    }
++}
+diff --git a/kernel/comps/usb/src/xhci.rs b/kernel/comps/usb/src/xhci.rs
+new file mode 100755
+index 0000000..4bbffa0
+--- /dev/null
++++ b/kernel/comps/usb/src/xhci.rs
+@@ -0,0 +1,815 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The xHCI host controller: every USB port of a computer made since about
++//! 2012, whatever its maker (Intel, AMD, ASMedia, Renesas, VIA, Fresco).
++//!
++//! One kernel task per controller runs it: it resets the controller, takes
++//! it from the firmware, and then attaches each device that is or becomes
++//! connected to a root port, gives it an address, reads its descriptors,
++//! configures it and hands its interfaces to the class drivers
++//! (`crate::hid`). Interrupts wake the task; a timer wakes it too, for
++//! controllers whose interrupts do not reach the kernel and for timeouts.
++//!
++//! Reference: eXtensible Host Controller Interface 1.2; Linux's
++//! `drivers/usb/host/xhci*.c` and `pci-quirks.c`.
++
++use alloc::{collections::BTreeMap, vec, vec::Vec};
++use core::sync::atomic::Ordering;
++
++use aster_pci::{cfg_space::BarAccess, common_device::PciCommonDevice};
++use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
++
++use crate::{
++    desc::{self, Configuration, Endpoint, Interface, TRANSFER_INTERRUPT},
++    hid::{self, ReportDescriptor},
++    ring::{EventRing, IDT, IOC, ISP, ProducerRing, Trb, trb_type},
++};
++
++/// Completion codes.
++const SUCCESS: u8 = 1;
++const STALL: u8 = 6;
++const SHORT_PACKET: u8 = 13;
++
++// Operational registers.
++const USBCMD: usize = 0x00;
++const USBSTS: usize = 0x04;
++const CRCR: usize = 0x18;
++const DCBAAP: usize = 0x30;
++const CONFIG: usize = 0x38;
++const PORTSC: usize = 0x400;
++
++const CMD_RUN: u32 = 1 << 0;
++const CMD_RESET: u32 = 1 << 1;
++const CMD_INTERRUPTS: u32 = 1 << 2;
++const STS_HALTED: u32 = 1 << 0;
++const STS_EVENT_INTERRUPT: u32 = 1 << 3;
++const STS_NOT_READY: u32 = 1 << 11;
++
++// Port status and control.
++const PORT_CONNECTED: u32 = 1 << 0;
++const PORT_ENABLED: u32 = 1 << 1;
++const PORT_RESET: u32 = 1 << 4;
++const PORT_POWER: u32 = 1 << 9;
++const PORT_RESET_CHANGE: u32 = 1 << 21;
++/// Read-only and read/write bits that writing PORTSC keeps (Linux's
++/// `xhci_port_state_to_neutral`): never a 1 to a write-1-to-clear bit.
++const PORT_KEEP: u32 = (1 << 0) | (1 << 3) | (0xf << 10) | (1 << 30) | (0xf << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
++/// The change bits, cleared by writing 1.
++const PORT_CHANGES: u32 = 0x7f << 17;
++
++// Interrupter 0 in the runtime registers.
++const IMAN: usize = 0x20;
++const IMOD: usize = 0x24;
++const ERSTSZ: usize = 0x28;
++const ERSTBA: usize = 0x30;
++const ERDP: usize = 0x38;
++const IMAN_PENDING: u32 = 1 << 0;
++const IMAN_ENABLE: u32 = 1 << 1;
++const ERDP_BUSY: u64 = 1 << 3;
++
++/// Endpoint context types.
++const EP_CONTROL: u32 = 4;
++const EP_INTERRUPT_IN: u32 = 7;
++
++/// Port speeds (PORTSC bits 13:10).
++const SPEED_FULL: u32 = 1;
++const SPEED_LOW: u32 = 2;
++const SPEED_HIGH: u32 = 3;
++
++/// Standard requests.
++const GET_DESCRIPTOR: u8 = 6;
++const SET_CONFIGURATION: u8 = 9;
++/// HID class requests.
++const SET_IDLE: u8 = 0x0a;
++const SET_PROTOCOL: u8 = 0x0b;
++
++const COMMAND_TIMEOUT_MS: u64 = 3_000;
++const TRANSFER_TIMEOUT_MS: u64 = 5_000;
++/// Reports a HID endpoint has in flight.
++const HID_BUFFERS: usize = 2;
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum Error {
++    Timeout,
++    Completion(u8),
++    NoMemory,
++    Descriptor,
++}
++
++type Result<T> = core::result::Result<T, Error>;
++
++/// Data of a control transfer.
++#[derive(Clone, Copy)]
++enum Data<'a> {
++    None,
++    In(usize),
++    Out(&'a [u8]),
++}
++
++/// A HID interface's endpoint, its reports and what they last said.
++struct HidEndpoint {
++    dci: u8,
++    ring: ProducerRing,
++    buffers: DmaCoherent,
++    size: usize,
++    in_flight: Vec<(u64, usize)>,
++    descriptor: ReportDescriptor,
++    /// Controls held, per report ID.
++    pressed: BTreeMap<u8, Vec<u32>>,
++}
++
++/// A device in a slot.
++struct Slot {
++    port: u8,
++    speed: u32,
++    output: DmaCoherent,
++    input: DmaCoherent,
++    ep0: ProducerRing,
++    buffer: DmaCoherent,
++    hid: Vec<HidEndpoint>,
++    /// The highest device context index configured.
++    last_dci: u8,
++}
++
++pub(crate) struct Controller {
++    mmio: BarAccess,
++    op: usize,
++    runtime: usize,
++    doorbells: usize,
++    max_slots: u8,
++    max_ports: u8,
++    context_size: usize,
++    dcbaa: DmaCoherent,
++    _scratchpad: Vec<DmaCoherent>,
++    commands: ProducerRing,
++    events: EventRing,
++    slots: BTreeMap<u8, Slot>,
++    /// The slot on each root port (index: port − 1).
++    ports: Vec<Option<u8>>,
++    /// Port numbers whose status changed, to look at.
++    changed: Vec<u8>,
++    name: alloc::string::String,
++    _device: PciCommonDevice,
++}
++
++impl Controller {
++    fn r32(&self, offset: usize) -> u32 {
++        self.mmio.read_once::<u32>(offset).unwrap_or(u32::MAX)
++    }
++
++    fn w32(&self, offset: usize, value: u32) {
++        let _ = self.mmio.write_once::<u32>(offset, value);
++    }
++
++    fn w64(&self, offset: usize, value: u64) {
++        self.w32(offset, value as u32);
++        self.w32(offset + 4, (value >> 32) as u32);
++    }
++
++    fn op_r(&self, register: usize) -> u32 {
++        self.r32(self.op + register)
++    }
++
++    fn op_w(&self, register: usize, value: u32) {
++        self.w32(self.op + register, value)
++    }
++
++    fn portsc(&self, port: u8) -> u32 {
++        self.op_r(PORTSC + 0x10 * usize::from(port - 1))
++    }
++
++    fn set_portsc(&self, port: u8, value: u32) {
++        self.op_w(PORTSC + 0x10 * usize::from(port - 1), value)
++    }
++
++    fn ring(&self, slot: u8, target: u8) {
++        self.w32(self.doorbells + 4 * usize::from(slot), u32::from(target));
++    }
++
++    /// Takes the controller from the firmware and brings it up.
++    pub(crate) fn new(mut device: PciCommonDevice, name: alloc::string::String) -> Option<Self> {
++        let location = *device.location();
++        let id = *device.device_id();
++        let mmio = device.bar_manager_mut().bar_mut(0)?.acquire().ok()?;
++        let read = |offset: usize| mmio.read_once::<u32>(offset).unwrap_or(u32::MAX);
++        let cap_length = (read(0) & 0xff) as usize;
++        let hcs1 = read(0x04);
++        let hcs2 = read(0x08);
++        let hcc1 = read(0x10);
++        let doorbells = (read(0x14) & !0x3) as usize;
++        let runtime = (read(0x18) & !0x1f) as usize;
++        if hcs1 == u32::MAX || cap_length == 0 {
++            return None;
++        }
++        let max_slots = (hcs1 & 0xff) as u8;
++        let max_ports = (hcs1 >> 24) as u8;
++        let context_size = if hcc1 & (1 << 2) != 0 { 64 } else { 32 };
++        let scratchpads = (((hcs2 >> 21) & 0x1f) << 5 | (hcs2 >> 27)) as usize;
++
++        // The firmware hands over its keyboard emulation (USB legacy support).
++        let mut capability = ((hcc1 >> 16) as usize) << 2;
++        while capability != 0 {
++            let header = read(capability);
++            if header & 0xff == 1 {
++                let _ = mmio.write_once::<u32>(capability, header | (1 << 24));
++                let deadline = crate::now_ms() + 1_000;
++                while read(capability) & (1 << 16) != 0 && crate::now_ms() < deadline {
++                    ostd::task::Task::yield_now();
++                }
++                if read(capability) & (1 << 16) != 0 {
++                    ostd::notice!("{:?}: the firmware kept the controller; taking it", location);
++                    let _ = mmio.write_once::<u32>(capability, read(capability) & !(1 << 16));
++                }
++                // No more SMIs from it; clear the pending ones.
++                let control = read(capability + 4);
++                let _ = mmio.write_once::<u32>(capability + 4, (control & !0x0001_e01f) | 0xe000_0000);
++            }
++            let next = ((header >> 8) & 0xff) as usize;
++            capability = if next == 0 { 0 } else { capability + (next << 2) };
++        }
++
++        // Intel's 7 and 8 series send their ports to the EHCI controller until
++        // told otherwise (Linux's `usb_enable_intel_xhci_ports`).
++        if id.vendor_id == 0x8086 && matches!(id.device_id, 0x1e31 | 0x8c31 | 0x9c31 | 0x8cb1 | 0x9cb1 | 0x0f35 | 0x22b5) {
++            location.write32(0xd8, location.read32(0xdc));
++            location.write32(0xd0, location.read32(0xd4));
++        }
++
++        let dcbaa = DmaCoherent::alloc(1, true).ok()?;
++        let mut scratchpad = Vec::new();
++        if scratchpads > 0 {
++            let array = DmaCoherent::alloc(1, true).ok()?;
++            for index in 0..scratchpads.min(512) {
++                let page = DmaCoherent::alloc(1, true).ok()?;
++                array.write_val(index * 8, &(page.daddr() as u64)).ok()?;
++                scratchpad.push(page);
++            }
++            dcbaa.write_val(0, &(array.daddr() as u64)).ok()?;
++            scratchpad.push(array);
++        }
++        let mut controller = Self {
++            mmio,
++            op: cap_length,
++            runtime,
++            doorbells,
++            max_slots,
++            max_ports,
++            context_size,
++            dcbaa,
++            _scratchpad: scratchpad,
++            commands: ProducerRing::new()?,
++            events: EventRing::new()?,
++            slots: BTreeMap::new(),
++            ports: vec![None; usize::from(max_ports)],
++            changed: Vec::new(),
++            name,
++            _device: device,
++        };
++        controller.start().then_some(())?;
++        ostd::notice!(
++            "{}: xHCI {:04x}:{:04x}, {} ports, {} slots, {}-byte contexts, {} scratchpad pages",
++            controller.name, id.vendor_id, id.device_id, max_ports, max_slots, context_size, scratchpads
++        );
++        Some(controller)
++    }
++
++    /// Stops, resets and starts the controller with its rings.
++    fn start(&mut self) -> bool {
++        if self.op_r(USBSTS) & STS_HALTED == 0 {
++            self.op_w(USBCMD, self.op_r(USBCMD) & !CMD_RUN);
++            if !self.wait(|this| this.op_r(USBSTS) & STS_HALTED != 0, 200) {
++                ostd::notice!("{}: the controller does not stop", self.name);
++            }
++        }
++        self.op_w(USBCMD, self.op_r(USBCMD) | CMD_RESET);
++        // Some Intel controllers need a moment before their registers answer.
++        self.sleep_ms(2);
++        if !self.wait(|this| this.op_r(USBCMD) & CMD_RESET == 0 && this.op_r(USBSTS) & STS_NOT_READY == 0, 1_000) {
++            ostd::notice!("{}: the controller does not come out of reset", self.name);
++            return false;
++        }
++        self.op_w(CONFIG, (self.op_r(CONFIG) & !0xff) | u32::from(self.max_slots));
++        self.w64(self.op + DCBAAP, self.dcbaa.daddr() as u64);
++        self.w64(self.op + CRCR, self.commands.base() | 1);
++        let interrupter = self.runtime;
++        self.w32(interrupter + ERSTSZ, 1);
++        self.w64(interrupter + ERDP, self.events.dequeue_pointer());
++        self.w64(interrupter + ERSTBA, self.events.table_base());
++        // At most 4000 interrupts a second (250 ns units).
++        self.w32(interrupter + IMOD, 1_000);
++        self.w32(interrupter + IMAN, IMAN_ENABLE | IMAN_PENDING);
++        self.op_w(USBCMD, CMD_RUN | CMD_INTERRUPTS);
++        if !self.wait(|this| this.op_r(USBSTS) & STS_HALTED == 0, 200) {
++            ostd::notice!("{}: the controller does not run", self.name);
++            return false;
++        }
++        // Power every port (where software switches the power).
++        for port in 1..=self.max_ports {
++            let status = self.portsc(port);
++            if status & PORT_POWER == 0 {
++                self.set_portsc(port, (status & PORT_KEEP) | PORT_POWER);
++            }
++            self.changed.push(port);
++        }
++        true
++    }
++
++    fn sleep_ms(&self, ms: u64) {
++        let deadline = crate::now_ms() + ms;
++        while crate::now_ms() < deadline {
++            crate::sleep();
++        }
++    }
++
++    /// Waits up to `ms` for `done`.
++    fn wait(&self, done: impl Fn(&Self) -> bool, ms: u64) -> bool {
++        let deadline = crate::now_ms() + ms;
++        loop {
++            if done(self) {
++                return true;
++            }
++            if crate::now_ms() >= deadline {
++                return false;
++            }
++            crate::sleep();
++        }
++    }
++
++    /// The controller's task: attaches what is plugged in, forever.
++    pub(crate) fn run(mut self) -> ! {
++        loop {
++            self.process_events(&mut |_| false);
++            while let Some(port) = self.changed.pop() {
++                self.port_changed(port);
++            }
++            crate::sleep_idle();
++        }
++    }
++
++    /// Takes the events the controller wrote; returns the first that `wanted`
++    /// accepts, handling the others (reports, port changes).
++    fn process_events(&mut self, wanted: &mut dyn FnMut(&Trb) -> bool) -> Option<Trb> {
++        let mut found = None;
++        let mut any = false;
++        while let Some(event) = self.events.pop() {
++            any = true;
++            if found.is_none() && wanted(&event) {
++                found = Some(event);
++                continue;
++            }
++            match event.kind() {
++                trb_type::PORT_STATUS_CHANGE => {
++                    let port = (event.parameter >> 24) as u8;
++                    if !self.changed.contains(&port) {
++                        self.changed.push(port);
++                    }
++                }
++                trb_type::TRANSFER_EVENT => self.transfer_done(&event),
++                _ => {}
++            }
++        }
++        if any {
++            self.w64(self.runtime + ERDP, self.events.dequeue_pointer() | ERDP_BUSY);
++            self.w32(self.runtime + IMAN, IMAN_ENABLE | IMAN_PENDING);
++            self.op_w(USBSTS, STS_EVENT_INTERRUPT);
++        }
++        found
++    }
++
++    /// Waits for an event `wanted` accepts.
++    fn wait_event(&mut self, wanted: &mut dyn FnMut(&Trb) -> bool, ms: u64) -> Result<Trb> {
++        let deadline = crate::now_ms() + ms;
++        crate::BUSY.fetch_add(1, Ordering::Relaxed);
++        let result = loop {
++            if let Some(event) = self.process_events(wanted) {
++                break Ok(event);
++            }
++            if crate::now_ms() >= deadline {
++                break Err(Error::Timeout);
++            }
++            crate::sleep();
++        };
++        crate::BUSY.fetch_sub(1, Ordering::Relaxed);
++        result
++    }
++
++    fn command(&mut self, trb: Trb) -> Result<Trb> {
++        let address = self.commands.push(trb);
++        self.ring(0, 0);
++        let event = self.wait_event(
++            &mut |event| event.kind() == trb_type::COMMAND_COMPLETION && event.parameter == address,
++            COMMAND_TIMEOUT_MS,
++        )?;
++        match event.completion_code() {
++            SUCCESS => Ok(event),
++            code => Err(Error::Completion(code)),
++        }
++    }
++
++    // ── Contexts ─────────────────────────────────────────────────────────
++
++    /// Writes dword `dword` of input context entry `entry` (0: input control,
++    /// 1: slot, 1 + DCI: endpoint).
++    fn input_write(&self, slot: &Slot, entry: usize, dword: usize, value: u32) {
++        let _ = slot.input.write_val(entry * self.context_size + dword * 4, &value);
++    }
++
++    fn output_read(&self, slot: &Slot, entry: usize, dword: usize) -> u32 {
++        slot.output.read_val(entry * self.context_size + dword * 4).unwrap_or(0)
++    }
++
++    fn clear_input(&self, slot: &Slot) {
++        let _ = slot.input.write_bytes(0, &vec![0u8; 33 * self.context_size]);
++    }
++
++    /// The default control endpoint's maximum packet size for a speed.
++    fn default_max_packet(speed: u32) -> u32 {
++        match speed {
++            SPEED_LOW | SPEED_FULL => 8,
++            SPEED_HIGH => 64,
++            _ => 512,
++        }
++    }
++
++    // ── Ports and devices ────────────────────────────────────────────────
++
++    fn port_changed(&mut self, port: u8) {
++        if port == 0 || port > self.max_ports {
++            return;
++        }
++        let status = self.portsc(port);
++        // Acknowledge the changes.
++        self.set_portsc(port, (status & PORT_KEEP) | (status & PORT_CHANGES));
++        let attached = self.ports[usize::from(port - 1)];
++        if status & PORT_CONNECTED == 0 {
++            if let Some(slot) = attached {
++                self.detach(port, slot);
++            }
++            return;
++        }
++        if attached.is_some() {
++            return;
++        }
++        // Let the connection settle (USB 2.0, 7.1.7.3).
++        self.sleep_ms(100);
++        if let Err(error) = self.attach(port) {
++            ostd::notice!("{}: the device on port {} did not start: {:?}", self.name, port, error);
++        }
++    }
++
++    fn detach(&mut self, port: u8, slot_id: u8) {
++        self.ports[usize::from(port - 1)] = None;
++        if let Some(slot) = self.slots.remove(&slot_id) {
++            // Whatever the device held is let go.
++            for endpoint in &slot.hid {
++                for held in endpoint.pressed.values() {
++                    crate::input::report(held, &[], &[]);
++                }
++            }
++        }
++        let _ = self.command(Trb { control: Trb::with_type(trb_type::DISABLE_SLOT) | u32::from(slot_id) << 24, ..Trb::default() });
++        let _ = self.dcbaa.write_val(usize::from(slot_id) * 8, &0u64);
++        ostd::notice!("{}: port {}: device removed", self.name, port);
++    }
++
++    fn attach(&mut self, port: u8) -> Result<()> {
++        // USB 3 ports enable themselves; USB 2 ports need a reset.
++        if self.portsc(port) & PORT_ENABLED == 0 {
++            let status = self.portsc(port);
++            self.set_portsc(port, (status & PORT_KEEP) | PORT_RESET);
++            if !self.wait(|this| this.portsc(port) & PORT_RESET_CHANGE != 0, 500) {
++                return Err(Error::Timeout);
++            }
++            let status = self.portsc(port);
++            self.set_portsc(port, (status & PORT_KEEP) | PORT_RESET_CHANGE);
++            self.sleep_ms(10);
++        }
++        let status = self.portsc(port);
++        if status & PORT_ENABLED == 0 || status & PORT_CONNECTED == 0 {
++            return Err(Error::Timeout);
++        }
++        let speed = (status >> 10) & 0xf;
++
++        let event = self.command(Trb { control: Trb::with_type(trb_type::ENABLE_SLOT), ..Trb::default() })?;
++        let slot_id = event.slot();
++        let slot = Slot {
++            port,
++            speed,
++            output: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            input: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            ep0: ProducerRing::new().ok_or(Error::NoMemory)?,
++            buffer: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            hid: Vec::new(),
++            last_dci: 1,
++        };
++        let _ = self.dcbaa.write_val(usize::from(slot_id) * 8, &(slot.output.daddr() as u64));
++        self.slots.insert(slot_id, slot);
++        self.ports[usize::from(port - 1)] = Some(slot_id);
++        let result = self.address_and_configure(slot_id);
++        if result.is_err() {
++            self.detach(port, slot_id);
++        }
++        result
++    }
++
++    fn address_and_configure(&mut self, slot_id: u8) -> Result<()> {
++        let (port, speed) = {
++            let slot = &self.slots[&slot_id];
++            (slot.port, slot.speed)
++        };
++        let max_packet = Self::default_max_packet(speed);
++        {
++            let slot = &self.slots[&slot_id];
++            self.clear_input(slot);
++            // Add the slot and the default control endpoint.
++            self.input_write(slot, 0, 1, 0b11);
++            self.input_write(slot, 1, 0, speed << 20 | 1 << 27);
++            self.input_write(slot, 1, 1, u32::from(port) << 16);
++            self.input_write(slot, 2, 1, 3 << 1 | EP_CONTROL << 3 | max_packet << 16);
++            let dequeue = slot.ep0.dequeue_pointer();
++            self.input_write(slot, 2, 2, dequeue as u32);
++            self.input_write(slot, 2, 3, (dequeue >> 32) as u32);
++            self.input_write(slot, 2, 4, 8);
++        }
++        let input = self.slots[&slot_id].input.daddr() as u64;
++        self.command(Trb {
++            parameter: input,
++            control: Trb::with_type(trb_type::ADDRESS_DEVICE) | u32::from(slot_id) << 24,
++            ..Trb::default()
++        })?;
++
++        // A full-speed device's control packets may be larger than 8 bytes.
++        let head = self.get_descriptor(slot_id, 0x80, desc::kind::DEVICE, 0, 8)?;
++        let real = u32::from(*head.get(7).ok_or(Error::Descriptor)?);
++        if speed == SPEED_FULL && real != max_packet && real >= 8 {
++            let slot = &self.slots[&slot_id];
++            self.clear_input(slot);
++            self.input_write(slot, 0, 1, 0b10);
++            self.input_write(slot, 2, 1, 3 << 1 | EP_CONTROL << 3 | real << 16);
++            self.command(Trb {
++                parameter: input,
++                control: Trb::with_type(trb_type::EVALUATE_CONTEXT) | u32::from(slot_id) << 24,
++                ..Trb::default()
++            })?;
++        }
++        let device = desc::parse_device(&self.get_descriptor(slot_id, 0x80, desc::kind::DEVICE, 0, 18)?).ok_or(Error::Descriptor)?;
++        let head = self.get_descriptor(slot_id, 0x80, desc::kind::CONFIGURATION, 0, 9)?;
++        let total = usize::from(u16::from_le_bytes([*head.get(2).ok_or(Error::Descriptor)?, *head.get(3).ok_or(Error::Descriptor)?]));
++        let full = self.get_descriptor(slot_id, 0x80, desc::kind::CONFIGURATION, 0, total.min(4096))?;
++        let configuration = desc::parse_configuration(&full).ok_or(Error::Descriptor)?;
++        self.control(slot_id, 0x00, SET_CONFIGURATION, u16::from(configuration.value), 0, Data::None)?;
++        ostd::notice!(
++            "{}: port {}: USB {:x}.{:02x} device {:04x}:{:04x}, class {:02x}, {} interface(s)",
++            self.name, port, device.usb >> 8, device.usb & 0xff, device.vendor, device.product, device.class,
++            configuration.interfaces.len()
++        );
++        self.start_drivers(slot_id, &configuration);
++        Ok(())
++    }
++
++    /// Hands each interface (its first alternate setting) to its driver.
++    fn start_drivers(&mut self, slot_id: u8, configuration: &Configuration) {
++        for interface in configuration.interfaces.iter().filter(|interface| interface.alternate == 0) {
++            let started = match interface.class {
++                3 => self.start_hid(slot_id, interface),
++                _ => Err(Error::Descriptor),
++            };
++            match started {
++                Ok(()) => ostd::notice!(
++                    "{}: interface {} (class {:02x}/{:02x}/{:02x}) started",
++                    self.name, interface.number, interface.class, interface.subclass, interface.protocol
++                ),
++                Err(_) => ostd::notice!(
++                    "{}: interface {} (class {:02x}/{:02x}/{:02x}) has no driver",
++                    self.name, interface.number, interface.class, interface.subclass, interface.protocol
++                ),
++            }
++        }
++    }
++
++    // ── Control transfers ────────────────────────────────────────────────
++
++    /// GET_DESCRIPTOR: `index` is the interface for a HID report descriptor.
++    fn get_descriptor(&mut self, slot_id: u8, request_type: u8, kind: u8, index: u16, length: usize) -> Result<Vec<u8>> {
++        let length =self.control(slot_id, request_type, GET_DESCRIPTOR, u16::from(kind) << 8, index, Data::In(length))?;
++        let mut data = vec![0u8; length];
++        self.slots[&slot_id].buffer.read_bytes(0, &mut data).map_err(|_| Error::NoMemory)?;
++        Ok(data)
++    }
++
++    /// A control transfer on the default endpoint; returns the bytes the
++    /// device sent (in the slot's buffer).
++    fn control(&mut self, slot_id: u8, request_type: u8, request: u8, value: u16, index: u16, data: Data) -> Result<usize> {
++        let (length, inward) = match data {
++            Data::None => (0, false),
++            Data::In(length) => (length.min(4096), true),
++            Data::Out(bytes) => (bytes.len().min(4096), false),
++        };
++        let slot = self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?;
++        if let Data::Out(bytes) = data {
++            slot.buffer.write_bytes(0, &bytes[..length]).map_err(|_| Error::NoMemory)?;
++        }
++        let setup = u64::from(request_type) | u64::from(request) << 8 | u64::from(value) << 16 | u64::from(index) << 32 | (length as u64) << 48;
++        let transfer_type = match (length, inward) {
++            (0, _) => 0,
++            (_, false) => 2,
++            (_, true) => 3,
++        };
++        slot.ep0.push(Trb { parameter: setup, status: 8, control: Trb::with_type(trb_type::SETUP) | IDT | transfer_type << 16 });
++        let mut data_trb = None;
++        if length > 0 {
++            data_trb = Some(slot.ep0.push(Trb {
++                parameter: slot.buffer.daddr() as u64,
++                status: length as u32,
++                control: Trb::with_type(trb_type::DATA) | ISP | u32::from(inward) << 16,
++            }));
++        }
++        // The status stage goes the other way (IN when there is no data).
++        let status_in = length == 0 || !inward;
++        let status_trb = slot.ep0.push(Trb { control: Trb::with_type(trb_type::STATUS) | IOC | u32::from(status_in) << 16, ..Trb::default() });
++        self.ring(slot_id, 1);
++        let mut received = length;
++        loop {
++            let event = self.wait_event(
++                &mut |event| event.kind() == trb_type::TRANSFER_EVENT && event.slot() == slot_id && event.endpoint() == 1,
++                TRANSFER_TIMEOUT_MS,
++            )?;
++            let code = event.completion_code();
++            if Some(event.parameter) == data_trb && code == SHORT_PACKET {
++                received = length - (event.status & 0xff_ffff) as usize;
++                continue;
++            }
++            if code != SUCCESS && code != SHORT_PACKET {
++                if code == STALL {
++                    self.recover_control(slot_id);
++                }
++                return Err(Error::Completion(code));
++            }
++            if event.parameter == status_trb {
++                return Ok(received);
++            }
++        }
++    }
++
++    /// After a stall, the default endpoint is reset and moved past the
++    /// failed transfer.
++    fn recover_control(&mut self, slot_id: u8) {
++        let _ = self.command(Trb { control: Trb::with_type(trb_type::RESET_ENDPOINT) | 1 << 16 | u32::from(slot_id) << 24, ..Trb::default() });
++        let Some(slot) = self.slots.get(&slot_id) else { return };
++        let dequeue = slot.ep0.dequeue_pointer();
++        let _ = self.command(Trb {
++            parameter: dequeue,
++            control: Trb::with_type(trb_type::SET_TR_DEQUEUE) | 1 << 16 | u32::from(slot_id) << 24,
++            ..Trb::default()
++        });
++    }
++
++    // ── Endpoints ────────────────────────────────────────────────────────
++
++    /// The endpoint context's Interval for a speed (Linux's
++    /// `xhci_get_endpoint_interval`).
++    fn interval(speed: u32, endpoint: &Endpoint) -> u32 {
++        let b = u32::from(endpoint.interval.max(1));
++        match speed {
++            SPEED_LOW | SPEED_FULL => (31 - (b * 8).leading_zeros()).clamp(3, 10),
++            _ => (b.min(16)) - 1,
++        }
++    }
++
++    /// Adds an endpoint to the slot's configuration, with its transfer ring.
++    fn configure_endpoint(&mut self, slot_id: u8, endpoint: &Endpoint, kind: u32, ring: &ProducerRing) -> Result<()> {
++        let dci = endpoint.dci();
++        let slot = self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?;
++        slot.last_dci = slot.last_dci.max(dci);
++        let (speed, last_dci) = (slot.speed, slot.last_dci);
++        let slot = &self.slots[&slot_id];
++        self.clear_input(slot);
++        self.input_write(slot, 0, 1, 1 | 1 << dci);
++        // The slot as it is, with its context entries reaching this endpoint.
++        for dword in 0..4 {
++            let mut value = self.output_read(slot, 0, dword);
++            if dword == 0 {
++                value = (value & !(0x1f << 27)) | u32::from(last_dci) << 27;
++            }
++            if dword == 3 {
++                value = 0;
++            }
++            self.input_write(slot, 1, dword, value);
++        }
++        let max_packet = u32::from(endpoint.max_packet & 0x7ff);
++        let burst = if speed >= 4 { u32::from(endpoint.max_burst) } else { u32::from((endpoint.max_packet >> 11) & 3) };
++        let entry = 1 + usize::from(dci);
++        self.input_write(slot, entry, 0, Self::interval(speed, endpoint) << 16);
++        self.input_write(slot, entry, 1, 3 << 1 | kind << 3 | burst << 8 | max_packet << 16);
++        let dequeue = ring.dequeue_pointer();
++        self.input_write(slot, entry, 2, dequeue as u32);
++        self.input_write(slot, entry, 3, (dequeue >> 32) as u32);
++        let payload = max_packet * (burst + 1);
++        self.input_write(slot, entry, 4, max_packet | payload << 16);
++        let input = slot.input.daddr() as u64;
++        self.command(Trb {
++            parameter: input,
++            control: Trb::with_type(trb_type::CONFIGURE_ENDPOINT) | u32::from(slot_id) << 24,
++            ..Trb::default()
++        })?;
++        Ok(())
++    }
++
++    // ── HID ──────────────────────────────────────────────────────────────
++
++    fn start_hid(&mut self, slot_id: u8, interface: &Interface) -> Result<()> {
++        let endpoint = *interface
++            .endpoints
++            .iter()
++            .find(|endpoint| endpoint.is_in() && endpoint.transfer_type() == TRANSFER_INTERRUPT)
++            .ok_or(Error::Descriptor)?;
++        let number = u16::from(interface.number);
++        let boot = interface.subclass == 1;
++        // Boot keyboards keep the boot protocol, which every one of them
++        // speaks; mice and other HID devices say what they report.
++        let descriptor = if boot && interface.protocol == 1 {
++            let _ = self.control(slot_id, 0x21, SET_PROTOCOL, 0, number, Data::None);
++            hid::parse(hid::BOOT_KEYBOARD).ok_or(Error::Descriptor)?
++        } else {
++            let length = usize::from(interface.hid_report_length.unwrap_or(256)).min(4096);
++            let parsed = self
++                .get_descriptor(slot_id, 0x81, desc::kind::HID_REPORT, number, length)
++                .ok()
++                .and_then(|report| hid::parse(&report));
++            match parsed {
++                Some(parsed) => {
++                    if boot {
++                        let _ = self.control(slot_id, 0x21, SET_PROTOCOL, 1, number, Data::None);
++                    }
++                    parsed
++                }
++                None if boot && interface.protocol == 2 => {
++                    let _ = self.control(slot_id, 0x21, SET_PROTOCOL, 0, number, Data::None);
++                    hid::parse(hid::BOOT_MOUSE).ok_or(Error::Descriptor)?
++                }
++                None => return Err(Error::Descriptor),
++            }
++        };
++        // Reports only when something changes.
++        let _ = self.control(slot_id, 0x21, SET_IDLE, 0, number, Data::None);
++        let ring = ProducerRing::new().ok_or(Error::NoMemory)?;
++        self.configure_endpoint(slot_id, &endpoint, EP_INTERRUPT_IN, &ring)?;
++        let size = usize::from(endpoint.max_packet & 0x7ff).clamp(8, 1024);
++        let mut hid = HidEndpoint {
++            dci: endpoint.dci(),
++            ring,
++            buffers: DmaCoherent::alloc(1, true).map_err(|_| Error::NoMemory)?,
++            size,
++            in_flight: Vec::new(),
++            descriptor,
++            pressed: BTreeMap::new(),
++        };
++        for index in 0..HID_BUFFERS {
++            Self::queue_report(&mut hid, index);
++        }
++        let dci = hid.dci;
++        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.hid.push(hid);
++        self.ring(slot_id, dci);
++        Ok(())
++    }
++
++    fn queue_report(hid: &mut HidEndpoint, index: usize) {
++        let buffer = hid.buffers.daddr() as u64 + (index * 1024) as u64;
++        let address = hid.ring.push(Trb {
++            parameter: buffer,
++            status: hid.size as u32,
++            control: Trb::with_type(trb_type::NORMAL) | IOC | ISP,
++        });
++        hid.in_flight.push((address, index));
++    }
++
++    /// A transfer on an endpoint other than the default one: a HID report.
++    fn transfer_done(&mut self, event: &Trb) {
++        let (slot_id, dci) = (event.slot(), event.endpoint());
++        let code = event.completion_code();
++        {
++            let Some(slot) = self.slots.get_mut(&slot_id) else { return };
++            let Some(hid) = slot.hid.iter_mut().find(|hid| hid.dci == dci) else { return };
++            let Some(position) = hid.in_flight.iter().position(|(address, _)| *address == event.parameter) else { return };
++            let (_, index) = hid.in_flight.remove(position);
++            if code == SUCCESS || code == SHORT_PACKET {
++                let length = hid.size.saturating_sub((event.status & 0xff_ffff) as usize);
++                let mut data = vec![0u8; length];
++                if hid.buffers.read_bytes(index * 1024, &mut data).is_ok() {
++                    if let Some(report) = hid.descriptor.decode(&data) {
++                        let before = hid.pressed.insert(report.report_id, report.pressed.clone()).unwrap_or_default();
++                        crate::input::report(&before, &report.pressed, &report.relative);
++                    }
++                }
++            }
++            if code != STALL {
++                Self::queue_report(hid, index);
++            }
++        }
++        if code == STALL {
++            ostd::notice!("{}: slot {} endpoint {}: stalled", self.name, slot_id, dci);
++            return;
++        }
++        self.ring(slot_id, dci);
++    }
++}
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index dd97512..ddb72a0 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -65,6 +65,8 @@ pub mod util;
+ mod vdso;
+ pub mod vm;
+ 
++pub use thread::kernel_thread::spawn_kernel_thread;
++
+ /// Boots the Asterinas core kernel.
+ pub fn boot() {
+     init::main();
+diff --git a/kernel/core/src/thread/kernel_thread.rs b/kernel/core/src/thread/kernel_thread.rs
+index 69b1cd8..b1052e2 100644
+--- a/kernel/core/src/thread/kernel_thread.rs
++++ b/kernel/core/src/thread/kernel_thread.rs
+@@ -42,6 +42,16 @@ impl AsKernelThread for Task {
+     }
+ }
+ 
++/// Starts a kernel thread running `func`: for drivers outside the core, such
++/// as the USB stack, whose work is a thread of its own. The scheduler runs
++/// only tasks that are threads.
++pub fn spawn_kernel_thread<F>(func: F)
++where
++    F: FnOnce() + Send + 'static,
++{
++    ThreadOptions::new(func).spawn();
++}
++
+ /// Options to create or spawn a new kernel thread.
+ pub(crate) struct ThreadOptions {
+     func: Option<Box<dyn FnOnce() + Send>>,
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index fa60ed6..abf38c1 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -19,6 +19,7 @@ extern crate aster_drm as _;
+ extern crate aster_i8042 as _;
+ extern crate aster_simpledrm as _;
+ extern crate aster_uart as _;
++extern crate aster_usb as _;
+ 
+ #[ostd::main]
+ fn main() {

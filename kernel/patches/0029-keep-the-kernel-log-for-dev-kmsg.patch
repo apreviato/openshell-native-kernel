@@ -1,0 +1,341 @@
+diff --git a/kernel/core/comps/logger/src/aster_logger.rs b/kernel/core/comps/logger/src/aster_logger.rs
+index c1f1416..ad2f346 100644
+--- a/kernel/core/comps/logger/src/aster_logger.rs
++++ b/kernel/core/comps/logger/src/aster_logger.rs
+@@ -1,9 +1,12 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use core::time::Duration;
++use core::{
++    sync::atomic::{AtomicU8, Ordering},
++    time::Duration,
++};
+ 
+ use ostd::{
+-    log::{Level, Record},
++    log::{LevelFilter, Record},
+     timer::Jiffies,
+ };
+ 
+@@ -12,15 +15,28 @@ struct AsterLogger;
+ 
+ static LOGGER: AsterLogger = AsterLogger;
+ 
++/// What the console shows: the `log_level` of the command line.
++static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(LevelFilter::Off as u8);
++
++/// What `/dev/kmsg` keeps, whatever the console shows: up to notices.
++/// (Information is the level of each system call's trace.)
++const KEPT_LEVEL: LevelFilter = LevelFilter::Notice;
++
+ impl ostd::log::Log for AsterLogger {
+     fn log(&self, record: &Record) {
+         let timestamp = Jiffies::elapsed().as_duration();
+-        print_logs(record, &timestamp);
++        if KEPT_LEVEL.is_enabled(record.level()) {
++            super::kmsg::keep(record, timestamp);
++        }
++        if LevelFilter::from_u8(CONSOLE_LEVEL.load(Ordering::Relaxed)).is_enabled(record.level()) {
++            print_logs(record, &timestamp);
++        }
+     }
+ }
+ 
+ #[cfg(feature = "log_color")]
+ fn print_logs(record: &Record, timestamp: &Duration) {
++    use ostd::log::Level;
+     use owo_colors::Style;
+ 
+     let secs = timestamp.as_secs();
+@@ -62,5 +78,12 @@ fn print_logs(record: &Record, timestamp: &Duration) {
+ }
+ 
+ pub(super) fn init() {
++    // The console keeps the command line's level; the records reach the
++    // logger down to what /dev/kmsg keeps.
++    let console = ostd::log::max_level();
++    CONSOLE_LEVEL.store(console as u8, Ordering::Relaxed);
++    if console < KEPT_LEVEL {
++        ostd::log::set_max_level(KEPT_LEVEL);
++    }
+     ostd::log::inject_logger(&LOGGER);
+ }
+diff --git a/kernel/core/comps/logger/src/kmsg.rs b/kernel/core/comps/logger/src/kmsg.rs
+new file mode 100755
+index 0000000..6e53a5e
+--- /dev/null
++++ b/kernel/core/comps/logger/src/kmsg.rs
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The kernel's log as `/dev/kmsg` reads it.
++//!
++//! The latest records stay in a ring, whatever the console shows, so that
++//! a computer without a serial console still has its kernel's messages. Each
++//! is kept as Linux formats a `/dev/kmsg` record: `<level>,<seq>,<usec>,-;<text>`.
++
++use core::{fmt, time::Duration};
++
++use ostd::{
++    log::Record,
++    sync::{LocalIrqDisabled, SpinLock},
++};
++
++/// How many records the ring keeps.
++const RECORDS: usize = 1024;
++/// The longest text kept of a record; the rest is cut.
++const TEXT: usize = 224;
++/// The longest record as `read` formats it: the header and the text.
++pub const MAX_RECORD: usize = TEXT + 64;
++/// A text identical to one of this many latest records is not kept again.
++const REPEATS_SEEN: u64 = 16;
++
++#[derive(Clone, Copy)]
++struct Kept {
++    seq: u64,
++    level: u8,
++    usec: u64,
++    len: u16,
++    text: [u8; TEXT],
++}
++
++impl Kept {
++    const EMPTY: Self = Self {
++        seq: 0,
++        level: 0,
++        usec: 0,
++        len: 0,
++        text: [0; TEXT],
++    };
++}
++
++struct Ring {
++    records: [Kept; RECORDS],
++    /// The sequence number of the next record.
++    next: u64,
++}
++
++static RING: SpinLock<Ring, LocalIrqDisabled> = SpinLock::new(Ring {
++    records: [Kept::EMPTY; RECORDS],
++    next: 0,
++});
++
++/// Text cut at a fixed length, with control characters as spaces.
++struct Text {
++    bytes: [u8; TEXT],
++    len: usize,
++}
++
++impl fmt::Write for Text {
++    fn write_str(&mut self, s: &str) -> fmt::Result {
++        for &byte in s.as_bytes() {
++            if self.len == TEXT {
++                break;
++            }
++            self.bytes[self.len] = if byte < 0x20 || byte == 0x7f { b' ' } else { byte };
++            self.len += 1;
++        }
++        Ok(())
++    }
++}
++
++/// Keeps a record.
++pub(super) fn keep(record: &Record, timestamp: Duration) {
++    let mut text = Text { bytes: [0; TEXT], len: 0 };
++    let _ = fmt::write(&mut text, format_args!("{}{}", record.prefix(), record.args()));
++    // A cut UTF-8 character would make the record invalid text.
++    while text.len > 0 && core::str::from_utf8(&text.bytes[..text.len]).is_err() {
++        text.len -= 1;
++    }
++    let mut ring = RING.lock();
++    // A message repeated over and over (an unimplemented system call that
++    // every program makes) would push everything else out: one is enough
++    // among the latest.
++    let recent = ring.next.saturating_sub(REPEATS_SEEN)..ring.next;
++    let repeated = recent.into_iter().any(|seq| {
++        let kept = &ring.records[(seq % RECORDS as u64) as usize];
++        kept.text[..kept.len as usize] == text.bytes[..text.len]
++    });
++    if repeated {
++        return;
++    }
++    let seq = ring.next;
++    ring.next += 1;
++    ring.records[(seq % RECORDS as u64) as usize] = Kept {
++        seq,
++        level: record.level() as u8,
++        usec: timestamp.as_micros() as u64,
++        len: text.len as u16,
++        text: text.bytes,
++    };
++}
++
++/// A buffer filled from the start, never past its end.
++struct Out<'a> {
++    bytes: &'a mut [u8],
++    len: usize,
++}
++
++impl Out<'_> {
++    fn put(&mut self, data: &[u8]) {
++        let room = self.bytes.len() - self.len;
++        let count = data.len().min(room);
++        self.bytes[self.len..self.len + count].copy_from_slice(&data[..count]);
++        self.len += count;
++    }
++}
++
++impl fmt::Write for Out<'_> {
++    fn write_str(&mut self, s: &str) -> fmt::Result {
++        self.put(s.as_bytes());
++        Ok(())
++    }
++}
++
++/// Formats the first record from `seq` on, or the oldest one kept when the
++/// ring no longer has those, into `out` (at least [`MAX_RECORD`] bytes).
++/// Returns its sequence number and length, or `None` when no record that
++/// new exists yet.
++pub fn read(seq: u64, out: &mut [u8]) -> Option<(u64, usize)> {
++    let kept = {
++        let ring = RING.lock();
++        if seq >= ring.next {
++            return None;
++        }
++        let oldest = ring.next.saturating_sub(RECORDS as u64);
++        ring.records[(seq.max(oldest) % RECORDS as u64) as usize]
++    };
++    let mut writer = Out { bytes: out, len: 0 };
++    let _ = fmt::write(
++        &mut writer,
++        format_args!("{},{},{},-;", kept.level, kept.seq, kept.usec),
++    );
++    writer.put(&kept.text[..kept.len as usize]);
++    writer.put(b"\n");
++    Some((kept.seq, writer.len))
++}
+diff --git a/kernel/core/comps/logger/src/lib.rs b/kernel/core/comps/logger/src/lib.rs
+index 09fd36e..03ab7c6 100644
+--- a/kernel/core/comps/logger/src/lib.rs
++++ b/kernel/core/comps/logger/src/lib.rs
+@@ -27,6 +27,7 @@ macro_rules! __log_prefix {
+ 
+ mod aster_logger;
+ mod console;
++pub mod kmsg;
+ 
+ pub use console::_print;
+ 
+diff --git a/kernel/core/src/device/mem/file.rs b/kernel/core/src/device/mem/file.rs
+index 564a890..e8f1a6a 100644
+--- a/kernel/core/src/device/mem/file.rs
++++ b/kernel/core/src/device/mem/file.rs
+@@ -149,6 +149,84 @@ impl FileOps for MemFile {
+     }
+ }
+ 
++/// An open `/dev/kmsg`: the kernel's log from its oldest kept record on, one
++/// record per read, as on Linux. Past the newest record a read returns 0.
++/// Writing logs the text as a notice from user space.
++pub(super) struct KmsgFile {
++    next: core::sync::atomic::AtomicU64,
++}
++
++impl KmsgFile {
++    pub(super) fn new() -> Self {
++        Self {
++            next: core::sync::atomic::AtomicU64::new(0),
++        }
++    }
++}
++
++impl Pollable for KmsgFile {
++    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
++        (IoEvents::IN | IoEvents::OUT) & mask
++    }
++}
++
++impl FileOps for KmsgFile {
++    fn read_at(
++        &self,
++        _offset: usize,
++        writer: &mut VmWriter,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        use core::sync::atomic::Ordering;
++
++        let mut record = [0u8; aster_logger::kmsg::MAX_RECORD];
++        let Some((seq, len)) = aster_logger::kmsg::read(self.next.load(Ordering::Relaxed), &mut record)
++        else {
++            return Ok(0);
++        };
++        if writer.avail() < len {
++            return_errno_with_message!(Errno::EINVAL, "the buffer is smaller than the log record");
++        }
++        let written = writer
++            .write_fallible(&mut VmReader::from(&record[..len]))
++            .map_err(|(err, _)| Error::from(err))?;
++        self.next.store(seq + 1, Ordering::Relaxed);
++        Ok(written)
++    }
++
++    fn write_at(
++        &self,
++        _offset: usize,
++        reader: &mut VmReader,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        const MAX_MESSAGE: usize = 1024;
++
++        let total = reader.remain();
++        let mut message = vec![0u8; total.min(MAX_MESSAGE)];
++        reader.read_fallible(&mut VmWriter::from(message.as_mut_slice()))?;
++        reader.skip(reader.remain());
++        let text = String::from_utf8_lossy(&message);
++        // Linux's optional "<level>" prefix is dropped.
++        let text = match text.strip_prefix('<').and_then(|rest| rest.split_once('>')) {
++            Some((level, rest)) if level.bytes().all(|b| b.is_ascii_digit()) => rest,
++            _ => &text,
++        };
++        ostd::notice!("user: {}", text.trim_end());
++        Ok(total)
++    }
++}
++
++impl PerOpenFileOps for KmsgFile {
++    fn check_seekable(&self) -> Result<()> {
++        Ok(())
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++}
++
+ impl PerOpenFileOps for MemFile {
+     fn check_seekable(&self) -> Result<()> {
+         Ok(())
+diff --git a/kernel/core/src/device/mem/mod.rs b/kernel/core/src/device/mem/mod.rs
+index e6755a9..a2c9ed2 100644
+--- a/kernel/core/src/device/mem/mod.rs
++++ b/kernel/core/src/device/mem/mod.rs
+@@ -57,6 +57,8 @@ pub(super) fn init_in_first_kthread() {
+     add_device(MemFile::Random).unwrap();
+     add_device(MemFile::Urandom).unwrap();
+     add_device(MemFile::Zero).unwrap();
++    // The kernel's log, kept for /dev/kmsg whatever the console shows.
++    add_device(MemFile::Kmsg).unwrap();
+     // The initramfs stays in memory reserved at boot. A system that runs from
+     // it, such as a live medium the kernel cannot read after booting, installs
+     // itself by copying it.
+@@ -113,6 +115,10 @@ impl Device for MemDevice {
+     }
+ 
+     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        // Each open file of /dev/kmsg reads the log from its own place.
++        if matches!(self.payload(), MemFile::Kmsg) {
++            return Ok(Box::new(file::KmsgFile::new()));
++        }
+         Ok(Box::new(*self.payload()))
+     }
+ }

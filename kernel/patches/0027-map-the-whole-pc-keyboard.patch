@@ -1,0 +1,156 @@
+diff --git a/kernel/comps/i8042/src/keyboard.rs b/kernel/comps/i8042/src/keyboard.rs
+index ad237d2..cd51ec3 100644
+--- a/kernel/comps/i8042/src/keyboard.rs
++++ b/kernel/comps/i8042/src/keyboard.rs
+@@ -335,9 +335,27 @@ impl ScancodeInfo {
+     fn to_key_code(&self) -> Option<KeyCode> {
+         let ScanCode(code) = self.scancode;
+ 
+-        // Handle extended keys.
++        // Handle extended keys (E0 prefix), as Linux's atkbd maps them. The
++        // "fake shifts" around Print Screen and the navigation keys (E0 2A,
++        // E0 36) map to nothing.
++        // Reference: <https://www.win.tue.nl/~aeb/linux/kbd/scancodes-1.html>.
+         if self.extended {
+             return match code {
++                0x10 => Some(KeyCode::PreviousSong),
++                0x19 => Some(KeyCode::NextSong),
++                0x1C => Some(KeyCode::KpEnter),
++                0x1D => Some(KeyCode::RightCtrl),
++                0x20 => Some(KeyCode::Mute),
++                0x21 => Some(KeyCode::Calc),
++                0x22 => Some(KeyCode::PlayPause),
++                0x24 => Some(KeyCode::StopCd),
++                0x2E => Some(KeyCode::VolumeDown),
++                0x30 => Some(KeyCode::VolumeUp),
++                0x32 => Some(KeyCode::HomePage),
++                0x35 => Some(KeyCode::KpSlash),
++                0x37 => Some(KeyCode::Sysrq),
++                0x38 => Some(KeyCode::RightAlt),
++                0x46 => Some(KeyCode::Pause), // Ctrl+Break
+                 0x47 => Some(KeyCode::Home),
+                 0x48 => Some(KeyCode::Up),
+                 0x49 => Some(KeyCode::PageUp),
+@@ -348,6 +366,17 @@ impl ScancodeInfo {
+                 0x51 => Some(KeyCode::PageDown),
+                 0x52 => Some(KeyCode::Insert),
+                 0x53 => Some(KeyCode::Delete),
++                0x5B => Some(KeyCode::LeftMeta),
++                0x5C => Some(KeyCode::RightMeta),
++                0x5D => Some(KeyCode::Compose),
++                0x5E => Some(KeyCode::Power),
++                0x5F => Some(KeyCode::Sleep),
++                0x63 => Some(KeyCode::WakeUp),
++                0x65 => Some(KeyCode::Search),
++                0x69 => Some(KeyCode::Forward),
++                0x6A => Some(KeyCode::Back),
++                0x6B => Some(KeyCode::Computer),
++                0x6C => Some(KeyCode::Mail),
+                 _ => None,
+             };
+         }
+@@ -416,9 +445,36 @@ impl ScancodeInfo {
+             // Modifier keys
+             0x1D => KeyCode::LeftCtrl,
+             0x2A => KeyCode::LeftShift,
++            0x36 => KeyCode::RightShift,
+             0x38 => KeyCode::LeftAlt,
+             0x3A => KeyCode::CapsLock,
+ 
++            // Lock keys
++            0x45 => KeyCode::NumLock,
++            0x46 => KeyCode::ScrollLock,
++
++            // Keypad (with Num Lock off, the keymap above the input layer
++            // gives the navigation keys, as in Linux)
++            0x37 => KeyCode::KpAsterisk,
++            0x47 => KeyCode::Kp7,
++            0x48 => KeyCode::Kp8,
++            0x49 => KeyCode::Kp9,
++            0x4A => KeyCode::KpMinus,
++            0x4B => KeyCode::Kp4,
++            0x4C => KeyCode::Kp5,
++            0x4D => KeyCode::Kp6,
++            0x4E => KeyCode::KpPlus,
++            0x4F => KeyCode::Kp1,
++            0x50 => KeyCode::Kp2,
++            0x51 => KeyCode::Kp3,
++            0x52 => KeyCode::Kp0,
++            0x53 => KeyCode::KpDot,
++
++            // ISO and ABNT2 (Brazilian) keys
++            0x56 => KeyCode::Key102nd,
++            0x73 => KeyCode::Ro,
++            0x7E => KeyCode::KpComma,
++
+             // Function keys
+             0x3B => KeyCode::F1,
+             0x3C => KeyCode::F2,
+diff --git a/kernel/core/comps/input/src/event_type_codes.rs b/kernel/core/comps/input/src/event_type_codes.rs
+index 9b3cefd..eccacab 100644
+--- a/kernel/core/comps/input/src/event_type_codes.rs
++++ b/kernel/core/comps/input/src/event_type_codes.rs
+@@ -349,6 +349,29 @@ pub enum KeyCode {
+     Power = 116,
+     Pause = 119,
+ 
++    // The rest of a PC keyboard, with Linux's codes: the ISO and ABNT2 keys,
++    // Print Screen, the context menu key, and the media and launch keys.
++    Key102nd = 86, // The key left of Z on ISO keyboards (<> on ABNT2)
++    Ro = 89,       // ABNT2's /? key, right of the period
++    Sysrq = 99,    // Print Screen
++    KpComma = 121, // ABNT2's keypad dot
++    Compose = 127, // Context menu key, as PC keyboards send it
++    Calc = 140,
++    Sleep = 142,
++    WakeUp = 143,
++    Mail = 155,
++    Computer = 157,
++    Back = 158,
++    Forward = 159,
++    NextSong = 163,
++    PlayPause = 164,
++    PreviousSong = 165,
++    StopCd = 166,
++    HomePage = 172,
++    Search = 217,
++    BrightnessDown = 224,
++    BrightnessUp = 225,
++
+     // Starting code of button events.
+     BtnMisc = 0x100,
+ 
+diff --git a/kernel/core/comps/input/src/input_dev.rs b/kernel/core/comps/input/src/input_dev.rs
+index b1f2a71..c475bd4 100644
+--- a/kernel/core/comps/input/src/input_dev.rs
++++ b/kernel/core/comps/input/src/input_dev.rs
+@@ -460,6 +460,29 @@ impl InputCapability {
+             KeyCode::Mute,
+             KeyCode::VolumeDown,
+             KeyCode::VolumeUp,
++            // The rest of a PC keyboard
++            KeyCode::Key102nd,
++            KeyCode::Ro,
++            KeyCode::KpComma,
++            KeyCode::Sysrq,
++            KeyCode::Compose,
++            KeyCode::Pause,
++            KeyCode::Power,
++            KeyCode::Sleep,
++            KeyCode::WakeUp,
++            KeyCode::Calc,
++            KeyCode::Mail,
++            KeyCode::Computer,
++            KeyCode::Back,
++            KeyCode::Forward,
++            KeyCode::NextSong,
++            KeyCode::PlayPause,
++            KeyCode::PreviousSong,
++            KeyCode::StopCd,
++            KeyCode::HomePage,
++            KeyCode::Search,
++            KeyCode::BrightnessDown,
++            KeyCode::BrightnessUp,
+         ];
+ 
+         for key in standard_keys {

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use openshell_shell::{read_hostd_readiness, write_cef_bootstrap, write_cef_startup};
 use openshell_shell::install::SYSTEM_SOCKET_ENV;
-use openshell_shell::session::MODE_ENV;
+use openshell_shell::session::{LOGS_ENV, MODE_ENV};
 use openshell_shell::update::{INBOX_ENV, RELEASE_KEYS_ENV};
 use openshell_shell::login::GREETER_SOCKET_ENV;
 use openshell_shell::session::{DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET};
@@ -64,6 +64,47 @@ impl Drop for SessionProcess {
         unsafe { kill(group, SIGKILL) };
         let _ = self.0.wait();
     }
+}
+
+/// The cursor theme the session's programs load: the helper's, which follows
+/// Settings ▸ Cursor (cursorTheme.py in the Desktop bundle).
+const CURSOR_THEME: &str = "OpenShell";
+/// How long the session waits for the cursor helper before the Desktop starts.
+const CURSOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts the Desktop's cursor helper for this display (`cursorTheme.py
+/// --watch`, as OpenShell Live's xsession.sh does) and waits until it has
+/// applied the saved cursor. The session goes on without it.
+fn start_cursor_watcher(bundle: &Path, home: &Path, runtime: &Path, state: &Path) -> Option<SessionProcess> {
+    let helper = bundle.join("hostd/native/cursorTheme.py");
+    if !helper.is_file() {
+        return None;
+    }
+    let ready = runtime.join("openshell-cursor-ready");
+    let _ = fs::remove_file(&ready);
+    let log = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600)
+        .open(state.join("cursor.log")).ok()?;
+    let child = session_command(OsStr::new("python3"))
+        .arg(&helper)
+        .arg("--watch")
+        .arg("--ready-file")
+        .arg(&ready)
+        .env("HOME", home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().ok()?)
+        .stderr(log)
+        .spawn()
+        .ok()?;
+    let mut watcher = SessionProcess(child);
+    let deadline = Instant::now() + CURSOR_READY_TIMEOUT;
+    while !ready.exists() && Instant::now() < deadline {
+        if matches!(watcher.0.try_wait(), Ok(Some(_))) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Some(watcher)
 }
 
 /// Restarts within RESTART_WINDOW, with an exponential delay between them.
@@ -131,7 +172,7 @@ fn session_command(executable: &OsStr) -> Command {
     // (MODE_ENV), and where updates go (update.rs).
     for name in [
         "PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE", "XDG_DATA_DIRS",
-        GREETER_SOCKET_ENV, SYSTEM_SOCKET_ENV, MODE_ENV, INBOX_ENV, RELEASE_KEYS_ENV,
+        GREETER_SOCKET_ENV, SYSTEM_SOCKET_ENV, MODE_ENV, INBOX_ENV, RELEASE_KEYS_ENV, LOGS_ENV,
     ] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
@@ -183,6 +224,16 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let profile_path = profile.to_str().filter(|path| !path.contains(['\r', '\n']))
         .ok_or("CEF profile path must be UTF-8 without line breaks")?;
 
+    // The cursor of OpenShell Live's session (xsession.sh): the Desktop's
+    // helper applies the saved cursor to this display before the Desktop
+    // draws and follows Settings ▸ Cursor; the session's programs find it as
+    // the "OpenShell" theme among the account's icons.
+    let _cursor = start_cursor_watcher(&bundle, &home, &runtime, &state);
+    let mut cursor_path = home.join(".icons").into_os_string();
+    cursor_path.push(":");
+    cursor_path.push(home.join(".local/share/icons"));
+    cursor_path.push(":/usr/share/icons:/usr/share/pixmaps");
+
     // hostd's errors, kept per session. Its stdout carries the bootstrap
     // secret and is never logged.
     let log = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(state.join("hostd.log"))?;
@@ -196,6 +247,8 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
             .env("HOME", &home)
             // The screen lock (openshell-lock) keeps its marker there, as on Live.
             .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XCURSOR_THEME", CURSOR_THEME)
+            .env("XCURSOR_PATH", &cursor_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(log.try_clone()?)
@@ -217,6 +270,8 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let mut browser = SessionProcess(browser
         .env("HOME", &home)
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XCURSOR_THEME", CURSOR_THEME)
+        .env("XCURSOR_PATH", &cursor_path)
         .stdin(Stdio::piped())
         .spawn()?);
     // The pipe stays open for the session: the host ends the session when it closes.

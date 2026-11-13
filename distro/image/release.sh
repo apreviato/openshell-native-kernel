@@ -31,11 +31,44 @@ release_files() {
 release_boot_cfg() {
     local name=$1
     shift
-    # GRUB sets $root, $openshell_slot and $openshell_data_uuid (grub.cfg).
-    # The echo reaches the serial port; the splash hides it on the screen.
+    local args="SHELL=/bin/sh LOGNAME=root HOME=/ USER=root PATH=/bin:/usr/bin:/benchmark loglevel=error earlycon console=hvc0 openshell.slot=\$openshell_slot openshell.release=$name openshell.data=\$openshell_data_uuid"
+    # GRUB sets $root, $openshell_slot, $openshell_data_uuid and, with the
+    # data partition, $openshell_data (grub.cfg). The echo reaches the serial
+    # port; the splash hides it on the screen.
+    #
+    # A system slot whose first boot copied the system to the data partition
+    # (installed-session.sh, populate_disk_root) starts from that copy, with
+    # the small boot-root.cpio (probes/disk-root.sh) instead of the whole
+    # system in memory. The copy's GRUB environment block says for which
+    # release it is ready; GRUB marks the attempt there first, and the system
+    # marks it good once it runs. An attempt that never got so far, a copy of
+    # another release or none starts the system from memory, as before.
     cat <<EOF
 echo "OpenShell Native: release $name"
-linux (\$root)/kernel SHELL=/bin/sh LOGNAME=root HOME=/ USER=root PATH=/bin:/usr/bin:/benchmark loglevel=error earlycon console=hvc0 openshell.slot=\$openshell_slot openshell.release=$name openshell.data=\$openshell_data_uuid -- $*
-initrd (\$root)/initramfs.cpio.gz
+set openshell_tree=
+if [ "\$openshell_slot" = a -o "\$openshell_slot" = b ]; then
+    set openshell_tree_env=(\$openshell_data)/openshell/system-root/\$openshell_slot.env
+    # Tested first: a missing file would print GRUB's error over the splash.
+    if [ -n "\$openshell_data" -a -f "\$openshell_tree_env" ]; then
+        set openshell_tree_release=
+        set openshell_tree_state=
+        if load_env --file \$openshell_tree_env openshell_tree_release openshell_tree_state; then
+            if [ "\$openshell_tree_release" = "$name" -a "\$openshell_tree_state" = good ]; then
+                set openshell_tree_state=trying
+                if save_env --file \$openshell_tree_env openshell_tree_state; then
+                    set openshell_tree=(\$openshell_data)/openshell/system-root/\$openshell_slot
+                fi
+            fi
+        fi
+    fi
+fi
+if [ -n "\$openshell_tree" ]; then
+    echo "OpenShell Native: the system's copy on the data partition"
+    linux (\$root)/kernel $args openshell.root=disk -- $*
+    initrd \$openshell_tree/opt/openshell-compat/boot-root.cpio
+else
+    linux (\$root)/kernel $args -- $*
+    initrd (\$root)/initramfs.cpio.gz
+fi
 EOF
 }

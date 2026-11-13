@@ -1,0 +1,460 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 77d8f4b..9822778 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -76,6 +76,17 @@ version = "0.2.21"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+ 
++[[package]]
++name = "aster-backlight"
++version = "0.1.0"
++dependencies = [
++ "aster-device",
++ "aster-pci",
++ "component",
++ "ostd",
++ "spin",
++]
++
+ [[package]]
+ name = "aster-bigtcp"
+ version = "0.1.0"
+@@ -484,6 +495,7 @@ dependencies = [
+ name = "asterinas"
+ version = "0.1.0"
+ dependencies = [
++ "aster-backlight",
+  "aster-core",
+  "aster-drm",
+  "aster-i8042",
+diff --git a/Cargo.toml b/Cargo.toml
+index 034636c..b62ee7b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,7 @@ members = [
+     "ostd/libs/ostd-test",
+     "ostd/libs/padding-struct",
+     "kernel",
++    "kernel/comps/backlight",
+     "kernel/comps/drm",
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
+@@ -82,6 +83,7 @@ default-members = [
+     "osdk/deps/test-kernel",
+     "ostd",
+     "kernel",
++    "kernel/comps/backlight",
+     "kernel/comps/drm",
+     "kernel/comps/i8042",
+     "kernel/comps/simpledrm",
+@@ -169,6 +171,7 @@ aster-core = { path = "kernel/core", default-features = false }
+ 
+ # Crates under kernel/comps
+ aster-drm = { path = "kernel/comps/drm" }
++aster-backlight = { path = "kernel/comps/backlight" }
+ aster-i8042 = { path = "kernel/comps/i8042" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+ aster-uart = { path = "kernel/comps/uart" }
+diff --git a/Components.toml b/Components.toml
+index 4c56d27..c87bba1 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -1,5 +1,6 @@
+ # template
+ [components]
++backlight = { name = "aster-backlight" }
+ block = { name = "aster-block" }
+ cmdline = { name = "aster-cmdline" }
+ console = { name = "aster-console" }
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 0b09fed..b0eb176 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -15,6 +15,7 @@ aster-simpledrm.workspace = true
+ aster-uart.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
++aster-backlight.workspace = true
+ aster-i8042.workspace = true
+ 
+ [features]
+diff --git a/kernel/comps/backlight/Cargo.toml b/kernel/comps/backlight/Cargo.toml
+new file mode 100755
+index 0000000..d32f8f7
+--- /dev/null
++++ b/kernel/comps/backlight/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "aster-backlight"
++version = "0.1.0"
++edition.workspace = true
++
++[target.x86_64-unknown-none.dependencies]
++aster-device.workspace = true
++aster-pci.workspace = true
++component.workspace = true
++ostd.workspace = true
++spin.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/backlight/src/intel.rs b/kernel/comps/backlight/src/intel.rs
+new file mode 100755
+index 0000000..43aa384
+--- /dev/null
++++ b/kernel/comps/backlight/src/intel.rs
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The backlight PWM of Intel graphics, as the firmware left it running.
++//!
++//! The layout depends on the chipset (PCH), which Linux's i915 tells from the
++//! ISA bridge's device ID (`intel_pch.c`), and the registers are those of
++//! `intel_backlight.c`:
++//!
++//! - Ibex Peak, Cougar Point, Panther Point (Ironlake to Ivy Bridge): the
++//!   period in the high half of `BLC_PWM_PCH_CTL2`, the duty cycle in the low
++//!   half of the CPU's `BLC_PWM_CPU_CTL`.
++//! - Lynx Point to Kaby Point (Haswell to Kaby Lake): period and duty cycle in
++//!   the halves of `BLC_PWM_PCH_CTL2`.
++//! - Cannon Point and later (Coffee Lake to today's), and Broxton and Gemini
++//!   Lake (Atom): a 32-bit period and duty cycle per PWM controller.
++
++use alloc::{sync::Arc, vec, vec::Vec};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    cfg_space::{Bar, BarAccess},
++    common_device::PciCommonDevice,
++};
++use ostd::{
++    bus::BusProbeError,
++    sync::{LocalIrqDisabled, SpinLock},
++};
++
++use crate::Backlight;
++
++const INTEL: u16 = 0x8086;
++const CLASS_DISPLAY: u8 = 0x03;
++const CLASS_BRIDGE: u8 = 0x06;
++const SUBCLASS_ISA: u8 = 0x01;
++
++// South display engine registers (offsets in the GPU's MMIO BAR).
++const BLC_PWM_PCH_CTL1: usize = 0xC8250;
++const BLC_PWM_PCH_CTL2: usize = 0xC8254;
++const BLC_PWM_CPU_CTL: usize = 0x48254;
++const BXT_BLC_PWM_CTL: [usize; 2] = [0xC8250, 0xC8350];
++const BXT_BLC_PWM_FREQ: [usize; 2] = [0xC8254, 0xC8354];
++const BXT_BLC_PWM_DUTY: [usize; 2] = [0xC8258, 0xC8358];
++const PWM_ENABLE: u32 = 1 << 31;
++
++/// Where the duty cycle and the period are.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Layout {
++    /// Period in `BLC_PWM_PCH_CTL2[31:16]`, duty in `BLC_PWM_CPU_CTL[15:0]`.
++    Pch,
++    /// Period and duty in `BLC_PWM_PCH_CTL2[31:16]` and `[15:0]`.
++    Lpt,
++    /// A 32-bit period and duty cycle of PWM controller `n`.
++    Bxt(usize),
++}
++
++/// The chipset's layout, from the ISA bridge (i915's `intel_pch_type`).
++fn layout_of_pch(pch: u16) -> Option<Layout> {
++    let layout = match pch & 0xff80 {
++        // Ibex Peak, Cougar Point, Panther Point.
++        0x3b00 | 0x1c00 | 0x1e00 => Layout::Pch,
++        // Lynx Point, Wildcat Point, Sunrise Point, Kaby Point (and their LP).
++        0x8c00 | 0x9c00 | 0x8c80 | 0x9c80 | 0xa100 | 0x9d00 | 0xa280 => Layout::Lpt,
++        // Cannon Point, Comet Point, Ice Point, Jasper and Mule Creek, Tiger
++        // Point, Alder Point, Meteor Point and later.
++        0xa300 | 0x9d80 | 0x0280 | 0x0680 | 0xa380 | 0x3480 | 0x4d80 | 0x3880 | 0x4b00
++        | 0xa080 | 0x4380 | 0x7a80 | 0x5180 | 0x7a00 | 0x5480 | 0x7e00 | 0xae00 | 0x7700
++        | 0x7f00 | 0xa800 => Layout::Bxt(0),
++        _ => return None,
++    };
++    Some(layout)
++}
++
++/// Broxton and Gemini Lake (Atom laptops) have no PCH: their GPU tells.
++fn layout_of_gpu(gpu: u16) -> Option<Layout> {
++    matches!(gpu, 0x0a84 | 0x1a84 | 0x1a85 | 0x5a84 | 0x5a85 | 0x3184 | 0x3185).then_some(Layout::Bxt(0))
++}
++
++struct IntelBacklight {
++    mmio: BarAccess,
++    layout: Layout,
++    max: u32,
++    lock: SpinLock<(), LocalIrqDisabled>,
++    /// The GPU, kept with its mapped registers.
++    _gpu: PciCommonDevice,
++}
++
++impl IntelBacklight {
++    fn read(&self, offset: usize) -> u32 {
++        self.mmio.read_once::<u32>(offset).unwrap_or(0)
++    }
++
++    fn write(&self, offset: usize, value: u32) {
++        let _ = self.mmio.write_once::<u32>(offset, value);
++    }
++
++    /// The PWM as the firmware left it: its period and duty cycle, if it is on
++    /// and its values make sense.
++    fn probe(mmio: &BarAccess, layout: Layout) -> Option<(u32, u32)> {
++        let read = |offset: usize| mmio.read_once::<u32>(offset).ok();
++        let (enabled, period, duty) = match layout {
++            Layout::Pch => {
++                let ctl2 = read(BLC_PWM_PCH_CTL2)?;
++                (read(BLC_PWM_PCH_CTL1)? & PWM_ENABLE != 0, ctl2 >> 16, read(BLC_PWM_CPU_CTL)? & 0xffff)
++            }
++            Layout::Lpt => {
++                let ctl2 = read(BLC_PWM_PCH_CTL2)?;
++                (read(BLC_PWM_PCH_CTL1)? & PWM_ENABLE != 0, ctl2 >> 16, ctl2 & 0xffff)
++            }
++            Layout::Bxt(n) => (
++                read(BXT_BLC_PWM_CTL[n])? & PWM_ENABLE != 0,
++                read(BXT_BLC_PWM_FREQ[n])?,
++                read(BXT_BLC_PWM_DUTY[n])?,
++            ),
++        };
++        // An unpowered register reads as all ones.
++        let plausible = enabled && period >= 16 && period != u32::MAX && duty <= period;
++        plausible.then_some((period, duty))
++    }
++}
++
++impl Backlight for IntelBacklight {
++    fn max(&self) -> u32 {
++        self.max
++    }
++
++    fn get(&self) -> u32 {
++        match self.layout {
++            Layout::Pch => self.read(BLC_PWM_CPU_CTL) & 0xffff,
++            Layout::Lpt => self.read(BLC_PWM_PCH_CTL2) & 0xffff,
++            Layout::Bxt(n) => self.read(BXT_BLC_PWM_DUTY[n]),
++        }
++        .min(self.max)
++    }
++
++    fn set(&self, level: u32) {
++        let level = level.min(self.max);
++        let _guard = self.lock.lock();
++        match self.layout {
++            Layout::Pch => {
++                let ctl = self.read(BLC_PWM_CPU_CTL) & !0xffff;
++                self.write(BLC_PWM_CPU_CTL, ctl | level);
++            }
++            Layout::Lpt => {
++                let ctl2 = self.read(BLC_PWM_PCH_CTL2) & !0xffff;
++                self.write(BLC_PWM_PCH_CTL2, ctl2 | level);
++            }
++            Layout::Bxt(n) => self.write(BXT_BLC_PWM_DUTY[n], level),
++        }
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++/// Keeps Intel's GPU and notes the chipset's ISA bridge, which it leaves alone.
++#[derive(Debug)]
++struct Driver {
++    gpus: SpinLock<Vec<PciCommonDevice>>,
++    pch: SpinLock<Option<u16>>,
++}
++
++impl Driver {
++    fn new() -> Self {
++        Self { gpus: SpinLock::new(Vec::new()), pch: SpinLock::new(None) }
++    }
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if id.vendor_id != INTEL {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        if id.class == CLASS_BRIDGE && id.subclass == SUBCLASS_ISA {
++            *self.pch.lock() = Some(id.device_id);
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        // The integrated GPU is on bus 0 (00:02.0); a discrete Intel GPU's
++        // backlight is not on this PWM.
++        if id.class != CLASS_DISPLAY || device.location().bus != 0 {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.gpus.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++pub(super) fn init() {
++    let driver = Arc::new(Driver::new());
++    PCI_BUS.lock().register_driver(driver.clone());
++    let pch = *driver.pch.lock();
++    for mut gpu in core::mem::take(&mut *driver.gpus.lock()) {
++        let gpu_id = gpu.device_id().device_id;
++        let Some(layout) = pch.and_then(layout_of_pch).or_else(|| layout_of_gpu(gpu_id)) else {
++            ostd::notice!("Intel GPU {:04x} with chipset {:04x?}: its backlight layout is unknown", gpu_id, pch);
++            continue;
++        };
++        let Some(Bar::Memory(_)) = gpu.bar_manager().bar(0) else { continue };
++        let Some(mmio) = gpu.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
++            ostd::notice!("Intel GPU {:04x}: its registers cannot be mapped", gpu_id);
++            continue;
++        };
++        // The firmware may have used the second PWM controller.
++        let candidates = match layout {
++            Layout::Bxt(_) => vec![Layout::Bxt(0), Layout::Bxt(1)],
++            other => vec![other],
++        };
++        let Some((layout, (period, duty))) = candidates
++            .into_iter()
++            .find_map(|layout| IntelBacklight::probe(&mmio, layout).map(|values| (layout, values)))
++        else {
++            ostd::notice!("Intel GPU {:04x} with chipset {:04x?}: the firmware left no backlight PWM running", gpu_id, pch);
++            continue;
++        };
++        ostd::notice!(
++            "Intel GPU {:04x} with chipset {:04x?}: backlight {:?} at {} of {}",
++            gpu_id, pch, layout, duty, period
++        );
++        let backlight = IntelBacklight { mmio, layout, max: period, lock: SpinLock::new(()), _gpu: gpu };
++        crate::add("intel_backlight", Arc::new(backlight));
++        // One built-in screen.
++        break;
++    }
++}
+diff --git a/kernel/comps/backlight/src/lib.rs b/kernel/comps/backlight/src/lib.rs
+new file mode 100755
+index 0000000..f2e1c46
+--- /dev/null
++++ b/kernel/comps/backlight/src/lib.rs
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The backlight of a laptop's built-in screen, as Linux's
++//! `/sys/class/backlight`.
++//!
++//! Without a GPU driver, the panel's backlight keeps what the firmware set.
++//! On Intel graphics (most laptops, and the built-in screen of most hybrid
++//! ones), the firmware leaves the backlight's PWM running in the south
++//! display engine, and its duty cycle is the brightness. This driver finds
++//! the PWM's layout from the chipset (PCH), as Linux's i915 does
++//! (`intel_backlight.c`), and offers `intel_backlight` with Linux's
++//! attributes: `brightness` (root may write it), `actual_brightness`,
++//! `max_brightness` and `type`. It refuses PWM values the firmware did not
++//! leave consistent, so that it never darkens a screen it does not understand.
++
++#![no_std]
++#![deny(unsafe_code)]
++#![cfg(target_arch = "x86_64")]
++
++extern crate alloc;
++
++// Set this crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "backlight: "
++    };
++}
++
++mod intel;
++
++use alloc::sync::Arc;
++use core::fmt::Write;
++
++use aster_device::{
++    class::{self, Class, ClassDevice, ClassHandle},
++    common::{Attr, Error},
++};
++use component::{ComponentInitError, init_component};
++use spin::Once;
++
++/// A panel backlight: its level, between 0 and `max`.
++pub trait Backlight: Send + Sync + 'static {
++    fn max(&self) -> u32;
++    fn get(&self) -> u32;
++    fn set(&self, level: u32);
++}
++
++/// Linux's `backlight` class.
++struct BacklightClass;
++
++type BacklightDevice = ClassDevice<BacklightClass>;
++
++impl Class for BacklightClass {
++    const NAME: &'static str = "backlight";
++    type Device = Arc<dyn Backlight>;
++
++    fn dev_attrs(&self) -> &'static [Attr<BacklightDevice>] {
++        ATTRS
++    }
++}
++
++const ATTRS: &[Attr<BacklightDevice>] = &[
++    Attr::rw("brightness", show_level, store_level),
++    Attr::ro("actual_brightness", show_level),
++    Attr::ro("max_brightness", |dev, w| {
++        writeln!(w, "{}", dev.payload().max()).map_err(|_| Error::Format)
++    }),
++    // A level the hardware applies as it is.
++    Attr::ro("type", |_dev, w| writeln!(w, "raw").map_err(|_| Error::Format)),
++];
++
++fn show_level(dev: &BacklightDevice, w: &mut dyn Write) -> aster_device::common::Result<()> {
++    writeln!(w, "{}", dev.payload().get()).map_err(|_| Error::Format)
++}
++
++fn store_level(dev: &BacklightDevice, value: &str) -> aster_device::common::Result<()> {
++    let level: u32 = value.trim().parse().map_err(|_| Error::InvalidValue)?;
++    let backlight = dev.payload();
++    if level > backlight.max() {
++        return Err(Error::InvalidValue);
++    }
++    backlight.set(level);
++    Ok(())
++}
++
++static CLASS: Once<Arc<ClassHandle<BacklightClass>>> = Once::new();
++
++/// Offers a backlight as `/sys/class/backlight/<name>`.
++fn add(name: &'static str, backlight: Arc<dyn Backlight>) {
++    let Some(class) = CLASS.get() else { return };
++    let device = BacklightDevice::builder(class, name, backlight).build();
++    if let Err(error) = aster_device::add_device(&device) {
++        ostd::warn!("could not add {}: {:?}", name, error);
++    }
++}
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    let class = class::register(BacklightClass).map_err(|_| ComponentInitError::Unknown)?;
++    CLASS.call_once(|| class);
++    intel::init();
++    Ok(())
++}
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 734d049..fa60ed6 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -12,6 +12,8 @@
+ // Each high-level component crate must have an explicit `extern crate` declaration
+ // to ensure that its component registration and initialization code are linked into
+ // the kernel, because the assembler does not otherwise reference symbols from that crate.
++#[cfg(target_arch = "x86_64")]
++extern crate aster_backlight as _;
+ extern crate aster_drm as _;
+ #[cfg(target_arch = "x86_64")]
+ extern crate aster_i8042 as _;

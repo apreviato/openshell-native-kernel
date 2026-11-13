@@ -13,6 +13,9 @@ pub const DESKTOP_HEALTH_ENV: &str = "OPENSHELL_NATIVE_HEALTH";
 /// Whether the session is a live medium's or an installed system's ("live" or
 /// "installed"): hostd's OPENSHELL_MODE, which OpenShell Live tells from its files.
 pub const MODE_ENV: &str = "OPENSHELL_MODE";
+/// Where the supervisor keeps the logs of each boot (`log_dir`), for the
+/// Desktop's Logs, which the session's group may read: Native has no journal.
+pub const LOGS_ENV: &str = "OPENSHELL_NATIVE_LOGS";
 const HEALTH_EXPIRY: Duration = Duration::from_secs(15);
 
 /// A command line of the configuration: words separated by spaces, without
@@ -75,6 +78,7 @@ impl SessionConfig {
         let (mut x_server, mut window_manager, mut shell) = (None, None, None);
         let (mut confirm, mut confirm_after) = (None, DEFAULT_CONFIRM_AFTER);
         let (mut greeter, mut password_file, mut password_tool) = (None, None, None);
+        let mut lock = None;
         let (mut installer, mut settings_dir, mut updates_dir) = (None, None, None);
         let mut env = Vec::new();
         for (number, line) in text.lines().enumerate() {
@@ -108,6 +112,7 @@ impl SessionConfig {
                 "greeter" => greeter = Some(command(value, key)?),
                 "password_file" => password_file = Some(absolute(value, key)?),
                 "password_tool" => password_tool = Some(command(value, key)?),
+                "lock" => lock = Some(command(value, key)?),
                 "installer" => installer = Some(command(value, key)?),
                 "settings_dir" => settings_dir = Some(absolute(value, key)?),
                 "updates_dir" => updates_dir = Some(absolute(value, key)?),
@@ -134,6 +139,7 @@ impl SessionConfig {
                 greeter,
                 password_file,
                 password_tool: password_tool.unwrap_or_else(|| vec![crate::login::DEFAULT_PASSWORD_TOOL.to_owned()]),
+                lock,
             }),
             (None, None) if password_tool.is_none() => None,
             _ => return Err("greeter and password_file go together".into()),

@@ -29,7 +29,7 @@ use openshell_shell::settings::{Saved, Setting, SystemFiles};
 use openshell_shell::update::{self, Updates};
 use openshell_shell::session::{
     boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig,
-    DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET, DESKTOP_HEALTHY,
+    DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET, DESKTOP_HEALTHY, LOGS_ENV,
 };
 
 const USAGE: &str = "Usage: openshell-session <config>";
@@ -171,6 +171,8 @@ struct Supervisor {
     system: Option<(UnixListener, std::path::PathBuf, Option<Installer>)>,
     /// The session asked to power off or restart.
     power: Option<PowerAction>,
+    /// The lock screen's password check passed since the last sign-in began.
+    unlocked: bool,
 }
 
 fn describe(status: i32) -> String {
@@ -188,6 +190,8 @@ impl Supervisor {
             .append(true)
             .mode(0o640)
             .open(self.logs.join(format!("{}.log", role.name())))?;
+        // The Desktop's Logs show it (the session's group reads this boot's logs).
+        std::os::unix::fs::fchown(&log, Some(0), Some(self.config.gid))?;
         let mut command = Command::new(&command_line[0]);
         command
             .args(&command_line[1..])
@@ -195,6 +199,7 @@ impl Supervisor {
             .env("HOME", &self.config.home)
             .env("DISPLAY", &self.config.display)
             .env("LANG", "C.UTF-8")
+            .env(LOGS_ENV, &self.config.log_dir)
             .envs(self.config.env.iter().map(|(name, value)| (name, value)))
             .current_dir(&self.config.home)
             .stdin(Stdio::null())
@@ -206,7 +211,9 @@ impl Supervisor {
         if let (Role::Greeter, Some(socket)) = (role, &self.greeter_socket) {
             command.env(GREETER_SOCKET_ENV, socket);
         }
-        if let (Role::Shell, Some((_, socket, _))) = (role, &self.system) {
+        // The shell asks it for power, settings and updates; the boot lock
+        // (a greeter) checks the password on it.
+        if let (Role::Shell | Role::Greeter, Some((_, socket, _))) = (role, &self.system) {
             command.env(SYSTEM_SOCKET_ENV, socket);
         }
         if role == Role::Shell && self.config.confirm.is_some() {
@@ -327,6 +334,10 @@ impl Supervisor {
         if !self.signed_in {
             self.sign_in()?;
         }
+        // Powered off or restarted from the lock screen: no shell (run ends).
+        if self.power.is_some() {
+            return Ok(());
+        }
         let shell = self.config.shell.clone();
         self.spawn(Role::Shell, &shell)?;
         Ok(())
@@ -342,7 +353,12 @@ impl Supervisor {
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o666))?;
         listener.set_nonblocking(true)?;
-        self.system = Some((listener, socket, self.config.installer.clone().map(Installer::new)));
+        // The installer hashes the new password with the sign-in's tool.
+        let password_tool = self.config.login.as_ref().map_or_else(
+            || vec![openshell_shell::login::DEFAULT_PASSWORD_TOOL.to_owned()],
+            |login| login.password_tool.clone(),
+        );
+        self.system = Some((listener, socket, self.config.installer.clone().map(|command| Installer::new(command, password_tool))));
         Ok(())
     }
 
@@ -366,7 +382,10 @@ impl Supervisor {
                     Some(login) => {
                         let answer = login.answer(line, Phase::Unlock).unwrap_or("invalid");
                         match answer {
-                            "ok" => self.journal.note("unlocked"),
+                            "ok" => {
+                                self.journal.note("unlocked");
+                                self.unlocked = true;
+                            }
                             "wrong" => {
                                 self.journal.note("a wrong password at the lock screen");
                                 thread::sleep(WRONG_PASSWORD_DELAY);
@@ -385,7 +404,10 @@ impl Supervisor {
                         });
                         match applied {
                             Ok(()) => {
-                                self.journal.note(&format!("set {setting:?}"));
+                                // A held brightness key would fill the journal.
+                                if !matches!(setting, Setting::Brightness(_)) {
+                                    self.journal.note(&format!("set {setting:?}"));
+                                }
                                 "ok".to_owned()
                             }
                             Err(error) => {
@@ -440,6 +462,11 @@ impl Supervisor {
             self.signed_in = true;
             return Ok(());
         };
+        if let Some(lock) = login.lock.clone() {
+            if login.stored()?.is_some() {
+                return self.unlock_to_sign_in(&lock);
+            }
+        }
         let folder = std::path::PathBuf::from(format!("/tmp/openshell-greeter-{}", std::process::id()));
         let _ = fs::remove_dir_all(&folder);
         fs::DirBuilder::new().mode(0o711).create(&folder)?;
@@ -505,6 +532,45 @@ impl Supervisor {
         result
     }
 
+    /// Signs in through the screen lock, as OpenShell Live's session does
+    /// (xsession.sh, openshell_wait_for_unlock): the lock runs as a greeter
+    /// until it ends with the password checked here (`unlocked`, from its
+    /// password check on the system socket) and its own success. A lock that
+    /// fails or is killed starts again: the Desktop never opens without it.
+    fn unlock_to_sign_in(&mut self, lock: &CommandLine) -> Result<(), Box<dyn Error>> {
+        let mut budget = RestartBudget::new(5, Duration::from_secs(60));
+        self.unlocked = false;
+        self.spawn(Role::Greeter, lock)?;
+        loop {
+            self.reap();
+            self.serve_system();
+            if STOP.load(Ordering::Relaxed) {
+                return Err("stopped".into());
+            }
+            if let Some(status) = self.exited(Role::XServer) {
+                return Err(format!("the X server exited with {} before signing in", describe(status)).into());
+            }
+            if self.power.is_some() {
+                self.stop(Role::Greeter);
+                return Ok(());
+            }
+            if let Some(status) = self.exited(Role::Greeter) {
+                self.members.retain(|member| member.role != Role::Greeter);
+                if status == 0 && self.unlocked {
+                    self.journal.note("signed in");
+                    self.signed_in = true;
+                    return Ok(());
+                }
+                self.journal.note(&format!("the lock ended with {} before the password; locking again", describe(status)));
+                let delay = budget.next_delay(Instant::now()).ok_or("the lock keeps failing")?;
+                thread::sleep(delay);
+                self.unlocked = false;
+                self.spawn(Role::Greeter, lock)?;
+            }
+            thread::sleep(POLL);
+        }
+    }
+
     /// The session is healthy: the release the computer booted is confirmed
     /// (the A/B transaction, distro/ab), once per boot. A failure is recorded;
     /// the release then stays on trial and the next boots fall back.
@@ -552,6 +618,13 @@ impl Supervisor {
                 self.journal.note(&format!("restarting the shell in {} ms", delay.as_millis()));
                 self.stop(Role::Shell);
                 thread::sleep(delay);
+                // As on Live: a Desktop that restarts opens behind the lock again.
+                if let Some(lock) = self.config.login.as_ref().and_then(|login| login.lock.clone()) {
+                    self.unlock_to_sign_in(&lock)?;
+                    if self.power.is_some() {
+                        continue;
+                    }
+                }
                 let shell = self.config.shell.clone();
                 self.spawn(Role::Shell, &shell)?;
                 health.reset();
@@ -648,8 +721,15 @@ fn main() -> ExitCode {
         }
         prepare_home(&config)?;
         let logs = boot_log_dir(Path::new(&config.log_dir), KEPT_BOOTS)?;
-        let journal = Journal(OpenOptions::new().create(true).append(true).mode(0o640).open(logs.join("session.log"))?);
-        let mut supervisor = Supervisor { config, logs, journal, members: Vec::new(), signed_in: false, greeter_socket: None, system: None, power: None };
+        // This boot's logs, for the Desktop's Logs: root writes them, the
+        // session's group reads them (OpenShell Live's journal, which its
+        // desktop user reads).
+        std::os::unix::fs::chown(&logs, Some(0), Some(config.gid))?;
+        fs::set_permissions(&logs, fs::Permissions::from_mode(0o750))?;
+        let journal_file = OpenOptions::new().create(true).append(true).mode(0o640).open(logs.join("session.log"))?;
+        std::os::unix::fs::fchown(&journal_file, Some(0), Some(config.gid))?;
+        let journal = Journal(journal_file);
+        let mut supervisor = Supervisor { config, logs, journal, members: Vec::new(), signed_in: false, greeter_socket: None, system: None, power: None, unlocked: false };
         supervisor.open_system_socket()?;
         // The time zone and the account's name chosen in Settings, before the session.
         if let Some(folder) = supervisor.config.settings_dir.clone() {

@@ -2,8 +2,17 @@
 # Installs the running live system on a disk, as root: the same layout as
 # mkimage.sh (GPT with the ESP, system_a, system_b, recovery and data), with
 # the signed boot chain, OpenShell Native's release in slot a, confirmed, and
-# the same release as recovery. The installed system asks for a password the
-# first time it starts (the session supervisor's sign-in).
+# the same release as recovery. As Calamares on OpenShell Live, it takes the
+# account and the computer's settings from the person, through the session
+# supervisor (userspace/shell/src/install.rs), in its environment:
+#
+#   OPENSHELL_INSTALL_PASSWORD_HASH   the password's SHA-512 crypt hash (required)
+#   OPENSHELL_INSTALL_NAME            the account's full name
+#   OPENSHELL_INSTALL_KEYBOARD        "<layout>" or "<layout> <variant>"
+#   OPENSHELL_INSTALL_TIMEZONE        "<Area/City>"
+#
+# and writes them where the installed system reads them (the supervisor's
+# login.rs and settings.rs): its first boot opens on the lock screen.
 #
 #   openshell-native-install list                candidate disks, "<device> <bytes>" per line
 #   openshell-native-install install <device>    progress as "PROGRESS <percent> <message>", then "DONE"
@@ -57,8 +66,19 @@ install)
     work=$(mktemp -d /tmp/openshell-install.XXXXXX)
     trap 'rm -rf "$work"' EXIT
 
+    hash=${OPENSHELL_INSTALL_PASSWORD_HASH:-}
+    case "$hash" in '$6$'*) ;; *) fail "no password was chosen" ;; esac
+
     progress 2 "Reading the system"
     mkdir -p "$work/slot" "$work/recovery" "$work/data/openshell/ab"
+    # The account and the computer's settings: root's, as the supervisor keeps them.
+    install -d -m 0700 "$work/data/openshell/account"
+    (umask 077 && printf '%s\n' "$hash" > "$work/data/openshell/account/password")
+    install -d -m 0755 "$work/data/openshell/system"
+    for setting in name:OPENSHELL_INSTALL_NAME keyboard:OPENSHELL_INSTALL_KEYBOARD timezone:OPENSHELL_INSTALL_TIMEZONE; do
+        value=$(printenv "${setting#*:}" || true)
+        if [ -n "$value" ]; then printf '%s\n' "$value" > "$work/data/openshell/system/${setting%%:*}"; fi
+    done
     cat /dev/initrd > "$work/slot/initramfs.cpio.gz"
     cp "$media/kernel" "$work/slot/kernel"
     cp "$media/boot.cfg" "$work/slot/boot.cfg"
