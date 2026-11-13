@@ -6,6 +6,7 @@ repository=$2
 tag=$3
 revision=$4
 expected_rust=$5
+release_version=${6:-}
 
 work=/tmp/openshell-native-work
 artifacts=/tmp/openshell-native-out
@@ -42,11 +43,12 @@ image_sources=/tmp/openshell-native-image
 
 # What each action builds and runs. apps is the kiosk with the Linux apps
 # profile; wine adds the Windows apps profile (OPENSHELL_WINE.md) to it.
-uses_bundle() { [[ "$action" == desktop || "$action" == kiosk || "$action" == apps || "$action" == wine ]]; }
-uses_graphics() { [[ "$action" == graphics || "$action" == kiosk || "$action" == apps || "$action" == wine ]]; }
+builds_media() { [[ "$action" == live-iso || "$action" == install-image ]]; }
+uses_bundle() { [[ "$action" == desktop || "$action" == desktop-image ]] || drives_desktop || builds_media; }
+uses_graphics() { [[ "$action" == graphics ]] || { [[ "$action" != desktop ]] && uses_bundle; }; }
 drives_desktop() { [[ "$action" == kiosk || "$action" == apps || "$action" == wine ]]; }
-uses_apps() { [[ "$action" == apps || "$action" == wine ]]; }
-uses_wine() { [[ "$action" == wine ]]; }
+uses_apps() { [[ "$action" == apps ]] || uses_wine; }
+uses_wine() { [[ "$action" == wine ]] || builds_media; }
 
 prepare_compat() {
     install -m 0644 "$compat/initramfs.nix" test/initramfs/nix/openshell-compat.nix
@@ -235,11 +237,11 @@ if [[ "$action" == control || "$action" == baseline ]]; then
     fi
 fi
 
-if uses_bundle; then
+if uses_bundle && ! builds_media; then
     prepare_compat
     run_control_hostd || control_status=1
 fi
-if uses_graphics; then
+if uses_graphics && ! builds_media && [[ "$action" != desktop-image ]]; then
     prepare_compat
     run_control_graphics || control_status=1
 fi
@@ -341,13 +343,16 @@ run_boot() {
     record_check "$name" passed
 }
 
-run_compat() {
+build_compat_image() {
     if ! timeout --kill-after=15s 25m nix-build test/initramfs/nix/openshell-compat.nix \
         -A image -o "$work/compat-initramfs" 2>&1 | tee "$artifacts/compat-initramfs.log"; then
         record_check compat-initramfs failed
         return 1
     fi
     record_check compat-initramfs passed
+}
+
+run_compat() {
     # The graphics closure (GTK, Mesa and Chromium) makes a large initramfs.
     # Chromium runs several processes at once, and TCG gives each vCPU a host thread.
     # Mesa adds LLVM to it, and the kiosk drives the whole Desktop.
@@ -429,7 +434,7 @@ run_image() {
     fi
     if OVMF_DIR="$ovmf_dir" timeout --kill-after=15s 150m bash "$image_sources/boot-test.sh" \
         "$work/image-ab/bin/openshell-ab" "$CARGO_TARGET_DIR/osdk/asterinas-osdk-bin.elf" \
-        "$work/compat-initramfs" "$artifacts/native-image" >> "$artifacts/native-image.log" 2>&1; then
+        "$work/compat-initramfs" "$artifacts/native-image" "$@" >> "$artifacts/native-image.log" 2>&1; then
         record_check native-image passed
     else
         tail -n 40 "$artifacts/native-image.log" >&2
@@ -438,8 +443,46 @@ run_image() {
     fi
 }
 
+if builds_media; then
+    prepare_compat
+    build_compat_image
+    desktop_initramfs=$(readlink -f "$work/compat-initramfs")
+    if [[ "$action" == install-image ]]; then
+        nix-build test/initramfs/nix/openshell-compat.nix -A ab -o "$work/image-ab" \
+            >> "$artifacts/native-image.log" 2>&1
+        export OPENSHELL_AB="$work/image-ab/bin/openshell-ab"
+        action=compat
+        prepare_compat
+        timeout --kill-after=15s 25m nix-build test/initramfs/nix/openshell-compat.nix \
+            -A image -o "$work/recovery-initramfs" 2>&1 | tee "$artifacts/recovery-initramfs.log"
+        action=install-image
+    fi
+    media_status=0
+    bash "$image_sources/build-media.sh" "$action" "$release_version" \
+        "$CARGO_TARGET_DIR/osdk/asterinas-osdk-bin.elf" "$desktop_initramfs" \
+        "$work/recovery-initramfs" "$artifacts" || media_status=$?
+    if (( media_status != 0 )); then
+        record_check "$action" failed
+        exit "$media_status"
+    fi
+    record_check "$action" passed
+    exit 0
+fi
+
+if [[ "$action" == image || "$action" == desktop-image ]]; then
+    prepare_compat
+    build_compat_image
+    if [[ "$action" == desktop-image ]]; then
+        OPENSHELL_IMAGE_DATA_MIB=768 run_image desktop
+    else
+        run_image
+    fi
+    exit "$control_status"
+fi
+
 if [[ "$action" == compat || "$action" == sandbox ]] || uses_bundle || uses_graphics; then
     prepare_compat
+    build_compat_image
     compat_status=0
     run_compat || compat_status=1
     if ! uses_graphics; then
@@ -464,7 +507,11 @@ fi
 if [[ "$action" == baseline ]]; then
     git restore -- test/initramfs/src/boot_hello.sh
     rm -f -- test/initramfs/etc/openshell-native-static-exit
-    run_compat || smoke_status=1
-    run_image || smoke_status=1
+    if build_compat_image; then
+        run_compat || smoke_status=1
+        run_image || smoke_status=1
+    else
+        smoke_status=1
+    fi
 fi
 exit $((control_status || smoke_status))

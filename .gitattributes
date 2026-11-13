@@ -8,3 +8,4 @@
 *.c text eol=lf
 *.py text eol=lf
 *.nix text eol=lf
+distro/image/grub.cfg text eol=lf

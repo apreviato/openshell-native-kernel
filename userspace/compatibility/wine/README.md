@@ -15,7 +15,7 @@ Wine Mono e Gecko não fazem parte do perfil: o prefixo é criado sem eles (`WIN
 
 ## Execução
 
-- [openshell-wine.sh](openshell-wine.sh) é o runner que a entrada `wine.desktop` do perfil usa para `.exe` e `.msi`. O programa roda em primeiro plano, e a sessão Xpra dura o mesmo que ele. O prefixo é do OpenShell (`~/.local/share/openshell/wine/prefixes/default`), criado na primeira vez com `wineboot`. A unidade Z:, que o Wine mapeia para o sistema de arquivos inteiro, é removida: o programa vê só C:. O programa aberto alcança só a própria pasta, como unidade P:. O prefixo é criado sem display: a janela de progresso do `wineboot` sumiria antes da do programa, e o Desktop encerra uma sessão cujas janelas todas fecharam.
+- [openshell-wine.sh](openshell-wine.sh) é o runner do perfil Wine. A abertura avulsa usa o prefixo `default`, e o fluxo de instalação cria um prefixo por app em `~/.local/share/openshell/wine/prefixes`. O prefixo é criado sem display com `wineboot`. O runner remove o mapeamento Z: e mapeia a pasta do arquivo aberto como P:. O processo roda com as permissões do usuário da sessão, inclusive para acessos fora dos mapeamentos de drives.
 - O Desktop reconhece `.exe` e `.msi` (`apps/desktop/src/host/openWith.ts`, no repositório `openshell`). Abrir um desses arquivos pelo Files ou pelo `open` do Terminal mostra o seletor, com o Wine recomendado; a execução é sempre uma escolha explícita.
 
 ## Provas
@@ -37,5 +37,5 @@ Wine Mono e Gecko não fazem parte do perfil: o prefixo é criado sem eles (`WIN
 | W1 · Wine em userspace | Passa no Linux de controle; o guest roda a mesma prova na ação `wine`. |
 | W2 · abrir `.exe` | Associação de `.exe` e `.msi`, runner em primeiro plano, limpeza pelo `hostd` ao fechar (a sessão Xpra inteira). |
 | W3 · janelas no Desktop | Pelo caminho Xpra dos apps Linux: a janela do programa é uma janela do OpenShell, com dock, foco, teclado e clipboard dos apps Linux. |
-| W4 · prefixos por app, instalação | Pendente: hoje há um prefixo único do OpenShell. |
+| W4 · prefixos por app, instalação | Runner e painel de Configurações oferecem prefixos por instalação, logs, backup e restauração. A prova ponta a ponta de instalação e preservação do prefixo durante rollback no Asterinas segue pendente. |
 | W5 · compatibilidade avançada | Pendente: Wine Mono, Gecko, VC runtimes sob demanda e medições. |

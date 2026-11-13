@@ -8,16 +8,20 @@
 use std::env;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use openshell_shell::session::{boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig};
+use openshell_shell::session::{
+    boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig,
+    DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET, DESKTOP_HEALTHY,
+};
 
 const USAGE: &str = "Usage: openshell-session <config>";
 const SIGINT: i32 = 2;
@@ -112,6 +116,7 @@ struct Member {
     role: Role,
     pid: i32,
     exited: Option<i32>,
+    health: Option<Receiver<Option<Instant>>>,
 }
 
 struct Supervisor {
@@ -147,18 +152,44 @@ impl Supervisor {
             .current_dir(&self.config.home)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
-            .stderr(log)
+            .stderr(log.try_clone()?)
             .process_group(0);
         // std drops the supplementary groups when it changes the user as root.
         command.uid(self.config.uid).gid(self.config.gid);
-        let child = command.spawn()?;
+        if role == Role::Shell && self.config.confirm.is_some() {
+            command.env(DESKTOP_HEALTH_ENV, "1").stdout(Stdio::piped());
+        } else {
+            command.env_remove(DESKTOP_HEALTH_ENV);
+        }
+        let mut child = command.spawn()?;
+        let health = child.stdout.take().map(|stdout| {
+            let (send, receive) = mpsc::channel();
+            thread::spawn(move || {
+                let mut log = log;
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    let event = match line.as_str() {
+                        DESKTOP_HEALTHY => Some(Instant::now()),
+                        DESKTOP_HEALTH_RESET => None,
+                        _ => {
+                            let _ = writeln!(log, "{line}");
+                            continue;
+                        }
+                    };
+                    if send.send(event).is_err() {
+                        return;
+                    }
+                }
+                let _ = send.send(None);
+            });
+            receive
+        });
         let pid = child.id() as i32;
         // The supervisor reaps every process with waitpid, the session's
         // orphans included.
         drop(child);
         self.journal.note(&format!("started {} (pid {pid})", role.name()));
         self.members.retain(|member| member.role != role);
-        self.members.push(Member { role, pid, exited: None });
+        self.members.push(Member { role, pid, exited: None, health });
         Ok(())
     }
 
@@ -250,7 +281,7 @@ impl Supervisor {
     /// the release then stays on trial and the next boots fall back.
     fn confirm_boot(&mut self) {
         let Some(confirm) = self.config.confirm.clone() else { return };
-        match Command::new(&confirm[0]).args(&confirm[1..]).stdin(Stdio::null()).status() {
+        match Command::new(&confirm[0]).args(&confirm[1..]).env_clear().stdin(Stdio::null()).status() {
             Ok(status) if status.success() => self.journal.note("the session is healthy; confirmed the boot"),
             Ok(status) => self.journal.note(&format!("confirming the boot failed ({status})")),
             Err(error) => self.journal.note(&format!("confirming the boot failed ({error})")),
@@ -264,13 +295,11 @@ impl Supervisor {
         let mut shell_budget = RestartBudget::new(5, Duration::from_secs(60));
         let mut wm_budget = RestartBudget::new(5, Duration::from_secs(60));
         let mut health = HealthWatch::new(self.config.confirm_after);
+        let mut confirmation_attempted = false;
+        let mut health_seen = false;
         self.start()?;
-        health.started(Instant::now());
         while !STOP.load(Ordering::Relaxed) {
             self.reap();
-            if health.healthy(Instant::now()) {
-                self.confirm_boot();
-            }
             if let Some(status) = self.exited(Role::XServer) {
                 // Without X, the whole session starts over.
                 self.journal.note(&format!("x failed ({}); restarting the session", describe(status)));
@@ -278,7 +307,7 @@ impl Supervisor {
                 let delay = session_budget.next_delay(Instant::now()).ok_or("the X server keeps failing")?;
                 thread::sleep(delay);
                 self.start()?;
-                health.started(Instant::now());
+                health.reset();
                 continue;
             }
             if let Some(status) = self.exited(Role::Shell) {
@@ -292,7 +321,7 @@ impl Supervisor {
                 thread::sleep(delay);
                 let shell = self.config.shell.clone();
                 self.spawn(Role::Shell, &shell)?;
-                health.started(Instant::now());
+                health.reset();
             }
             if self.exited(Role::WindowManager).is_some() {
                 if let Some(delay) = wm_budget.next_delay(Instant::now()) {
@@ -300,7 +329,30 @@ impl Supervisor {
                     thread::sleep(delay);
                     if let Some(window_manager) = self.config.window_manager.clone() {
                         self.spawn(Role::WindowManager, &window_manager)?;
+                        health.reset();
+                        if let Some(events) = self.members.iter().find_map(|member| member.health.as_ref()) {
+                            for _ in events.try_iter() {}
+                        }
                     }
+                }
+            } else if !confirmation_attempted {
+                if let Some(events) = self.members.iter().find_map(|member| member.health.as_ref()) {
+                    for event in events.try_iter() {
+                        match event {
+                            Some(at) => {
+                                if !health_seen {
+                                    self.journal.note("the Desktop reported its first successful health check");
+                                    health_seen = true;
+                                }
+                                health.report(at);
+                            }
+                            None => health.reset(),
+                        }
+                    }
+                }
+                if health.healthy(Instant::now()) {
+                    confirmation_attempted = true;
+                    self.confirm_boot();
                 }
             }
             thread::sleep(POLL);

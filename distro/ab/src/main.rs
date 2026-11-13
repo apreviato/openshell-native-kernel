@@ -24,10 +24,12 @@ const USAGE: &str = "Usage: openshell-ab <disk-dir> <command>
   stage <source-dir> <manifest> <schema> <keys-dir>
                                          check <manifest>.sig against the keys,
                                          then write, verify and stage the other slot
+  update-mounted <source-dir> <manifest> <schema> <keys-dir> <slot-mount>
+                                         update the mounted inactive partition and schedule a trial
   trial                                  boot the staged slot on trial
   boot                                   choose the slot to boot: a, b or recovery
   booted <a|b|recovery>                  record the boot GRUB chose (its grubenv)
-  confirm <a|b>                          confirm the running slot
+  confirm <a|b> [release]                confirm the running slot and, if given, verify its release
 Every change rewrites <disk-dir>/grubenv, in place, for GRUB.
 The release tooling:
   openshell-ab keygen <private.pem> <public.pem>
@@ -95,10 +97,16 @@ fn write_slot(source: &Path, slot_dir: &Path, manifest: &Manifest) -> Result<(),
         fs::remove_dir_all(slot_dir)?;
     }
     fs::create_dir_all(slot_dir)?;
+    write_release(source, slot_dir, manifest)
+}
+
+fn write_release(source: &Path, slot_dir: &Path, manifest: &Manifest) -> Result<(), Box<dyn std::error::Error>> {
     for (name, _, _) in &manifest.files {
         let target = slot_dir.join(name);
-        fs::copy(source.join(name), &target)?;
-        File::open(&target)?.sync_all()?;
+        let mut input = File::open(source.join(name))?;
+        let mut output = OpenOptions::new().write(true).create_new(true).open(&target)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
     }
     File::open(slot_dir)?.sync_all()?;
     for (name, size, expected) in &manifest.files {
@@ -107,6 +115,100 @@ fn write_slot(source: &Path, slot_dir: &Path, manifest: &Manifest) -> Result<(),
             return Err(format!("{name} does not match the manifest (sha256 {})", hex(&actual)).into());
         }
     }
+    Ok(())
+}
+
+/// Returns the verified manifest before any change to the disk.
+fn signed_manifest(path: &str, schema: &str, keys: &str) -> Result<Manifest, Box<dyn std::error::Error>> {
+    let text = fs::read(path)?;
+    let signed = fs::read_to_string(format!("{path}.sig")).map_err(|_| Error::Manifest("no signature".into()))?;
+    if !signature::verify(&text, &signed, &trusted_keys(Path::new(keys))?) {
+        return Err(Error::Manifest("not signed by a trusted key".into()).into());
+    }
+    let manifest = Manifest::parse(std::str::from_utf8(&text)?)?;
+    manifest.check_compatible(env::consts::ARCH, schema.parse()?)?;
+    Ok(manifest)
+}
+
+/// This updater uses the GPT layout made by distro/image/mkimage.sh. Derive
+/// the expected partition from the mounted data disk and the running slot.
+fn mounted_target(disk: &Path, target: &Path, selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cmdline = fs::read_to_string("/proc/cmdline")?;
+    let value = |key| cmdline.split_whitespace().find_map(|word| word.strip_prefix(key));
+    let running = value("openshell.slot=").and_then(Slot::parse).ok_or("not booted from a system slot")?;
+    let current = selector.slot(running);
+    if selector.confirmed != Some(running) || current.state != State::Good ||
+        value("openshell.release=") != Some(current.release.as_str()) {
+        return Err("the running release must be the confirmed slot".into());
+    }
+    let disk = disk.canonicalize()?;
+    let target = target.canonicalize()?;
+    let data = disk.parent().and_then(Path::parent).ok_or("expected <data>/openshell/ab")?;
+    if disk != data.join("openshell/ab") {
+        return Err("expected <data>/openshell/ab".into());
+    }
+    let mounts = fs::read_to_string("/proc/mounts")?;
+    let writable_device = |path: &Path| {
+        mounts.lines().filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let device = fields.next()?;
+            let mount = fields.next()?;
+            let fs_type = fields.next()?;
+            let flags = fields.next()?;
+            (Path::new(mount) == path).then_some((device, fs_type, flags))
+        }).last()
+            .filter(|(_, fs_type, flags)| *fs_type == "ext2" && flags.split(',').any(|flag| flag == "rw"))
+            .map(|(device, _, _)| device)
+    };
+    let drive = writable_device(data).and_then(|device| device.strip_prefix("/dev/"))
+        .and_then(|device| device.strip_suffix('5'))
+        .filter(|stem| {
+            match stem.strip_suffix('p') {
+                Some(name) if name.ends_with(|c: char| c.is_ascii_digit()) => {
+                    name.bytes().any(|byte| byte.is_ascii_alphabetic())
+                }
+                _ => stem.ends_with(|c: char| c.is_ascii_alphabetic()),
+            }
+        })
+        .filter(|stem| stem.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .ok_or("data must be mounted from partition 5 of the OpenShell disk")?;
+    let partition = if running == Slot::A { 3 } else { 2 };
+    if writable_device(&target) != Some(format!("/dev/{drive}{partition}").as_str()) {
+        return Err("target is not the mounted inactive system partition".into());
+    }
+    Ok(target)
+}
+
+fn update_mounted(
+    store: &mut DirectoryStore, source: &Path, target: &Path, manifest: &Manifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for required in ["kernel", "initramfs.cpio.gz", "boot.cfg"] {
+        if !manifest.files.iter().any(|(name, size, _)| name == required && *size > 0) {
+            return Err(Error::Manifest(format!("missing boot artifact {required}")).into());
+        }
+    }
+    let selector = load(store).ok_or(Error::NoSelector)?;
+    let target = mounted_target(&store.0, target, &selector)?;
+    let source = source.canonicalize()?;
+    if source.starts_with(&target) {
+        return Err("source must be outside the inactive partition".into());
+    }
+    let slot = begin_update(store)?;
+    write_boot_env(&store.0, load(store).as_ref())?;
+    for entry in fs::read_dir(&target)? {
+        let entry = entry?;
+        if entry.file_name() == "lost+found" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            return Err("unexpected directory in the inactive system partition".into());
+        }
+        fs::remove_file(entry.path())?;
+    }
+    write_release(&source, &target, manifest)?;
+    finish_update(store, slot, &manifest.release)?;
+    request_trial(store, slot)?;
+    println!("scheduled {} for trial in slot {}", manifest.release, slot.name());
     Ok(())
 }
 
@@ -150,13 +252,23 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let [disk, command, rest @ ..] = args else { return Err(USAGE.into()) };
     let disk = PathBuf::from(disk);
+    if command == "install" {
+        fs::create_dir_all(&disk)?;
+    }
+    // Use an inode that stays in place for every writer of the selector and grubenv.
+    let _lock = if command == "status" {
+        None
+    } else {
+        let lock = File::open(&disk)?;
+        lock.lock()?;
+        Some(lock)
+    };
     let mut store = DirectoryStore(disk.clone());
     match (command.as_str(), rest) {
         ("install", [release]) => {
             if load(&store).is_some() {
                 return Err("the disk already has a selector".into());
             }
-            fs::create_dir_all(&disk)?;
             store.write(1, &Selector::install(release)?.encode())?;
         }
         ("status", []) => {
@@ -169,18 +281,15 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("generation {}", selector.generation);
         }
         ("stage", [source, manifest, schema, keys]) => {
-            // The signature first: nothing of an unsigned manifest is read.
-            let text = fs::read(manifest)?;
-            let signed = fs::read_to_string(format!("{manifest}.sig")).map_err(|_| Error::Manifest("no signature".into()))?;
-            if !signature::verify(&text, &signed, &trusted_keys(Path::new(keys))?) {
-                return Err(Error::Manifest("not signed by a trusted key".into()).into());
-            }
-            let manifest = Manifest::parse(std::str::from_utf8(&text)?)?;
-            manifest.check_compatible(env::consts::ARCH, schema.parse()?)?;
+            let manifest = signed_manifest(manifest, schema, keys)?;
             let slot = begin_update(&mut store)?;
             write_slot(Path::new(source), &disk.join(format!("slot-{}", slot.name())), &manifest)?;
             finish_update(&mut store, slot, &manifest.release)?;
             println!("staged {} in slot {}", manifest.release, slot.name());
+        }
+        ("update-mounted", [source, manifest, schema, keys, target]) => {
+            let manifest = signed_manifest(manifest, schema, keys)?;
+            update_mounted(&mut store, Path::new(source), Path::new(target), &manifest)?;
         }
         ("trial", []) => {
             let selector = load(&store).ok_or(Error::NoSelector)?;
@@ -202,7 +311,16 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let env = read_boot_env(&disk, load(&store).as_ref());
             record_boot(&mut store, booted, &env)?;
         }
-        ("confirm", [slot]) => confirm(&mut store, Slot::parse(slot).ok_or("slot is a or b")?)?,
+        ("confirm", [slot, release @ ..]) if release.len() <= 1 => {
+            let slot = Slot::parse(slot).ok_or("slot is a or b")?;
+            if let [release] = release {
+                let selector = load(&store).ok_or(Error::NoSelector)?;
+                if selector.slot(slot).release != *release {
+                    return Err("running release does not match the slot".into());
+                }
+            }
+            confirm(&mut store, slot)?;
+        }
         _ => return Err(USAGE.into()),
     }
     if command != "status" {

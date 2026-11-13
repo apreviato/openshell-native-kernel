@@ -6,6 +6,28 @@ Base experimental x86-64 do OpenShell com kernel em Rust e ABI Linux. O [plano d
 
 Use Node.js 22+ e um engine Docker Linux amd64. No Windows, use Docker Desktop no modo Linux. O primeiro build baixa a imagem oficial do Asterinas, o código-fonte e as dependências de Rust e Nix. O QEMU usa TCG no contêiner, com discos virtuais descartáveis.
 
+### Gerar a mídia
+
+```bash
+make bundle
+make iso
+make install-image
+```
+
+```powershell
+.\make-live.ps1
+.\make-live.ps1 -BuildOnly
+.\make-live.ps1 -BuildOnly -InstallImage
+```
+
+No Windows, execute `make-live.ps1` como administrador para criar um pendrive. O script lista os dispositivos USB elegíveis, pede confirmação do número e só então começa o build. Confere a identidade novamente antes de apagar o dispositivo e compara o SHA-256 lido do pendrive com o da imagem. Use `-Iso <arquivo>` para gravar uma ISO existente com seu `.sha256`, `-DiskNumber <número>` para indicar o dispositivo diretamente e `-WhatIf` para ver o plano.
+
+Se o bundle já existe, use `BUNDLE=/caminho/do/bundle` no Make ou `-Bundle <diretório>` no PowerShell. Cada execução produz a mídia, o arquivo `.sha256` e o relatório `run.json` em `out/native-*/`. `make iso` gera uma ISO live x86-64 para UEFI com estado temporário. `make install-image` gera um disco GPT de referência com slots A/B, recovery e dados persistentes. As duas mídias incluem o Desktop, Xpra e Wine 11.0. O PowerShell verifica o SHA-256 depois de copiar a mídia para o host.
+
+A sessão usa Xvfb. Saída gráfica no monitor físico, Secure Boot, Calamares e instalação no disco interno ainda precisam de integração e validação. A revisão atual do kernel oferece VirtIO e NVMe. O firmware UEFI carrega a ISO híbrida do pendrive. Boot de um sistema instalado em SATA/AHCI, armazenamento USB e outros controladores depende de suporte no kernel.
+
+### Sondas e builds de desenvolvimento
+
 ```text
 node tools/build/native.mjs doctor
 node tools/build/native.mjs build
@@ -14,6 +36,8 @@ node tools/build/native.mjs control
 node tools/build/native.mjs compat
 node tools/build/native.mjs sandbox
 node tools/build/native.mjs baseline
+node tools/build/native.mjs image
+node tools/build/native.mjs desktop-image <openshell-desktop-bundle>
 node tools/build/native.mjs graphics
 node tools/build/native.mjs desktop <openshell-desktop-bundle>
 node tools/build/native.mjs kiosk <openshell-desktop-bundle>
@@ -30,6 +54,8 @@ node tools/build/native.mjs wine <openshell-desktop-bundle>
 | `compat` | Inicia o initramfs com os runtimes e exige que as sondas de Node e Python passem. Os resultados de seccomp e de namespaces também aparecem no log. |
 | `sandbox` | Exige, além das sondas de Node e Python, prova de que o kernel aplicou filtros seccomp e de que um processo sem privilégios entrou em novos namespaces de usuário, PID e rede. |
 | `baseline` | Executa o controle Linux, os testes Rust do launcher, os três boots do smoke e o boot de compatibilidade. Registra os resultados de seccomp e de namespaces para decidir se os testes gráficos podem avançar. |
+| `image` | Testa discos GPT descartáveis com OVMF e GRUB. Verifica a atualização do slot inativo pelo Asterinas, três tentativas sem confirmação e retorno, confirmação do novo slot e recuperação com metadados ou configurações de boot ausentes. Os logs por boot ficam em `out/native-*/native-image/`. |
+| `desktop-image` | Inicia o bundle do Desktop a partir do slot em teste e usa a sessão instalada em `data` para confirmar o boot. Um segundo boot verifica a confirmação persistida. |
 | `graphics` | Compila o shell Rust e o host CEF contra o CEF 147 do nixpkgs fixado e inicia um initramfs com Xvfb, Mesa, Openbox, xdotool e o host. Exige, além das sondas do `compat`, as checagens de sandbox do Chromium, o servidor X e o [smoke do CEF](tools/desktop/cef-smoke.mjs) com o sandbox ativo, nos modos `host` e `isolation`. Os mesmos smokes rodam antes no Linux do builder, com o sandbox. Usa 12 GB e 4 vCPUs no QEMU. |
 | `desktop` | Inclui no initramfs o bundle OpenShell Desktop indicado e executa o [smoke do hostd](tools/desktop/hostd-smoke.mjs) como usuário sem privilégios, primeiro no Linux do builder e depois no guest, além das sondas do `compat`. |
 | `kiosk` | Reúne `graphics` e `desktop` e abre o bundle indicado no shell. O [smoke do shell](tools/desktop/shell-smoke.mjs) dirige o Desktop real com entrada X11: Files, Terminal, atalhos e foco do Browser nativo, zoom, download, DevTools, seleção de arquivos, PDF, captura de tela com as abas, histórico do clipboard, recuperação do renderer e do hostd, encerramento e segunda sessão. O [smoke da sessão](tools/desktop/session-smoke.mjs) executa o supervisor `openshell-session` como root. Os dois rodam antes no Linux do builder. |
@@ -100,13 +126,14 @@ O smoke usa um perfil descartável e testa a troca do token por cookie, o carreg
 
 ## Atualização A/B
 
-[`distro/ab`](distro/ab) implementa a transação da seção 6 do [plano](ARCHITECTURE.md). Ela ainda não está ligada a um bootloader nem a partições reais:
+[`distro/ab`](distro/ab) implementa a transação da seção 6 do [plano](ARCHITECTURE.md). A [imagem experimental](distro/image) usa uma ESP com GRUB e quatro partições ext2, `system_a`, `system_b`, `recovery` e `data`.
 
 - **Seletor.** Grava o estado de cada slot (`empty`, `staged`, `trial:N`, `good`, `bad`) e o slot confirmado em duas cópias, com geração e CRC-32. Cada mudança grava a cópia mais antiga, então uma gravação interrompida deixa a mais nova intacta.
 - **Assinatura.** O manifesto vem com `<manifesto>.sig`: uma assinatura Ed25519, em base64, dos bytes exatos do manifesto, como o atualizador do OpenShell Desktop assina e confere seus releases. `stage` recebe a pasta das chaves confiáveis (PEM) e confere a assinatura antes de ler qualquer coisa do manifesto. `openshell-ab keygen` e `openshell-ab sign` servem às ferramentas de release e aos testes.
 - **Atualização.** Torna o slot inativo não inicializável antes de escrever nele. Depois confere tamanho e SHA-256 de cada arquivo contra o manifesto do release, junto com a arquitetura e a faixa de schema dos dados, e só então o marca como `staged`.
-- **Boot.** Registra cada tentativa de um release em teste antes da entrega. Depois de três tentativas sem confirmação, o slot vira `bad` e o boot volta ao slot confirmado. Sem cópia válida do seletor, o boot vai para o recovery.
-- **Confirmação.** O supervisor `openshell-session` confirma o boot uma vez, como root, quando a sessão está saudável: o shell rodou `confirm_after` segundos (60 por padrão) sem falhar, e cada reinício do shell ou do X recomeça a contagem. O comando vem da chave `confirm` da configuração, `openshell-ab <disco> confirm <slot>` na imagem. Uma falha fica no journal, e o release continua em teste.
+- **Atualização pelo guest.** `openshell-ab <data>/openshell/ab update-mounted <origem> <manifesto> <schema> <chaves> <slot-montado>` valida a release assinada e agenda o próximo boot em teste. O comando exige que o slot em execução coincida com a release confirmada e que o destino seja a partição inativa ext2 do mesmo disco GPT da partição `data`. O GRUB identifica as partições da imagem por UUID. Use o diretório das chaves públicas confiáveis da instalação.
+- **Boot.** O GRUB lê `grubenv` na partição `data` e grava o desconto antes de entregar o controle a um slot em teste. Após três tentativas sem confirmação, volta ao slot confirmado. O serviço de boot sincroniza esse resultado com o seletor. A imagem também prova o boot do recovery com o ambiente ausente ou sem um `boot.cfg` utilizável nos slots.
+- **Confirmação.** A sessão instalada mantém o perfil em `data`. O renderer envia relatórios periódicos depois que o Desktop monta a interface e conclui uma leitura e escrita autenticadas pelo hostd. O supervisor exige 60 segundos de relatórios contínuos por padrão e reinicia a contagem quando perde os relatórios ou quando a sessão reinicia. O comando de confirmação verifica se o identificador da release em execução coincide com o registrado no slot.
 
 Os testes unitários simulam um corte de energia em cada gravação de uma atualização inteira. Em todos os casos, o boot seguinte escolhe um slot `good` ou em teste, nunca um slot incompleto. Também conferem a assinatura com o vetor 1 da RFC 8032. O [smoke](distro/ab/smoke.sh) repete o fluxo com o CLI sobre um diretório: recusa um manifesto alterado depois de assinado, um assinado por chave não confiável e um sem assinatura. Roda no Linux, na CI e no guest, em `/ext2`. O [smoke da sessão](tools/desktop/session-smoke.mjs) exige a confirmação do boot, uma única vez.
 
@@ -116,7 +143,7 @@ cargo build --release --manifest-path distro/ab/Cargo.toml
 sh distro/ab/smoke.sh distro/ab/target/release/openshell-ab
 ```
 
-Faltam a escolha do slot pelo bootloader e as partições `system_a`, `system_b`, `recovery` e `data`.
+O cenário `update` começa com apenas o slot A instalado e disponibiliza uma release assinada em `data`. O Asterinas monta o slot B, rejeita a atualização do slot ativo e a release sem assinatura, grava a release assinada e reinicia no slot B. A ação `desktop-image` usa um bundle com suporte ao relatório de saúde. O instalador para hardware segue pendente.
 
 ## Integração com o OpenShell
 

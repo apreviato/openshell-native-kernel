@@ -1,0 +1,33 @@
+diff --git a/kernel/core/comps/nvme/src/nvme_queue.rs b/kernel/core/comps/nvme/src/nvme_queue.rs
+--- a/kernel/core/comps/nvme/src/nvme_queue.rs
++++ b/kernel/core/comps/nvme/src/nvme_queue.rs
+@@ -305,11 +305,6 @@ where
+         }
+     }
+ 
+-    /// Returns the number of free SQ slots available for new commands.
+-    pub(crate) fn free_slots(&self) -> usize {
+-        self.queue.free_slots()
+-    }
+-
+     /// Rings the SQ tail doorbell after one or more enqueued commands.
+     fn ring_doorbell(&mut self) {
+         let new_tail = self.queue.inner.tail;
+@@ -349,6 +344,17 @@ impl<'a, Q, T> NvmeSubmissionQueueAccess<'a, Q>
+ where
+     Q: DerefMut<Target = NvmeSubmissionQueue<Context<T>>>,
+ {
++    /// Returns the contiguous entries that can be submitted from the SQ tail.
++    pub(crate) fn free_slots(&self) -> usize {
++        let tail = self.queue.inner.tail as usize;
++        // SQHD tells us which entries the controller has consumed. Those
++        // commands can still be in flight and we use the entry index as CID.
++        // Keep each CID reserved until its completion is taken.
++        (0..self.queue.free_slots())
++            .take_while(|offset| self.queue.context.0[(tail + offset) % QUEUE_DEPTH].is_none())
++            .count()
++    }
++
+     /// Submits a batch of commands with contexts and rings the SQ doorbell once.
+     pub(crate) fn submit_with_items(
+         &mut self,

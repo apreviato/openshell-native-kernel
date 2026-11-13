@@ -55,14 +55,15 @@ use_prefix() {
     export WINEPREFIX
 }
 
-backup() {
+# Keep the backup path separate from the program path in the caller.
+backup() (
     mkdir -p "$backups"
     wineserver -w 2>/dev/null || true
     file=$backups/$1-${2:-$(date -u +%Y%m%dT%H%M%SZ)}.tar.gz
     tar -czf "$file.partial" -C "$prefixes" "$1"
     mv "$file.partial" "$file"
     echo "$file"
-}
+)
 
 # The prefix, created on first use and brought to this Wine.
 prepare() {

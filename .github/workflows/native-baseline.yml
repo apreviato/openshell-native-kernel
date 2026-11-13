@@ -8,7 +8,7 @@ on:
       mode:
         description: Linux validation to run
         type: choice
-        options: [smoke, compat, sandbox, control, baseline, graphics]
+        options: [smoke, compat, sandbox, control, baseline, image, graphics]
         default: smoke
 
 permissions:
@@ -32,14 +32,20 @@ jobs:
           node --check tools/desktop/smoke.mjs
           node --check tools/desktop/cef-smoke.mjs
           node --check tools/desktop/hostd-smoke.mjs
+          node --check tools/desktop/apps-smoke.mjs
           node --check tools/desktop/shell-smoke.mjs
           node --check tools/desktop/session-smoke.mjs
+          node --check tools/desktop/wine-smoke.mjs
           node --test tools/desktop/linux-sandbox.test.mjs
           bash -n tools/desktop/build-cef.sh
           bash -n tools/desktop/cef-baseline.sh
           bash -n tools/qemu/run.sh
+          bash -n distro/image/mkimage.sh
+          bash -n distro/image/boot-test.sh
           sh -n userspace/compatibility/probes/boot.sh
           sh -n userspace/compatibility/probes/compat-boot.sh
+          sh -n userspace/compatibility/probes/image-boot.sh
+          sh -n userspace/compatibility/probes/installed-session.sh
       - name: Check the Rust shell
         run: cargo test --locked --manifest-path userspace/shell/Cargo.toml
       - name: Check the A/B release transaction

@@ -47,7 +47,12 @@ release 2026.12.0
 "$ab" "$disk" stage "$work/2026.12.0" "$work/2026.12.0/MANIFEST" 2 "$keys"
 "$ab" "$disk" trial
 expect b
-"$ab" "$disk" confirm b
+if "$ab" "$disk" confirm b 2026.11.0 2>/dev/null; then
+    echo 'Confirmed a slot with a different release' >&2
+    exit 1
+fi
+"$ab" "$disk" status | grep -Fxq 'b: Trial(2) 2026.12.0'
+"$ab" "$disk" confirm b 2026.12.0
 expect b
 
 # An update that never confirms: three attempts, then the confirmed slot.

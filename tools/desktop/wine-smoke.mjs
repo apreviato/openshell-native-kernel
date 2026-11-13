@@ -95,7 +95,10 @@ async function installedApplication(installer, output, report, baseEnv) {
   const program = join(prefix, "drive_c", "Program Files", "OpenShell Probe", "probe.exe");
   const settings = () => readFileSync(join(prefix, "openshell-prefix.conf"), "utf8");
   const shortcuts = () => desktopEntries(join(data, "applications")).filter((entry) => entry.text.includes(`WINEPREFIX=${prefix}"`));
-  const setting = () => /Setting\s+REG_SZ\s+(\S+)/.exec(runner(["--prefix", id, "reg", "query", "HKCU\\Software\\OpenShell\\Probe", "/v", "Setting"]).stdout)?.[1] ?? null;
+  const setting = () => {
+    const result = runner(["--prefix", id, "reg", "query", "HKCU\\Software\\OpenShell\\Probe", "/v", "Setting"]);
+    return /Setting\s+REG_SZ\s+(\S+)/.exec(ok(result, "Querying the setting"))?.[1] ?? null;
+  };
   const settle = () => run("wineserver", ["-w"], { env: prefixEnv, timeout: 120_000 * scale });
 
   let began = Date.now();

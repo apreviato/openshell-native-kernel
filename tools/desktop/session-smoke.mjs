@@ -13,7 +13,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 const usage = "Usage: node tools/desktop/session-smoke.mjs <openshell-session> <openshell-shell> <desktop-bundle> <cef-host> <Xvfb> <openbox> [output-dir]";
 const scale = Math.max(1, Number(process.env.OPENSHELL_CEF_SMOKE_TIMEOUT_MS ?? 45_000) / 45_000);
 const USER = 65534;
-const DISPLAY = ":5";
+const DISPLAY = process.env.OPENSHELL_SESSION_SMOKE_DISPLAY ?? ":5";
 
 function processes() {
   const table = new Map();
@@ -137,7 +137,7 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
   }
 
   try {
-    // The healthy session confirms the boot (the A/B transaction): here, it leaves a mark.
+    // Confirm only after the real renderer and hostd have reported health.
     const confirmed = join(scratch, "confirmed");
     const confirmScript = join(scratch, "confirm.sh");
     writeFileSync(confirmScript, `#!/bin/sh\necho confirmed >> ${confirmed}\n`, { mode: 0o755 });
@@ -151,7 +151,7 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
       `shell=${launcher} ${bundle} ${host} ${state} ${process.execPath}`,
       `env=PATH=${process.env.PATH ?? "/usr/bin:/bin"}`,
       `confirm=/bin/sh ${confirmScript}`,
-      "confirm_after=5",
+      "confirm_after=10",
       `env=OPENSHELL_NATIVE_PORT=${await freePort()}`,
       ...["FONTCONFIG_FILE", "XDG_CONFIG_DIRS"].filter((name) => process.env[name]).map((name) => `env=${name}=${process.env[name]}`),
     ].join("\n");
@@ -179,6 +179,7 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
     await check("shell-restart", async () => {
       // A crash of the CEF host ends the shell; the supervisor starts it again.
       process.kill(first.cef, "SIGKILL");
+      assert.ok(!existsSync(confirmed), "The initial session was confirmed before the stability window");
       const second = await waitFor("a new shell", () => {
         const launcherPid = find(supervisor.pid, (cmdline) => cmdline[0] === launcher);
         const cef = find(supervisor.pid, (cmdline) => cmdline[0] === host);
@@ -192,7 +193,7 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
     });
 
     await check("confirm", async () => {
-      // Five seconds of the restarted shell without a failure, then once.
+      // The restarted renderer must complete a new stability window.
       await waitFor("the boot to be confirmed", () => existsSync(confirmed));
       await new Promise((done) => setTimeout(done, 7_000));
       assert.equal(readFileSync(confirmed, "utf8"), "confirmed\n", "The boot was confirmed more than once");
@@ -232,7 +233,11 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
     throw error;
   } finally {
     if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null) {
-      supervisor.kill("SIGKILL");
+      supervisor.kill("SIGTERM");
+      for (let tries = 0; tries < 60 && supervisor.exitCode === null && supervisor.signalCode === null; tries++) {
+        await sleep(250);
+      }
+      if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill("SIGKILL");
     }
     writeFileSync(join(output, "session-smoke.json"), `${JSON.stringify(report, null, 2)}\n`);
     rmSync(scratch, { recursive: true, force: true });

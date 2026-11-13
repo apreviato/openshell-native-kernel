@@ -7,6 +7,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub const DESKTOP_HEALTHY: &str = "OPENSHELL_DESKTOP_HEALTHY";
+pub const DESKTOP_HEALTH_RESET: &str = "OPENSHELL_DESKTOP_HEALTH_RESET";
+pub const DESKTOP_HEALTH_ENV: &str = "OPENSHELL_NATIVE_HEALTH";
+const HEALTH_EXPIRY: Duration = Duration::from_secs(15);
+
 /// A command line of the configuration: words separated by spaces, without
 /// quoting. System paths of the image have no spaces.
 pub type CommandLine = Vec<String>;
@@ -25,11 +30,11 @@ pub struct SessionConfig {
     /// Run once per boot, as root, when the session is healthy: it confirms
     /// the release the computer booted (`openshell-ab <disk> confirm <slot>`).
     pub confirm: Option<CommandLine>,
-    /// How long the shell runs without failing before the boot counts as healthy.
+    /// How long the Desktop reports health continuously before confirming.
     pub confirm_after: Duration,
 }
 
-/// By default, a minute of the shell without a failure makes a boot healthy.
+/// By default the Desktop must report health continuously for a minute.
 pub const DEFAULT_CONFIRM_AFTER: Duration = Duration::from_secs(60);
 
 fn command(value: &str, key: &str) -> Result<CommandLine, String> {
@@ -128,33 +133,36 @@ impl SessionConfig {
     }
 }
 
-/// Whether the boot is healthy: the shell has run `after` without failing.
-/// It says so once; a failure starts the count again.
+/// Continuous health from the current Desktop, with a deadline for each report.
 pub struct HealthWatch {
     after: Duration,
     since: Option<Instant>,
-    reported: bool,
+    last: Option<Instant>,
 }
 
 impl HealthWatch {
     pub fn new(after: Duration) -> Self {
-        Self { after, since: None, reported: false }
+        Self { after, since: None, last: None }
     }
 
-    /// The shell (re)started now.
-    pub fn started(&mut self, now: Instant) {
-        self.since = Some(now);
+    pub fn reset(&mut self) {
+        self.since = None;
+        self.last = None;
     }
 
-    /// True once, when the shell has stayed up long enough.
-    pub fn healthy(&mut self, now: Instant) -> bool {
-        match self.since {
-            Some(since) if !self.reported && now.duration_since(since) >= self.after => {
-                self.reported = true;
-                true
-            }
-            _ => false,
+    pub fn report(&mut self, now: Instant) {
+        if !self.fresh(now) {
+            self.since = Some(now);
         }
+        self.last = Some(now);
+    }
+
+    fn fresh(&self, now: Instant) -> bool {
+        self.last.is_some_and(|last| now.duration_since(last) < HEALTH_EXPIRY)
+    }
+
+    pub fn healthy(&self, now: Instant) -> bool {
+        self.fresh(now) && self.since.is_some_and(|since| now.duration_since(since) >= self.after)
     }
 }
 
@@ -255,17 +263,20 @@ env=PATH=/usr/bin:/bin
     }
 
     #[test]
-    fn a_boot_is_healthy_once_the_shell_stays_up() {
+    fn confirmation_requires_fresh_desktop_health_throughout_the_window() {
         let start = Instant::now();
-        let mut watch = HealthWatch::new(Duration::from_secs(60));
-        assert!(!watch.healthy(start + Duration::from_secs(120)), "not before the shell starts");
-        watch.started(start);
-        assert!(!watch.healthy(start + Duration::from_secs(30)));
-        // The shell failed and started again: the count starts over.
-        watch.started(start + Duration::from_secs(40));
-        assert!(!watch.healthy(start + Duration::from_secs(90)));
-        assert!(watch.healthy(start + Duration::from_secs(100)));
-        assert!(!watch.healthy(start + Duration::from_secs(200)), "said once");
+        let time = |seconds| start + Duration::from_secs(seconds);
+        let mut watch = HealthWatch::new(Duration::from_secs(20));
+        assert!(!watch.healthy(time(30)));
+        watch.report(time(40));
+        assert!(!watch.healthy(time(60)));
+        watch.report(time(60));
+        watch.report(time(70));
+        assert!(!watch.healthy(time(70)));
+        watch.report(time(80));
+        assert!(watch.healthy(time(80)));
+        watch.reset();
+        assert!(!watch.healthy(time(80)));
     }
 
     #[test]

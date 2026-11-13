@@ -1,14 +1,15 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const lock = JSON.parse(readFileSync(join(root, "kernel", "config", "upstream.lock.json"), "utf8"));
-const bundleActions = ["desktop", "kiosk", "apps", "wine"];
-const shellActions = ["graphics", "kiosk", "apps", "wine"];
-const actions = ["doctor", "build", "smoke", "compat", "control", "sandbox", "baseline", "graphics", ...bundleActions];
+const mediaActions = ["live-iso", "install-image"];
+const bundleActions = ["desktop", "kiosk", "apps", "wine", "desktop-image", ...mediaActions];
+const shellActions = ["graphics", "kiosk", "apps", "wine", "desktop-image", ...mediaActions];
+const actions = ["doctor", "build", "smoke", "compat", "control", "sandbox", "baseline", "image", "graphics", ...bundleActions];
 const usage = `Usage: node tools/build/native.mjs <${actions.filter((name) => !bundleActions.includes(name)).join("|")}>
        node tools/build/native.mjs <${bundleActions.join("|")}> <openshell-desktop-bundle>`;
 
@@ -136,9 +137,10 @@ async function run(action, bundlePath) {
       "create", "--init", "--platform", "linux/amd64", "--entrypoint", "/bin/bash",
       // The Linux control of the graphics actions runs the Chromium sandbox,
       // which needs unprivileged user namespaces in the container.
-      ...(shellActions.includes(action) ? ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"] : []),
+      ...(shellActions.includes(action) && !mediaActions.includes(action)
+        ? ["--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined"] : []),
       image, "/tmp/openshell-native-run.sh", action,
-      lock.repository, lock.tag, lock.commit, lock.rust,
+      lock.repository, lock.tag, lock.commit, lock.rust, String(bundle?.version ?? ""),
     ]);
     docker(["cp", join(root, "tools", "qemu", "run.sh"), `${container}:/tmp/openshell-native-run.sh`]);
     docker(["cp", join(root, "userspace", "compatibility"), `${container}:/tmp/openshell-native-compat`]);
@@ -170,6 +172,13 @@ async function run(action, bundlePath) {
       throw error;
     }
     docker(["cp", `${container}:/tmp/openshell-native-out/.`, output]);
+    if (mediaActions.includes(action)) {
+      const pattern = action === "live-iso" ? /-amd64\.iso$/ : /-amd64\.img$/;
+      const file = readdirSync(output).find((name) => name.startsWith("openshell-native-") && pattern.test(name));
+      if (!file || !existsSync(join(output, `${file}.sha256`))) throw new Error("Media or checksum is missing.");
+      report.media = file;
+      console.log(`Media: ${join(output, file)}`);
+    }
     report.status = "passed";
   } catch (error) {
     report.status = "failed";

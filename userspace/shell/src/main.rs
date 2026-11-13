@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use openshell_shell::{read_hostd_readiness, write_cef_bootstrap, write_cef_startup};
+use openshell_shell::session::{DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET};
 
 const USAGE: &str = "Usage: openshell-shell <desktop-bundle> <cef-host> <state-dir> [node]";
 const SIGINT: i32 = 2;
@@ -164,7 +165,9 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let home = create_directory(&state.join("home"), true)?;
     let data = create_directory(&state.join("hostd"), true)?;
     let profile = create_directory(&state.join("cef"), true)?;
-    let runtime = create_directory(&state.join("runtime"), true)?;
+    let runtime = env::var_os("OPENSHELL_NATIVE_RUNTIME_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| state.join("runtime"));
+    let runtime = create_directory(&runtime, true)?;
     let profile_path = profile.to_str().filter(|path| !path.contains(['\r', '\n']))
         .ok_or("CEF profile path must be UTF-8 without line breaks")?;
 
@@ -189,6 +192,9 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let (mut daemon, Some(url)) = start_hostd()? else { return Ok(()) };
 
     let mut browser = session_command(cef.as_os_str());
+    if env::var(DESKTOP_HEALTH_ENV).as_deref() == Ok("1") {
+        browser.env(DESKTOP_HEALTH_ENV, "1");
+    }
     if env::var_os("XAUTHORITY").is_none() {
         if let Some(path) = env::var_os("HOME").map(|home| PathBuf::from(home).join(".Xauthority")) {
             if path.is_file() { browser.env("XAUTHORITY", path); }
@@ -209,6 +215,11 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
             return if status.success() { Ok(()) } else { Err(format!("CEF host exited with {status}").into()) };
         }
         if let Some(status) = daemon.0.try_wait()? {
+            if env::var(DESKTOP_HEALTH_ENV).as_deref() == Ok("1") {
+                let mut stdout = io::stdout().lock();
+                writeln!(stdout, "{DESKTOP_HEALTH_RESET}")?;
+                stdout.flush()?;
+            }
             let Some(delay) = budget.next_delay() else {
                 return Err(format!("hostd exited with {status} too often").into());
             };

@@ -297,4 +297,4 @@ Próximos passos, em ordem:
 3. Paridade do Browser: a matriz de atalhos e os layouts de teclado. Cofre de senhas, OSD e notificações sobre as abas, fullscreen e gravação de tela estão feitos; as permissões seguem o Live, que não as guarda entre sessões.
 4. Testes de contrato do `host-api` (feitos, seção 10) e a medida do Electron no mesmo Linux de controle, que depende do executável Linux do Electron 44.5.1, antes de portar serviços do `hostd`.
 5. Autenticação nativa antes da sessão e Xorg sobre DRM.
-6. Imagem com partições `system_a`, `system_b`, `recovery` e `data` e seleção de slot no boot. O manifesto assinado (Ed25519, o formato do atualizador do Desktop) e a confirmação do slot pelo supervisor estão feitos ([README](README.md#atualização-ab)).
+6. A imagem experimental integra as partições `system_a`, `system_b`, `recovery` e `data`, a seleção de slot no GRUB e a atualização assinada do slot inativo em execução. A ação `desktop-image` exercita a confirmação ligada à saúde do Desktop instalado. O instalador segue pendente ([README](README.md#atualização-ab)).

@@ -69,6 +69,17 @@ constexpr int kMaxViewSize = 16384;
 constexpr std::size_t kMaxRendererRestarts = 3;
 constexpr auto kRendererRestartWindow = std::chrono::minutes(1);
 
+bool ReportsDesktopHealth() {
+  const char* enabled = std::getenv("OPENSHELL_NATIVE_HEALTH");
+  return enabled && std::strcmp(enabled, "1") == 0;
+}
+
+void DesktopHealth(bool healthy) {
+  if (ReportsDesktopHealth()) {
+    std::cout << (healthy ? "OPENSHELL_DESKTOP_HEALTHY" : "OPENSHELL_DESKTOP_HEALTH_RESET") << std::endl;
+  }
+}
+
 std::uint32_t ContextOf(Kind kind) {
   switch (kind) {
     case Kind::kPrimary:
@@ -350,6 +361,9 @@ class BrowserClient final : public CefClient,
     const bool main = !frame || frame->IsMain();
     const auto url = request->GetURL();
     if (Allows(startup_, kind_, main ? OPEN_SHELL_MAIN_FRAME : OPEN_SHELL_SUBFRAME, url)) {
+      if (IsDesktop() && main) {
+        DesktopHealth(false);
+      }
       return false;
     }
     if (IsTab() && main) {
@@ -668,6 +682,7 @@ class BrowserClient final : public CefClient,
     if (!IsDesktop() || session_->closing) {
       return;
     }
+    DesktopHealth(false);
     CloseTabs(*session_);
     // The Desktop reloads with its session cookie, a few times per minute.
     auto& restarts = session_->renderer_restarts;
@@ -940,6 +955,7 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
     hello->SetBool("surfaceLayout", true);
     hello->SetBool("shortcutPhases", true);
     hello->SetBool("overlays", true);
+    hello->SetBool("health", ReportsDesktopHealth());
     hello->SetString("event", kBrowserEvent);
     value->SetDictionary(hello);
     return {200, CefWriteJSON(value, JSON_WRITER_DEFAULT).ToString()};
@@ -949,6 +965,10 @@ Reply RunCommand(Session& session, const std::string& command, const std::string
     return Error(400, "The command takes a JSON object");
   }
   auto args = parsed->GetDictionary();
+  if (command == "desktop/health") {
+    DesktopHealth(args->GetBool("healthy"));
+    return {};
+  }
   if (command == "focus-desktop") {
     FocusDesktop(session);
     return {};

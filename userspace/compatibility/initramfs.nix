@@ -249,6 +249,8 @@ let
       install -m 0644 ${./openshell-ab/smoke.sh} "$out/opt/openshell-compat/ab-smoke.sh"
       # One boot of the disk image test (distro/image/boot-test.sh).
       install -m 0644 ${probes}/image-boot.sh "$out/opt/openshell-compat/image-boot.sh"
+      install -m 0644 ${probes}/installed-session.sh "$out/opt/openshell-compat/installed-session.sh"
+      install -m 0644 ${probes}/installed-storage.sh "$out/opt/openshell-compat/installed-storage.sh"
     ''}
     install -m 0644 ${probes}/hostd-smoke.mjs ${probes}/unprivileged.py ${probes}/node.mjs ${probes}/python.py ${probes}/inotify.py ${probes}/namespaces.py "$out/opt/openshell-compat/"
     ${lib.optionalString (bundle != null) ''

@@ -29,18 +29,14 @@ largest=1
 for release in "$disk/slot-a" "$disk/slot-b" "$recovery"; do
     [[ -d "$release" ]] && (( $(mib "$release") > largest )) && largest=$(mib "$release")
 done
-esp=32 slot=$(( largest + largest / 5 + 16 )) data=64
+esp=32 slot=$(( largest + largest / 5 + 16 )) data=${OPENSHELL_IMAGE_DATA_MIB:-64}
+if [[ -n "$extra" ]]; then
+    payload=$(mib "$extra")
+    data=$((data + payload + payload / 5))
+fi
 names=(esp system_a system_b recovery data)
 sizes=("$esp" "$slot" "$slot" "$slot" "$data")
 labels=("" osn-system_a osn-system_b osn-recovery osn-data)
-
-# The EFI system partition: GRUB with grub.cfg in its memory disk.
-"$mkstandalone" -O x86_64-efi -o "$work/BOOTX64.EFI" \
-    --modules="part_gpt fat ext2 search search_label regexp loadenv test echo multiboot2 normal configfile" \
-    "boot/grub/grub.cfg=$here/grub.cfg"
-mkfs.vfat -C -n OSN-ESP "$work/esp.img" $(( esp * 1024 )) > /dev/null
-mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT
-mcopy -i "$work/esp.img" "$work/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
 
 ext2() {
     local label=$1 source=$2 size=$3
@@ -55,6 +51,20 @@ ext2 osn-system_a "$( [[ -d "$disk/slot-a" ]] && echo "$disk/slot-a" || echo "$w
 ext2 osn-system_b "$( [[ -d "$disk/slot-b" ]] && echo "$disk/slot-b" || echo "$work/empty")" "$slot"
 ext2 osn-recovery "$recovery" "$slot"
 ext2 osn-data "$work/data" "$data"
+
+# Bind the EFI loader to the filesystems created for this image.
+for label in "${labels[@]:1}"; do
+    uuid=$(LC_ALL=C dumpe2fs -h "$work/$label.img" 2>/dev/null | awk '/^Filesystem UUID:/ { print $3 }')
+    test -n "$uuid"
+    printf 'set openshell_%s_uuid=%s\n' "${label#osn-}" "$uuid"
+done > "$work/grub.cfg"
+cat "$here/grub.cfg" >> "$work/grub.cfg"
+"$mkstandalone" -O x86_64-efi -o "$work/BOOTX64.EFI" \
+    --modules="part_gpt fat ext2 search search_fs_uuid regexp loadenv test echo multiboot2 normal configfile serial terminal" \
+    "boot/grub/grub.cfg=$work/grub.cfg"
+mkfs.vfat -C -n OSN-ESP "$work/esp.img" $(( esp * 1024 )) > /dev/null
+mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT
+mcopy -i "$work/esp.img" "$work/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
 
 # The disk: 1 MiB for the GPT, the partitions, 1 MiB for the backup GPT.
 total=2
