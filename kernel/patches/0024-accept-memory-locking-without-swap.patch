@@ -1,0 +1,133 @@
+diff --git a/kernel/core/src/syscall/arch/generic.rs b/kernel/core/src/syscall/arch/generic.rs
+index d65fe64..fb44a1b 100644
+--- a/kernel/core/src/syscall/arch/generic.rs
++++ b/kernel/core/src/syscall/arch/generic.rs
+@@ -81,6 +81,7 @@ macro_rules! import_generic_syscall_entries {
+             move_mount::sys_move_mount,
+             mprotect::sys_mprotect,
+             mremap::sys_mremap,
++            mlock::{sys_mlock, sys_mlock2, sys_mlockall, sys_munlock, sys_munlockall},
+             msync::sys_msync,
+             munmap::sys_munmap,
+             nanosleep::{sys_clock_nanosleep, sys_nanosleep},
+@@ -388,6 +389,10 @@ macro_rules! define_syscalls_with_generic_syscall_table {
+             SYS_FADVISE64 = 223              => sys_fadvise64(args[..4]);
+             SYS_MPROTECT = 226               => sys_mprotect(args[..3]);
+             SYS_MSYNC = 227                  => sys_msync(args[..3]);
++            SYS_MLOCK = 228                  => sys_mlock(args[..2]);
++            SYS_MUNLOCK = 229                => sys_munlock(args[..2]);
++            SYS_MLOCKALL = 230               => sys_mlockall(args[..1]);
++            SYS_MUNLOCKALL = 231             => sys_munlockall(args[..0]);
+             SYS_MADVISE = 233                => sys_madvise(args[..3]);
+             SYS_ACCEPT4 = 242                => sys_accept4(args[..4]);
+             SYS_WAIT4 = 260                  => sys_wait4(args[..4]);
+@@ -402,6 +407,7 @@ macro_rules! define_syscalls_with_generic_syscall_table {
+             SYS_GETRANDOM = 278              => sys_getrandom(args[..3]);
+             SYS_MEMFD_CREATE = 279           => sys_memfd_create(args[..2]);
+             SYS_EXECVEAT = 281               => sys_execveat(args[..5], &mut user_ctx);
++            SYS_MLOCK2 = 284                 => sys_mlock2(args[..3]);
+             SYS_PREADV2 = 286                => sys_preadv2(args[..6]);
+             SYS_PWRITEV2 = 287               => sys_pwritev2(args[..6]);
+             SYS_STATX = 291                  => sys_statx(args[..5]);
+diff --git a/kernel/core/src/syscall/arch/x86.rs b/kernel/core/src/syscall/arch/x86.rs
+index ee146e8..08d723f 100644
+--- a/kernel/core/src/syscall/arch/x86.rs
++++ b/kernel/core/src/syscall/arch/x86.rs
+@@ -81,6 +81,7 @@ use super::{
+     move_mount::sys_move_mount,
+     mprotect::sys_mprotect,
+     mremap::sys_mremap,
++    mlock::{sys_mlock, sys_mlock2, sys_mlockall, sys_munlock, sys_munlockall},
+     msync::sys_msync,
+     munmap::sys_munmap,
+     nanosleep::{sys_clock_nanosleep, sys_nanosleep},
+@@ -320,6 +321,10 @@ impl_syscall_nums_and_dispatch_fn! {
+     SYS_SCHED_GETSCHEDULER = 145 => sys_sched_getscheduler(args[..1]);
+     SYS_SCHED_GET_PRIORITY_MAX = 146 => sys_sched_get_priority_max(args[..1]);
+     SYS_SCHED_GET_PRIORITY_MIN = 147 => sys_sched_get_priority_min(args[..1]);
++    SYS_MLOCK = 149            => sys_mlock(args[..2]);
++    SYS_MUNLOCK = 150          => sys_munlock(args[..2]);
++    SYS_MLOCKALL = 151         => sys_mlockall(args[..1]);
++    SYS_MUNLOCKALL = 152       => sys_munlockall(args[..0]);
+     SYS_PIVOT_ROOT = 155       => sys_pivot_root(args[..2]);
+     SYS_PRCTL = 157            => sys_prctl(args[..5]);
+     SYS_ARCH_PRCTL = 158       => sys_arch_prctl(args[..2]);
+@@ -417,6 +422,7 @@ impl_syscall_nums_and_dispatch_fn! {
+     SYS_GETRANDOM = 318        => sys_getrandom(args[..3]);
+     SYS_MEMFD_CREATE = 319     => sys_memfd_create(args[..2]);
+     SYS_EXECVEAT = 322         => sys_execveat(args[..5], &mut user_ctx);
++    SYS_MLOCK2 = 325           => sys_mlock2(args[..3]);
+     SYS_PREADV2 = 327          => sys_preadv2(args[..6]);
+     SYS_PWRITEV2 = 328         => sys_pwritev2(args[..6]);
+     SYS_STATX = 332            => sys_statx(args[..5]);
+diff --git a/kernel/core/src/syscall/mlock.rs b/kernel/core/src/syscall/mlock.rs
+new file mode 100644
+index 0000000..033307a
+--- /dev/null
++++ b/kernel/core/src/syscall/mlock.rs
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `mlock`, `mlock2`, `munlock`, `mlockall` and `munlockall`.
++//!
++//! The kernel never swaps user memory out: every page that is resident stays
++//! resident, which is all that locking promises. The calls check their
++//! arguments as Linux does and succeed, so that programs that keep secrets
++//! only in locked memory (password prompts, key agents) run.
++
++use super::SyscallReturn;
++use crate::{prelude::*, vm::vmar::VMAR_CAP_ADDR};
++
++const MLOCK_ONFAULT: u32 = 0x01;
++const MCL_CURRENT: i32 = 1;
++const MCL_FUTURE: i32 = 2;
++const MCL_ONFAULT: i32 = 4;
++
++fn check_range(addr: Vaddr, len: usize) -> Result<()> {
++    if VMAR_CAP_ADDR.checked_sub(addr).is_none_or(|gap| gap < len) {
++        return_errno_with_message!(Errno::ENOMEM, "the range is not in userspace");
++    }
++    Ok(())
++}
++
++pub(super) fn sys_mlock(addr: Vaddr, len: usize, _ctx: &Context) -> Result<SyscallReturn> {
++    check_range(addr, len)?;
++    Ok(SyscallReturn::Return(0))
++}
++
++pub(super) fn sys_mlock2(addr: Vaddr, len: usize, flags: u32, _ctx: &Context) -> Result<SyscallReturn> {
++    if flags & !MLOCK_ONFAULT != 0 {
++        return_errno_with_message!(Errno::EINVAL, "invalid mlock2 flags");
++    }
++    check_range(addr, len)?;
++    Ok(SyscallReturn::Return(0))
++}
++
++pub(super) fn sys_munlock(addr: Vaddr, len: usize, _ctx: &Context) -> Result<SyscallReturn> {
++    check_range(addr, len)?;
++    Ok(SyscallReturn::Return(0))
++}
++
++pub(super) fn sys_mlockall(flags: i32, _ctx: &Context) -> Result<SyscallReturn> {
++    let known = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
++    if flags & !known != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
++        return_errno_with_message!(Errno::EINVAL, "invalid mlockall flags");
++    }
++    Ok(SyscallReturn::Return(0))
++}
++
++pub(super) fn sys_munlockall(_ctx: &Context) -> Result<SyscallReturn> {
++    Ok(SyscallReturn::Return(0))
++}
+diff --git a/kernel/core/src/syscall/mod.rs b/kernel/core/src/syscall/mod.rs
+index d5eefbc..5236770 100644
+--- a/kernel/core/src/syscall/mod.rs
++++ b/kernel/core/src/syscall/mod.rs
+@@ -99,6 +99,7 @@ mod mount;
+ mod move_mount;
+ mod mprotect;
+ mod mremap;
++mod mlock;
+ mod msync;
+ mod munmap;
+ mod nanosleep;

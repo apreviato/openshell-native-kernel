@@ -25,17 +25,17 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/openshell-boot-test-XXXXXX")
 trap 'rm -rf "$work"' EXIT
 "$ab" keygen "$work/release.key" "$work/keys.pem"
 mkdir -p "$work/keys" && mv "$work/keys.pem" "$work/keys/release.pem"
+source "$here/release.sh"
+# The kernel's Secure Boot signature: the build's key, or one for this test.
+if [[ -z "${SB_KEYS:-}" ]]; then
+    export SB_KEYS="$work/secureboot"
+    sb_key "$SB_KEYS"
+fi
 
 # A release: the kernel and initramfs under test, and its boot command.
 release() {
     local name=$1 dir=$2
-    mkdir -p "$dir"
-    cp "$kernel" "$dir/kernel"
-    cp "$initramfs" "$dir/initramfs.cpio.gz"
-    cat > "$dir/boot.cfg" <<EOF
-multiboot2 (\$root)/kernel SHELL=/bin/sh LOGNAME=root HOME=/ USER=root PATH=/bin:/benchmark loglevel=error earlycon console=hvc0 openshell.slot=\$openshell_slot openshell.release=$name openshell.data=\$openshell_data_uuid -- sh -l /opt/openshell-compat/image-boot.sh
-module2 --nounzip (\$root)/initramfs.cpio.gz
-EOF
+    release_files "$dir" "$kernel" "$initramfs" "$name" sh -l /opt/openshell-compat/image-boot.sh
     {
         printf 'release=%s\narch=x86_64\nschema=1..1\n' "$name"
         for file in kernel initramfs.cpio.gz boot.cfg; do
@@ -72,10 +72,19 @@ qemu() {
         disk_device=(nvme,bus=pcie.0,addr=0x6,drive=disk,serial=osn-nvme-test,bootindex=0)
     fi
     if [[ "$profile" == desktop ]]; then memory=12G cpus=4 deadline=15m; fi
+    # Secure Boot (SECURE_VARS, see secure_boot below): OVMF enforcing it from these variables.
+    local machine=q35,kernel-irqchip=split firmware=(-bios "${OVMF_DIR:-/root/ovmf/release}/OVMF.fd")
+    if [[ -n "${SECURE_VARS:-}" ]]; then
+        cp "$SECURE_VARS" "$log.vars"
+        machine=$machine,smm=on
+        firmware=(-global driver=cfi.pflash01,property=secure,value=on
+            -drive "if=pflash,format=raw,unit=0,readonly=on,file=$SECURE_CODE"
+            -drive "if=pflash,format=raw,unit=1,file=$log.vars")
+    fi
     timeout --kill-after=15s "${OPENSHELL_IMAGE_BOOT_TIMEOUT:-$deadline}" qemu-system-x86_64 \
         -cpu Icelake-Server,+x2apic -smp "$cpus" -m "$memory" --no-reboot -nographic -display none \
-        -machine q35,kernel-irqchip=split -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        -bios "${OVMF_DIR:-/root/ovmf/release}/OVMF.fd" \
+        -machine "$machine" -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+        "${firmware[@]}" \
         -drive if=none,format=raw,id=disk,file="$image" \
         -device "${disk_device[@]}" \
         -device virtio-serial-pci,disable-legacy=on,disable-modern=off -device virtconsole,chardev=mux \
@@ -110,8 +119,7 @@ run() {
         step=$(( step + 1 ))
     done
     if ! grep -q "^OPENSHELL_IMAGE_STATUS $status\$" "$output/$name-$(( step - 1 )).log.txt"; then
-        printf 'image %s: the selector does not end with %s
-' "$name" "$status" >&2
+        printf 'image %s: the selector does not end with %s\n' "$name" "$status" >&2
         return 1
     fi
 }
@@ -131,6 +139,34 @@ run fallback "$work/fallback" "b: Bad 2026.12.0"
 installed "$work/confirm"
 plan=("b 2026.12.0 confirm" "b 2026.12.0 confirm")
 run confirm "$work/confirm" "b: Good 2026.12.0 (confirmed)"
+
+# Secure Boot enforcing with Microsoft's keys, as on a computer: shim and
+# Debian's GRUB start, and GRUB refuses the kernel until OpenShell Native's
+# certificate is trusted (MokManager on a computer, the firmware's db here, which
+# shim trusts too); then the chain boots the slot. Needs OVMF's Secure Boot
+# build with Microsoft's keys and virt-fw-vars (Debian and Ubuntu: ovmf, python3-virt-firmware).
+SECURE_CODE=${SECURE_CODE:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd}
+microsoft_vars=${SECURE_MS_VARS:-/usr/share/OVMF/OVMF_VARS_4M.ms.fd}
+if [[ -f "$SECURE_CODE" && -f "$microsoft_vars" ]] && command -v virt-fw-vars > /dev/null; then
+    installed "$work/secure"
+    plan=("b 2026.12.0 confirm")
+    mkdir -p "$work/secure-untrusted-data/openshell/image-test"
+    printf '%s\n' "${plan[@]}" > "$work/secure-untrusted-data/openshell/image-test/plan"
+    bash "$here/mkimage.sh" "$work/secure" "$work/recovery" "$work/secure-untrusted.img" "$work/secure-untrusted-data"
+    SECURE_VARS=$microsoft_vars OPENSHELL_IMAGE_BOOT_TIMEOUT=2m qemu "$work/secure-untrusted.img" "$output/secure-untrusted.log"
+    if grep -q '^OPENSHELL_IMAGE_STEP_DONE' "$output/secure-untrusted.log.txt" ||
+        ! tr -d '\r' < "$output/secure-untrusted.log.serial" | grep -q 'bad shim signature'; then
+        echo 'Secure Boot: the kernel booted, or was refused otherwise, without its certificate' >&2
+        tail -c 2000 "$output/secure-untrusted.log.serial" >&2
+        exit 1
+    fi
+    virt-fw-vars --input "$microsoft_vars" --output "$work/secure-trusted.vars" \
+        --add-db 3b8b6c1e-0000-4c4e-8a4f-4f70656e5368 "$SB_KEYS/openshell-native.crt" > /dev/null
+    SECURE_VARS="$work/secure-trusted.vars" run secure "$work/secure" "b: Good 2026.12.0 (confirmed)"
+    echo OPENSHELL_IMAGE_SECURE_BOOT_OK
+else
+    echo "OPENSHELL_IMAGE_SECURE_BOOT_SKIPPED (no OVMF Secure Boot build or virt-fw-vars)"
+fi
 mkdir -p "$work/blank"
 plan=("recovery recovery none")
 run recovery "$work/blank" "none"

@@ -1,0 +1,93 @@
+diff --git a/kernel/core/src/device/mem/file.rs b/kernel/core/src/device/mem/file.rs
+index 5fb4d89..564a890 100644
+--- a/kernel/core/src/device/mem/file.rs
++++ b/kernel/core/src/device/mem/file.rs
+@@ -51,6 +51,7 @@ pub(in crate::device) enum MemFile {
+     Aio,
+     Kmsg,
+     Oldmem,
++    Initrd,
+ }
+ 
+ impl MemFile {
+@@ -68,6 +69,7 @@ impl MemFile {
+             MemFile::Aio => 10,
+             MemFile::Kmsg => 11,
+             MemFile::Oldmem => 12,
++            MemFile::Initrd => 250,
+         }
+     }
+ 
+@@ -85,6 +87,7 @@ impl MemFile {
+             MemFile::Aio => "aio",
+             MemFile::Kmsg => "kmsg",
+             MemFile::Oldmem => "oldmem",
++            MemFile::Initrd => "initrd",
+         }
+     }
+ }
+@@ -99,11 +102,21 @@ impl Pollable for MemFile {
+ impl FileOps for MemFile {
+     fn read_at(
+         &self,
+-        _offset: usize,
++        offset: usize,
+         writer: &mut VmWriter,
+         _status_flags: StatusFlags,
+     ) -> Result<usize> {
+         match self {
++            MemFile::Initrd => {
++                let initrd = ostd::boot::boot_info().initramfs.unwrap_or(&[]);
++                let Some(rest) = initrd.get(offset..) else { return Ok(0) };
++                let len = rest.len().min(writer.avail());
++                match writer.write_fallible(&mut VmReader::from(&rest[..len])) {
++                    Ok(written) => Ok(written),
++                    Err((err, 0)) => Err(err.into()),
++                    Err((_, written)) => Ok(written),
++                }
++            }
+             MemFile::Full | MemFile::Zero => {
+                 let len = writer.avail();
+                 writer.fill_zeros(len)?;
+@@ -142,6 +155,7 @@ impl PerOpenFileOps for MemFile {
+     }
+ 
+     fn is_offset_aware(&self) -> bool {
+-        false
++        // Read in order, from the position of the open file.
++        matches!(self, MemFile::Initrd)
+     }
+ }
+diff --git a/kernel/core/src/device/mem/mod.rs b/kernel/core/src/device/mem/mod.rs
+index bb684a1..e6755a9 100644
+--- a/kernel/core/src/device/mem/mod.rs
++++ b/kernel/core/src/device/mem/mod.rs
+@@ -15,6 +15,7 @@
+ //! - 10 = /dev/aio     Asynchronous I/O notification interface
+ //! - 11 = /dev/kmsg    Writes to this come out as printk's, reads export the buffered printk records.
+ //! - 12 = /dev/oldmem  OBSOLETE - replaced by /proc/vmcore
++//! - 250 = /dev/initrd  The boot loader's initramfs, as it was loaded (read-only, root)
+ //!
+ //! See <https://www.kernel.org/doc/Documentation/admin-guide/devices.txt>.
+ //!
+@@ -56,6 +57,12 @@ pub(super) fn init_in_first_kthread() {
+     add_device(MemFile::Random).unwrap();
+     add_device(MemFile::Urandom).unwrap();
+     add_device(MemFile::Zero).unwrap();
++    // The initramfs stays in memory reserved at boot. A system that runs from
++    // it, such as a live medium the kernel cannot read after booting, installs
++    // itself by copying it.
++    if ostd::boot::boot_info().initramfs.is_some() {
++        add_device(MemFile::Initrd).unwrap();
++    }
+ }
+ 
+ /// The `mem` class: memory devices such as `/dev/null`.
+@@ -72,6 +79,7 @@ impl Class for MemClass {
+                 mkmod!(a+rw)
+             }
+             MemFile::Kmsg => mkmod!(a+r, u+w),
++            MemFile::Initrd => mkmod!(u+r),
+             _ => return None,
+         };
+         Some(DevNode {

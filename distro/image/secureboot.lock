@@ -1,0 +1,10 @@
+# The signed UEFI boot chain of OpenShell Native media, as OpenShell Live's:
+# Debian's Microsoft-signed shim, its MokManager and Debian's signed GRUB
+# (Debian 13 "trixie"). The kernel, Asterinas, is signed with OpenShell
+# Native's own key, which the computer trusts once its certificate is enrolled
+# in MokManager (distro/image/secureboot.sh).
+#
+# <package> <version> <path under https://deb.debian.org/debian/> <sha256>
+shim-signed 1.51~1+deb13u1+16.1-2~deb13u1 pool/main/s/shim-signed/shim-signed_1.51~1+deb13u1+16.1-2~deb13u1_amd64.deb 3c802fa303c0e6bf126adee74028d1042e3120360d159c2c05181dc9b2f61005
+shim-helpers-amd64-signed 1+16.1+2~deb13u1 pool/main/s/shim-helpers-amd64-signed/shim-helpers-amd64-signed_1+16.1+2~deb13u1_amd64.deb 7e950d75d5a40ecc0a99f727452ce35780b47a04d9a2cc3b1ff7c2bb316c033e
+grub-efi-amd64-signed 1+2.12+9+deb13u2 pool/main/g/grub-efi-amd64-signed/grub-efi-amd64-signed_1+2.12+9+deb13u2_amd64.deb da8bb31308a3682a7d9343fc42bf7f603ad85bb5483eeb3ece23e2f1be2e9bbd

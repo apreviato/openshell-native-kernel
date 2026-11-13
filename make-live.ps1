@@ -76,11 +76,19 @@ if (-not $Iso) {
 $media = (Resolve-Path -LiteralPath $media).Path
 $expected = ((Get-Content -LiteralPath "$media.sha256" -TotalCount 1) -split '\s+')[0]
 if ($expected -notmatch '^[0-9a-fA-F]{64}$') { throw "Invalid SHA-256 in $media.sha256" }
+$secureBoot = @'
+Secure Boot: the stick starts like OpenShell Live's (Debian's shim and GRUB). The first time on a
+computer with Secure Boot on, enroll OpenShell Native's key once: in the boot menu choose
+"Enroll the OpenShell Native key", then in MokManager Enroll key from disk >
+ENROLL_THIS_KEY_IN_MOKMANAGER.cer > Continue > Yes, and reboot.
+'@
 if ($writeUsb) {
     Write-OpenShellNativeUsb -Iso $media -ExpectedHash $expected -Target $target
+    Write-Host $secureBoot
     return
 }
 if ((Get-FileHash -LiteralPath $media -Algorithm SHA256).Hash -ne $expected) {
     throw "SHA-256 verification failed for $media"
 }
 Write-Host "Verified image: $media"
+Write-Host $secureBoot

@@ -38,6 +38,8 @@ let
       install -Dm0644 target/release/libopenshell_shell.a "$out/lib/libopenshell_shell.a"
       install -Dm0755 target/release/openshell-shell "$out/bin/openshell-shell"
       install -Dm0755 target/release/openshell-session "$out/bin/openshell-session"
+      install -Dm0755 target/release/openshell-authproto "$out/bin/openshell-authproto"
+      install -Dm0755 target/release/openshell-power "$out/bin/openshell-power"
       runHook postInstall
     '';
   };
@@ -76,6 +78,15 @@ let
       done
       # The setuid helper is not used: the sandbox runs in user namespaces.
       rm -f "$out/runtime/chrome-sandbox"
+      # The host loads libcef.so from its own folder ($ORIGIN). The SDK's folder,
+      # which the build left in its RUNPATH, would bring the whole SDK (1.3 GB)
+      # into every image that holds the host.
+      rpath=$(patchelf --print-rpath "$out/runtime/openshell-cef-host" | tr ':' '\n' | grep -v '^${cef}' | paste -sd: -)
+      patchelf --set-rpath "$rpath" "$out/runtime/openshell-cef-host"
+      if grep -rq '${builtins.baseNameOf cef}' "$out"; then
+        echo "The CEF host still refers to the SDK" >&2
+        exit 1
+      fi
       grep -m1 '^#define CEF_VERSION ' ${cef}/include/cef_version.h > "$out/cef-version.txt"
       runHook postInstall
     '';

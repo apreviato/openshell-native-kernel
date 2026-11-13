@@ -91,9 +91,11 @@ prepare() {
     fi
     rm -f "$WINEPREFIX/dosdevices/z:"
     # Temporary files out of the prefix, which backups keep.
+    # The cache may be gone (removed, or a restored backup): MSI and others
+    # cannot open anything without a temporary folder.
+    mkdir -p "$cache/$id/temp"
     for temp in "$WINEPREFIX"/drive_c/users/*/AppData/Local/Temp; do
         [ -d "$temp" ] && [ ! -L "$temp" ] || continue
-        mkdir -p "$cache/$id/temp"
         rm -rf "$temp"
         ln -s "$cache/$id/temp" "$temp"
     done

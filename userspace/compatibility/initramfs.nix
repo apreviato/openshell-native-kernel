@@ -5,6 +5,20 @@ let
   node = pkgs.nodejs_24;
   python = pkgs.python3;
   probes = ./openshell-probes;
+  # The live and install media (tools/qemu/run.sh, builds_media): the system as
+  # people use it, without the smokes' probe applications and test installer,
+  # which the Desktop would list and the computer would keep in memory.
+  media = builtins.pathExists ./openshell-media;
+  # Installing the live system on a disk (distro/image/install.sh, with the
+  # payload tools/qemu/run.sh puts in ./openshell-media).
+  installer =
+    if media then
+      pkgs.writeShellScriptBin "openshell-native-install" ''
+        export PATH=${lib.makeBinPath [ pkgs.parted pkgs.e2fsprogs pkgs.dosfstools pkgs.mtools ]}:$PATH
+        ${builtins.readFile ./openshell-media/install.sh}
+      ''
+    else
+      null;
   # The OpenShell Desktop bundle, when the build provides one.
   bundle = if builtins.pathExists ./openshell-bundle then ./openshell-bundle else null;
   seccomp = pkgs.runCommandCC "openshell-seccomp-probe" { } ''
@@ -36,20 +50,37 @@ let
       {
         inherit (shell) cefHost;
         launcher = shell.shell;
-        # setxkbmap: hostd's keyboard service sets the session's layout with it (Settings ▸ Keyboard).
+        # setxkbmap: hostd's keyboard service sets the session's layout with it
+        # (Settings ▸ Keyboard); xset: its lock service, when the screen turns off.
         tools = [
           pkgs.xvfb
           openbox
           pkgs.xdotool
           pkgs.xwd
           pkgs.setxkbmap
+          pkgs.xset
         ];
         # Xvfb and libglvnd find the drivers where NixOS installs them.
         mesa = pkgs.mesa;
+        # The session's X server (probes/openshell-x.sh): Xorg with the
+        # modesetting driver on the kernel's DRM device, the evdev driver,
+        # and Xvfb where there is no screen.
+        display = pkgs.writeShellScriptBin "openshell-x" ''
+          export OPENSHELL_XORG=${pkgs.xorg-server}/bin/Xorg
+          export OPENSHELL_XORG_MODULES=${pkgs.xorg-server}/lib/xorg/modules,${pkgs.xf86-input-evdev}/lib/xorg/modules
+          export OPENSHELL_XORG_FONTS=${pkgs.font-misc-misc}/share/fonts/X11/misc,${pkgs.font-cursor-misc}/share/fonts/X11/misc
+          export OPENSHELL_XVFB=${pkgs.xvfb}/bin/Xvfb
+          ${builtins.readFile (probes + "/openshell-x.sh")}
+        '';
         # Match the Desktop's CSS and the font families shipped by OpenShell Live.
         fonts = pkgs.makeFontsConf {
           fontDirectories = with pkgs; [
-            cascadia-code
+            # Cascadia Code and Mono only, as TrueType: the package's Nerd Font,
+            # Powerline and OpenType copies add 150 MB to a system in memory.
+            (pkgs.runCommand "openshell-cascadia" { } ''
+              mkdir -p "$out/share/fonts/truetype"
+              cp ${pkgs.cascadia-code}/share/fonts/truetype/Cascadia{Code,Mono}-*.ttf "$out/share/fonts/truetype/"
+            '')
             jetbrains-mono
             liberation_ttf
             dejavu_fonts
@@ -67,15 +98,24 @@ let
   apps =
     if graphics != null && builtins.pathExists ./openshell-apps then
       rec {
+        # Xpra without what the Desktop does not use and the whole system
+        # would carry in memory: webcam forwarding (OpenCV, NumPy, BLAS), its
+        # OpenGL client (PyOpenGL) and GStreamer's "bad" and "ugly" plugins
+        # (speech synthesis, MIDI), which PulseAudio's full build brings too.
+        # Xpra treats each one as optional.
+        xpraPackage = (pkgs.xpra.override { pulseaudioFull = pkgs.pulseaudio; }).overrideAttrs (old: {
+          propagatedBuildInputs = lib.filter (input: !(builtins.elem (input.pname or "") [ "opencv" "numpy" "pyopengl" "pyopengl-accelerate" ])) old.propagatedBuildInputs;
+          buildInputs = lib.filter (input: !(builtins.elem (input.pname or "") [ "gst-plugins-bad" "gst-plugins-ugly" ])) old.buildInputs;
+        });
         # The guest's X server is Xvfb. Xpra's default, Xorg with the dummy
         # driver, names a configuration file that does not exist under Nix.
         xpra = pkgs.symlinkJoin {
           name = "openshell-xpra";
-          paths = [ pkgs.xpra ];
+          paths = [ xpraPackage ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             rm "$out/bin/xpra"
-            makeWrapper ${pkgs.xpra}/bin/xpra "$out/bin/xpra" --add-flags \
+            makeWrapper ${xpraPackage}/bin/xpra "$out/bin/xpra" --add-flags \
               "--xvfb='${pkgs.xvfb}/bin/Xvfb -nolisten tcp -noreset +extension GLX +extension Composite +extension RANDR +extension RENDER -extension DOUBLE-BUFFER -auth \$XAUTHORITY -screen 0 8192x4096x24+32 -dpi 96x96'"
           '';
         };
@@ -139,7 +179,8 @@ let
         '';
         # cursorTheme.py draws the applications' OpenShell cursor from Adwaita's
         # (share/icons, in XDG_DATA_DIRS) and tells the toolkits through xsettingsd and xrdb.
-        packages = [ xpra html5 python gtkProbe qtProbe entries dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb ];
+        probeApps = lib.optionals (!media) [ gtkProbe qtProbe entries ];
+        packages = [ xpra html5 python dbusSession pkgs.dbus pkgs.adwaita-icon-theme pkgs.xsettingsd pkgs.xrdb ] ++ probeApps;
       }
     else
       null;
@@ -177,10 +218,68 @@ let
       }
     else
       null;
+  # The screen lock (lock/README.md), as on OpenShell Live: XSecureLock with
+  # Live's lock screen as its auth module, which checks the password with the
+  # session supervisor (openshell-authproto) and powers off through it
+  # (openshell-power). hostd's lock service runs openshell-lock.
+  lock =
+    if apps != null && builtins.pathExists ./openshell-lock then
+      rec {
+        # Without its screensaver hacks and the htpasswd and pamtester helpers:
+        # Apache, xscreensaver, Perl and systemd in a system that is in memory.
+        xsecurelock = pkgs.xsecurelock.overrideAttrs (old: {
+          buildInputs = lib.filter (input: !(builtins.elem (input.pname or "") [ "apache-httpd" "pamtester" ])) old.buildInputs;
+          configureFlags = [ "--with-pam-service-name=login" "--without-xscreensaver" "--without-htpasswd" "--without-pamtester" ];
+          postInstall = "";
+        });
+        python = pkgs.python3.withPackages (p: [ p.pygobject3 p.pycairo ]);
+        # Live's modules as they are, with the paths of this system.
+        screen = pkgs.stdenv.mkDerivation {
+          name = "openshell-lock-screen";
+          src = ./openshell-lock;
+          nativeBuildInputs = [ pkgs.wrapGAppsHook3 pkgs.gobject-introspection ];
+          buildInputs = [ pkgs.gtk3 python ];
+          installPhase = ''
+            modules="$out/lib/openshell-lock"
+            install -Dm0644 -t "$modules" lock_screen.py lock_view.py lock_auth.py lock_settings.py
+            # The session user's home is the Desktop's ($HOME, openshell-lock),
+            # not the one in /etc/passwd: Settings ▸ Lock screen and the photo are there.
+            substituteInPlace "$modules/lock_screen.py" \
+              --replace-fail "'/usr/local/lib/openshell'" "'$modules'" \
+              --replace-fail "Path('/usr/bin/xsecurelock')" "Path('${xsecurelock}/bin/xsecurelock')" \
+              --replace-fail "'/usr/bin/setxkbmap'" "'${pkgs.setxkbmap}/bin/setxkbmap'" \
+              --replace-fail "'/usr/bin/systemctl'" "'${graphics.launcher}/bin/openshell-power'" \
+              --replace-fail "account.pw_dir" "(os.environ.get('HOME') or account.pw_dir)"
+            substituteInPlace "$modules/lock_auth.py" \
+              --replace-fail "'/usr/libexec/xsecurelock/authproto_pam'" "'${graphics.launcher}/bin/openshell-authproto'"
+            # XSecureLock's auth module, auth_openshell as on Live: XSecureLock
+            # takes only auth_* executables.
+            mkdir -p "$out/bin"
+            printf '#!%s\nexec %s -I %s\n' "${pkgs.runtimeShell}" "${python}/bin/python3" "$modules/lock_screen.py" > "$out/bin/auth_openshell"
+            chmod 0755 "$out/bin/auth_openshell"
+          '';
+        };
+        ready = pkgs.writeShellScript "openshell-lock-ready" (builtins.readFile ./openshell-lock/lock-ready.sh);
+        command = pkgs.runCommand "openshell-lock" { } ''
+          mkdir -p "$out/bin"
+          substitute ${./openshell-lock/lock.sh} "$out/bin/openshell-lock" \
+            --replace-fail @env@ ${pkgs.coreutils}/bin/env \
+            --replace-fail @path@ /opt/openshell-compat/bin:/bin:/usr/bin \
+            --replace-fail @cursors@ ${pkgs.adwaita-icon-theme}/share/icons \
+            --replace-fail @auth@ ${screen}/bin/auth_openshell \
+            --replace-fail @authproto@ ${graphics.launcher}/bin/openshell-authproto \
+            --replace-fail @saver@ ${xsecurelock}/libexec/xsecurelock/saver_blank \
+            --replace-fail @xsecurelock@ ${xsecurelock}/bin/xsecurelock \
+            --replace-fail @ready@ ${ready}
+          chmod 0755 "$out/bin/openshell-lock"
+        '';
+      }
+    else
+      null;
   # The applications the Desktop finds where Debian has them (/usr/share/applications).
   applications = pkgs.symlinkJoin {
     name = "openshell-applications";
-    paths = lib.optional (apps != null) apps.entries ++ lib.optional (wine != null) wine.entries;
+    paths = lib.optional (apps != null && !media) apps.entries ++ lib.optional (wine != null) wine.entries;
   };
   # The Desktop Terminal integrates with bash, as on OpenShell Live.
   shell = if bundle != null then pkgs.bashInteractive else null;
@@ -213,17 +312,23 @@ let
       [
         graphics.cefHost
         graphics.launcher
-        graphics.mesa
         graphics.fonts
+        graphics.display
       ]
+      # Software OpenGL (Mesa with LLVM, 800 MB) for WebGL and the apps' GLX.
+      # The media, which run from memory, leave it out: the CEF host then uses
+      # its own SwiftShader for WebGL.
+      ++ lib.optional (!media) graphics.mesa
       ++ graphics.tools
     )
     ++ lib.optionals (apps != null) apps.packages
-    ++ lib.optionals (wine != null) [ wine.package wine.runner wine.probe ]
+    ++ lib.optionals (wine != null) ([ wine.package wine.runner ] ++ lib.optional (!media) wine.probe)
+    ++ lib.optional (lock != null) lock.command
     # /usr/share/applications links to it.
     ++ lib.optional (apps != null) applications
     ++ lib.optional (shell != null) shell
     ++ lib.optional (ab != null) ab
+    ++ lib.optional (installer != null) installer
   );
   extended = pkgs.runCommand "openshell-native-compat-root" { } ''
     mkdir -p "$out"
@@ -261,7 +366,7 @@ let
     ''}
     ${lib.optionalString (graphics != null) ''
       for tool in ${lib.concatMapStringsSep " " (tool: "${tool}/bin") graphics.tools}; do
-        for program in Xvfb openbox xdotool xwd setxkbmap; do
+        for program in Xvfb openbox xdotool xwd setxkbmap xset; do
           if [ -e "$tool/$program" ]; then
             ln -s "$tool/$program" "$out/opt/openshell-compat/bin/$program"
           fi
@@ -270,8 +375,11 @@ let
       ln -s ${graphics.cefHost}/runtime "$out/opt/openshell-cef"
       ln -s ${graphics.launcher}/bin/openshell-shell "$out/opt/openshell-compat/bin/openshell-shell"
       ln -s ${graphics.launcher}/bin/openshell-session "$out/opt/openshell-compat/bin/openshell-session"
-      mkdir -p "$out/run"
-      ln -s ${graphics.mesa} "$out/run/opengl-driver"
+      ln -s ${graphics.display}/bin/openshell-x "$out/opt/openshell-compat/bin/openshell-x"
+      ${lib.optionalString (!media) ''
+        mkdir -p "$out/run"
+        ln -s ${graphics.mesa} "$out/run/opengl-driver"
+      ''}
       chmod u+w "$out/etc"
       mkdir -p "$out/etc/fonts"
       chmod u+w "$out/etc/fonts"
@@ -284,7 +392,7 @@ let
       # Where hostd looks for them, as on Debian.
       ln -sf ${apps.python}/bin/python3 "$out/opt/openshell-compat/bin/python3"
       for program in ${apps.xpra}/bin/xpra ${pkgs.dbus}/bin/dbus-run-session ${pkgs.dbus}/bin/dbus-daemon \
-          ${apps.gtkProbe}/bin/openshell-gtk-probe ${apps.qtProbe}/bin/openshell-qt-probe \
+          ${lib.optionalString (!media) "${apps.gtkProbe}/bin/openshell-gtk-probe ${apps.qtProbe}/bin/openshell-qt-probe"} \
           ${pkgs.xsettingsd}/bin/xsettingsd ${pkgs.xrdb}/bin/xrdb; do
         ln -s "$program" "$out/opt/openshell-compat/bin/"
       done
@@ -306,8 +414,17 @@ let
         ln -s "${wine.package}/bin/$program" "$out/opt/openshell-compat/bin/"
       done
       ln -s ${wine.runner}/bin/openshell-wine "$out/opt/openshell-compat/bin/"
-      ln -s ${wine.probe}/share/openshell/openshell-probe-setup.msi "$out/opt/openshell-compat/openshell-probe-setup.msi"
+      ${lib.optionalString (!media) ''ln -s ${wine.probe}/share/openshell/openshell-probe-setup.msi "$out/opt/openshell-compat/openshell-probe-setup.msi"''}
       install -m 0644 ${probes}/wine-smoke.mjs "$out/opt/openshell-compat/"
+    ''}
+    ${lib.optionalString (lock != null) ''
+      ln -s ${lock.command}/bin/openshell-lock "$out/opt/openshell-compat/bin/"
+      ln -s ${graphics.launcher}/bin/openshell-power "$out/opt/openshell-compat/bin/"
+    ''}
+    ${lib.optionalString media ''
+      mkdir -p "$out/opt/openshell-media"
+      cp -R ${./openshell-media}/. "$out/opt/openshell-media/"
+      ln -s ${installer}/bin/openshell-native-install "$out/opt/openshell-compat/bin/openshell-native-install"
     ''}
     rm "$out/test/boot_hello.sh"
     install -m 0755 ${probes}/compat-boot.sh "$out/test/boot_hello.sh"

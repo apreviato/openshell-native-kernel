@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The OpenShell Native disk: GPT with an EFI system partition (GRUB and
-# grub.cfg), the system slots system_a and system_b, recovery and data.
+# The OpenShell Native disk: GPT with an EFI system partition (the signed
+# boot chain of secureboot.sh and grub.cfg), the system slots system_a and
+# system_b, recovery and data.
 #
 #   mkimage.sh <disk-dir> <recovery-dir> <output.img> [data-dir]
 #
@@ -12,16 +13,17 @@
 # that boot it (grub.cfg sources the chosen slot's).
 #
 # No root and no loop devices: each filesystem is built as a file (mke2fs -d,
-# mtools) and copied into its partition.
+# mtools) and copied into its partition. SB_KEYS names the folder of the
+# Secure Boot key, whose certificate the ESP carries for MokManager.
 set -euo pipefail
 
-[[ $# -eq 3 || $# -eq 4 ]] || { sed -n '2,15p' "$0" >&2; exit 2; }
+[[ $# -eq 3 || $# -eq 4 ]] || { sed -n '2,18p' "$0" >&2; exit 2; }
 disk=$1 recovery=$2 output=$3 extra=${4:-}
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/openshell-image-XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
-mkstandalone=$(command -v grub-mkstandalone || echo /usr/local/grub/bin/grub-mkstandalone)
+source "$here/secureboot.sh"
 
 # Partitions in MiB: ESP, the two slots and recovery the size of the largest release, then data.
 mib() { du -sm --apparent-size "$1" | cut -f1; }
@@ -59,12 +61,13 @@ for label in "${labels[@]:1}"; do
     printf 'set openshell_%s_uuid=%s\n' "${label#osn-}" "$uuid"
 done > "$work/grub.cfg"
 cat "$here/grub.cfg" >> "$work/grub.cfg"
-"$mkstandalone" -O x86_64-efi -o "$work/BOOTX64.EFI" \
-    --modules="part_gpt fat ext2 search search_fs_uuid regexp loadenv test echo multiboot2 normal configfile serial terminal" \
-    "boot/grub/grub.cfg=$work/grub.cfg"
+# Debian's GRUB for disks reads /EFI/debian/grub.cfg of the ESP it booted
+# from, and never a live stick's menu.
+sb_esp_files "$work/esp" "${SB_KEYS:?the Secure Boot key folder}" disk
+mkdir -p "$work/esp/EFI/debian"
+cp "$work/grub.cfg" "$work/esp/EFI/debian/grub.cfg"
 mkfs.vfat -C -n OSN-ESP "$work/esp.img" $(( esp * 1024 )) > /dev/null
-mmd -i "$work/esp.img" ::/EFI ::/EFI/BOOT
-mcopy -i "$work/esp.img" "$work/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
+(cd "$work/esp" && mcopy -s -i "$work/esp.img" ./* ::/)
 
 # The disk: 1 MiB for the GPT, the partitions, 1 MiB for the backup GPT.
 total=2

@@ -40,6 +40,9 @@ bundle=/tmp/openshell-native-bundle
 shell_sources=/tmp/openshell-native-shell
 ab_sources=/tmp/openshell-native-ab
 image_sources=/tmp/openshell-native-image
+# OpenShell Native's Secure Boot key (distro/image/secureboot.sh): the host's
+# .secureboot folder when there is one, made here otherwise and handed back.
+export SB_KEYS=/tmp/openshell-native-secureboot
 
 # What each action builds and runs. apps is the kiosk with the Linux apps
 # profile; wine adds the Windows apps profile (OPENSHELL_WINE.md) to it.
@@ -54,7 +57,7 @@ prepare_compat() {
     install -m 0644 "$compat/initramfs.nix" test/initramfs/nix/openshell-compat.nix
     rm -rf test/initramfs/nix/openshell-probes test/initramfs/nix/openshell-bundle \
         test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab test/initramfs/nix/openshell-apps \
-        test/initramfs/nix/openshell-wine
+        test/initramfs/nix/openshell-wine test/initramfs/nix/openshell-media test/initramfs/nix/openshell-lock
     cp -R "$probes" test/initramfs/nix/openshell-probes
     cp -R "$ab_sources" test/initramfs/nix/openshell-ab
     # The Desktop profiles add the OpenShell bundle to the initramfs.
@@ -65,14 +68,43 @@ prepare_compat() {
     if uses_graphics; then
         cp -R "$shell_sources" test/initramfs/nix/openshell-shell
     fi
-    # The apps profile adds Xpra and the probe applications, and the wine
-    # profile Wine (initramfs.nix).
+    # The apps profile adds Xpra and the probe applications, with the screen
+    # lock (lock/README.md), and the wine profile Wine (initramfs.nix).
     if uses_apps; then
         mkdir test/initramfs/nix/openshell-apps
+        cp -R "$compat/lock" test/initramfs/nix/openshell-lock
     fi
     if uses_wine; then
         cp -R "$compat/wine" test/initramfs/nix/openshell-wine
     fi
+    # The media leave out the smokes' probe applications and test installer,
+    # and carry what installs them on a disk (distro/image/install.sh): the
+    # signed kernel, the disk's boot files and grub.cfg. The live system is
+    # its initramfs, which the installer reads from /dev/initrd.
+    if builds_media; then
+        prepare_media_payload "$release_version"
+    fi
+}
+
+# What installs a live medium on a disk (distro/image/install.sh), in the
+# image the next nix-build makes: the signed kernel, the disk's boot files,
+# grub.cfg and the slots' boot commands. The live system is its initramfs,
+# read from /dev/initrd.
+prepare_media_payload() {
+    local payload=test/initramfs/nix/openshell-media
+    rm -rf "$payload"
+    mkdir "$payload"
+    prepare_secure_boot >> "$artifacts/media-payload.log" 2>&1
+    (
+        source "$image_sources/release.sh"
+        sb_sign "$SB_KEYS" "$kernel_efi" "$payload/kernel"
+        sb_esp_files "$payload/boot" "$SB_KEYS" disk
+        release_boot_cfg "$1" "${RELEASE_SESSION[@]}" > "$payload/boot.cfg"
+        release_boot_cfg recovery "${RELEASE_RECOVERY[@]}" > "$payload/recovery.cfg"
+    ) >> "$artifacts/media-payload.log" 2>&1
+    install -m 0644 "$image_sources/grub.cfg" "$payload/grub.cfg"
+    install -m 0755 "$image_sources/install.sh" "$payload/install.sh"
+    printf '%s\n' "$1" > "$payload/release"
 }
 
 # Runs the CEF smokes, and the Desktop shell smoke for the kiosk, on the
@@ -150,8 +182,12 @@ run_control_graphics() {
     if drives_desktop; then
         control_smoke control-shell "$probes/shell-smoke.mjs" \
             "$work/control-launcher/bin/openshell-shell" "$bundle" "$host"
-        # The supervisor runs as root and starts the session as the user.
-        if PATH="$path" FONTCONFIG_FILE="$work/control-fonts" XDG_CONFIG_DIRS="$work/control-graphicsTools/etc/xdg" \
+        # The supervisor runs as root and starts the session as the user; the
+        # sign-in hashes with BusyBox's cryptpw, as in the guest.
+        local busybox
+        busybox=$(nix-build -E "(import ./distro/nixpkgs.nix {}).busybox" --no-out-link 2>> "$artifacts/control-graphics-build.log") || busybox=
+        if OPENSHELL_SMOKE_CRYPTPW=${busybox:+$busybox/bin/busybox cryptpw} \
+            PATH="$path" FONTCONFIG_FILE="$work/control-fonts" XDG_CONFIG_DIRS="$work/control-graphicsTools/etc/xdg" \
             OPENSHELL_CEF_SMOKE_TIMEOUT_MS=90000 timeout --kill-after=10s 15m "$work/control-node/bin/node" \
             "$probes/session-smoke.mjs" "$work/control-launcher/bin/openshell-session" \
             "$work/control-launcher/bin/openshell-shell" "$bundle" "$host" "$tools/Xvfb" "$tools/openbox" \
@@ -263,8 +299,10 @@ else
 fi
 
 ovmf_dir=${OVMF_DIR:-/root/ovmf/release}
+# The Linux EFI handover, as on a computer: Debian's signed GRUB boots it
+# under Secure Boot (distro/image/secureboot.sh), and has no multiboot2 there.
 profile=(
-    TARGET_ARCH=x86_64 BOOT_METHOD=grub-rescue-iso BOOT_PROTOCOL=multiboot2
+    TARGET_ARCH=x86_64 BOOT_METHOD=grub-rescue-iso BOOT_PROTOCOL=linux-efi-handover64
     OVMF=on "OVMF_DIR=$ovmf_dir" ENABLE_KVM=0 SMP=1 MEM=2G RELEASE=1
     INITRAMFS=on CONSOLE=hvc0 QEMU_DISPLAY=none NETDEV=none
 )
@@ -299,6 +337,9 @@ if [[ ! -s "$iso" ]]; then
 fi
 cp "$iso" "$artifacts/asterinas.iso"
 (cd "$artifacts" && sha256sum asterinas.iso > SHA256SUMS)
+# The kernel GRUB loads with `linux`: an EFI image with the handover entry.
+kernel_efi="$work/asterinas.efi"
+cp "$CARGO_TARGET_DIR/osdk/iso_root/boot/asterinas-osdk-bin" "$kernel_efi"
 record_check kernel-build passed
 
 if [[ "$action" == build ]]; then
@@ -423,17 +464,39 @@ run_compat() {
     return "$status"
 }
 
+# What the signed boot chain needs (distro/image/secureboot.sh): sbsign from
+# the pinned nixpkgs, and for the image test OVMF's Secure Boot build with
+# Microsoft's keys and virt-fw-vars. The key is made once and kept.
+prepare_secure_boot() {
+    [[ -n "${SBSIGN:-}" ]] && return 0
+    local tools
+    tools=$(nix-build -E "(import ./distro/nixpkgs.nix {}).sbsigntool" --no-out-link) || return 1
+    export SBSIGN="$tools/bin/sbsign"
+    if [[ ! -f /usr/share/OVMF/OVMF_CODE_4M.secboot.fd ]] || ! command -v virt-fw-vars > /dev/null; then
+        { apt-get update -qq && apt-get install -y -qq ovmf python3-virt-firmware; } > "$artifacts/secure-boot-tools.log" 2>&1 ||
+            echo 'Secure Boot test firmware unavailable; the image test skips its Secure Boot boots.' >&2
+    fi
+    (source "$image_sources/secureboot.sh" && sb_key "$SB_KEYS")
+    # Handed back to the host (native.mjs keeps it in .secureboot), never published.
+    mkdir -p "$artifacts/secureboot-key"
+    cp "$SB_KEYS"/openshell-native.* "$artifacts/secureboot-key/"
+}
+
 # The disk image (distro/image): GPT with the system slots, recovery and
 # data, GRUB choosing the slot from the A/B transaction's grubenv, booted in
 # QEMU once per step of each plan. Without the Desktop, the slots stay small.
 run_image() {
+    if ! prepare_secure_boot >> "$artifacts/native-image.log" 2>&1; then
+        record_check native-image failed
+        return 1
+    fi
     if ! timeout --kill-after=15s 25m nix-build test/initramfs/nix/openshell-compat.nix \
         -A ab -o "$work/image-ab" >> "$artifacts/native-image.log" 2>&1; then
         record_check native-image failed
         return 1
     fi
     if OVMF_DIR="$ovmf_dir" timeout --kill-after=15s 150m bash "$image_sources/boot-test.sh" \
-        "$work/image-ab/bin/openshell-ab" "$CARGO_TARGET_DIR/osdk/asterinas-osdk-bin.elf" \
+        "$work/image-ab/bin/openshell-ab" "$kernel_efi" \
         "$work/compat-initramfs" "$artifacts/native-image" "$@" >> "$artifacts/native-image.log" 2>&1; then
         record_check native-image passed
     else
@@ -458,8 +521,9 @@ if builds_media; then
         action=install-image
     fi
     media_status=0
-    bash "$image_sources/build-media.sh" "$action" "$release_version" \
-        "$CARGO_TARGET_DIR/osdk/asterinas-osdk-bin.elf" "$desktop_initramfs" \
+    prepare_secure_boot || media_status=$?
+    (( media_status == 0 )) && bash "$image_sources/build-media.sh" "$action" "$release_version" \
+        "$kernel_efi" "$desktop_initramfs" \
         "$work/recovery-initramfs" "$artifacts" || media_status=$?
     if (( media_status != 0 )); then
         record_check "$action" failed
@@ -469,15 +533,39 @@ if builds_media; then
     exit 0
 fi
 
+# The live medium's installer (distro/image/install-test.sh): a small live
+# system of the media profile installs itself on an NVMe disk, which then
+# boots alone through the signed chain.
+run_install_test() {
+    prepare_compat
+    prepare_media_payload 2026.11.0-install-test
+    install -m 0644 "$probes/install-boot.sh" test/initramfs/nix/openshell-probes/compat-boot.sh
+    if ! timeout --kill-after=15s 25m nix-build test/initramfs/nix/openshell-compat.nix \
+        -A image -o "$work/install-initramfs" >> "$artifacts/native-install.log" 2>&1; then
+        record_check native-install failed
+        return 1
+    fi
+    if timeout --kill-after=15s 90m bash "$image_sources/install-test.sh" "$kernel_efi" \
+        "$work/install-initramfs" "$artifacts/native-install" >> "$artifacts/native-install.log" 2>&1; then
+        record_check native-install passed
+    else
+        tail -n 40 "$artifacts/native-install.log" >&2
+        record_check native-install failed
+        return 1
+    fi
+}
+
 if [[ "$action" == image || "$action" == desktop-image ]]; then
     prepare_compat
     build_compat_image
+    image_status=0
     if [[ "$action" == desktop-image ]]; then
-        OPENSHELL_IMAGE_DATA_MIB=768 run_image desktop
+        OPENSHELL_IMAGE_DATA_MIB=768 run_image desktop || image_status=1
     else
-        run_image
+        run_image || image_status=1
+        run_install_test || image_status=1
     fi
-    exit "$control_status"
+    exit $((control_status || image_status))
 fi
 
 if [[ "$action" == compat || "$action" == sandbox ]] || uses_bundle || uses_graphics; then

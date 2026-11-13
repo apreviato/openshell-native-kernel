@@ -32,6 +32,11 @@ pub struct SessionConfig {
     pub confirm: Option<CommandLine>,
     /// How long the Desktop reports health continuously before confirming.
     pub confirm_after: Duration,
+    /// Signing in before the shell starts (login.rs): `greeter`,
+    /// `password_file` and, optionally, `password_tool`.
+    pub login: Option<crate::login::LoginConfig>,
+    /// The live session's installer (install.rs), which the supervisor runs as root.
+    pub installer: Option<CommandLine>,
 }
 
 /// By default the Desktop must report health continuously for a minute.
@@ -61,6 +66,8 @@ impl SessionConfig {
         let (mut user, mut display, mut home, mut log_dir) = (None, None, None, None);
         let (mut x_server, mut window_manager, mut shell) = (None, None, None);
         let (mut confirm, mut confirm_after) = (None, DEFAULT_CONFIRM_AFTER);
+        let (mut greeter, mut password_file, mut password_tool) = (None, None, None);
+        let mut installer = None;
         let mut env = Vec::new();
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -90,6 +97,10 @@ impl SessionConfig {
                 "wm" => window_manager = Some(command(value, key)?),
                 "shell" => shell = Some(command(value, key)?),
                 "confirm" => confirm = Some(command(value, key)?),
+                "greeter" => greeter = Some(command(value, key)?),
+                "password_file" => password_file = Some(absolute(value, key)?),
+                "password_tool" => password_tool = Some(command(value, key)?),
+                "installer" => installer = Some(command(value, key)?),
                 "confirm_after" => {
                     let seconds = value.parse::<u64>().map_err(|_| "confirm_after is a number of seconds")?;
                     confirm_after = Duration::from_secs(seconds.max(1));
@@ -108,6 +119,15 @@ impl SessionConfig {
                 _ => return Err(format!("line {}: unknown key {key}", number + 1)),
             }
         }
+        let login = match (greeter, password_file) {
+            (Some(greeter), Some(password_file)) => Some(crate::login::LoginConfig {
+                greeter,
+                password_file,
+                password_tool: password_tool.unwrap_or_else(|| vec![crate::login::DEFAULT_PASSWORD_TOOL.to_owned()]),
+            }),
+            (None, None) if password_tool.is_none() => None,
+            _ => return Err("greeter and password_file go together".into()),
+        };
         let (uid, gid) = user.ok_or("missing user")?;
         if uid == 0 {
             return Err("The session does not run as root".into());
@@ -124,6 +144,8 @@ impl SessionConfig {
             env,
             confirm,
             confirm_after,
+            login,
+            installer,
         })
     }
 

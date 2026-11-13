@@ -28,6 +28,11 @@ Wine Mono e Gecko não fazem parte do perfil: o prefixo é criado sem eles (`WIN
 | Um `.exe` aberto pelo Terminal escolhe o Wine e abre numa janela do Desktop (Xpra) | fase `linux-apps` do [smoke do shell](../../../tools/desktop/shell-smoke.mjs), com `OPENSHELL_SMOKE_WINE=1` | Passa | Pendente |
 | O prefixo do OpenShell não tem a unidade Z: | idem | Passa | Pendente |
 | Fechar a janela encerra o Wine | idem | Passa | Pendente |
+| W4: um instalador MSI ([probe.wxs](probe.wxs)) instala num prefixo próprio, com atalho no Desktop e sem associações de arquivo do Wine | `wine-smoke.mjs`, com `OPENSHELL_WINE_PROBE_MSI` | Passa | Pendente |
+| W4: o programa abre pelo atalho, como o Desktop o abre, e a configuração sobrevive entre execuções | idem | Passa | Pendente |
+| W4: backup, remoção (com o atalho) e restauração do prefixo, com a configuração | idem | Passa | Pendente |
+| W4: outro Wine rodou o prefixo por último: backup antes da atualização, e a versão registrada | idem | Passa | Pendente |
+| W4: desinstalação pelo MSI, e remoção do prefixo sem processos restantes | idem | Passa | Pendente |
 
 ## Estado das fases
 
@@ -37,5 +42,5 @@ Wine Mono e Gecko não fazem parte do perfil: o prefixo é criado sem eles (`WIN
 | W1 · Wine em userspace | Passa no Linux de controle; o guest roda a mesma prova na ação `wine`. |
 | W2 · abrir `.exe` | Associação de `.exe` e `.msi`, runner em primeiro plano, limpeza pelo `hostd` ao fechar (a sessão Xpra inteira). |
 | W3 · janelas no Desktop | Pelo caminho Xpra dos apps Linux: a janela do programa é uma janela do OpenShell, com dock, foco, teclado e clipboard dos apps Linux. |
-| W4 · prefixos por app, instalação | Runner e painel de Configurações oferecem prefixos por instalação, logs, backup e restauração. A prova ponta a ponta de instalação e preservação do prefixo durante rollback no Asterinas segue pendente. |
+| W4 · prefixos por app, instalação | Runner e painel de Configurações oferecem prefixos por instalação, logs, backup e restauração. O gate W4 do `wine-smoke` passa no Linux de controle. No Asterinas, roda na ação `wine` e segue pendente. Os prefixos ficam nos dados da pessoa (`XDG_DATA_HOME`), fora dos slots que uma atualização ou um rollback substitui. |
 | W5 · compatibilidade avançada | Pendente: Wine Mono, Gecko, VC runtimes sob demanda e medições. |

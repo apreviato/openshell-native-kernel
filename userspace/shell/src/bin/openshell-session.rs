@@ -3,13 +3,17 @@
 //! It starts the X server, the window manager and the shell launcher as the
 //! session user, restarts what fails within a budget, reaps the processes that
 //! the session leaves behind and shuts everything down in order. Each boot
-//! keeps its logs in its own directory.
+//! keeps its logs in its own directory. With a sign-in (login.rs), it runs the
+//! greeter before the shell, and checks the lock screen's password. Asked to
+//! power off or restart (power.rs), it stops the session and exits with that
+//! action's status for init to carry out.
 
 use std::env;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -18,6 +22,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use openshell_shell::install::{Installer, INSTALL_PREFIX, SYSTEM_SOCKET_ENV};
+use openshell_shell::login::{parse_request, Phase, Request, GREETER_SOCKET_ENV, MAX_REQUEST};
+use openshell_shell::power::PowerAction;
 use openshell_shell::session::{
     boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig,
     DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET, DESKTOP_HEALTHY,
@@ -43,6 +50,30 @@ extern "C" {
     fn chown(path: *const std::ffi::c_char, uid: u32, gid: u32) -> i32;
     fn signal(number: i32, handler: extern "C" fn(i32)) -> usize;
     fn capset(header: *mut CapHeader, data: *const CapData) -> i32;
+    fn getsockopt(socket: i32, level: i32, name: i32, value: *mut std::ffi::c_void, length: *mut u32) -> i32;
+}
+
+const SOL_SOCKET: i32 = 1;
+const SO_PEERCRED: i32 = 17;
+
+#[repr(C)]
+#[derive(Default)]
+struct PeerCredentials {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// The user of the process at the other end of a Unix socket.
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut credentials = PeerCredentials::default();
+    let mut length = std::mem::size_of::<PeerCredentials>() as u32;
+    let pointer = (&mut credentials as *mut PeerCredentials).cast();
+    if unsafe { getsockopt(stream.as_raw_fd(), SOL_SOCKET, SO_PEERCRED, pointer, &mut length) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
 }
 
 #[repr(C)]
@@ -98,6 +129,7 @@ impl Journal {
 enum Role {
     XServer,
     WindowManager,
+    Greeter,
     Shell,
 }
 
@@ -106,10 +138,14 @@ impl Role {
         match self {
             Role::XServer => "x",
             Role::WindowManager => "wm",
+            Role::Greeter => "greeter",
             Role::Shell => "shell",
         }
     }
 }
+
+/// After a wrong password, the greeter waits this long for the answer.
+const WRONG_PASSWORD_DELAY: Duration = Duration::from_secs(2);
 
 /// A process of the session, which leads its own process group.
 struct Member {
@@ -124,6 +160,15 @@ struct Supervisor {
     logs: std::path::PathBuf,
     journal: Journal,
     members: Vec<Member>,
+    /// Signed in through the greeter (or no sign-in configured).
+    signed_in: bool,
+    /// The greeter's socket while it runs.
+    greeter_socket: Option<std::path::PathBuf>,
+    /// The system socket (power, the lock screen's password check and the
+    /// live session's installer), with the installer.
+    system: Option<(UnixListener, std::path::PathBuf, Option<Installer>)>,
+    /// The session asked to power off or restart.
+    power: Option<PowerAction>,
 }
 
 fn describe(status: i32) -> String {
@@ -156,6 +201,12 @@ impl Supervisor {
             .process_group(0);
         // std drops the supplementary groups when it changes the user as root.
         command.uid(self.config.uid).gid(self.config.gid);
+        if let (Role::Greeter, Some(socket)) = (role, &self.greeter_socket) {
+            command.env(GREETER_SOCKET_ENV, socket);
+        }
+        if let (Role::Shell, Some((_, socket, _))) = (role, &self.system) {
+            command.env(SYSTEM_SOCKET_ENV, socket);
+        }
         if role == Role::Shell && self.config.confirm.is_some() {
             command.env(DESKTOP_HEALTH_ENV, "1").stdout(Stdio::piped());
         } else {
@@ -237,7 +288,7 @@ impl Supervisor {
     }
 
     fn stop_all(&mut self) {
-        for role in [Role::Shell, Role::WindowManager, Role::XServer] {
+        for role in [Role::Shell, Role::Greeter, Role::WindowManager, Role::XServer] {
             self.stop(role);
         }
     }
@@ -271,9 +322,155 @@ impl Supervisor {
         if let Some(window_manager) = self.config.window_manager.clone() {
             self.spawn(Role::WindowManager, &window_manager)?;
         }
+        if !self.signed_in {
+            self.sign_in()?;
+        }
         let shell = self.config.shell.clone();
         self.spawn(Role::Shell, &shell)?;
         Ok(())
+    }
+
+    /// Opens the system socket (install.rs): power, the lock screen's
+    /// password check and the live session's installer.
+    fn open_system_socket(&mut self) -> io::Result<()> {
+        let folder = std::path::PathBuf::from(format!("/tmp/openshell-system-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::DirBuilder::new().mode(0o711).create(&folder)?;
+        let socket = folder.join("system.sock");
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o666))?;
+        listener.set_nonblocking(true)?;
+        self.system = Some((listener, socket, self.config.installer.clone().map(Installer::new)));
+        Ok(())
+    }
+
+    /// Answers what the session asked on the system socket, from its user only.
+    fn serve_system(&mut self) {
+        let Some((listener, _, installer)) = &self.system else { return };
+        while let Ok((stream, _)) = listener.accept() {
+            if peer_uid(&stream).ok() != Some(self.config.uid) {
+                continue;
+            }
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let _ = BufReader::new(&stream).take(MAX_REQUEST as u64 + 1).read_until(b'\n', &mut request);
+            let line = String::from_utf8_lossy(&request);
+            let line = line.strip_suffix('\n').unwrap_or(&line);
+            let unlock = matches!(parse_request(line), Some(Request::State | Request::Login(_)));
+            let answer = if unlock && request.len() <= MAX_REQUEST {
+                // The lock screen's password check (openshell-authproto).
+                match &self.config.login {
+                    Some(login) => {
+                        let answer = login.answer(line, Phase::Unlock).unwrap_or("invalid");
+                        match answer {
+                            "ok" => self.journal.note("unlocked"),
+                            "wrong" => {
+                                self.journal.note("a wrong password at the lock screen");
+                                thread::sleep(WRONG_PASSWORD_DELAY);
+                            }
+                            _ => {}
+                        }
+                        answer.to_owned()
+                    }
+                    None => "unavailable".to_owned(),
+                }
+            } else if PowerAction::is_request(line) {
+                match PowerAction::from_request(line) {
+                    Some(action) => {
+                        self.journal.note(&format!("the session asked to {}", action.verb()));
+                        self.power = Some(action);
+                        "ok".to_owned()
+                    }
+                    None => "invalid".to_owned(),
+                }
+            } else if let Some(installer) = installer {
+                installer.answer(line)
+            } else if line.starts_with(INSTALL_PREFIX) {
+                // Only the live medium installs (installed-session.sh).
+                "unavailable".to_owned()
+            } else {
+                "invalid".to_owned()
+            };
+            if answer == "started" {
+                self.journal.note(&format!("the installer started ({line})"));
+            }
+            let _ = writeln!(&stream, "{answer}");
+        }
+    }
+
+    /// Runs the greeter until the person signs in (login.rs). It answers the
+    /// greeter's requests on a socket, from the session user's processes only
+    /// (the supervisor no longer has CAP_CHOWN to give the socket away, so it
+    /// checks each peer); a greeter that fails starts again, within a budget.
+    fn sign_in(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(login) = self.config.login.clone() else {
+            self.signed_in = true;
+            return Ok(());
+        };
+        let folder = std::path::PathBuf::from(format!("/tmp/openshell-greeter-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::DirBuilder::new().mode(0o711).create(&folder)?;
+        let socket = folder.join("greeter.sock");
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o666))?;
+        listener.set_nonblocking(true)?;
+        self.greeter_socket = Some(socket);
+        let mut budget = RestartBudget::new(5, Duration::from_secs(60));
+        self.spawn(Role::Greeter, &login.greeter)?;
+        let result: Result<(), Box<dyn Error>> = loop {
+            self.reap();
+            if STOP.load(Ordering::Relaxed) {
+                break Err("stopped".into());
+            }
+            if let Some(status) = self.exited(Role::XServer) {
+                break Err(format!("the X server exited with {} before signing in", describe(status)).into());
+            }
+            if self.exited(Role::Greeter).is_some() {
+                let Some(delay) = budget.next_delay(Instant::now()) else { break Err("the greeter keeps failing".into()) };
+                self.stop(Role::Greeter);
+                thread::sleep(delay);
+                self.spawn(Role::Greeter, &login.greeter)?;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    if peer_uid(&stream).ok() != Some(self.config.uid) {
+                        self.journal.note("refused a sign-in request from another user");
+                        continue;
+                    }
+                    stream.set_nonblocking(false)?;
+                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    // One line: its newline ends the request.
+                    let mut request = Vec::new();
+                    let _ = BufReader::new(&stream).take(MAX_REQUEST as u64 + 1).read_until(b'\n', &mut request);
+                    let line = String::from_utf8_lossy(&request);
+                    let line = line.strip_suffix('\n').unwrap_or(&line);
+                    let answer = if request.len() > MAX_REQUEST { "invalid" } else { login.answer(line, Phase::SignIn)? };
+                    match answer {
+                        "ok" => self.journal.note("signed in"),
+                        "wrong" => {
+                            self.journal.note("a wrong password at the greeter");
+                            thread::sleep(WRONG_PASSWORD_DELAY);
+                        }
+                        _ => {}
+                    }
+                    let _ = writeln!(stream, "{answer}");
+                    if answer == "ok" {
+                        break Ok(());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL),
+                Err(error) => break Err(error.into()),
+            }
+        };
+        self.greeter_socket = None;
+        let _ = fs::remove_dir_all(&folder);
+        if result.is_ok() {
+            // The greeter has its answer; the Desktop takes over the screen.
+            self.stop(Role::Greeter);
+            self.signed_in = true;
+        }
+        result
     }
 
     /// The session is healthy: the release the computer booted is confirmed
@@ -288,9 +485,9 @@ impl Supervisor {
         }
     }
 
-    /// Runs the session until the shell ends it, a stop is requested or
-    /// failures exceed the budget.
-    fn run(&mut self) -> Result<(), Box<dyn Error>> {
+    /// Runs the session until the shell ends it, it asks to power off or
+    /// restart, a stop is requested or failures exceed the budget.
+    fn run(&mut self) -> Result<Option<PowerAction>, Box<dyn Error>> {
         let mut session_budget = RestartBudget::new(3, Duration::from_secs(300));
         let mut shell_budget = RestartBudget::new(5, Duration::from_secs(60));
         let mut wm_budget = RestartBudget::new(5, Duration::from_secs(60));
@@ -300,6 +497,10 @@ impl Supervisor {
         self.start()?;
         while !STOP.load(Ordering::Relaxed) {
             self.reap();
+            self.serve_system();
+            if let Some(action) = self.power {
+                return Ok(Some(action));
+            }
             if let Some(status) = self.exited(Role::XServer) {
                 // Without X, the whole session starts over.
                 self.journal.note(&format!("x failed ({}); restarting the session", describe(status)));
@@ -313,7 +514,7 @@ impl Supervisor {
             if let Some(status) = self.exited(Role::Shell) {
                 if status == 0 {
                     self.journal.note("the shell ended the session");
-                    return Ok(());
+                    return Ok(None);
                 }
                 let delay = shell_budget.next_delay(Instant::now()).ok_or("the shell keeps failing")?;
                 self.journal.note(&format!("restarting the shell in {} ms", delay.as_millis()));
@@ -358,7 +559,7 @@ impl Supervisor {
             thread::sleep(POLL);
         }
         self.journal.note("stop requested");
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -399,7 +600,7 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return if args.len() == 1 { ExitCode::SUCCESS } else { ExitCode::from(2) };
     }
-    let result = (|| -> Result<(), Box<dyn Error>> {
+    let result = (|| -> Result<Option<PowerAction>, Box<dyn Error>> {
         if unsafe { geteuid() } != 0 {
             return Err("The supervisor runs as root and starts the session as its user".into());
         }
@@ -416,7 +617,8 @@ fn main() -> ExitCode {
         prepare_home(&config)?;
         let logs = boot_log_dir(Path::new(&config.log_dir), KEPT_BOOTS)?;
         let journal = Journal(OpenOptions::new().create(true).append(true).mode(0o640).open(logs.join("session.log"))?);
-        let mut supervisor = Supervisor { config, logs, journal, members: Vec::new() };
+        let mut supervisor = Supervisor { config, logs, journal, members: Vec::new(), signed_in: false, greeter_socket: None, system: None, power: None };
+        supervisor.open_system_socket()?;
         supervisor.journal.note(&format!("session logs in {}", supervisor.logs.display()));
         // Root keeps only what the supervision needs.
         drop_capabilities()?;
@@ -430,7 +632,8 @@ fn main() -> ExitCode {
         outcome
     })();
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(None) => ExitCode::SUCCESS,
+        Ok(Some(action)) => ExitCode::from(action.exit_status()),
         Err(error) => {
             eprintln!("openshell-session: {error}");
             ExitCode::FAILURE

@@ -1,0 +1,52 @@
+diff --git a/kernel/core/comps/framebuffer/src/console.rs b/kernel/core/comps/framebuffer/src/console.rs
+index a91a08a..0b272c1 100644
+--- a/kernel/core/comps/framebuffer/src/console.rs
++++ b/kernel/core/comps/framebuffer/src/console.rs
+@@ -116,6 +116,12 @@ struct ConsoleState {
+ impl ConsoleState {
+     fn new(backend: Arc<FrameBuffer>) -> Self {
+         let buffer_size = backend.io_mem().size();
++        // The console starts from what is on the screen, so activating it
++        // keeps the boot splash until text is written.
++        let mut bytes = alloc::vec![0; buffer_size];
++        if backend.read_bytes_at(0, &mut bytes).is_err() {
++            bytes.fill(0);
++        }
+         Self {
+             x_pos: 0,
+             y_pos: 0,
+@@ -124,7 +130,7 @@ impl ConsoleState {
+             font: BitmapFont::new_basic8x8(),
+             is_active: false,
+             mode: ConsoleMode::Text,
+-            bytes: alloc::vec![0; buffer_size],
++            bytes,
+             backend,
+         }
+     }
+diff --git a/kernel/core/comps/framebuffer/src/framebuffer.rs b/kernel/core/comps/framebuffer/src/framebuffer.rs
+index c79a7d0..e217a9d 100644
+--- a/kernel/core/comps/framebuffer/src/framebuffer.rs
++++ b/kernel/core/comps/framebuffer/src/framebuffer.rs
+@@ -131,7 +131,8 @@ pub(crate) fn init() {
+         }
+     };
+ 
+-    framebuffer.clear();
++    // What the boot loader drew stays on the screen (a splash) until a
++    // console or a display server draws over it.
+     FRAMEBUFFER.call_once(|| Arc::new(framebuffer));
+ }
+ 
+@@ -184,6 +185,11 @@ impl FrameBuffer {
+         self.io_mem.write_bytes(offset, bytes)
+     }
+ 
++    /// Reads raw bytes at the specified offset.
++    pub fn read_bytes_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
++        self.io_mem.read_bytes(offset, bytes)
++    }
++
+     /// Clears the framebuffer with default color (black).
+     pub fn clear(&self) {
+         let frame = alloc::vec![0u8; self.io_mem().size()];

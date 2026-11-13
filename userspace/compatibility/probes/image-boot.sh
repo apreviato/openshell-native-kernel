@@ -76,6 +76,38 @@ elif [ "$3" = desktop ]; then
     sh ./installed-session.sh &
     session=$!
     trap 'kill -TERM "$session" 2>/dev/null || true; wait "$session" 2>/dev/null || true' EXIT
+    # The installed session asks for the password first (the first boot
+    # creates it): answered on the supervisor's socket as the session user,
+    # as the Desktop's sign-in page does.
+    ./python -I ./unprivileged.py ./node -e '
+        const { createConnection } = require("node:net");
+        const { readdirSync } = require("node:fs");
+        const socket = () => readdirSync("/tmp").filter(name => name.startsWith("openshell-greeter-") && name !== "openshell-greeter-state")
+            .map(name => `/tmp/${name}/greeter.sock`)[0];
+        const ask = (path, line) => new Promise((resolve, reject) => {
+            const connection = createConnection(path);
+            let answer = "";
+            connection.on("connect", () => connection.write(line + "\n"));
+            connection.on("data", chunk => { answer += chunk; });
+            connection.on("close", () => resolve(answer.trim()));
+            connection.on("error", reject);
+        });
+        (async () => {
+            for (let tries = 0; tries < 900; tries++) {
+                const path = socket();
+                if (path) {
+                    try {
+                        const state = await ask(path, "state");
+                        const answer = await ask(path, `${state === "create" ? "create" : "login"} image-test-password`);
+                        console.log(`OPENSHELL_IMAGE_SIGN_IN ${state} ${answer}`);
+                        return;
+                    } catch {}
+                }
+                await new Promise(done => setTimeout(done, 1000));
+            }
+            console.log("OPENSHELL_IMAGE_SIGN_IN_TIMEOUT");
+        })();
+    ' &
     count=0
     while ! ./openshell-ab "$ab" status | grep -Fxq "$slot: Good $release (confirmed)"; do
         kill -0 "$session"
@@ -97,6 +129,8 @@ elif [ "$3" = desktop ]; then
     wait "$session" || true
     trap - EXIT
     grep -q 'confirmed the boot' /data/openshell/session-logs/*/session.log
+    grep -q 'signed in' /data/openshell/session-logs/*/session.log
+    test "$(stat -c %a /data/openshell/account/password)" = 600
     test -f /data/openshell/desktop/hostd/docs/Welcome.md
     echo OPENSHELL_IMAGE_DESKTOP_OK
 fi

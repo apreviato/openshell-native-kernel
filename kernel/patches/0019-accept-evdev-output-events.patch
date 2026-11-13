@@ -1,0 +1,46 @@
+diff --git a/kernel/core/src/device/evdev/file.rs b/kernel/core/src/device/evdev/file.rs
+index 91b3401..42f48e2 100644
+--- a/kernel/core/src/device/evdev/file.rs
++++ b/kernel/core/src/device/evdev/file.rs
+@@ -401,11 +401,38 @@ impl FileOps for EvdevFile {
+     fn write_at(
+         &self,
+         _offset: usize,
+-        _reader: &mut VmReader,
++        reader: &mut VmReader,
+         _status_flags: StatusFlags,
+     ) -> Result<usize> {
+-        // TODO: In Linux, writing to evdev files is permitted and will inject input events.
+-        return_errno_with_message!(Errno::ENOSYS, "writing to evdev files is not supported yet");
++        // Reference: <https://elixir.bootlin.com/linux/v6.17.9/source/drivers/input/evdev.c#L506>
++        //
++        // X's evdev driver sets the keyboard's LEDs this way (Caps Lock, Num Lock) and
++        // fails the keyboard when the write fails. Output events (LED, sound and the sync
++        // between them) are accepted; there is no path to the devices for them yet, so
++        // they change nothing. Injecting input events is not supported yet.
++        const EVENT_SIZE: usize = size_of::<EvdevEvent>();
++        let requested = reader.remain();
++        if requested < EVENT_SIZE {
++            return_errno_with_message!(Errno::EINVAL, "an evdev write is a whole input event");
++        }
++        let mut written = 0;
++        while reader.remain() >= EVENT_SIZE {
++            let event = reader.read_val::<EvdevEvent>()?;
++            let output = [EventTypes::SYN, EventTypes::LED, EventTypes::SND]
++                .iter()
++                .any(|kind| kind.as_index() == event.type_);
++            if !output {
++                if written > 0 {
++                    break;
++                }
++                return_errno_with_message!(
++                    Errno::ENOSYS,
++                    "injecting input events through evdev files is not supported yet"
++                );
++            }
++            written += EVENT_SIZE;
++        }
++        Ok(written)
+     }
+ }
+ 

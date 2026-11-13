@@ -24,7 +24,40 @@ No Windows, execute `make-live.ps1` como administrador para criar um pendrive. O
 
 Se o bundle já existe, use `BUNDLE=/caminho/do/bundle` no Make ou `-Bundle <diretório>` no PowerShell. Cada execução produz a mídia, o arquivo `.sha256` e o relatório `run.json` em `out/native-*/`. `make iso` gera uma ISO live x86-64 para UEFI com estado temporário. `make install-image` gera um disco GPT de referência com slots A/B, recovery e dados persistentes. As duas mídias incluem o Desktop, Xpra e Wine 11.0. O PowerShell verifica o SHA-256 depois de copiar a mídia para o host.
 
-A sessão usa Xvfb. Saída gráfica no monitor físico, Secure Boot, Calamares e instalação no disco interno ainda precisam de integração e validação. A revisão atual do kernel oferece VirtIO e NVMe. O firmware UEFI carrega a ISO híbrida do pendrive. Boot de um sistema instalado em SATA/AHCI, armazenamento USB e outros controladores depende de suporte no kernel.
+#### Secure Boot
+
+As mídias iniciam como as do OpenShell Live: o firmware carrega o shim do Debian, assinado pela Microsoft, e o shim carrega o GRUB assinado pelo Debian, das versões fixadas em [secureboot.lock](distro/image/secureboot.lock). O Asterinas não pode ter a assinatura do Debian. Por isso, o kernel é assinado com a chave do OpenShell Native, e o GRUB pede ao shim que o confira contra as chaves do dono da máquina (MOK). Com Secure Boot ligado, cada computador inscreve o certificado uma vez:
+
+1. No menu do pendrive, escolha **Enroll the OpenShell Native key**. O MokManager do Debian abre.
+2. Escolha **Enroll key from disk**, o volume do pendrive, `ENROLL_THIS_KEY_IN_MOKMANAGER.cer`, **Continue** e **Yes**, e reinicie.
+
+Sem o certificado, o GRUB recusa o kernel ("bad shim signature"). Nesse caso, **Try OpenShell Native** mostra os passos acima e abre o MokManager sozinho, e o disco instalado, quando não inicia nenhum slot, faz o mesmo. A inscrição é inevitável com Secure Boot ligado: só um kernel assinado pela Microsoft ou por uma distribuição que ela assina dispensaria esse passo. Com Secure Boot desligado, nada é pedido. O GRUB assinado do Debian não tem `multiboot2` sob Secure Boot. Por isso, o kernel é construído com `BOOT_PROTOCOL=linux-efi-handover64` e entra pelo `linux`/`initrd` do GRUB, inclusive nas validações em QEMU.
+
+A chave nasce no primeiro build e fica em `.secureboot/` (fora do Git); os builds seguintes a reutilizam, para que o certificado inscrito continue valendo. Guarde uma cópia: mídias assinadas com outra chave pedem nova inscrição. `OPENSHELL_SECURE_BOOT_KEYS` aponta outra pasta. O teste do disco ([boot-test.sh](distro/image/boot-test.sh)) inicia o slot com o OVMF em Secure Boot e as chaves da Microsoft: primeiro sem o certificado, com o kernel recusado, e depois com ele.
+
+#### Carregamento
+
+O boot mostra a mesma tela de carregamento do OpenShell Live: o wordmark OPENSHELL e a barra sobre o quase-preto do Desktop. O GRUB desenha [splash.png](distro/image/splash.png) (feito por [make-splash.py](distro/image/make-splash.py) com as imagens do tema Plymouth do Live, na mesma geometria) enquanto carrega o kernel e o initramfs, e o [splash.cfg](distro/image/splash.cfg) da ESP serve ao menu do pendrive e ao disco instalado. O GRUB entrega a tela como está (`gfxpayload=keep`), o stub EFI não escreve nela (patch [0022](kernel/patches/README.md)) e o kernel não a apaga (patch 0023). A tela de carregamento do próprio Desktop, com o mesmo desenho, assume em seguida, e depois vem a entrada. As mensagens do GRUB continuam na porta serial, que os testes leem.
+
+#### Tela, teclado e mouse
+
+A sessão das mídias mostra o Desktop na tela do computador. O [openshell-x](userspace/compatibility/probes/openshell-x.sh) inicia o Xorg com o driver `modesetting` sobre o `/dev/dri/card0` do kernel (simpledrm sobre o framebuffer do UEFI, na resolução que o firmware entregou), com o driver `evdev` em cada `/dev/input/event*`. Sem udev nem logind, o script entrega a tela, as entradas e o console ao usuário da sessão antes de iniciá-la, como o logind faz com o seat ativo, e o X roda sem privilégios. Sem DRM, ele inicia o Xvfb, como nos smokes em QEMU. No QEMU com framebuffer UEFI, o X desenha na tela do firmware (captura por `screendump`), e teclas e o mouse PS/2 chegam ao X. O teclado depende do patch [0019](kernel/patches/README.md). O kernel ainda não tem pilha USB: teclado e mouse USB não funcionam, enquanto teclados e touchpads PS/2 (i8042) funcionam. Não há aceleração 3D; a tela usa o framebuffer do firmware, sem troca de resolução nem segundo monitor.
+
+#### Entrada
+
+O sistema instalado pede a senha antes do Desktop. O supervisor `openshell-session`, como root, inicia o X e o Openbox e depois o Desktop como greeter. É o mesmo bundle, na página de entrada, como o usuário da sessão. O shell só começa depois da senha certa. O primeiro boot cria a senha, e não há como recuperá-la. O hash SHA-512 crypt (`$6$`, do `cryptpw` do BusyBox, que lê a senha de um descritor e nunca dos argumentos) fica em `/data/openshell/account/password`, de root, modo 0600. A página pergunta pelo hostd, que repassa a um socket Unix do supervisor. O supervisor só responde a processos do usuário da sessão (`SO_PEERCRED`) e espera 2 s antes de cada resposta a uma senha errada. A sessão live entra sem senha, como a do OpenShell Live. O [smoke da sessão](tools/desktop/session-smoke.mjs) exige que o shell só comece depois da entrada, e o teste do disco ([image-boot.sh](userspace/compatibility/probes/image-boot.sh)) entra no Desktop instalado pelo mesmo socket.
+
+#### Bloqueio de tela e energia
+
+O bloqueio é o do OpenShell Live, com a mesma tela: o XSecureLock cobre a tela e segura teclado e mouse, e a tela de bloqueio do Live é o módulo de autenticação dele ([lock/](userspace/compatibility/lock/README.md)). A senha é a da entrada: o `openshell-authproto` a confere com o supervisor pelo socket do sistema, com a mesma espera depois de uma senha errada. O botão Bloquear e o tempo sem uso de Configurações ▸ Tela de bloqueio bloqueiam a tela; no Native, o Desktop informa ao hostd o tempo sem uso que o X registra, porque não há logind para o `xss-lock`. A sessão live, sem senha, não bloqueia, como a do Live. A tela de bloqueio guarda a senha só em memória travada, e o kernel aceita `mlock` (patch 0024).
+
+Desligar e reiniciar, no Desktop e na tela de bloqueio, também passam pelo supervisor, que não tem `CAP_SYS_BOOT`: ele encerra a sessão e sai com o código da ação, e o init grava o disco de dados (`sync`, desmontagem) e desliga ou reinicia. Não há suspensão.
+
+#### Instalação
+
+O pendrive live instala o sistema, como o Calamares no Live: **Install OpenShell** no Desktop live lista os discos internos (NVMe e VirtIO, de 16 GiB ou mais), pede confirmação (**Erase and install**), mostra o progresso e oferece reiniciar no fim. O supervisor roda o [instalador](distro/image/install.sh) como root. Ele cria a tabela GPT do disco de referência (ESP, `system_a`, `system_b`, recovery e dados), grava a cadeia assinada e o splash na ESP, a versão no slot A, já confirmada, e a mesma versão como recovery. O primeiro boot do disco pede a criação da senha. O kernel não lê o pendrive depois do boot (não há pilha USB), então o sistema live roda inteiro da memória, e o instalador copia o initramfs que o computador carregou, exposto em `/dev/initrd` (patch [0021](kernel/patches/README.md)). O computador precisa de memória para o sistema descompactado além do uso normal. Por isso, a mídia deixa de fora o Mesa (o CEF usa o SwiftShader dele para WebGL) e as aplicações de teste. O [teste do instalador](distro/image/install-test.sh) instala em um NVMe do QEMU e inicia o disco sozinho pela cadeia assinada.
+
+A revisão atual do kernel oferece VirtIO e NVMe. Boot de um sistema instalado em SATA/AHCI, armazenamento USB e outros controladores depende de suporte no kernel.
 
 ### Sondas e builds de desenvolvimento
 

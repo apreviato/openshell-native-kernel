@@ -163,12 +163,14 @@ async function installedApplication(installer, output, report, baseEnv) {
   report.timings.upgrade = Date.now() - began;
   report.checks.upgrade = "passed";
 
-  // Uninstalled by Wine's uninstaller: the program goes, and then the prefix.
+  // Listed as installed in the prefix, and uninstalled: the program goes, and then the prefix.
   const listed = runner(["--prefix", id, "uninstaller", "--list"]);
   ok(listed, "Listing installed programs");
-  const product = /\{[0-9A-Fa-f-]+\}/.exec(listed.stdout)?.[0];
-  assert.ok(product, "Wine does not list the installed program");
-  ok(runner(["--prefix", id, "uninstaller", "--remove", product]), "The uninstall");
+  // Wine's uninstaller prints its list on stderr.
+  const product = /\{[0-9A-Fa-f-]+\}/.exec(`${listed.stdout}\n${listed.stderr}`)?.[0];
+  assert.ok(product, `Wine does not list the installed program: ${listed.stderr.slice(-300)}`);
+  // Quiet: `uninstaller --remove` asks first, as it does in the Desktop.
+  ok(runner(["--prefix", id, "msiexec", "/x", product, "/qn"]), "The uninstall");
   settle();
   assert.ok(!existsSync(program), "The uninstaller left the program");
   ok(runner(["--remove", id]), "The removal");

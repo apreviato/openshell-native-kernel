@@ -1,10 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
+const secureBootKeys = process.env.OPENSHELL_SECURE_BOOT_KEYS ?? join(root, ".secureboot");
 const lock = JSON.parse(readFileSync(join(root, "kernel", "config", "upstream.lock.json"), "utf8"));
 const mediaActions = ["live-iso", "install-image"];
 const bundleActions = ["desktop", "kiosk", "apps", "wine", "desktop-image", ...mediaActions];
@@ -146,6 +147,11 @@ async function run(action, bundlePath) {
     docker(["cp", join(root, "userspace", "compatibility"), `${container}:/tmp/openshell-native-compat`]);
     docker(["cp", join(root, "distro", "ab"), `${container}:/tmp/openshell-native-ab`]);
     docker(["cp", join(root, "distro", "image"), `${container}:/tmp/openshell-native-image`]);
+    // OpenShell Native's Secure Boot key: the same one for every build, so a
+    // computer enrolls its certificate once (distro/image/secureboot.sh).
+    if (existsSync(join(secureBootKeys, "openshell-native.key"))) {
+      docker(["cp", secureBootKeys, `${container}:/tmp/openshell-native-secureboot`]);
+    }
     for (const name of ["hostd-smoke.mjs", "cef-smoke.mjs", "shell-smoke.mjs", "session-smoke.mjs", "linux-sandbox.mjs", "apps-smoke.mjs", "wine-smoke.mjs"]) {
       docker(["cp", join(root, "tools", "desktop", name), `${container}:/tmp/openshell-native-compat/probes/${name}`]);
     }
@@ -169,9 +175,11 @@ async function run(action, bundlePath) {
       await startContainer(container);
     } catch (error) {
       docker(["cp", `${container}:/tmp/openshell-native-out/.`, output], { optional: true });
+      keepSecureBootKey(output);
       throw error;
     }
     docker(["cp", `${container}:/tmp/openshell-native-out/.`, output]);
+    keepSecureBootKey(output);
     if (mediaActions.includes(action)) {
       const pattern = action === "live-iso" ? /-amd64\.iso$/ : /-amd64\.img$/;
       const file = readdirSync(output).find((name) => name.startsWith("openshell-native-") && pattern.test(name));
@@ -195,6 +203,18 @@ async function run(action, bundlePath) {
     }
     saveReport();
   }
+}
+
+/** The key a build made goes to .secureboot (git-ignored) the first time, and never stays in out/. */
+function keepSecureBootKey(output) {
+  const made = join(output, "secureboot-key");
+  if (!existsSync(made)) return;
+  if (!existsSync(join(secureBootKeys, "openshell-native.key"))) {
+    mkdirSync(secureBootKeys, { recursive: true });
+    cpSync(made, secureBootKeys, { recursive: true });
+    console.log(`Secure Boot key kept in ${secureBootKeys}: back it up; media signed with another key need enrolling again.`);
+  }
+  rmSync(made, { recursive: true, force: true });
 }
 
 const [action, ...extra] = process.argv.slice(2);

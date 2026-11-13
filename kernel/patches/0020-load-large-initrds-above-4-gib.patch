@@ -1,0 +1,105 @@
+diff --git a/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/alloc.rs b/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/alloc.rs
+index 92def90..1e3d4ac 100644
+--- a/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/alloc.rs
++++ b/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/alloc.rs
+@@ -22,6 +22,11 @@ pub(crate) fn alloc_at(addr: usize, size: usize) -> &'static mut [MaybeUninit<u8
+ }
+ 
+ pub(super) fn alloc_pages(ty: AllocateType, size: usize) -> &'static mut [MaybeUninit<u8>] {
++    try_alloc_pages(ty, size).expect("the UEFI allocation fails")
++}
++
++/// Like `alloc_pages`, but `None` when the firmware has no such memory.
++pub(super) fn try_alloc_pages(ty: AllocateType, size: usize) -> Option<&'static mut [MaybeUninit<u8>]> {
+     assert!(
+         size <= isize::MAX as usize,
+         "the size to allocate exceeds `isize::MAX`"
+@@ -32,7 +37,7 @@ pub(super) fn alloc_pages(ty: AllocateType, size: usize) -> &'static mut [MaybeU
+         uefi::boot::MemoryType::LOADER_DATA,
+         size.div_ceil(super::efi::PAGE_SIZE as usize),
+     )
+-    .expect("the UEFI allocation fails");
++    .ok()?;
+ 
+     // SAFETY:
+     // 1. The address is not zero and the size is reasonable (there are less the `isize::MAX` bytes
+@@ -41,5 +46,5 @@ pub(super) fn alloc_pages(ty: AllocateType, size: usize) -> &'static mut [MaybeU
+     // 2. The memory region is allocated via the UEFI firmware, so it is valid for reading and
+     //    writing. We will not deallocate it, so it live for `'static`.
+     // 3. The type alignment is 1 and the type can contain uninitialized data.
+-    unsafe { core::slice::from_raw_parts_mut(allocated.as_ptr().cast(), size) }
++    Some(unsafe { core::slice::from_raw_parts_mut(allocated.as_ptr().cast(), size) })
+ }
+diff --git a/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/efi.rs b/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/efi.rs
+index ab85f6f..3089410 100644
+--- a/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/efi.rs
++++ b/ostd/libs/linux-bzimage/setup/src/x86/amd64_efi/efi.rs
+@@ -8,7 +8,7 @@ use uefi::{mem::memory_map::MemoryMap, prelude::*, proto::BootPolicy};
+ use uefi_raw::table::system::SystemTable;
+ 
+ use super::decoder::decode_payload;
+-use crate::x86::amd64_efi::alloc::alloc_pages;
++use crate::x86::amd64_efi::alloc::{alloc_pages, try_alloc_pages};
+ 
+ pub(super) const PAGE_SIZE: u64 = 4096;
+ 
+@@ -78,10 +78,13 @@ fn efi_phase_boot(boot_params: &mut BootParams) {
+         && boot_params.ext_ramdisk_image == 0
+         && let Some(initrd) = load_initrd()
+     {
+-        boot_params.hdr.ramdisk_image = initrd.as_ptr().addr().try_into().unwrap();
+-        boot_params.ext_ramdisk_image = 0;
+-        boot_params.hdr.ramdisk_size = initrd.len().try_into().unwrap();
+-        boot_params.ext_ramdisk_size = 0;
++        // The upper halves go to the `ext_` fields, as Linux's boot protocol has them:
++        // a large initrd may only fit above 4 GiB.
++        let (address, size) = (initrd.as_ptr().addr() as u64, initrd.len() as u64);
++        boot_params.hdr.ramdisk_image = address as u32;
++        boot_params.ext_ramdisk_image = (address >> 32) as u32;
++        boot_params.hdr.ramdisk_size = size as u32;
++        boot_params.ext_ramdisk_size = (size >> 32) as u32;
+     }
+ 
+     // Fill the boot params with the RSDP address if it is not provided.
+@@ -196,7 +199,10 @@ fn load_initrd() -> Option<&'static [u8]> {
+         return None;
+     }
+ 
+-    let initrd = alloc_pages(AllocateType::MaxAddress(u32::MAX as u64), size);
++    // Below 4 GiB when it fits there. On a computer, the firmware's memory there is
++    // fragmented, and a large initrd (OpenShell's desktop) needs a block above it.
++    let initrd = try_alloc_pages(AllocateType::MaxAddress(u32::MAX as u64), size)
++        .unwrap_or_else(|| alloc_pages(AllocateType::AnyPages, size));
+     // SAFETY: The arguments are correctly specified according to the UEFI specification.
+     let status = unsafe {
+         (load_file2.0.load_file)(
+diff --git a/ostd/src/arch/x86/boot/linux_boot/mod.rs b/ostd/src/arch/x86/boot/linux_boot/mod.rs
+index 41627a7..199986f 100644
+--- a/ostd/src/arch/x86/boot/linux_boot/mod.rs
++++ b/ostd/src/arch/x86/boot/linux_boot/mod.rs
+@@ -98,17 +98,17 @@ impl ToEarlyBootInfo for BootParams {
+     }
+ 
+     fn initramfs(&self) -> Option<&'static [u8]> {
+-        if self.ext_ramdisk_image != 0 || self.ext_ramdisk_size != 0 {
+-            // See the explanation in `kernel_commandline`.
++        // An initramfs above 4 GiB is fine, unlike the command line: nothing reads it
++        // before the linear mapping covers all physical memory (it is unpacked in the
++        // first kernel thread), and its region is reserved by address only.
++        let image = (self.ext_ramdisk_image as usize) << 32 | self.hdr.ramdisk_image as usize;
++        let size = (self.ext_ramdisk_size as usize) << 32 | self.hdr.ramdisk_size as usize;
++        if image == 0 || size == 0 {
+             return None;
+         }
+ 
+-        if self.hdr.ramdisk_image == 0 || self.hdr.ramdisk_size == 0 {
+-            return None;
+-        }
+-
+-        let initramfs_ptr = paddr_to_vaddr(self.hdr.ramdisk_image as usize);
+-        let initramfs_len = self.hdr.ramdisk_size as usize;
++        let initramfs_ptr = paddr_to_vaddr(image);
++        let initramfs_len = size;
+         // SAFETY:
+         // 1. The initramfs is safe to read because of the contract with the loader.
+         // 2. We reserve the initramfs region in `memory_regions`, so it will live as an immutable

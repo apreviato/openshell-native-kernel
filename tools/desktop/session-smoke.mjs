@@ -5,7 +5,7 @@
 // process of it to end.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -137,6 +137,38 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
   }
 
   try {
+    // Signing in before the shell (login.rs): a greeter that asks the
+    // supervisor as the Desktop's sign-in page does. BusyBox's cryptpw makes
+    // the hash: /bin/cryptpw in the guest, OPENSHELL_SMOKE_CRYPTPW elsewhere.
+    const passwordTool = process.env.OPENSHELL_SMOKE_CRYPTPW || (existsSync("/bin/cryptpw") ? "/bin/cryptpw" : "");
+    const passwordFile = join(scratch, "account", "password");
+    const greeterReport = join(state, "greeter.json");
+    const greeterScript = join(scratch, "greeter.mjs");
+    writeFileSync(greeterScript, `import { createConnection } from "node:net";
+import { writeFileSync } from "node:fs";
+const ask = (line) => new Promise((resolve, reject) => {
+  const connection = createConnection(process.env.OPENSHELL_GREETER_SOCKET);
+  let answer = "";
+  connection.setEncoding("utf8");
+  connection.on("connect", () => connection.write(line + "\\n"));
+  connection.on("data", (chunk) => { answer += chunk; });
+  connection.on("close", () => resolve(answer.trim()));
+  connection.on("error", reject);
+});
+// Each answer is kept as it comes: after "ok" the supervisor closes the greeter.
+const steps = [];
+const pending = ["state", "login correct horse", "create correct horse"];
+const next = async () => {
+  const line = pending.shift();
+  if (!line) return;
+  const answer = await ask(line);
+  steps.push([line.split(" ")[0], answer]);
+  writeFileSync(${JSON.stringify(greeterReport)}, JSON.stringify(steps));
+  await next();
+};
+await next();
+setInterval(() => {}, 1000);
+`, { mode: 0o644 });
     // Confirm only after the real renderer and hostd have reported health.
     const confirmed = join(scratch, "confirmed");
     const confirmScript = join(scratch, "confirm.sh");
@@ -153,6 +185,7 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
       `confirm=/bin/sh ${confirmScript}`,
       "confirm_after=10",
       `env=OPENSHELL_NATIVE_PORT=${await freePort()}`,
+      ...(passwordTool ? [`greeter=${process.execPath} ${greeterScript}`, `password_file=${passwordFile}`, `password_tool=${passwordTool}`] : []),
       ...["FONTCONFIG_FILE", "XDG_CONFIG_DIRS"].filter((name) => process.env[name]).map((name) => `env=${name}=${process.env[name]}`),
     ].join("\n");
     const configPath = join(scratch, "session.conf");
@@ -169,6 +202,23 @@ async function smoke([supervisorPath, launcher, bundle, host, xvfb, openbox], ou
         hostd: find(supervisor.pid, (cmdline) => cmdline.some((arg) => arg.endsWith("openshell-hostd.mjs"))),
       };
       assert.ok(first.launcher && first.cef && first.hostd, `The session is incomplete: ${JSON.stringify(first)}`);
+      if (passwordTool) {
+        // No password yet: the greeter creates it, after a sign-in that cannot work.
+        // The last answer may be lost: on "ok" the supervisor closes the greeter at once.
+        const steps = JSON.parse(readFileSync(greeterReport, "utf8"));
+        assert.deepEqual(steps.slice(0, 2), [["state", "create"], ["login", "wrong"]]);
+        assert.ok(steps.length === 2 || JSON.stringify(steps[2]) === JSON.stringify(["create", "ok"]), JSON.stringify(steps));
+        const hash = statSync(passwordFile);
+        assert.equal(hash.uid, 0, "The password's hash is not root's");
+        assert.equal(hash.mode & 0o777, 0o600, "Others can read the password's hash");
+        assert.match(readFileSync(passwordFile, "utf8"), /^\$6\$[^$]+\$[^$]+\n$/, "The password file is not a SHA-512 crypt hash");
+        const journal = readFileSync(join(logs, "0001", "session.log"), "utf8");
+        assert.ok(journal.indexOf("signed in") >= 0 && journal.indexOf("signed in") < journal.indexOf("started shell"),
+          "The shell started before signing in");
+        report.signIn = "passed";
+      } else {
+        report.signIn = "skipped: no cryptpw";
+      }
       const owner = readFileSync(`/proc/${first.cef}/status`, "utf8").match(/^Uid:\s+(\d+)/m)?.[1];
       assert.equal(Number(owner), USER, "The shell does not run as the session user");
       // The supervisor keeps only CAP_FOWNER, CAP_KILL, CAP_SETGID and CAP_SETUID.

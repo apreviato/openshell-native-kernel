@@ -1489,6 +1489,12 @@ class DesktopApp final : public CefApp, public CefBrowserProcessHandler {
       // The image ships its own pinned Mesa. Chromium's blocklist, meant for
       // unknown drivers, otherwise refuses WebGL on its llvmpipe renderer.
       command_line->AppendSwitch("ignore-gpu-blocklist");
+      // The media leave Mesa out (they run from memory): WebGL then runs on
+      // the SwiftShader that CEF ships, which Chromium no longer picks by itself.
+      if (access("/run/opengl-driver/lib", F_OK) != 0) {
+        command_line->AppendSwitchWithValue("use-angle", "swiftshader");
+        command_line->AppendSwitch("enable-unsafe-swiftshader");
+      }
       // Verbose Chromium logs for the test fixtures. Child processes inherit
       // the switches. The Desktop never enables them.
       if (!config_.desktop && std::getenv("OPENSHELL_CEF_DIAGNOSTICS")) {

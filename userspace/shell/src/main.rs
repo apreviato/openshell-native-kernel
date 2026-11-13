@@ -14,6 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use openshell_shell::{read_hostd_readiness, write_cef_bootstrap, write_cef_startup};
+use openshell_shell::install::SYSTEM_SOCKET_ENV;
+use openshell_shell::login::GREETER_SOCKET_ENV;
 use openshell_shell::session::{DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET};
 
 const USAGE: &str = "Usage: openshell-shell <desktop-bundle> <cef-host> <state-dir> [node]";
@@ -120,7 +122,9 @@ fn session_command(executable: &OsStr) -> Command {
     command.env_clear().process_group(0);
     // A system without /etc/fonts, such as NixOS, names its font configuration,
     // and XDG_DATA_DIRS says where the installed applications' entries are.
-    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE", "XDG_DATA_DIRS"] {
+    // As a greeter, hostd answers the sign-in page through the supervisor's socket;
+    // on the live medium, it installs the system through the supervisor's other one.
+    for name in ["PATH", "LANG", "LC_ALL", "DISPLAY", "XAUTHORITY", "FONTCONFIG_FILE", "XDG_DATA_DIRS", GREETER_SOCKET_ENV, SYSTEM_SOCKET_ENV] {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
         }
@@ -182,6 +186,8 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
             .arg("--home").arg(&home)
             .arg("--data-dir").arg(&data)
             .env("HOME", &home)
+            // The screen lock (openshell-lock) keeps its marker there, as on Live.
+            .env("XDG_RUNTIME_DIR", &runtime)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(log.try_clone()?)
