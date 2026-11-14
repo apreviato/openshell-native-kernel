@@ -1,0 +1,822 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 60b5719..994c665 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -171,6 +171,7 @@ dependencies = [
+  "aster-logger",
+  "aster-network",
+  "aster-nvme",
++ "aster-pci",
+  "aster-rights",
+  "aster-rights-proc",
+  "aster-softirq",
+diff --git a/kernel/comps/ahci/src/hba.rs b/kernel/comps/ahci/src/hba.rs
+index 373a6ad..ae1fc40 100755
+--- a/kernel/comps/ahci/src/hba.rs
++++ b/kernel/comps/ahci/src/hba.rs
+@@ -312,7 +312,11 @@ impl Controller {
+             (Some(msi), Ok(mut irq)) => {
+                 let io = regs.0.clone();
+                 let events = events.clone();
+-                irq.on_active(move |_| interrupt(&io, &events));
++                let counter = aster_pci::irq_stats::interrupt_counter(irq.num(), &name);
++                irq.on_active(move |_| {
++                    counter.count();
++                    interrupt(&io, &events)
++                });
+                 msi.set_interrupt_vector(irq);
+                 true
+             }
+diff --git a/kernel/comps/ethernet/src/e1000.rs b/kernel/comps/ethernet/src/e1000.rs
+index df73e51..53e6c11 100755
+--- a/kernel/comps/ethernet/src/e1000.rs
++++ b/kernel/comps/ethernet/src/e1000.rs
+@@ -13,7 +13,7 @@ use core::sync::atomic::Ordering;
+ 
+ use aster_pci::{PciDeviceId, cfg_space::BarAccess, common_device::PciCommonDevice};
+ 
+-use crate::{Nic, RxProbe, ring::Ring};
++use crate::{Interrupt, Nic, RxProbe, ring::Ring};
+ 
+ mod reg {
+     pub(super) const CTRL: usize = 0x0000;
+@@ -21,6 +21,9 @@ mod reg {
+     pub(super) const EERD: usize = 0x0014;
+     pub(super) const CTRL_EXT: usize = 0x0018;
+     pub(super) const FWSM: usize = 0x5b54;
++    pub(super) const ICR: usize = 0x00c0;
++    pub(super) const ITR: usize = 0x00c4;
++    pub(super) const IMS: usize = 0x00d0;
+     pub(super) const IMC: usize = 0x00d8;
+     pub(super) const RCTL: usize = 0x0100;
+     pub(super) const TCTL: usize = 0x0400;
+@@ -103,6 +106,12 @@ pub(crate) fn supports(id: &PciDeviceId) -> bool {
+     id.vendor_id == 0x8086 && [E1000, E1000E, ICH, LPT].iter().any(|list| list.contains(&id.device_id))
+ }
+ 
++/// Interrupt causes: link change, receive sequence error, descriptors
++/// running low, overrun, and the receive timer (frames arrived).
++const INTERRUPTS: u32 = 1 << 2 | 1 << 3 | 1 << 4 | 1 << 6 | 1 << 7;
++/// At most 8000 interrupts a second (in units of 256 ns).
++const ITR_8000: u32 = 488;
++
+ struct E1000Nic {
+     mmio: BarAccess,
+     rx: Ring,
+@@ -110,6 +119,7 @@ struct E1000Nic {
+     /// The oldest transmit descriptor not yet seen done.
+     tx_clean: usize,
+     mac: [u8; 6],
++    _interrupt: Option<Interrupt>,
+     _device: PciCommonDevice,
+ }
+ 
+@@ -230,10 +240,24 @@ pub(crate) fn start(mut device: PciCommonDevice) -> bool {
+     write32(&mmio, reg::TIPG, TIPG_COPPER);
+     write32(&mmio, reg::TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
+ 
++    // The interrupt: reading the cause register clears it.
++    let interrupt = if old_layout {
++        None
++    } else {
++        let causes = mmio.clone();
++        Interrupt::attach(&mut device, move || {
++            let _ = read32(&causes, reg::ICR);
++        })
++    };
++    if interrupt.is_some() {
++        write32(&mmio, reg::ITR, ITR_8000);
++        write32(&mmio, reg::IMS, INTERRUPTS);
++    }
+     let probe: Arc<dyn RxProbe> = Arc::new(Probe { descriptors: rx.descriptors.clone(), next: rx.next.clone() });
+-    let nic = E1000Nic { mmio, rx, tx, tx_clean: 0, mac, _device: device };
+     let model = if old_layout { "Intel 8254x" } else if lpt || ICH.contains(&id.device_id) { "Intel PCH LAN" } else { "Intel 8257x" };
+-    crate::register(Box::new(nic), probe, model);
++    let nic = E1000Nic { mmio, rx, tx, tx_clean: 0, mac, _interrupt: interrupt, _device: device };
++    let proven = nic._interrupt.as_ref().map(Interrupt::proven);
++    crate::register(Box::new(nic), probe, proven, model);
+     true
+ }
+ 
+diff --git a/kernel/comps/ethernet/src/igb.rs b/kernel/comps/ethernet/src/igb.rs
+index 6390bb9..4a262f1 100755
+--- a/kernel/comps/ethernet/src/igb.rs
++++ b/kernel/comps/ethernet/src/igb.rs
+@@ -13,13 +13,18 @@ use core::sync::atomic::Ordering;
+ 
+ use aster_pci::{PciDeviceId, cfg_space::BarAccess, common_device::PciCommonDevice};
+ 
+-use crate::{Nic, RxProbe, ring::Ring};
++use crate::{Interrupt, Nic, RxProbe, ring::Ring};
+ 
+ mod reg {
+     pub(super) const CTRL: usize = 0x0000;
+     pub(super) const STATUS: usize = 0x0008;
+     pub(super) const MDIC: usize = 0x0020;
++    pub(super) const ICR: usize = 0x1500;
++    pub(super) const IMS: usize = 0x1508;
+     pub(super) const IMC: usize = 0x150c;
++    /// Which interrupt vector each queue's events take.
++    pub(super) const IVAR0: usize = 0x1700;
++    pub(super) const EITR0: usize = 0x1680;
+     pub(super) const IMC_IGC: usize = 0x00d8;
+     pub(super) const RCTL: usize = 0x0100;
+     pub(super) const TCTL: usize = 0x0400;
+@@ -115,12 +120,21 @@ fn write32(mmio: &BarAccess, at: usize, value: u32) {
+     let _ = mmio.write_once::<u32>(at, value);
+ }
+ 
++/// Interrupt causes: transmit done, link change, receive sequence error,
++/// descriptors running low, and the receive timer (frames arrived).
++const INTERRUPTS: u32 = 1 << 0 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 7;
++/// Queue 0's receive and transmit events on vector 0, both valid.
++const IVAR_QUEUE0: u32 = 0x8080;
++/// At most 8000 interrupts a second (microseconds, from bit 2).
++const EITR_8000: u32 = 125 << 2;
++
+ struct IgbNic {
+     mmio: BarAccess,
+     rx: Ring,
+     tx: Ring,
+     tx_clean: usize,
+     mac: [u8; 6],
++    _interrupt: Option<Interrupt>,
+     _device: PciCommonDevice,
+ }
+ 
+@@ -196,7 +210,13 @@ pub(crate) fn start(mut device: PciCommonDevice) -> bool {
+         crate::delay_ms(1);
+     }
+ 
+-    let nic = IgbNic { mmio, rx, tx, tx_clean: 0, mac, _device: device };
++    // The interrupt (one MSI message for everything, as Linux's igb and
++    // igc run without MSI-X): reading the cause register clears it.
++    let causes = mmio.clone();
++    let interrupt = Interrupt::attach(&mut device, move || {
++        let _ = read32(&causes, reg::ICR);
++    });
++    let nic = IgbNic { mmio, rx, tx, tx_clean: 0, mac, _interrupt: interrupt, _device: device };
+     for index in 0..RX_COUNT {
+         nic.give_rx(index);
+     }
+@@ -210,8 +230,16 @@ pub(crate) fn start(mut device: PciCommonDevice) -> bool {
+     write32(&nic.mmio, reg::RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC);
+     write32(&nic.mmio, reg::TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
+ 
++    if nic._interrupt.is_some() {
++        write32(&nic.mmio, reg::IVAR0, IVAR_QUEUE0);
++        write32(&nic.mmio, reg::EITR0, EITR_8000);
++        write32(&nic.mmio, reg::IMS, INTERRUPTS);
++    }
++
+     let probe: Arc<dyn RxProbe> = Arc::new(Probe { descriptors: nic.rx.descriptors.clone(), next: nic.rx.next.clone() });
+-    crate::register(Box::new(nic), probe, if igc { "Intel I225/I226" } else { "Intel 82576/I210/I211/I350" });
++    let model = if igc { "Intel I225/I226" } else { "Intel 82576/I210/I211/I350" };
++    let proven = nic._interrupt.as_ref().map(Interrupt::proven);
++    crate::register(Box::new(nic), probe, proven, model);
+     true
+ }
+ 
+diff --git a/kernel/comps/ethernet/src/lib.rs b/kernel/comps/ethernet/src/lib.rs
+index f220df3..f980eb7 100755
+--- a/kernel/comps/ethernet/src/lib.rs
++++ b/kernel/comps/ethernet/src/lib.rs
+@@ -27,7 +27,7 @@ mod r8169;
+ mod ring;
+ 
+ use alloc::{format, string::String, sync::Arc, vec::Vec};
+-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+ 
+ use aster_bigtcp::{
+     device::{AnyNetworkDevice, ChecksumCapabilities, DeviceCapabilities, EthernetAddress, Medium, NetError},
+@@ -36,12 +36,14 @@ use aster_bigtcp::{
+ use aster_pci::{
+     PCI_BUS, PciDeviceId,
+     bus::{PciDevice, PciDriver},
++    capability::msi::CapabilityMsiData,
+     common_device::PciCommonDevice,
+ };
+ use aster_softirq::BottomHalfDisabled;
+ use component::{ComponentInitError, init_component};
+ use ostd::{
+     bus::BusProbeError,
++    irq::IrqLine,
+     mm::{VmReader, VmWriter},
+     sync::SpinLock,
+ };
+@@ -64,6 +66,44 @@ pub(crate) trait RxProbe: Send + Sync {
+     fn has_frames(&self) -> bool;
+ }
+ 
++/// A controller's interrupt (MSI): received frames have the stack read
++/// them at once. Until its first interrupt arrives the timer keeps looking
++/// at the controller each millisecond, as it does for one without MSI, so
++/// a controller whose interrupts do not reach the kernel works as before.
++pub(crate) struct Interrupt {
++    _msi: CapabilityMsiData,
++    /// The first interrupt arrived.
++    proven: Arc<AtomicBool>,
++}
++
++impl Interrupt {
++    /// Takes the controller's MSI message; `acknowledge` reads (and so
++    /// clears) what it signals, in the handler.
++    pub(crate) fn attach(device: &mut PciCommonDevice, acknowledge: impl Fn() + Send + Sync + 'static) -> Option<Self> {
++        let mut msi = device.acquire_msi_capability()?;
++        let mut irq = IrqLine::alloc().ok()?;
++        let location = device.location();
++        let counter = aster_pci::irq_stats::interrupt_counter(
++            irq.num(),
++            &format!("ethernet {:02x}:{:02x}.{}", location.bus, location.device, location.function),
++        );
++        let proven = Arc::new(AtomicBool::new(false));
++        let seen = proven.clone();
++        irq.on_active(move |_| {
++            counter.count();
++            acknowledge();
++            seen.store(true, Ordering::Relaxed);
++            aster_network::raise_receive_softirq();
++        });
++        msi.set_interrupt_vector(irq);
++        Some(Self { _msi: msi, proven })
++    }
++
++    pub(crate) fn proven(&self) -> Arc<AtomicBool> {
++        self.proven.clone()
++    }
++}
++
+ struct EthDevice {
+     mac: EthernetAddress,
+     nic: alloc::boxed::Box<dyn Nic>,
+@@ -121,16 +161,25 @@ impl AnyNetworkDevice for EthDevice {
+     fn notify_poll_end(&mut self) {}
+ }
+ 
+-/// The controllers' receive rings, for the timer.
+-static PROBES: SpinLock<Vec<Arc<dyn RxProbe>>> = SpinLock::new(Vec::new());
++/// The controllers' receive rings, for the timer, each with whether its
++/// interrupts work.
++static PROBES: SpinLock<Vec<(Arc<dyn RxProbe>, Option<Arc<AtomicBool>>)>> = SpinLock::new(Vec::new());
+ static NAMES: AtomicU32 = AtomicU32::new(0);
+ static TICKS: AtomicU64 = AtomicU64::new(0);
++/// How often the timer still looks at a controller whose interrupts work,
++/// in milliseconds: an interrupt lost costs this much at most.
++const INTERRUPT_WATCH_MS: u64 = 128;
+ 
+-/// Each millisecond: a controller with frames waiting has the stack read them.
++/// Each millisecond: a controller with frames waiting has the stack read
++/// them. One whose interrupts work is only looked at now and then.
+ fn tick() {
+-    TICKS.fetch_add(1, Ordering::Relaxed);
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
+     let Some(probes) = PROBES.try_lock() else { return };
+-    if probes.iter().any(|probe| probe.has_frames()) {
++    let waiting = probes.iter().any(|(probe, proven)| {
++        let interrupts = proven.as_ref().is_some_and(|proven| proven.load(Ordering::Relaxed));
++        (!interrupts || ticks % INTERRUPT_WATCH_MS == 0) && probe.has_frames()
++    });
++    if waiting {
+         aster_network::raise_receive_softirq();
+     }
+ }
+@@ -161,15 +210,16 @@ impl PciDriver for Driver {
+ }
+ 
+ /// Offers a controller to the network stack as eth<n>.
+-pub(crate) fn register(nic: alloc::boxed::Box<dyn Nic>, probe: Arc<dyn RxProbe>, model: &str) {
++pub(crate) fn register(nic: alloc::boxed::Box<dyn Nic>, probe: Arc<dyn RxProbe>, interrupt: Option<Arc<AtomicBool>>, model: &str) {
+     let name: String = format!("eth{}", NAMES.fetch_add(1, Ordering::Relaxed));
+     let mac = nic.mac();
+     ostd::notice!(
+-        "{}: {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}",
++        "{}: {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, link {}, {}",
+         name, model, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+-        if nic.link_up() { "up" } else { "down" }
++        if nic.link_up() { "up" } else { "down" },
++        if interrupt.is_some() { "MSI" } else { "polled" }
+     );
+-    PROBES.lock().push(probe);
++    PROBES.lock().push((probe, interrupt));
+     let device: Arc<SpinLock<dyn AnyNetworkDevice, BottomHalfDisabled>> =
+         Arc::new(SpinLock::new(EthDevice { mac: EthernetAddress(mac), nic }));
+     aster_network::register_device(name, device);
+diff --git a/kernel/comps/ethernet/src/r8169.rs b/kernel/comps/ethernet/src/r8169.rs
+index 9cb2d83..ef065b2 100755
+--- a/kernel/comps/ethernet/src/r8169.rs
++++ b/kernel/comps/ethernet/src/r8169.rs
+@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering;
+ 
+ use aster_pci::{PciDeviceId, cfg_space::BarAccess, common_device::PciCommonDevice};
+ 
+-use crate::{Nic, RxProbe, ring::Ring};
++use crate::{Interrupt, Nic, RxProbe, ring::Ring};
+ 
+ mod reg {
+     pub(super) const MAC0: usize = 0x00;
+@@ -89,6 +89,10 @@ pub(crate) fn supports(id: &PciDeviceId) -> bool {
+     IDS.contains(&(id.vendor_id, id.device_id))
+ }
+ 
++/// Interrupt causes: frames received, receive errors, the ring or the
++/// FIFO overrun, link change.
++const INTERRUPTS: u16 = 1 << 0 | 1 << 1 | 1 << 4 | 1 << 5 | 1 << 6;
++
+ struct RealtekNic {
+     mmio: BarAccess,
+     rx: Ring,
+@@ -96,6 +100,7 @@ struct RealtekNic {
+     tx_clean: usize,
+     mac: [u8; 6],
+     tx_poll: usize,
++    _interrupt: Option<Interrupt>,
+     _device: PciCommonDevice,
+ }
+ 
+@@ -184,6 +189,30 @@ pub(crate) fn start(mut device: PciCommonDevice) -> bool {
+     w32(&mmio, reg::RX_CONFIG, rx_config);
+     w8(&mmio, reg::CFG9346, CFG9346_LOCK);
+ 
++    // The interrupt, on the PCIe chips (the RTL8169 of PCI slots stays
++    // polled, as Linux keeps MSI off on it): writing the causes back
++    // clears them.
++    let interrupt = if matches!(id.device_id, 0x8169 | 0x8167) {
++        None
++    } else {
++        let causes = mmio.clone();
++        Interrupt::attach(&mut device, move || {
++            if is_8125 {
++                let status = causes.read_once::<u32>(reg::INTR_STATUS_8125).unwrap_or(0);
++                let _ = causes.write_once::<u32>(reg::INTR_STATUS_8125, status);
++            } else {
++                let status = causes.read_once::<u16>(reg::INTR_STATUS).unwrap_or(0);
++                let _ = causes.write_once::<u16>(reg::INTR_STATUS, status);
++            }
++        })
++    };
++    if interrupt.is_some() {
++        if is_8125 {
++            w32(&mmio, reg::INTR_MASK_8125, u32::from(INTERRUPTS));
++        } else {
++            w16(&mmio, reg::INTR_MASK, INTERRUPTS);
++        }
++    }
+     let probe: Arc<dyn RxProbe> = Arc::new(Probe { descriptors: rx.descriptors.clone(), next: rx.next.clone() });
+     let model = if is_8125 { "Realtek RTL8125" } else if id.device_id == 0x8136 { "Realtek RTL810x" } else { "Realtek RTL8111/8168" };
+     let nic = RealtekNic {
+@@ -193,9 +222,11 @@ pub(crate) fn start(mut device: PciCommonDevice) -> bool {
+         tx_clean: 0,
+         mac,
+         tx_poll: if is_8125 { reg::TX_POLL_8125 } else { reg::TX_POLL },
++        _interrupt: interrupt,
+         _device: device,
+     };
+-    crate::register(Box::new(nic), probe, model);
++    let proven = nic._interrupt.as_ref().map(Interrupt::proven);
++    crate::register(Box::new(nic), probe, proven, model);
+     true
+ }
+ 
+diff --git a/kernel/comps/sound/src/hda.rs b/kernel/comps/sound/src/hda.rs
+index cd8a2b9..b0c69a3 100755
+--- a/kernel/comps/sound/src/hda.rs
++++ b/kernel/comps/sound/src/hda.rs
+@@ -14,8 +14,9 @@
+ use alloc::{string::String, sync::Arc, vec::Vec};
+ use core::sync::atomic::{AtomicBool, Ordering};
+ 
+-use aster_pci::{cfg_space::BarAccess, common_device::PciCommonDevice};
++use aster_pci::{capability::msi::CapabilityMsiData, cfg_space::BarAccess, common_device::PciCommonDevice};
+ use ostd::{
++    irq::IrqLine,
+     mm::{HasDaddr, VmIo, dma::DmaCoherent},
+     sync::Mutex,
+ };
+@@ -30,6 +31,7 @@ mod reg {
+     pub(super) const GCTL: usize = 0x08;
+     pub(super) const STATESTS: usize = 0x0e;
+     pub(super) const INTCTL: usize = 0x20;
++    pub(super) const INTSTS: usize = 0x24;
+     pub(super) const CORBLBASE: usize = 0x40;
+     pub(super) const CORBUBASE: usize = 0x44;
+     pub(super) const CORBWP: usize = 0x48;
+@@ -64,6 +66,12 @@ mod reg {
+ const GCTL_RESET: u32 = 1 << 0;
+ const SD_CTL_RESET: u8 = 1 << 0;
+ const SD_CTL_RUN: u8 = 1 << 1;
++/// Interrupt when a buffer descriptor marked so completes (each period).
++const SD_CTL_IOCE: u8 = 1 << 2;
++/// A stream's status bits (completion, FIFO and descriptor errors): each
++/// cleared by writing it.
++const SD_STS_ALL: u8 = 0x1c;
++const INTCTL_GLOBAL: u32 = 1 << 31;
+ /// Busy-wait budget, in register reads (one takes about a microsecond).
+ const WAIT_READS: usize = 200_000;
+ /// Buffer descriptor list entries: one per period.
+@@ -132,9 +140,28 @@ pub(crate) struct Controller {
+     input_streams: usize,
+     output_streams: usize,
+     _positions: DmaCoherent,
++    /// The controller's interrupt (MSI): streams say when a period ends.
++    interrupts: bool,
++    _msi: Option<CapabilityMsiData>,
+     _device: PciCommonDevice,
+ }
+ 
++/// The interrupt: the streams that finished a period have their status
++/// cleared (MSI is edge triggered: every cause, or no more interrupts),
++/// and the positions move on.
++fn interrupt(regs: &Regs, streams: usize) {
++    let status = regs.r32(reg::INTSTS);
++    if status == u32::MAX {
++        return;
++    }
++    for index in 0..streams {
++        if status & (1 << index) != 0 {
++            regs.w8(reg::SD_BASE + index * reg::SD_SIZE + reg::SD_STS, SD_STS_ALL);
++        }
++    }
++    crate::streams_moved();
++}
++
+ /// A ring size the controller offers: 256, 16 or 2 entries (and its code).
+ fn ring_size(capability: u8) -> (u8, u16) {
+     if capability & 0x40 != 0 {
+@@ -218,6 +245,27 @@ impl Controller {
+         regs.w32(reg::DPLBASE, positions.daddr() as u32 | 1);
+         regs.w32(reg::DPUBASE, (positions.daddr() as u64 >> 32) as u32);
+ 
++        // The interrupt: one MSI message for the streams. Without it the
++        // timer looks at the running streams every other millisecond.
++        let mut msi = device.acquire_msi_capability();
++        let interrupts = match (msi.as_mut(), IrqLine::alloc()) {
++            (Some(msi), Ok(mut irq)) => {
++                let (handler_regs, streams) = (regs.clone(), input_streams + output_streams);
++                let counter = aster_pci::irq_stats::interrupt_counter(irq.num(), &name);
++                irq.on_active(move |_| {
++                    counter.count();
++                    interrupt(&handler_regs, streams)
++                });
++                msi.set_interrupt_vector(irq);
++                regs.w32(reg::INTCTL, INTCTL_GLOBAL | ((1u32 << (input_streams + output_streams)) - 1));
++                true
++            }
++            _ => {
++                crate::no_interrupt();
++                false
++            }
++        };
++
+         let mut controller = Self {
+             regs,
+             name,
+@@ -234,6 +282,8 @@ impl Controller {
+             input_streams,
+             output_streams,
+             _positions: positions,
++            interrupts,
++            _msi: msi,
+             _device: device,
+         };
+         for address in 0..15u8 {
+@@ -246,12 +296,13 @@ impl Controller {
+             }
+         }
+         ostd::notice!(
+-            "{}: HDA {:04x}:{:04x}, {} output and {} input streams, codecs {:?}",
++            "{}: HDA {:04x}:{:04x}, {} output and {} input streams, {}, codecs {:?}",
+             controller.name,
+             id.vendor_id,
+             id.device_id,
+             output_streams,
+             input_streams,
++            if interrupts { "MSI" } else { "polled" },
+             controller.codecs.iter().map(|codec| alloc::format!("{:08x}", codec.vendor)).collect::<Vec<_>>()
+         );
+         Some(controller)
+@@ -429,7 +480,7 @@ impl Stream {
+         regs.wait(|r| r.r8(ctl) & SD_CTL_RESET != 0);
+         regs.w8(ctl, regs.r8(ctl) & !SD_CTL_RESET);
+         regs.wait(|r| r.r8(ctl) & SD_CTL_RESET == 0);
+-        regs.w8(self.base + reg::SD_STS, 0x1c);
++        regs.w8(self.base + reg::SD_STS, SD_STS_ALL);
+     }
+ }
+ 
+@@ -467,13 +518,15 @@ impl StreamHw for Stream {
+ 
+     fn start(&self) {
+         let ctl = self.base + reg::SD_CTL;
+-        self.regs().w8(ctl, self.regs().r8(ctl) | SD_CTL_RUN);
++        let interrupt = if self.controller.interrupts { SD_CTL_IOCE } else { 0 };
++        self.regs().w8(ctl, self.regs().r8(ctl) | SD_CTL_RUN | interrupt);
+         self.running.store(true, Ordering::Release);
+     }
+ 
+     fn stop(&self) {
+         let ctl = self.base + reg::SD_CTL;
+-        self.regs().w8(ctl, self.regs().r8(ctl) & !SD_CTL_RUN);
++        self.regs().w8(ctl, self.regs().r8(ctl) & !(SD_CTL_RUN | SD_CTL_IOCE));
++        self.regs().w8(self.base + reg::SD_STS, SD_STS_ALL);
+         self.running.store(false, Ordering::Release);
+     }
+ 
+diff --git a/kernel/comps/sound/src/lib.rs b/kernel/comps/sound/src/lib.rs
+index 985a067..74bc566 100755
+--- a/kernel/comps/sound/src/lib.rs
++++ b/kernel/comps/sound/src/lib.rs
+@@ -80,24 +80,53 @@ pub(crate) fn note_running(running: bool) {
+     }
+ }
+ 
+-/// Every other millisecond while streams run: their positions move on and
+-/// whoever waits for room or data wakes.
++/// Some controller has no interrupt: the timer follows the streams.
++static POLLED: AtomicBool = AtomicBool::new(false);
++/// The streams' interrupts so far: the timer steps back once they come.
++static STREAM_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
++/// How often the timer still looks at the streams when interrupts work,
++/// in milliseconds: an interrupt lost costs this much at most.
++const INTERRUPT_WATCH_MS: u64 = 64;
++
++pub(crate) fn no_interrupt() {
++    POLLED.store(true, Ordering::Relaxed);
++}
++
++/// The running streams' positions move on and whoever waits for room or
++/// data wakes.
++fn update_streams() {
++    let Some(cards) = CARDS.try_lock() else { return };
++    for card in cards.iter() {
++        for pcm in card.pcms() {
++            if pcm.is_running() {
++                pcm.update();
++            }
++        }
++    }
++}
++
++/// A controller's interrupt: some stream finished a period.
++pub(crate) fn streams_moved() {
++    STREAM_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
++    update_streams();
++}
++
++/// Each millisecond. While streams run, every other one where a controller
++/// has no interrupt (or none has arrived yet): the positions move on. With
++/// interrupts, which come at each period's end, only now and then.
+ fn tick() {
+     let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
+     if ticks % 500 == 0 {
+         JACKS_DUE.store(true, Ordering::Release);
+         JACKS.wake_all();
+     }
+-    if RUNNING.load(Ordering::Acquire) == 0 || ticks % 2 != 0 {
++    if RUNNING.load(Ordering::Acquire) == 0 {
+         return;
+     }
+-    let Some(cards) = CARDS.try_lock() else { return };
+-    for card in cards.iter() {
+-        for pcm in card.pcms() {
+-            if pcm.is_running() {
+-                pcm.update();
+-            }
+-        }
++    let interrupts = !POLLED.load(Ordering::Relaxed) && STREAM_INTERRUPTS.load(Ordering::Relaxed) != 0;
++    let every = if interrupts { INTERRUPT_WATCH_MS } else { 2 };
++    if ticks % every == 0 {
++        update_streams();
+     }
+ }
+ 
+diff --git a/kernel/comps/usb/src/lib.rs b/kernel/comps/usb/src/lib.rs
+index 4c2db45..a523e96 100755
+--- a/kernel/comps/usb/src/lib.rs
++++ b/kernel/comps/usb/src/lib.rs
+@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use aster_pci::{
+     PCI_BUS, PciDeviceId,
+     bus::{PciDevice, PciDriver},
+-    capability::msix::CapabilityMsixData,
++    capability::{msi::CapabilityMsiData, msix::CapabilityMsixData},
+     common_device::PciCommonDevice,
+ };
+ use component::{ComponentInitError, init_component};
+@@ -125,7 +125,7 @@ impl PciDriver for Driver {
+ }
+ 
+ /// The controllers found, with their interrupts, until their tasks start.
+-static PENDING: SpinLock<Vec<(PciCommonDevice, Option<CapabilityMsixData>, String)>> = SpinLock::new(Vec::new());
++static PENDING: SpinLock<Vec<(PciCommonDevice, Option<CapabilityMsixData>, Option<CapabilityMsiData>, String)>> = SpinLock::new(Vec::new());
+ 
+ // Claims the controllers and offers the input devices before the X server
+ // and evdev look for them.
+@@ -142,13 +142,19 @@ fn init() -> Result<(), ComponentInitError> {
+     for (index, mut device) in controllers.into_iter().enumerate() {
+         let location = *device.location();
+         let name = format!("xhci{} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
+-        // Interrupter 0 on MSI-X vector 0; without MSI-X, the timer polls.
++        // Interrupter 0 on MSI-X vector 0, or on the one message of MSI
++        // (the controllers of Intel's 7 series and others of their time
++        // have no MSI-X); without either, the timer polls.
+         let msix = match device.acquire_msix_capability() {
+             Ok(Some(mut msix)) => match IrqLine::alloc() {
+                 Ok(irq) => {
++                    let counter = aster_pci::irq_stats::interrupt_counter(irq.num(), &name);
+                     msix.set_interrupt_vector(irq, 0);
+                     if let Some(irq) = msix.irq_mut(0) {
+-                        irq.on_active(|_| wake());
++                        irq.on_active(move |_| {
++                            counter.count();
++                            wake()
++                        });
+                     }
+                     Some(msix)
+                 }
+@@ -156,11 +162,27 @@ fn init() -> Result<(), ComponentInitError> {
+             },
+             _ => None,
+         };
+-        if msix.is_none() {
++        let msi = if msix.is_some() {
++            None
++        } else {
++            match (device.acquire_msi_capability(), IrqLine::alloc()) {
++                (Some(mut msi), Ok(mut irq)) => {
++                    let counter = aster_pci::irq_stats::interrupt_counter(irq.num(), &name);
++                    irq.on_active(move |_| {
++                        counter.count();
++                        wake()
++                    });
++                    msi.set_interrupt_vector(irq);
++                    Some(msi)
++                }
++                _ => None,
++            }
++        };
++        if msix.is_none() && msi.is_none() {
+             INTERRUPTS.store(false, Ordering::Relaxed);
+-            ostd::notice!("{}: no MSI-X; polling", name);
++            ostd::notice!("{}: no MSI-X or MSI; polling", name);
+         }
+-        PENDING.lock().push((device, msix, name));
++        PENDING.lock().push((device, msix, msi, name));
+     }
+     Ok(())
+ }
+@@ -168,9 +190,9 @@ fn init() -> Result<(), ComponentInitError> {
+ // One task per controller, once there is a scheduler.
+ #[init_component(kthread)]
+ fn start() -> Result<(), ComponentInitError> {
+-    for (device, msix, name) in core::mem::take(&mut *PENDING.lock()) {
++    for (device, msix, msi, name) in core::mem::take(&mut *PENDING.lock()) {
+         aster_core::spawn_kernel_thread(move || {
+-            let _msix = msix;
++            let _interrupt = (msix, msi);
+             match xhci::Controller::new(device, name) {
+                 Some(controller) => controller.run(),
+                 None => ostd::warn!("an xHCI controller did not start"),
+diff --git a/kernel/core/Cargo.toml b/kernel/core/Cargo.toml
+index 30fe550..1ca3400 100644
+--- a/kernel/core/Cargo.toml
++++ b/kernel/core/Cargo.toml
+@@ -17,6 +17,7 @@ aster-fuse.workspace = true
+ aster-input.workspace = true
+ aster-logger.workspace = true
+ aster-network.workspace = true
++aster-pci.workspace = true
+ aster-nvme.workspace = true
+ aster-rights.workspace = true
+ aster-rights-proc.workspace = true
+diff --git a/kernel/core/comps/pci/src/irq_stats.rs b/kernel/core/comps/pci/src/irq_stats.rs
+new file mode 100644
+index 0000000..9939f38
+--- /dev/null
++++ b/kernel/core/comps/pci/src/irq_stats.rs
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! How many interrupts each device raised, by the name its driver gave
++//! it: what `/proc/interrupts` shows, and how to tell on a computer
++//! whether a device's interrupts arrive at all.
++
++use alloc::{string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicU64, Ordering};
++
++use ostd::sync::SpinLock;
++
++static COUNTERS: SpinLock<Vec<(u8, String, Arc<AtomicU64>)>> = SpinLock::new(Vec::new());
++
++/// A device's count, which its interrupt handler adds to.
++#[derive(Clone, Debug)]
++pub struct InterruptCounter(Arc<AtomicU64>);
++
++impl InterruptCounter {
++    /// One more interrupt. Safe in the handler: it takes no lock.
++    pub fn count(&self) {
++        self.0.fetch_add(1, Ordering::Relaxed);
++    }
++
++    pub fn total(&self) -> u64 {
++        self.0.load(Ordering::Relaxed)
++    }
++}
++
++/// A counter for the interrupts of `name` on the interrupt line `line`.
++pub fn interrupt_counter(line: u8, name: &str) -> InterruptCounter {
++    let counter = Arc::new(AtomicU64::new(0));
++    COUNTERS.lock().push((line, String::from(name), counter.clone()));
++    InterruptCounter(counter)
++}
++
++/// Each counted device: its interrupt line, its name, its count so far.
++pub fn interrupt_counts() -> Vec<(u8, String, u64)> {
++    let mut counts: Vec<_> =
++        COUNTERS.lock().iter().map(|(line, name, counter)| (*line, name.clone(), counter.load(Ordering::Relaxed))).collect();
++    counts.sort();
++    counts
++}
+diff --git a/kernel/core/comps/pci/src/lib.rs b/kernel/core/comps/pci/src/lib.rs
+index 7ec4ae7..81a2cca 100644
+--- a/kernel/core/comps/pci/src/lib.rs
++++ b/kernel/core/comps/pci/src/lib.rs
+@@ -73,6 +73,7 @@ pub mod capability;
+ pub mod cfg_space;
+ pub mod common_device;
+ mod device_info;
++pub mod irq_stats;
+ 
+ extern crate alloc;
+ 
+diff --git a/kernel/core/src/fs/fs_impls/procfs/interrupts.rs b/kernel/core/src/fs/fs_impls/procfs/interrupts.rs
+new file mode 100644
+index 0000000..162295b
+--- /dev/null
++++ b/kernel/core/src/fs/fs_impls/procfs/interrupts.rs
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `/proc/interrupts`: the devices that signal by message (MSI and MSI-X),
++//! each with its interrupt line and how many interrupts it raised, in
++//! Linux's columns for one processor column (the counts are the sum).
++
++use aster_util::printer::VmPrinter;
++
++use crate::{
++    fs::{
++        file::mkmod,
++        procfs::template::{ProcFile, ProcFileOps},
++        vfs::inode::Inode,
++    },
++    prelude::*,
++};
++
++pub(super) struct InterruptsFileOps;
++
++impl InterruptsFileOps {
++    pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(a+r))
++    }
++}
++
++impl ProcFileOps for InterruptsFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        writeln!(printer, "           CPU0")?;
++        for (line, name, count) in aster_pci::irq_stats::interrupt_counts() {
++            writeln!(printer, "{:>4}: {:>10}   PCI-MSI  {}", line, count, name)?;
++        }
++        Ok(printer.bytes_written())
++    }
++}
+diff --git a/kernel/core/src/fs/fs_impls/procfs/mod.rs b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+old mode 100644
+new mode 100755
+index 9e2249d..6408fc1
+--- a/kernel/core/src/fs/fs_impls/procfs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+@@ -11,6 +11,7 @@ use template::{
+ use self::{
+     cmdline::CmdLineFileOps,
+     cpuinfo::CpuInfoFileOps,
++    interrupts::InterruptsFileOps,
+     loadavg::LoadAvgFileOps,
+     meminfo::MemInfoFileOps,
+     mounts::MountsSymOps,
+@@ -45,6 +46,7 @@ use crate::{
+ mod cmdline;
+ mod cpuinfo;
+ mod filesystems;
++mod interrupts;
+ mod loadavg;
+ mod net;
+ mod partitions;
+@@ -163,6 +165,7 @@ impl RootDirOps {
+             FileSystemsFileOps::new_inode,
+         ),
+         ("diskstats", InodeType::File, DiskstatsFileOps::new_inode),
++        ("interrupts", InodeType::File, InterruptsFileOps::new_inode),
+         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
+         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),
+         ("mounts", InodeType::SymLink, MountsSymOps::new_inode),

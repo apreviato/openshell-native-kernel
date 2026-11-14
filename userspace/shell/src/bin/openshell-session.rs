@@ -23,11 +23,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openshell_shell::drives::{self, MountOps, SystemView};
+use openshell_shell::firewall::{self, Firewall};
 use openshell_shell::install::{Installer, INSTALL_PREFIX, SYSTEM_SOCKET_ENV};
 use openshell_shell::login::{parse_request, Phase, Request, GREETER_SOCKET_ENV, MAX_REQUEST};
 use openshell_shell::power::PowerAction;
 use openshell_shell::settings::{Saved, Setting, SystemFiles};
+use openshell_shell::ssh::{self, Ssh};
 use openshell_shell::update::{self, Updates};
+use openshell_shell::wifi::{self, ControlSockets, Wifi};
 use openshell_shell::session::{
     boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig,
     DESKTOP_HEALTH_ENV, DESKTOP_HEALTH_RESET, DESKTOP_HEALTHY, LOGS_ENV,
@@ -479,6 +482,33 @@ impl Supervisor {
                         answer
                     }
                     None => "unavailable".to_owned(),
+                }
+            } else if firewall::is_request(line) {
+                let answer = Firewall::new(self.config.settings_dir.clone()).answer(line);
+                if line != "firewall status" {
+                    self.journal.note(&format!("{line}: {answer}"));
+                }
+                answer
+            } else if ssh::is_request(line) {
+                let answer = Ssh::new(self.config.settings_dir.clone()).answer(line);
+                if line != "ssh status" {
+                    self.journal.note(&format!("{line}: {answer}"));
+                }
+                answer
+            } else if wifi::is_request(line) {
+                // Only a whole line: one cut at the limit could still read
+                // as a request, with another password.
+                if request.last() != Some(&b'\n') {
+                    "invalid".to_owned()
+                } else {
+                    let answer = Wifi::new(self.config.settings_dir.clone()).answer(line, &mut ControlSockets);
+                    // What changes something, by its verb alone: the line
+                    // may hold a password.
+                    let verb = line.split(' ').nth(1).unwrap_or("");
+                    if !matches!(verb, "status" | "networks" | "scan") {
+                        self.journal.note(&format!("wifi {verb}: {}", answer.split(' ').next().unwrap_or("")));
+                    }
+                    answer
                 }
             } else if drives::is_request(line) {
                 // /media/<user>, as udisks2 mounts the session's drives.

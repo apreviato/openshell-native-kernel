@@ -1,6 +1,6 @@
 # OpenShell Native — Plano de implementação e estado atual
 
-**Revisão 1.0 · 13 de novembro de 2026.** Substitui a proposta técnica v0.1 de 11 de novembro, cujas etapas 0 a 6 estão concluídas.
+**Revisão 1.2 · 14 de novembro de 2026.** Substitui a proposta técnica v0.1 de 11 de novembro, cujas etapas 0 a 6 estão concluídas. A 1.1 acrescentou o Wi-Fi acima do chip (patches 0039 a 0041); a 1.2, interrupções na rede e no som, o firewall e os sockets em todos os endereços (patches 0042 a 0044), com o SSH, o compartilhamento de tela e a impressão na imagem, e a primeira parte do driver Wi-Fi da Intel (patch 0045).
 
 OpenShell Native é a edição instalável do OpenShell com kernel em Rust e compatibilidade binária Linux. A base é o Asterinas v0.19.0, mantido como upstream rastreável com uma série de patches. O sistema roda o mesmo bundle do OpenShell Desktop do OpenShell Live (Debian), num shell CEF em vez do Electron ([plano CEF](ARCHITECTURE-CEF.md)), com supervisor, instalador, atualização A/B e recovery próprios. O OpenShell Live continua como edição Debian independente e como controle de comportamento: cada recurso do Native é medido contra o que o Live faz.
 
@@ -49,9 +49,9 @@ Resultados no QEMU, salvo indicação, e no piloto de hardware em andamento. O [
 | ABI e sandbox | Chromium com seccomp-bpf e namespaces de usuário, PID e rede; Node, Python, Xorg, Xpra e Wine. | `ip route add` (netlink `RTM_NEWROUTE`), journald e serviços systemd. |
 | Tela e entrada | Xorg sobre DRM (simpledrm) com Mesa em software; teclado PS/2 e USB, touchpads Synaptics e ELAN, mouse USB, hubs; brilho Intel. | Aceleração de GPU, dois monitores, touchpads I2C-HID, brilho AMD, IME. |
 | Armazenamento | VirtIO, NVMe, SATA (AHCI, patch 0037) e USB (Bulk-Only); ext2, exFAT e FAT12/16/32; `/sys/block`, `/proc/partitions`, `/proc/diskstats`; montagem pelo Desktop. | NTFS, UAS, NCQ, unidades ópticas. |
-| Rede | VirtIO, Intel e1000/e1000e/igb/igc, Realtek RTL8111/8168/8125, ancoragem USB (ECM, NCM, RNDIS); DHCP no kernel, rotas pelo netlink, `/proc/net/{route,dev,pnp}`. | Wi-Fi, adaptadores USB com chip próprio (ASIX, RTL815x), IPv6 por SLAAC/DHCPv6, firewall (netfilter). |
+| Rede | VirtIO, Intel e1000/e1000e/igb/igc, Realtek RTL8111/8168/8125, ancoragem USB (ECM, NCM, RNDIS); DHCP no kernel, rotas pelo netlink, `/proc/net/{route,dev,pnp}`; sockets `AF_PACKET`; servidores em `0.0.0.0` (TCP e UDP, patch 0044); firewall de entrada com estado em `/proc/net/firewall` (patch 0043). Wi-Fi acima do chip: nl80211 por netlink genérico, `wpa_supplicant` sem alteração, pedidos da sessão pelo supervisor, página Rede (testado com o rádio simulado `wlan.sim`). | Drivers dos chips Wi-Fi (Intel até o início do firmware, patch 0045; Realtek, MediaTek, Qualcomm), hotspot, adaptadores USB com chip próprio (ASIX, RTL815x), IPv6 por SLAAC/DHCPv6 e servidores em `::`, grupos multicast (mDNS), regras de saída no firewall. |
 | Som | Intel HDA com o caminho genérico de codecs, ALSA em `/dev/snd`, PulseAudio da sessão; volume, microfone e troca para o fone. | HDMI/DisplayPort, ajustes por modelo, microfones digitais (SOF). |
-| Sessão | Entrada com senha, bloqueio, desligar e reiniciar, instalador, ajustes (fuso, nome, teclado, brilho), discos, logs, processos e desempenho. | Suspensão, impressoras, Bluetooth. |
+| Sessão | Entrada com senha, bloqueio, desligar e reiniciar, instalador, ajustes (fuso, nome, teclado, brilho), discos, logs, processos e desempenho; firewall, SSH e Wi-Fi a pedido da sessão, pelo supervisor; tela compartilhada (x11vnc) e impressão (CUPS, impressoras de rede pelo endereço). | Suspensão, Bluetooth; descoberta de impressoras e impressoras USB. SSH, x11vnc e CUPS ainda sem um boot de imagem que os confira. |
 | Desktop | Desktop, Files, Terminal, Browser com abas nativas, apps Linux (Xpra) e Windows (Wine), modelos locais (llama.cpp b11960 na CPU), ditado (Whisper) e leitura em voz (Piper) na página, dicas no tema. | Paridade de serviços que dependem do Debian (NetworkManager, udisks, journald) é por adaptadores, somente leitura onde o Native não tem o serviço. |
 | Dados e atualização | Imagem GPT com `system_a`, `system_b`, `recovery` e `data`; instalação em NVMe, SATA, USB ou VirtIO; atualização assinada do slot inativo pelo canal de releases; trial de 3 boots e retorno. | Criptografia de disco, snapshots. |
 
@@ -68,15 +68,15 @@ Resultados no QEMU, salvo indicação, e no piloto de hardware em andamento. O [
 | 6 · Imagem e recuperação | Concluída | Imagem A/B com atualização, trial, retorno e recovery em VirtIO e NVMe (`boot-test.sh`, que nesta revisão ganhou o caso SATA, ainda a rodar); instalador live. |
 | 7 · Hardware de referência | Em andamento | Primeiros testes em notebook físico. Drivers de PC acrescentados dos patches 0027 em diante (teclado, brilho, USB, rede, som, SATA): falta conferir cada um em máquinas reais. |
 | 8 · Conectividade sem fio | Planejada | Exige o chip de cada máquina (`lspci -nn`, `lsusb` no Live) e o firmware do linux-firmware. |
-| 9 · Periféricos e serviços | Planejada | Impressão, firewall, suspensão, aceleração de GPU. |
+| 9 · Periféricos e serviços | Em andamento | Firewall no kernel, testado no QEMU (patch 0043). SSH, compartilhamento de tela e impressão na imagem, a conferir no primeiro build. Faltam suspensão e aceleração de GPU. |
 
 ### Próximos passos, em ordem
 
 1. **Conferir no hardware o que já passa no QEMU.** Instalação e boot num disco SATA; Ethernet Intel I219, I211/I225 e Realtek RTL8111/8125 (sem emulação no QEMU); som nos codecs Realtek, Conexant e Cirrus; ancoragem USB de celulares; modelos locais com um GGUF do catálogo na imagem.
-2. **Wi-Fi Intel, por etapas testadas no notebook.** Carregamento de firmware no kernel, driver PCIe do iwlwifi (família MVM) até a varredura; associação a redes abertas e WPA2 com endereço por DHCP; lista e conexão na página Rede. Depois, Realtek, MediaTek e Qualcomm.
+2. **Drivers dos chips Wi-Fi, cada um conferido em hardware.** A parte comum está pronta (componente `aster-wlan`, patches 0039 a 0041): um driver só implementa as operações de `radio::Radio`. Intel primeiro, por ser a mais comum: o firmware -77 fala o mesmo conjunto de comandos em AX200, AX201, AX210 e AX211, que por isso saem de um só driver. A primeira parte está escrita (componente `aster-iwlwifi`, patch 0045): reconhecer a placa, carregar o firmware pelo transporte PCIe de segunda geração e ouvir o `alive`; **o primeiro teste em hardware é ler no log do kernel até onde ela chega**. Depois os comandos de início, a varredura (a placa passa a listar redes), e associação, chaves e dados; em seguida as famílias 9000, 8000 e 7000, de transporte e comandos mais antigos. Depois Realtek (rtw88, rtw89), MediaTek (MT7921/7922) e Qualcomm (ath10k, ath11k).
 3. **Bluetooth.** HCI por USB (btusb) e sockets `AF_BLUETOOTH` com a interface de gerenciamento que o BlueZ usa; firmware Intel e Realtek.
-4. **Firewall e impressão.** Netfilter mínimo para as regras que a página Firewall aplica; CUPS com os drivers que o Live empacota.
-5. **Desempenho.** MSI (patch 0037) também no som e nas placas de rede, que hoje são lidos pelo timer; NCQ no SATA; IPv6 por SLAAC.
+4. **Conferir os serviços novos numa imagem.** SSH (entrar com a senha da conta e com chave, `sftp`), tela compartilhada (x11vnc com um cliente VNC) e impressão (uma impressora IPP de rede, ou o `ippeveprinter` do CUPS): cada um depende de chamadas do kernel que só o programa real exercita. Depois, grupos multicast para a descoberta de impressoras (mDNS) e impressoras USB.
+5. **Desempenho.** As placas de rede e o som já avisam por interrupção (MSI, patch 0042), com o temporizador como reserva até a primeira chegar: conferir em hardware com `/proc/interrupts`. Depois NCQ no SATA e IPv6 por SLAAC.
 
 ## 5. Segurança e robustez
 
@@ -98,5 +98,5 @@ Já conferidos e sem mudança: o FAT (boot sector validado, cadeias fora do volu
 | Composição pelo nixpkgs do Asterinas | Adotada: closure única para ISO, imagem e testes, com os pacotes que o Live tem em versões próximas. |
 | Boot pelo shim e GRUB do Debian | Adotada: Secure Boot sem carregador próprio; o GRUB lê o `grubenv` da partição de dados para o trial. |
 | Filesystem dos dados | Adotado ext2 nos slots e na partição de dados; journaling, snapshots e criptografia ficam para avaliação. |
-| Drivers no kernel, um por família | Adotada: cada família (HDA, e1000, igb, r8169, xHCI, AHCI) num componente próprio com polling ou MSI, testada no QEMU onde há emulação e no hardware do piloto onde não há. |
+| Drivers no kernel, um por família | Adotada: cada família (HDA, e1000, igb, r8169, xHCI, AHCI) num componente próprio com MSI e varredura como reserva, testada no QEMU onde há emulação e no hardware do piloto onde não há. |
 | `hostd` em Rust | Condicionada aos testes de contrato do `host-api`, método a método. |

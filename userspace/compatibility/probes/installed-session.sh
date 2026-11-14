@@ -276,6 +276,222 @@ EOF
 # and, as it writes them to stderr too, to supervisor.log: never to the
 # console, which is the screen on a computer, over the Desktop.
 mkdir -p "$data/openshell/session-logs"
+# The firewall (userspace/shell/src/firewall.rs): the rules the supervisor
+# keeps go to the kernel before anything listens, when it was left on.
+if [ -n "${settings:-}" ] && [ -e "$data/openshell/system/firewall.on" ] && [ -e /proc/net/firewall ]; then
+    cat "$data/openshell/system/firewall.rules" > /proc/net/firewall || echo "the firewall's rules were not taken" >&2
+fi
+# Wi-Fi (userspace/shell/src/wifi.rs): wpa_supplicant runs the kernel's Wi-Fi
+# interfaces, which the supervisor hands to it when the session asks. Its
+# control sockets are root's alone: whoever reaches them tells it which
+# files to read and which plug-ins to load. It starts again if it ends; its
+# log is this boot's.
+wifi=
+if [ -x "$root/bin/wpa_supplicant" ]; then
+    mkdir -p /run/openshell-wifi/interfaces
+    chmod 0700 /run/openshell-wifi /run/openshell-wifi/interfaces
+    : > "$data/openshell/session-logs/wifi.log"
+    (
+        while :; do
+            # What it writes (the saved networks, with their passwords) is
+            # for root alone.
+            (umask 077; exec "$root/bin/wpa_supplicant" -g /run/openshell-wifi/global -t) >> "$data/openshell/session-logs/wifi.log" 2>&1
+            rm -f /run/openshell-wifi/global
+            sleep 2
+        done
+    ) &
+    wifi=$!
+fi
+# Remote access by SSH (userspace/shell/src/ssh.rs): OpenSSH's server runs
+# while the supervisor keeps its mark, which the session asks for in
+# Settings. An installed system only: the account's password is what lets
+# someone in. The host keys are made once and stay on the data partition, so
+# the computer keeps its identity; the server's log is this boot's.
+ssh_run=/run/openshell-ssh
+ssh_keys=$data/openshell/system/ssh
+# What the server needs before it starts; fails where something is missing.
+ssh_prepare() {
+    mkdir -p "$ssh_keys" /var/empty
+    chmod 0700 "$ssh_keys"
+    chmod 0755 /var/empty
+    for kind in ed25519 rsa; do
+        if [ ! -s "$ssh_keys/ssh_host_${kind}_key" ]; then
+            rm -f "$ssh_keys/ssh_host_${kind}_key" "$ssh_keys/ssh_host_${kind}_key.pub"
+            "$root/bin/ssh-keygen" -q -t "$kind" -N '' -C openshell -f "$ssh_keys/ssh_host_${kind}_key" || return 1
+        fi
+    done
+    # The keys' fingerprints, which the supervisor gives the Desktop.
+    for kind in ed25519 rsa; do
+        "$root/bin/ssh-keygen" -lf "$ssh_keys/ssh_host_${kind}_key.pub" || return 1
+    done > "$ssh_run/fingerprints.new"
+    mv "$ssh_run/fingerprints.new" "$ssh_run/fingerprints"
+    # The server's own user: the part of it that listens to someone who has
+    # not signed in yet runs as this one, in an empty folder.
+    grep -q '^sshd:' /etc/passwd || echo 'sshd:x:74:74:SSH server:/var/empty:/bin/false' >> /etc/passwd
+    grep -q '^sshd:' /etc/group || echo 'sshd:x:74:' >> /etc/group
+    # The account as the server looks for it: the session's home, a shell,
+    # and the hash of its password (the supervisor's, login.rs: SHA-512
+    # crypt, which crypt(3) checks). Without a password only keys let in
+    # (~/.ssh/authorized_keys).
+    account=$(awk -F: '$3 == 65534 { print $1; exit }' /etc/passwd)
+    [ -n "$account" ] || return 1
+    account_shell=/bin/sh
+    if [ -x /bin/bash ]; then account_shell=/bin/bash; fi
+    if ! awk -F: -v home="$state/home" -v shell="$account_shell" '$3 == 65534 && $6 == home && $7 == shell { found = 1 } END { exit !found }' /etc/passwd; then
+        awk -F: -v OFS=: -v home="$state/home" -v shell="$account_shell" '$3 == 65534 { $6 = home; $7 = shell } { print }' /etc/passwd > /etc/passwd.ssh || return 1
+        mv /etc/passwd.ssh /etc/passwd
+    fi
+    account_hash=$(head -n1 "$data/openshell/account/password" 2> /dev/null || true)
+    case "$account_hash" in
+        '$6$'*) ;;
+        *) account_hash='!' ;;
+    esac
+    (
+        umask 077
+        {
+            grep -v "^$account:" /etc/shadow 2> /dev/null || true
+            printf '%s:%s:19000:0:99999:7:::\n' "$account" "$account_hash"
+        } > /etc/shadow.ssh
+        mv /etc/shadow.ssh /etc/shadow
+    ) || return 1
+    # IPv4 only: the kernel's sockets do not listen on every IPv6 address yet.
+    cat > "$ssh_run/sshd_config" <<EOF
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
+HostKey $ssh_keys/ssh_host_ed25519_key
+HostKey $ssh_keys/ssh_host_rsa_key
+PidFile $ssh_run/sshd.pid
+UsePAM no
+PermitRootLogin no
+AllowUsers $account
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+AuthorizedKeysFile .ssh/authorized_keys
+UseDNS no
+PrintMotd no
+Subsystem sftp internal-sftp
+SetEnv PATH=$root/bin:/bin:/usr/bin
+EOF
+}
+ssh_service=
+if [ -n "${settings:-}" ] && [ -x "$root/bin/sshd" ]; then
+    # Nothing of an earlier boot (the system's copy on the disk keeps /run).
+    rm -rf "$ssh_run"
+    mkdir -p "$ssh_run"
+    chmod 0755 "$ssh_run"
+    (
+        set +e
+        while :; do
+            if [ -e "$data/openshell/system/ssh.on" ]; then
+                if [ ! -e "$ssh_run/running" ]; then
+                    if ssh_prepare; then
+                        : > "$ssh_run/running"
+                        # "running" lasts as long as the server does.
+                        (
+                            "$root/bin/sshd" -D -e -f "$ssh_run/sshd_config"
+                            rm -f "$ssh_run/running" "$ssh_run/sshd.pid"
+                        ) &
+                    fi
+                    # One that ends at once starts again, slowly.
+                    sleep 5
+                fi
+            elif [ -e "$ssh_run/running" ]; then
+                # Turned off: the server stops; who is signed in stays, as
+                # with Live's service.
+                kill "$(cat "$ssh_run/sshd.pid" 2> /dev/null)" 2> /dev/null || killall sshd 2> /dev/null
+                sleep 1
+            fi
+            sleep 1
+        done
+    ) >> "$data/openshell/session-logs/ssh.log" 2>&1 &
+    ssh_service=$!
+fi
+# Printing: CUPS's scheduler, for this computer's programs only (the
+# loopback address and its socket), with the session's person as its
+# administrator, who adds and removes printers in Settings: nobody else has
+# an account here. Printers and their settings stay on the data partition
+# (a live session's last until it ends). It starts again if it ends; its log
+# is this boot's.
+cups_service=
+if [ -x "$root/bin/cupsd" ] && [ -d "$root/cups/lib/cups" ]; then
+    if [ -n "${settings:-}" ]; then
+        cups_state=$data/openshell/system/cups
+    else
+        cups_state=/tmp/openshell-cups
+    fi
+    # Nothing of an earlier boot (its socket, its certificates).
+    rm -rf /run/cups
+    mkdir -p "$cups_state" /run/cups /var/spool /var/cache
+    chmod 0755 "$cups_state" /run/cups
+    # CUPS's tools look for the scheduler's socket and their settings in
+    # /etc/cups, and the scheduler keeps its files there.
+    if [ ! -L /etc/cups ]; then
+        rm -rf /etc/cups
+        ln -s "$cups_state" /etc/cups
+    fi
+    cat > "$cups_state/client.conf" <<EOF
+ServerName /run/cups/cups.sock
+EOF
+    # The programs that make a job into what the printer takes, and the
+    # ones that send it, run as the session's user.
+    cat > "$cups_state/cups-files.conf" <<EOF
+SystemGroup root
+ServerRoot $cups_state
+ServerBin $root/cups/lib/cups
+DataDir $root/cups/share/cups
+StateDir /run/cups
+CacheDir /var/cache/cups
+RequestRoot /var/spool/cups
+TempDir /var/spool/cups/tmp
+AccessLog stderr
+ErrorLog stderr
+PageLog stderr
+SetEnv PATH $root/cups/lib/cups/filter:$root/cups/bin:$root/bin:/bin:/usr/bin
+User nobody
+Group nogroup
+FileDevice No
+EOF
+    cat > "$cups_state/cupsd.conf" <<EOF
+Listen 127.0.0.1:631
+Listen /run/cups/cups.sock
+LogLevel warn
+AccessLogLevel none
+DefaultShared No
+Browsing No
+BrowseLocalProtocols none
+WebInterface No
+DefaultAuthType None
+<Location />
+  Order allow,deny
+  Allow localhost
+</Location>
+<Location /admin>
+  Order allow,deny
+  Allow localhost
+</Location>
+<Policy default>
+  JobPrivateAccess default
+  JobPrivateValues default
+  SubscriptionPrivateAccess default
+  SubscriptionPrivateValues default
+  <Limit All>
+    Order deny,allow
+  </Limit>
+</Policy>
+EOF
+    : > "$data/openshell/session-logs/cups.log"
+    (
+        set +e
+        while :; do
+            "$root/bin/cupsd" -f -c "$cups_state/cupsd.conf" -s "$cups_state/cups-files.conf" >> "$data/openshell/session-logs/cups.log" 2>&1
+            rm -f /run/cups/cups.sock
+            sleep 5
+        done
+    ) &
+    cups_service=$!
+fi
 "$root/bin/openshell-session" "$config" >> "$data/openshell/session-logs/supervisor.log" 2>&1 &
 supervisor=$!
 trap 'kill -TERM "$supervisor" 2>/dev/null || true' HUP INT TERM
@@ -283,6 +499,21 @@ status=0
 wait "$supervisor" || status=$?
 if kill -0 "$supervisor" 2>/dev/null; then
     wait "$supervisor" || status=$?
+fi
+# The session ended: so does the supplicant, which leaves its network.
+if [ -n "$wifi" ]; then
+    kill "$wifi" 2>/dev/null || true
+    killall wpa_supplicant 2>/dev/null || true
+fi
+# And the SSH server, with whoever is signed in, and the printing scheduler.
+if [ -n "$ssh_service" ]; then
+    kill "$ssh_service" 2>/dev/null || true
+    killall sshd sshd-session 2>/dev/null || true
+    rm -f "$ssh_run/running" "$ssh_run/sshd.pid"
+fi
+if [ -n "$cups_service" ]; then
+    kill "$cups_service" 2>/dev/null || true
+    killall cupsd 2>/dev/null || true
 fi
 # The session asked to power off or restart (userspace/shell/src/power.rs,
 # POWEROFF_STATUS and REBOOT_STATUS): the supervisor cannot, init can, once

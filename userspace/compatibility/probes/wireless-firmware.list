@@ -1,0 +1,45 @@
+# The firmware of the Wi-Fi and Bluetooth chips the kernel has drivers for,
+# out of linux-firmware (the files Debian ships as firmware-iwlwifi and the
+# like). initramfs.nix copies what these lines name into /lib/firmware,
+# where the kernel's drivers ask for them (kernel component aster-firmware);
+# a driver that asks for a file no line here names fails its build's test.
+#
+#   <pattern>                 files, relative to linux-firmware's lib/firmware
+#   licence <file> <sha256>   a licence text of linux-firmware's LICENSES
+#                             folder, copied beside the files (its release
+#                             is nixpkgs' linux-firmware version)
+
+# Intel Wi-Fi (kernel/comps/iwlwifi): one firmware per chip family. The
+# AX200 to AX211 take release 77 on every chip, which speaks one set of
+# commands across them (Linux's newer release for the AX210 speaks another).
+licence LICENCE.iwlwifi_firmware 1ig50lipldqw4gyipsik4n09jnwkf04f4hkm7dlzqlgqgh609m8n
+# AX200.
+iwlwifi-cc-a0-77.ucode
+# AX201 and the other CNVi radios of 10th and 11th generation Core: the
+# AX radio (hr) and the 9560 and 9462 ones (jf) on the same platforms.
+iwlwifi-Qu-b0-hr-b0-77.ucode
+iwlwifi-Qu-c0-hr-b0-77.ucode
+iwlwifi-QuZ-a0-hr-b0-77.ucode
+iwlwifi-Qu-b0-jf-b0-77.ucode
+iwlwifi-Qu-c0-jf-b0-77.ucode
+iwlwifi-QuZ-a0-jf-b0-77.ucode
+# AX210, AX211, AX411 and the CNVi radios of 12th generation Core on.
+iwlwifi-ty-a0-gf-a0-77.ucode
+iwlwifi-ty-a0-gf-a0.pnvm
+iwlwifi-so-a0-gf-a0-77.ucode
+iwlwifi-so-a0-gf-a0.pnvm
+iwlwifi-so-a0-gf4-a0-77.ucode
+iwlwifi-so-a0-gf4-a0.pnvm
+iwlwifi-so-a0-hr-b0-77.ucode
+iwlwifi-so-a0-jf-b0-77.ucode
+# 9260, 9560, 9461 and 9462.
+iwlwifi-9260-th-b0-jf-b0-46.ucode
+iwlwifi-9000-pu-b0-jf-b0-46.ucode
+# 8260 and 8265.
+iwlwifi-8000C-36.ucode
+iwlwifi-8265-36.ucode
+# 7260, 7265, 3160, 3165 and 3168.
+iwlwifi-7260-17.ucode
+iwlwifi-7265D-29.ucode
+iwlwifi-3160-17.ucode
+iwlwifi-3168-29.ucode

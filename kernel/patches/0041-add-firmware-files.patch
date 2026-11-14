@@ -1,0 +1,371 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index df2a2f0..60b5719 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -164,6 +164,7 @@ dependencies = [
+  "aster-cmdline",
+  "aster-console",
+  "aster-device",
++ "aster-firmware",
+  "aster-framebuffer",
+  "aster-fuse",
+  "aster-input",
+@@ -268,6 +269,15 @@ dependencies = [
+  "spin",
+ ]
+ 
++[[package]]
++name = "aster-firmware"
++version = "0.1.0"
++dependencies = [
++ "component",
++ "ostd",
++ "spin",
++]
++
+ [[package]]
+ name = "aster-framebuffer"
+ version = "0.1.0"
+@@ -569,6 +579,7 @@ dependencies = [
+  "aster-core",
+  "aster-drm",
+  "aster-ethernet",
++ "aster-firmware",
+  "aster-i8042",
+  "aster-simpledrm",
+  "aster-uart",
+diff --git a/Cargo.toml b/Cargo.toml
+index 4dc2b05..dabacbf 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,7 @@ members = [
+     "kernel/comps/usb",
+     "kernel/comps/ahci",
+     "kernel/comps/wlan",
++    "kernel/comps/firmware",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -98,6 +99,7 @@ default-members = [
+     "kernel/comps/usb",
+     "kernel/comps/ahci",
+     "kernel/comps/wlan",
++    "kernel/comps/firmware",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -186,6 +188,7 @@ aster-i8042 = { path = "kernel/comps/i8042" }
+ aster-usb = { path = "kernel/comps/usb" }
+ aster-ahci = { path = "kernel/comps/ahci" }
+ aster-wlan = { path = "kernel/comps/wlan" }
++aster-firmware = { path = "kernel/comps/firmware" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+diff --git a/Components.toml b/Components.toml
+index 063c088..0a46ac2 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -24,6 +24,7 @@ uart = { name = "aster-uart" }
+ usb = { name = "aster-usb" }
+ ahci = { name = "aster-ahci" }
+ wlan = { name = "aster-wlan" }
++firmware = { name = "aster-firmware" }
+ ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+ 
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 1ffc9d2..ee8ceb1 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -16,6 +16,7 @@ aster-uart.workspace = true
+ aster-usb.workspace = true
+ aster-ahci.workspace = true
+ aster-wlan.workspace = true
++aster-firmware.workspace = true
+ aster-ethernet.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+diff --git a/kernel/comps/firmware/Cargo.toml b/kernel/comps/firmware/Cargo.toml
+new file mode 100755
+index 0000000..616c1e0
+--- /dev/null
++++ b/kernel/comps/firmware/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "aster-firmware"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++component.workspace = true
++ostd.workspace = true
++spin.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/firmware/src/lib.rs b/kernel/comps/firmware/src/lib.rs
+new file mode 100755
+index 0000000..0462a7e
+--- /dev/null
++++ b/kernel/comps/firmware/src/lib.rs
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Firmware files for the devices that need them (Wi-Fi and Bluetooth
++//! chips run code their makers publish in linux-firmware): a driver asks
++//! for a file by the name Linux knows it by, and gets its bytes from
++//! `/lib/firmware` of the running system.
++//!
++//! The kernel reads files; this component does not. The kernel registers
++//! its reader ([`set_reader`]) and drivers wait here ([`load`]) until the
++//! file is there: the first requests come while the system's files are
++//! still being found (the root of an installed system is mounted by the
++//! first program), so a file that is missing is looked for again for a
++//! while before the driver is told there is none.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++// This crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "firmware: "
++    };
++}
++
++use alloc::{sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use component::{ComponentInitError, init_component};
++use ostd::{sync::WaitQueue, timer::Jiffies};
++use spin::Once;
++
++/// The largest file taken: the biggest in linux-firmware are a few
++/// megabytes.
++pub const MAX_SIZE: usize = 32 * 1024 * 1024;
++/// The longest name, with its directories.
++const MAX_NAME: usize = 128;
++/// How long a missing file is looked for, and how often.
++const WAIT_MS: u64 = 45_000;
++const RETRY_MS: u64 = 500;
++
++/// Reads a firmware file by its name under the firmware directories, if
++/// it is there now.
++pub type Reader = fn(name: &str) -> Option<Vec<u8>>;
++
++static READER: Once<Reader> = Once::new();
++static WAKE: WaitQueue = WaitQueue::new();
++static WOKEN: AtomicBool = AtomicBool::new(false);
++static WAITERS: AtomicUsize = AtomicUsize::new(0);
++static TICKS: AtomicUsize = AtomicUsize::new(0);
++
++/// The kernel's reader of firmware files.
++pub fn set_reader(reader: Reader) {
++    READER.call_once(|| reader);
++}
++
++/// Whether a name is one a driver may ask for: a relative path of plain
++/// characters, without `..`.
++pub fn valid_name(name: &str) -> bool {
++    !name.is_empty()
++        && name.len() <= MAX_NAME
++        && name.split('/').all(|part| {
++            !part.is_empty()
++                && part != "."
++                && part != ".."
++                && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
++        })
++}
++
++fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++/// Each timer tick (1 ms): every 100, the tasks that wait for a file.
++fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    if ticks % 100 == 0 && WAITERS.load(Ordering::Relaxed) != 0 {
++        WOKEN.store(true, Ordering::Release);
++        WAKE.wake_all();
++    }
++}
++
++fn sleep_ms(ms: u64) {
++    let deadline = now_ms() + ms;
++    WAITERS.fetch_add(1, Ordering::AcqRel);
++    while now_ms() < deadline {
++        WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
++    }
++    WAITERS.fetch_sub(1, Ordering::AcqRel);
++}
++
++/// The file `name` if it is there now.
++pub fn try_load(name: &str) -> Option<Arc<[u8]>> {
++    if !valid_name(name) {
++        return None;
++    }
++    let bytes = (READER.get()?)(name)?;
++    (!bytes.is_empty() && bytes.len() <= MAX_SIZE).then(|| bytes.into())
++}
++
++/// The file `name`, waiting for the system's files while they are not
++/// there yet. Called from a driver's own task: it sleeps.
++pub fn load(name: &str) -> Option<Arc<[u8]>> {
++    if !valid_name(name) {
++        ostd::warn!("{:?} is not a firmware name", name);
++        return None;
++    }
++    let deadline = now_ms() + WAIT_MS;
++    loop {
++        if let Some(bytes) = try_load(name) {
++            ostd::info!("{} ({} bytes)", name, bytes.len());
++            return Some(bytes);
++        }
++        if now_ms() >= deadline {
++            return None;
++        }
++        sleep_ms(RETRY_MS);
++    }
++}
++
++/// The first of `names` that is there (a chip's newest firmware first),
++/// with its name; waits as [`load`] does.
++pub fn load_first<'a>(names: impl IntoIterator<Item = &'a str> + Clone) -> Option<(&'a str, Arc<[u8]>)> {
++    let deadline = now_ms() + WAIT_MS;
++    loop {
++        for name in names.clone() {
++            if let Some(bytes) = try_load(name) {
++                ostd::info!("{} ({} bytes)", name, bytes.len());
++                return Some((name, bytes));
++            }
++        }
++        if now_ms() >= deadline {
++            return None;
++        }
++        sleep_ms(RETRY_MS);
++    }
++}
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    ostd::timer::register_callback_on_cpu(tick);
++    Ok(())
++}
+diff --git a/kernel/core/Cargo.toml b/kernel/core/Cargo.toml
+index cc77546..30fe550 100644
+--- a/kernel/core/Cargo.toml
++++ b/kernel/core/Cargo.toml
+@@ -23,6 +23,7 @@ aster-rights-proc.workspace = true
+ aster-softirq.workspace = true
+ aster-sound.workspace = true
+ aster-wlan.workspace = true
++aster-firmware.workspace = true
+ aster-systree.workspace = true
+ aster-time.workspace = true
+ aster-util.workspace = true
+diff --git a/kernel/core/src/fs/firmware.rs b/kernel/core/src/fs/firmware.rs
+new file mode 100644
+index 0000000..b645d55
+--- /dev/null
++++ b/kernel/core/src/fs/firmware.rs
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Firmware files for device drivers: what the `aster-firmware` component
++//! reads them with. A file is looked for under the directories Linux
++//! keeps firmware in, as the first process sees them: the system's root
++//! once that process has mounted it.
++
++use alloc::format;
++
++use super::{file::InodeType, vfs::path::FsPath};
++use crate::{
++    prelude::*,
++    process::{INIT_PROCESS_PID, pid_table, posix_thread::AsPosixThread},
++};
++
++const DIRECTORIES: [&str; 2] = ["/lib/firmware", "/usr/lib/firmware"];
++
++pub(super) fn init() {
++    aster_firmware::set_reader(read);
++}
++
++fn read(name: &str) -> Option<Vec<u8>> {
++    let process = pid_table::pid_table_mut().get_process_unfiltered(INIT_PROCESS_PID)?;
++    let thread = process.main_thread();
++    let fs = thread.as_posix_thread()?.read_fs();
++    let resolver = fs.resolver().read();
++    for directory in DIRECTORIES {
++        let path = format!("{}/{}", directory, name);
++        let Ok(fs_path) = FsPath::try_from(path.as_str()) else {
++            continue;
++        };
++        let Ok(found) = resolver.lookup(&fs_path) else {
++            continue;
++        };
++        let inode = found.inode();
++        let size = inode.size();
++        if inode.type_() != InodeType::File || size == 0 || size > aster_firmware::MAX_SIZE {
++            continue;
++        }
++        let mut bytes = vec![0u8; size];
++        let mut offset = 0;
++        while offset < size {
++            match inode.read_bytes_at(offset, &mut bytes[offset..]) {
++                Ok(0) | Err(_) => break,
++                Ok(length) => offset += length,
++            }
++        }
++        if offset == size {
++            return Some(bytes);
++        }
++    }
++    None
++}
+diff --git a/kernel/core/src/fs/mod.rs b/kernel/core/src/fs/mod.rs
+index b52c088..32b7901 100644
+--- a/kernel/core/src/fs/mod.rs
++++ b/kernel/core/src/fs/mod.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ pub mod file;
++mod firmware;
+ mod fs_impls;
+ pub(crate) mod initramfs;
+ pub(crate) mod pipe;
+@@ -29,6 +30,7 @@ use crate::{
+ pub(crate) fn init() {
+     vfs::init();
+     fs_impls::init();
++    firmware::init();
+ }
+ 
+ pub(crate) fn init_on_each_cpu() {
+diff --git a/kernel/core/src/fs/vfs/fs_apis/inode.rs b/kernel/core/src/fs/vfs/fs_apis/inode.rs
+index 0a377c3..e8a5031 100644
+--- a/kernel/core/src/fs/vfs/fs_apis/inode.rs
++++ b/kernel/core/src/fs/vfs/fs_apis/inode.rs
+@@ -733,7 +733,6 @@ impl dyn Inode {
+         (self as &dyn Any).downcast_ref::<T>()
+     }
+ 
+-    #[cfg_attr(not(ktest), expect(dead_code))]
+     pub(crate) fn read_bytes_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+         let mut writer = VmWriter::from(buf).to_fallible();
+         self.read_at(offset, &mut writer, StatusFlags::empty())
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index f9a5dee..0f22838 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -22,6 +22,7 @@ extern crate aster_uart as _;
+ extern crate aster_usb as _;
+ extern crate aster_ahci as _;
+ extern crate aster_wlan as _;
++extern crate aster_firmware as _;
+ extern crate aster_ethernet as _;
+ 
+ #[ostd::main]

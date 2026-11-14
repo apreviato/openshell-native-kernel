@@ -1,0 +1,1885 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 994c665..6778d07 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -329,6 +329,17 @@ dependencies = [
+  "zerocopy",
+ ]
+ 
++[[package]]
++name = "aster-iwlwifi"
++version = "0.1.0"
++dependencies = [
++ "aster-core",
++ "aster-firmware",
++ "aster-pci",
++ "component",
++ "ostd",
++]
++
+ [[package]]
+ name = "aster-logger"
+ version = "0.1.0"
+@@ -582,6 +593,7 @@ dependencies = [
+  "aster-ethernet",
+  "aster-firmware",
+  "aster-i8042",
++ "aster-iwlwifi",
+  "aster-simpledrm",
+  "aster-uart",
+  "aster-usb",
+diff --git a/Cargo.toml b/Cargo.toml
+index dabacbf..a6d43b8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,7 @@ members = [
+     "kernel/comps/ahci",
+     "kernel/comps/wlan",
+     "kernel/comps/firmware",
++    "kernel/comps/iwlwifi",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -100,6 +101,7 @@ default-members = [
+     "kernel/comps/ahci",
+     "kernel/comps/wlan",
+     "kernel/comps/firmware",
++    "kernel/comps/iwlwifi",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -189,6 +191,7 @@ aster-usb = { path = "kernel/comps/usb" }
+ aster-ahci = { path = "kernel/comps/ahci" }
+ aster-wlan = { path = "kernel/comps/wlan" }
+ aster-firmware = { path = "kernel/comps/firmware" }
++aster-iwlwifi = { path = "kernel/comps/iwlwifi" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+diff --git a/Components.toml b/Components.toml
+index 0a46ac2..84e913d 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -25,6 +25,7 @@ usb = { name = "aster-usb" }
+ ahci = { name = "aster-ahci" }
+ wlan = { name = "aster-wlan" }
+ firmware = { name = "aster-firmware" }
++iwlwifi = { name = "aster-iwlwifi" }
+ ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+ 
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index ee8ceb1..418ff05 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -17,6 +17,7 @@ aster-usb.workspace = true
+ aster-ahci.workspace = true
+ aster-wlan.workspace = true
+ aster-firmware.workspace = true
++aster-iwlwifi.workspace = true
+ aster-ethernet.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+diff --git a/kernel/comps/iwlwifi/Cargo.toml b/kernel/comps/iwlwifi/Cargo.toml
+new file mode 100644
+index 0000000..6cc47fe
+--- /dev/null
++++ b/kernel/comps/iwlwifi/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "aster-iwlwifi"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-core.workspace = true
++aster-firmware.workspace = true
++aster-pci.workspace = true
++component.workspace = true
++ostd.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/iwlwifi/src/csr.rs b/kernel/comps/iwlwifi/src/csr.rs
+new file mode 100755
+index 0000000..9c668eb
+--- /dev/null
++++ b/kernel/comps/iwlwifi/src/csr.rs
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The chip's registers (BAR 0), by Linux's names (`iwl-csr.h`,
++//! `iwl-fh.h`, `iwl-prph.h`): the control and status registers the host
++//! reads and writes directly, and the addresses of the "periphery"
++//! registers behind them, which take the chip awake to reach.
++
++#![allow(dead_code)]
++
++pub(crate) const HW_IF_CONFIG: usize = 0x000;
++pub(crate) const INT: usize = 0x008;
++pub(crate) const INT_MASK: usize = 0x00c;
++pub(crate) const FH_INT_STATUS: usize = 0x010;
++pub(crate) const RESET: usize = 0x020;
++pub(crate) const GP_CNTRL: usize = 0x024;
++pub(crate) const HW_REV: usize = 0x028;
++pub(crate) const GIO: usize = 0x03c;
++pub(crate) const CTXT_INFO_BA: usize = 0x040;
++pub(crate) const UCODE_DRV_GP1_CLR: usize = 0x05c;
++pub(crate) const MBOX_SET: usize = 0x088;
++pub(crate) const HW_RF_ID: usize = 0x09c;
++pub(crate) const MAC_SHADOW_REG_CTRL: usize = 0x0a8;
++pub(crate) const LTR_LONG_VAL_AD: usize = 0x0d4;
++pub(crate) const LTR_LAST_MSG: usize = 0x0dc;
++pub(crate) const GIO_CHICKEN_BITS: usize = 0x100;
++pub(crate) const DBG_HPET_MEM: usize = 0x240;
++pub(crate) const DBG_LINK_PWR_MGMT: usize = 0x250;
++/// The second context format (AX210 on).
++pub(crate) const CTXT_INFO_BOOT_CTRL: usize = 0x000;
++pub(crate) const CTXT_INFO_ADDR: usize = 0x118;
++pub(crate) const IML_DATA_ADDR: usize = 0x120;
++pub(crate) const IML_SIZE_ADDR: usize = 0x128;
++pub(crate) const IML_RESP_ADDR: usize = 0x12c;
++
++/// The periphery registers' window.
++pub(crate) const HBUS_TARG_PRPH_WADDR: usize = 0x444;
++pub(crate) const HBUS_TARG_PRPH_RADDR: usize = 0x448;
++pub(crate) const HBUS_TARG_PRPH_WDAT: usize = 0x44c;
++pub(crate) const HBUS_TARG_PRPH_RDAT: usize = 0x450;
++/// A queue's write pointer: the index, with the queue in the bits above.
++pub(crate) const HBUS_TARG_WRPTR: usize = 0x460;
++pub(crate) const HBUS_TARG_WRPTR_Q_SHIFT: u32 = 16;
++/// The free receive buffers' write index, queue 0 (22000 family).
++pub(crate) const RFH_Q0_FRBDCB_WIDX_TRG: usize = 0x1c80;
++
++/// MSI-X: the causes, their masks and which vector each goes to.
++pub(crate) const MSIX_FH_INT_CAUSES_AD: usize = 0x2800;
++pub(crate) const MSIX_FH_INT_MASK_AD: usize = 0x2804;
++pub(crate) const MSIX_HW_INT_CAUSES_AD: usize = 0x2808;
++pub(crate) const MSIX_HW_INT_MASK_AD: usize = 0x280c;
++pub(crate) const MSIX_AUTOMASK_ST_AD: usize = 0x2810;
++pub(crate) const MSIX_RX_IVAR: usize = 0x2880;
++pub(crate) const MSIX_IVAR: usize = 0x2890;
++
++pub(crate) const HW_IF_CONFIG_HAP_WAKE: u32 = 0x0008_0000;
++pub(crate) const HW_IF_CONFIG_PCI_OWN_SET: u32 = 0x0040_0000;
++pub(crate) const HW_IF_CONFIG_WAKE_ME: u32 = 0x0800_0000;
++
++pub(crate) const GP_CNTRL_MAC_CLOCK_READY: u32 = 0x0000_0001;
++pub(crate) const GP_CNTRL_INIT_DONE: u32 = 0x0000_0004;
++pub(crate) const GP_CNTRL_MAC_ACCESS_REQ: u32 = 0x0000_0008;
++pub(crate) const GP_CNTRL_GOING_TO_SLEEP: u32 = 0x0000_0010;
++pub(crate) const GP_CNTRL_RFKILL_WAKE_L1A_EN: u32 = 0x0400_0000;
++/// Clear: the radio's switch is off.
++pub(crate) const GP_CNTRL_HW_RF_KILL_SW: u32 = 0x0800_0000;
++
++pub(crate) const RESET_FORCE_NMI: u32 = 0x0000_0002;
++pub(crate) const RESET_SW_RESET: u32 = 0x0000_0080;
++
++pub(crate) const GIO_L0S_DISABLED: u32 = 0x0000_0002;
++pub(crate) const GIO_CHICKEN_L1A_NO_L0S_RX: u32 = 0x0080_0000;
++pub(crate) const DBG_HPET_MEM_VAL: u32 = 0xffff_0000;
++pub(crate) const RESET_LINK_PWR_MGMT_DISABLED: u32 = 0x8000_0000;
++pub(crate) const MBOX_SET_OS_ALIVE: u32 = 1 << 5;
++pub(crate) const UCODE_SW_BIT_RFKILL: u32 = 0x0000_0002;
++pub(crate) const UCODE_DRV_GP1_CMD_BLOCKED: u32 = 0x0000_0004;
++pub(crate) const MAC_SHADOW_REG_CTRL_ENABLE: u32 = 0x800f_ffff;
++
++pub(crate) const AUTO_FUNC_BOOT_ENA: u32 = 1 << 1;
++pub(crate) const AUTO_FUNC_INIT: u32 = 1 << 7;
++
++/// "No snoop" and "snoop" latency: required, in microseconds (scale 2),
++/// 250 of them.
++pub(crate) const LTR_LONG_VAL: u32 = 0x8000_0000 | (2 << 26) | (250 << 16) | 0x0000_8000 | (2 << 10) | 250;
++
++/// MSI-X causes from the data path (FH): a bit a receive queue.
++pub(crate) const MSIX_FH_CAUSES_Q0: u32 = 1 << 0;
++pub(crate) const MSIX_FH_CAUSES_Q1: u32 = 1 << 1;
++pub(crate) const MSIX_FH_CAUSES_D2S_CH0: u32 = 1 << 16;
++pub(crate) const MSIX_FH_CAUSES_D2S_CH1: u32 = 1 << 17;
++pub(crate) const MSIX_FH_CAUSES_S2D: u32 = 1 << 19;
++pub(crate) const MSIX_FH_CAUSES_FH_ERR: u32 = 1 << 21;
++/// MSI-X causes from the chip itself (HW).
++pub(crate) const MSIX_HW_CAUSES_ALIVE: u32 = 1 << 0;
++pub(crate) const MSIX_HW_CAUSES_WAKEUP: u32 = 1 << 1;
++/// The image loader finished (AX210 on; the same bit as WAKEUP).
++pub(crate) const MSIX_HW_CAUSES_IML: u32 = 1 << 1;
++pub(crate) const MSIX_HW_CAUSES_RESET_DONE: u32 = 1 << 2;
++pub(crate) const MSIX_HW_CAUSES_CT_KILL: u32 = 1 << 6;
++pub(crate) const MSIX_HW_CAUSES_RF_KILL: u32 = 1 << 7;
++pub(crate) const MSIX_HW_CAUSES_PERIODIC: u32 = 1 << 8;
++pub(crate) const MSIX_HW_CAUSES_SW_ERR: u32 = 1 << 25;
++pub(crate) const MSIX_HW_CAUSES_SCD: u32 = 1 << 26;
++pub(crate) const MSIX_HW_CAUSES_FH_TX: u32 = 1 << 27;
++pub(crate) const MSIX_HW_CAUSES_HW_ERR: u32 = 1 << 29;
++pub(crate) const MSIX_HW_CAUSES_HAP: u32 = 1 << 30;
++/// In a cause's vector byte: the cause stays until the host clears it.
++pub(crate) const MSIX_NON_AUTO_CLEAR_CAUSE: u8 = 1 << 7;
++
++/// Periphery registers.
++pub(crate) const UREG_CPU_INIT_RUN: u32 = 0x00a0_5c44;
++pub(crate) const UREG_CHICK: u32 = 0x00a0_5c00;
++pub(crate) const UREG_CHICK_MSI_ENABLE: u32 = 1 << 24;
++pub(crate) const UREG_CHICK_MSIX_ENABLE: u32 = 1 << 25;
++pub(crate) const HPM_MAC_LTR_CSR: u32 = 0x00a0_348c;
++pub(crate) const HPM_MAC_LTR_ENABLE_ALL: u32 = 0xf;
++pub(crate) const HPM_UMAC_LTR: u32 = 0x00a0_3480;
++pub(crate) const WFPM_CTRL_REG: u32 = 0x00a0_3030;
++pub(crate) const WFPM_AUX_CTL_AUX_IF_MAC_OWNER: u32 = 0x8000_0000;
++pub(crate) const WFPM_OTP_CFG1: u32 = 0x00a0_3098;
++pub(crate) const WFPM_OTP_CFG1_IS_CDB: u32 = 1 << 4;
++/// The companion radio's identity (22000 family; AX210 family).
++pub(crate) const SD_REG_VER: u32 = 0x00a2_9600;
++pub(crate) const SD_REG_VER_GEN2: u32 = 0x00a2_b800;
++/// The AX210 family's second-processor registers sit this much higher.
++pub(crate) const UMAC_PRPH_OFFSET_AX210: u32 = 0x0030_0000;
+diff --git a/kernel/comps/iwlwifi/src/fw.rs b/kernel/comps/iwlwifi/src/fw.rs
+new file mode 100755
+index 0000000..2555ee4
+--- /dev/null
++++ b/kernel/comps/iwlwifi/src/fw.rs
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Intel's firmware files (`iwlwifi-*.ucode`, in linux-firmware): a header
++//! and a list of typed blocks (TLVs). What this driver takes from one:
++//! the program's sections, in the order the chip loads them, what the
++//! program says it can do (API and capability bits) and the version of
++//! each command it speaks, which is how one driver talks to the firmware
++//! of several chips.
++
++use alloc::{string::String, vec::Vec};
++use core::ops::Range;
++
++/// Every file since the 7000 series starts with a zero and this.
++const MAGIC: u32 = 0x0a4c_5749;
++/// The header: zero, magic, a name of 64 bytes, version, build, 8 unused.
++const HEADER: usize = 88;
++
++/// Between the sections of the first processor (LMAC) and the second's
++/// (UMAC), and before the pages the firmware takes on demand.
++pub(crate) const CPU1_CPU2_SEPARATOR: u32 = 0xffff_cccc;
++pub(crate) const PAGING_SEPARATOR: u32 = 0xaaaa_bbbb;
++
++const TLV_PROBE_MAX_LEN: u32 = 6;
++const TLV_FLAGS: u32 = 18;
++const TLV_SEC_RT: u32 = 19;
++const TLV_PHY_SKU: u32 = 23;
++const TLV_SECURE_SEC_RT: u32 = 24;
++const TLV_API_CHANGES_SET: u32 = 29;
++const TLV_ENABLED_CAPABILITIES: u32 = 30;
++const TLV_N_SCAN_CHANNELS: u32 = 31;
++const TLV_PAGING: u32 = 32;
++const TLV_FW_VERSION: u32 = 36;
++const TLV_CMD_VERSIONS: u32 = 48;
++const TLV_IML: u32 = 52;
++const TLV_FW_NUM_STATIONS: u32 = 0x48;
++
++/// The bit sets a file may fill: 32 bits a block, a few blocks.
++const BIT_WORDS: usize = 8;
++/// More sections than any file has: a bound for a damaged one.
++const MAX_SECTIONS: usize = 128;
++
++/// "No version stated" (the firmware's own mark is 99 for commands it
++/// keeps to itself).
++pub(crate) const VERSION_UNKNOWN: u8 = 0xff;
++
++/// Why a file is not a firmware this driver loads.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Error {
++    /// Not a TLV firmware file.
++    Magic,
++    /// A block runs past the end of the file, or is too short for its type.
++    Truncated,
++    /// No runtime program in it.
++    NoSections,
++}
++
++/// A piece of the program: where the chip wants it, and its bytes in the
++/// file.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct Section {
++    pub(crate) offset: u32,
++    pub(crate) data: Range<usize>,
++}
++
++impl Section {
++    pub(crate) fn is_separator(&self) -> bool {
++        self.offset == CPU1_CPU2_SEPARATOR || self.offset == PAGING_SEPARATOR
++    }
++}
++
++/// A command's version, as the firmware states it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct CommandVersion {
++    pub(crate) group: u8,
++    pub(crate) command: u8,
++    pub(crate) version: u8,
++    /// Of the notification with the same number.
++    pub(crate) notification: u8,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct Firmware {
++    /// "release/core74::f39cc7f9".
++    pub(crate) name: String,
++    /// The API number in the file's name (77).
++    pub(crate) major: u32,
++    pub(crate) minor: u32,
++    /// The runtime program's sections, separators included.
++    pub(crate) sections: Vec<Section>,
++    /// The memory the firmware pages into, in bytes; 0: none.
++    pub(crate) paging_size: u32,
++    /// The image loader the newer chips run first (AX210 on).
++    pub(crate) iml: Option<Range<usize>>,
++    pub(crate) flags: u32,
++    api: [u32; BIT_WORDS],
++    capabilities: [u32; BIT_WORDS],
++    pub(crate) command_versions: Vec<CommandVersion>,
++    /// The radio's configuration, with the antennas the board has.
++    pub(crate) phy_config: u32,
++    pub(crate) scan_channels: u32,
++    pub(crate) max_probe_length: u32,
++    pub(crate) stations: u32,
++}
++
++fn le32(bytes: &[u8], at: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
++}
++
++impl Firmware {
++    pub(crate) fn parse(file: &[u8]) -> Result<Self, Error> {
++        if file.len() < HEADER || le32(file, 0) != Some(0) || le32(file, 4) != Some(MAGIC) {
++            return Err(Error::Magic);
++        }
++        let name_bytes = &file[8..72];
++        let name_end = name_bytes.iter().position(|byte| *byte == 0).unwrap_or(name_bytes.len());
++        let name: String = name_bytes[..name_end].iter().map(|byte| if byte.is_ascii_graphic() || *byte == b' ' { *byte as char } else { '?' }).collect();
++        let version = le32(file, 72).ok_or(Error::Truncated)?;
++        let mut firmware = Firmware {
++            name,
++            // The header has the API number; the version block, when
++            // there is one, repeats it with the build.
++            major: version,
++            minor: 0,
++            sections: Vec::new(),
++            paging_size: 0,
++            iml: None,
++            flags: 0,
++            api: [0; BIT_WORDS],
++            capabilities: [0; BIT_WORDS],
++            command_versions: Vec::new(),
++            phy_config: 0,
++            scan_channels: 0,
++            max_probe_length: 0,
++            stations: 0,
++        };
++        let mut at = HEADER;
++        while at < file.len() {
++            let (Some(kind), Some(length)) = (le32(file, at), le32(file, at + 4)) else {
++                return Err(Error::Truncated);
++            };
++            let start = at + 8;
++            let end = start.checked_add(length as usize).filter(|end| *end <= file.len()).ok_or(Error::Truncated)?;
++            let body = &file[start..end];
++            let word = |index: usize| le32(body, index * 4).ok_or(Error::Truncated);
++            match kind {
++                TLV_SEC_RT | TLV_SECURE_SEC_RT => {
++                    if firmware.sections.len() >= MAX_SECTIONS {
++                        return Err(Error::Truncated);
++                    }
++                    firmware.sections.push(Section { offset: word(0)?, data: start + 4..end });
++                }
++                TLV_PAGING => firmware.paging_size = word(0)?,
++                TLV_IML => firmware.iml = Some(start..end),
++                TLV_FLAGS => firmware.flags = word(0)?,
++                TLV_API_CHANGES_SET | TLV_ENABLED_CAPABILITIES => {
++                    let (index, bits) = (word(0)? as usize, word(1)?);
++                    let set = if kind == TLV_API_CHANGES_SET { &mut firmware.api } else { &mut firmware.capabilities };
++                    // Blocks past what this driver knows of are a newer
++                    // firmware's: nothing it asks about.
++                    if let Some(slot) = set.get_mut(index) {
++                        *slot = bits;
++                    }
++                }
++                TLV_CMD_VERSIONS => {
++                    for entry in body.chunks_exact(4) {
++                        firmware.command_versions.push(CommandVersion { command: entry[0], group: entry[1], version: entry[2], notification: entry[3] });
++                    }
++                }
++                TLV_PHY_SKU => firmware.phy_config = word(0)?,
++                TLV_N_SCAN_CHANNELS => firmware.scan_channels = word(0)?,
++                TLV_PROBE_MAX_LEN => firmware.max_probe_length = word(0)?,
++                TLV_FW_NUM_STATIONS => firmware.stations = word(0)?,
++                TLV_FW_VERSION => {
++                    firmware.major = word(0)?;
++                    firmware.minor = word(1)?;
++                }
++                _ => {}
++            }
++            // Blocks are padded to four bytes.
++            at = start + ((length as usize + 3) & !3);
++        }
++        if firmware.sections.iter().all(Section::is_separator) {
++            return Err(Error::NoSections);
++        }
++        Ok(firmware)
++    }
++
++    /// The firmware has API change `bit` (`IWL_UCODE_TLV_API_*`).
++    // For the commands that follow the firmware's start, as the two below.
++    #[allow(dead_code)]
++    pub(crate) fn has_api(&self, bit: u32) -> bool {
++        self.api.get((bit / 32) as usize).is_some_and(|word| word >> (bit % 32) & 1 == 1)
++    }
++
++    /// The firmware has capability `bit` (`IWL_UCODE_TLV_CAPA_*`).
++    #[allow(dead_code)]
++    pub(crate) fn has_capability(&self, bit: u32) -> bool {
++        self.capabilities.get((bit / 32) as usize).is_some_and(|word| word >> (bit % 32) & 1 == 1)
++    }
++
++    /// The version of a command, or `VERSION_UNKNOWN` when the file does
++    /// not state it.
++    pub(crate) fn command_version(&self, group: u8, command: u8) -> u8 {
++        self.command_versions.iter().find(|entry| entry.group == group && entry.command == command).map_or(VERSION_UNKNOWN, |entry| entry.version)
++    }
++
++    #[allow(dead_code)]
++    pub(crate) fn notification_version(&self, group: u8, command: u8) -> u8 {
++        self.command_versions.iter().find(|entry| entry.group == group && entry.command == command).map_or(VERSION_UNKNOWN, |entry| entry.notification)
++    }
++
++    /// The antennas the board has, a bit each (A, B, C): to send, to
++    /// receive.
++    pub(crate) fn antennas(&self) -> (u8, u8) {
++        (((self.phy_config >> 16) & 0xf) as u8, ((self.phy_config >> 20) & 0xf) as u8)
++    }
++
++    /// The sections as the chip's loader takes them: the first
++    /// processor's, the second's, and the pages.
++    pub(crate) fn groups(&self) -> (&[Section], &[Section], &[Section]) {
++        fn run(sections: &[Section]) -> (&[Section], &[Section]) {
++            let count = sections.iter().position(Section::is_separator).unwrap_or(sections.len());
++            // What follows starts after the separator.
++            (&sections[..count], sections.get(count + 1..).unwrap_or(&[]))
++        }
++        let (lmac, rest) = run(&self.sections);
++        let (umac, rest) = run(rest);
++        let (paging, _) = run(rest);
++        (lmac, umac, paging)
++    }
++}
+diff --git a/kernel/comps/iwlwifi/src/ids.rs b/kernel/comps/iwlwifi/src/ids.rs
+new file mode 100755
+index 0000000..027d30d
+--- /dev/null
++++ b/kernel/comps/iwlwifi/src/ids.rs
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Which Intel Wi-Fi chips this driver runs, and the firmware each takes.
++//!
++//! A card is two chips: the MAC (on the card, or inside the processor's
++//! companion chip on laptops: "integrated") and the radio (RF). The PCI
++//! device number tells the MAC's family; the MAC's revision register and
++//! the radio's identity tell the firmware file, by the names Linux and
++//! linux-firmware use (`iwlwifi-Qu-c0-hr-b0-77.ucode`).
++
++use alloc::{format, string::String, vec::Vec};
++
++pub(crate) const VENDOR_INTEL: u16 = 0x8086;
++
++/// How the chip is started and what its queues look like.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Family {
++    /// AX200 and AX201 ("22000"): the context information block.
++    Ax200,
++    /// AX210, AX211 and AX411: the second context format, with the image
++    /// loader and the platform's NVM file.
++    Ax210,
++}
++
++/// A MAC, by its PCI device number.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Mac {
++    pub(crate) device: u16,
++    pub(crate) family: Family,
++    /// Part of the platform's chipset, with the radio on a companion card.
++    pub(crate) integrated: bool,
++}
++
++const fn mac(device: u16, family: Family, integrated: bool) -> Mac {
++    Mac { device, family, integrated }
++}
++
++/// Linux's `iwl_hw_card_ids` for these families.
++pub(crate) const MACS: [Mac; 15] = [
++    // AX200, the card (and Killer AX1650x/w).
++    mac(0x2723, Family::Ax200, false),
++    // AX201 and its relatives in Comet Lake, Ice Lake, Jasper Lake and
++    // Tiger Lake platforms.
++    mac(0x02f0, Family::Ax200, true),
++    mac(0x06f0, Family::Ax200, true),
++    mac(0x34f0, Family::Ax200, true),
++    mac(0x3df0, Family::Ax200, true),
++    mac(0x4df0, Family::Ax200, true),
++    mac(0x43f0, Family::Ax200, true),
++    mac(0xa0f0, Family::Ax200, true),
++    // AX210, the card (and Killer AX1675x/w).
++    mac(0x2725, Family::Ax210, false),
++    // AX211, AX411 and the AX201/9560 radios on Alder Lake, Raptor Lake
++    // and Meteor Lake platforms.
++    mac(0x7af0, Family::Ax210, true),
++    mac(0x7f70, Family::Ax210, true),
++    mac(0x51f0, Family::Ax210, true),
++    mac(0x54f0, Family::Ax210, true),
++    mac(0x51f1, Family::Ax210, true),
++    mac(0x7a70, Family::Ax210, true),
++];
++
++pub(crate) fn mac_of(vendor: u16, device: u16) -> Option<&'static Mac> {
++    if vendor != VENDOR_INTEL {
++        return None;
++    }
++    MACS.iter().find(|mac| mac.device == device)
++}
++
++/// The MAC's kind, in its revision register (`CSR_HW_REV`, bits 15-4).
++pub(crate) const MAC_TYPE_QU: u32 = 0x33;
++pub(crate) const MAC_TYPE_CC: u32 = 0x34;
++pub(crate) const MAC_TYPE_QUZ: u32 = 0x35;
++pub(crate) const MAC_TYPE_SO: u32 = 0x37;
++pub(crate) const MAC_TYPE_TY: u32 = 0x42;
++pub(crate) const MAC_TYPE_SOF: u32 = 0x43;
++
++/// The radio's kind (`CSR_HW_RF_ID`, bits 23-12).
++pub(crate) const RF_TYPE_JF2: u32 = 0x105;
++pub(crate) const RF_TYPE_JF1: u32 = 0x108;
++pub(crate) const RF_TYPE_HR2: u32 = 0x10a;
++pub(crate) const RF_TYPE_HR1: u32 = 0x10c;
++pub(crate) const RF_TYPE_GF: u32 = 0x10d;
++/// Two radios on one card (AX411).
++const RF_ID_CDB: u32 = 1 << 28;
++
++pub(crate) fn mac_type(hw_rev: u32) -> u32 {
++    (hw_rev & 0x000f_fff0) >> 4
++}
++
++pub(crate) fn rf_type(hw_rf_id: u32) -> u32 {
++    (hw_rf_id & 0x00ff_f000) >> 12
++}
++
++/// The radio's identity from the companion chip's own register
++/// (`SD_REG_VER`), where the MAC's register says nothing (integrated
++/// MACs); `cdb`: the platform says there are two radios. None: a radio
++/// this driver does not know.
++pub(crate) fn rf_id_from_crf(crf_id: u32, cdb: bool) -> Option<u32> {
++    let kind = match crf_id & 0xfff {
++        0x201 => RF_TYPE_JF1,
++        0x202 => RF_TYPE_JF2,
++        0x501 => RF_TYPE_HR1,
++        0x503 | 0x504 => RF_TYPE_HR2,
++        0x410 => RF_TYPE_GF,
++        _ => return None,
++    };
++    let step = (crf_id & 0x0f00_0000) >> 24;
++    let slave = (crf_id & 0x0008_0000) != 0;
++    let mut id = (kind << 12) | (step << 8);
++    if cdb || slave {
++        id += RF_ID_CDB;
++    }
++    Some(id)
++}
++
++/// The firmware's name before its API number: "iwlwifi-Qu-c0-hr-b0".
++/// None: a MAC or a radio this driver has no firmware for.
++pub(crate) fn firmware_prefix(hw_rev: u32, hw_rf_id: u32) -> Option<String> {
++    let step = hw_rev & 0xf;
++    let step_letter = |step: u32| if step == 0xf { 'z' } else { (b'a' + (step as u8).min(25)) as char };
++    let (mac, mac_step) = match mac_type(hw_rev) {
++        MAC_TYPE_QU => ("Qu", step_letter(step)),
++        // Its radio is on the card: one firmware.
++        MAC_TYPE_CC => return Some(String::from("iwlwifi-cc-a0")),
++        // Every QuZ, So and Ty takes the firmware of the first step.
++        MAC_TYPE_QUZ => ("QuZ", 'a'),
++        MAC_TYPE_SO | MAC_TYPE_SOF => ("so", 'a'),
++        MAC_TYPE_TY => ("ty", 'a'),
++        _ => return None,
++    };
++    let (rf, rf_step) = match rf_type(hw_rf_id) {
++        RF_TYPE_JF1 | RF_TYPE_JF2 => ("jf", 'b'),
++        RF_TYPE_HR1 | RF_TYPE_HR2 => ("hr", 'b'),
++        RF_TYPE_GF => ("gf", 'a'),
++        _ => return None,
++    };
++    let cdb = if hw_rf_id & RF_ID_CDB != 0 { "4" } else { "" };
++    Some(format!("iwlwifi-{mac}-{mac_step}0-{rf}{cdb}-{rf_step}0"))
++}
++
++/// The firmware API this driver speaks: the last one whose commands are
++/// the same on every chip of both families (the later ones for AX210
++/// change to another command set).
++pub(crate) const FIRMWARE_API: u32 = 77;
++
++/// The files to look for, in order: where linux-firmware has them now
++/// (`intel/iwlwifi/`) and where it had them.
++pub(crate) fn firmware_files(prefix: &str) -> Vec<String> {
++    let name = format!("{prefix}-{FIRMWARE_API}.ucode");
++    alloc::vec![format!("intel/iwlwifi/{name}"), name]
++}
++
++/// The platform's NVM file of the AX210 family, which its firmware asks
++/// for after it starts.
++// For the commands that follow the firmware's start.
++#[allow(dead_code)]
++pub(crate) fn pnvm_files(prefix: &str) -> Vec<String> {
++    let name = format!("{prefix}.pnvm");
++    alloc::vec![format!("intel/iwlwifi/{name}"), name]
++}
+diff --git a/kernel/comps/iwlwifi/src/lib.rs b/kernel/comps/iwlwifi/src/lib.rs
+new file mode 100755
+index 0000000..66ee2b4
+--- /dev/null
++++ b/kernel/comps/iwlwifi/src/lib.rs
+@@ -0,0 +1,354 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Intel Wi-Fi: the AX200 and AX201 (Wi-Fi 6) and the AX210, AX211 and
++//! AX411 (Wi-Fi 6E), the cards of most laptops since 2019, as Linux's
++//! iwlwifi runs them.
++//!
++//! The chip runs its maker's firmware (`iwlwifi-*.ucode`, in
++//! linux-firmware), which this driver hands to the chip's loader and then
++//! commands. One firmware API (77) speaks the same commands on every chip
++//! of both families ([`ids`]), so one driver serves them all; the file
++//! says which version of each command it takes ([`fw`]).
++//!
++//! What is here so far: finding the card and its radio, loading the
++//! firmware and hearing it say it runs ([`trans`]). The kernel's log says
++//! how far a card gets. The commands that make it a radio of the Wi-Fi
++//! component (`aster-wlan`: scanning, joining a network, keys, frames)
++//! come next.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++// This crate's log prefix for `ostd::log`.
++macro_rules! __log_prefix {
++    () => {
++        "iwlwifi: "
++    };
++}
++
++mod csr;
++mod fw;
++mod ids;
++mod trans;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    common_device::PciCommonDevice,
++};
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    sync::{SpinLock, WaitQueue},
++    timer::Jiffies,
++};
++
++use crate::{
++    fw::Firmware,
++    trans::{Packet, Transport},
++};
++
++/// Wakes the cards' tasks: an interrupt, or the timer.
++static WAKE: WaitQueue = WaitQueue::new();
++static WOKEN: AtomicBool = AtomicBool::new(false);
++static TICKS: AtomicUsize = AtomicUsize::new(0);
++/// Tasks that wait on a time-out: the timer wakes them each millisecond.
++static WAITING: AtomicUsize = AtomicUsize::new(0);
++/// Cards whose interrupts have not been seen to arrive: the timer looks
++/// at them every other millisecond, as it does for every card every 100.
++static UNPROVEN: AtomicUsize = AtomicUsize::new(0);
++
++/// The legacy group's "the firmware runs" and its good status.
++const UCODE_ALIVE_NTFY: u8 = 0x01;
++const ALIVE_STATUS_OK: u16 = 0xcafe;
++/// How long the firmware has to start, and how long its "alive" cause is
++/// waited for before the receive buffers are handed over without it.
++const ALIVE_TIMEOUT_MS: u64 = 2000;
++const ALIVE_CAUSE_MS: u64 = 500;
++/// The legacy group's echo: the firmware answers it and does nothing
++/// else. The first command, to see that commands go and answers come.
++const ECHO_CMD: u8 = 0x03;
++const ECHO_TIMEOUT_MS: u64 = 1000;
++/// The group of most commands, and its scan request.
++const LONG_GROUP: u8 = 0x01;
++const SCAN_REQ_UMAC: u8 = 0x0d;
++
++pub(crate) fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++fn wake() {
++    WOKEN.store(true, Ordering::Release);
++    WAKE.wake_all();
++}
++
++/// Waits for an interrupt or the next timer wake-up.
++fn sleep() {
++    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
++}
++
++/// Sleeps about `ms` milliseconds; from a card's task.
++pub(crate) fn sleep_ms(ms: u64) {
++    let deadline = now_ms() + ms;
++    WAITING.fetch_add(1, Ordering::AcqRel);
++    while now_ms() < deadline {
++        sleep();
++    }
++    WAITING.fetch_sub(1, Ordering::AcqRel);
++}
++
++/// Waits about `ms` milliseconds without giving the processor away, for
++/// the short settling times of the chip.
++pub(crate) fn delay_ms(ms: u64) {
++    let deadline = now_ms() + ms + 1;
++    while now_ms() < deadline {
++        core::hint::spin_loop();
++    }
++}
++
++/// Each timer tick (1 ms).
++fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    let period = if WAITING.load(Ordering::Relaxed) > 0 {
++        1
++    } else if UNPROVEN.load(Ordering::Relaxed) > 0 {
++        2
++    } else {
++        100
++    };
++    if ticks % period == 0 {
++        wake();
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++/// Claims the cards of [`ids::MACS`].
++#[derive(Debug)]
++struct Driver {
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if ids::mac_of(id.vendor_id, id.device_id).is_none() {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.found.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++/// The cards found, until their tasks start.
++static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
++    PCI_BUS.lock().register_driver(driver.clone());
++    let cards = core::mem::take(&mut *driver.found.lock());
++    if cards.is_empty() {
++        return Ok(());
++    }
++    ostd::timer::register_callback_on_cpu(tick);
++    *PENDING.lock() = cards;
++    Ok(())
++}
++
++// One task per card, once there is a scheduler: the firmware is a file,
++// read when the system's files are there.
++#[init_component(kthread)]
++fn start() -> Result<(), ComponentInitError> {
++    for (index, device) in core::mem::take(&mut *PENDING.lock()).into_iter().enumerate() {
++        aster_core::spawn_kernel_thread(move || run(index, device));
++    }
++    Ok(())
++}
++
++/// A card's task.
++fn run(index: usize, device: PciCommonDevice) {
++    let id = *device.device_id();
++    let location = *device.location();
++    let name: String = format!("iwlwifi{} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
++    let Some(mac) = ids::mac_of(id.vendor_id, id.device_id) else { return };
++    let mut transport = match Transport::new(device, mac, name.clone(), wake) {
++        Ok(transport) => transport,
++        Err(error) => {
++            ostd::warn!("{}: {:04x}:{:04x} did not start: {:?}", name, id.vendor_id, id.device_id, error);
++            return;
++        }
++    };
++    ostd::notice!(
++        "{}: Intel {:04x}, MAC {:#x} ({:?}{}), radio {:#x}",
++        name,
++        id.device_id,
++        transport.hw_rev,
++        mac.family,
++        if mac.integrated { ", integrated" } else { "" },
++        transport.hw_rf_id
++    );
++    let Some(prefix) = ids::firmware_prefix(transport.hw_rev, transport.hw_rf_id) else {
++        ostd::warn!("{}: no firmware is known for this MAC and radio", name);
++        return;
++    };
++    let files = ids::firmware_files(&prefix);
++    let Some((file_name, file)) = aster_firmware::load_first(files.iter().map(String::as_str)) else {
++        ostd::warn!("{}: the firmware {} is not in /lib/firmware", name, files[0]);
++        return;
++    };
++    let firmware = match Firmware::parse(&file) {
++        Ok(firmware) => firmware,
++        Err(error) => {
++            ostd::warn!("{}: {} is not a firmware this driver loads: {:?}", name, file_name, error);
++            return;
++        }
++    };
++    let (tx_antennas, rx_antennas) = firmware.antennas();
++    ostd::notice!(
++        "{}: firmware {} ({}, API {}): antennas {:#x}/{:#x}, {} scan channels, scan command v{}",
++        name,
++        file_name,
++        firmware.name,
++        firmware.major,
++        tx_antennas,
++        rx_antennas,
++        firmware.scan_channels,
++        firmware.command_version(LONG_GROUP, SCAN_REQ_UMAC)
++    );
++    UNPROVEN.fetch_add(1, Ordering::AcqRel);
++    let mut proven = false;
++    // Three tries: a chip that was left half started by the platform's
++    // own firmware can need a second reset.
++    let mut alive = false;
++    for attempt in 1..=3 {
++        match start_firmware(&mut transport, &firmware, &file) {
++            Ok(()) => {
++                alive = true;
++                break;
++            }
++            Err(reason) => {
++                ostd::warn!("{}: the firmware did not start (try {}): {}", name, attempt, reason);
++                transport.stop();
++                sleep_ms(100);
++            }
++        }
++    }
++    if !alive {
++        UNPROVEN.fetch_sub(1, Ordering::AcqRel);
++        return;
++    }
++    match echo(&mut transport) {
++        Ok(()) => ostd::notice!("{}: the firmware answers commands", name),
++        Err(reason) => ostd::warn!("{}: the firmware did not answer a command: {}", name, reason),
++    }
++    // What the firmware says from here on. The commands that follow its
++    // start (the radio's data, scanning, links) are the next part of this
++    // driver: until then the card stays as it is, started and idle.
++    loop {
++        sleep();
++        if !proven && transport.interrupt_seen.load(Ordering::Relaxed) {
++            proven = true;
++            UNPROVEN.fetch_sub(1, Ordering::AcqRel);
++            ostd::info!("{}: interrupts arrive", name);
++        }
++        let causes = transport.causes();
++        for packet in transport.receive() {
++            ostd::debug!("{}: notification {:#04x}/{:#04x}, {} bytes", name, packet.group, packet.command, packet.data.len());
++        }
++        if causes.error {
++            ostd::warn!("{}: the firmware stopped with an error", name);
++            transport.stop();
++            if !proven {
++                UNPROVEN.fetch_sub(1, Ordering::AcqRel);
++            }
++            return;
++        }
++    }
++}
++
++/// Sends the echo command and waits for its answer.
++fn echo(transport: &mut Transport) -> Result<(), String> {
++    let sequence = transport.send_command(0, ECHO_CMD, 0, &[]).ok_or_else(|| String::from("the command queue did not take it"))?;
++    let deadline = now_ms() + ECHO_TIMEOUT_MS;
++    WAITING.fetch_add(1, Ordering::AcqRel);
++    let result = loop {
++        let causes = transport.causes();
++        if transport.receive().iter().any(|packet| packet.answers(sequence)) {
++            break Ok(());
++        }
++        if causes.error {
++            break Err(String::from("the firmware stopped with an error"));
++        }
++        if now_ms() >= deadline {
++            break Err(String::from("no answer in time"));
++        }
++        sleep();
++    };
++    WAITING.fetch_sub(1, Ordering::AcqRel);
++    result
++}
++
++/// Loads the firmware and waits until it says it runs.
++fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -> Result<(), String> {
++    transport.start_firmware(firmware, file).map_err(|error| format!("{error:?}"))?;
++    let deadline = now_ms() + ALIVE_TIMEOUT_MS;
++    let (mut interrupt, mut offered) = (false, false);
++    WAITING.fetch_add(1, Ordering::AcqRel);
++    let result = loop {
++        let causes = transport.causes();
++        if causes.error {
++            break Err(String::from("the chip reported an error while loading"));
++        }
++        if causes.alive && !interrupt {
++            interrupt = true;
++            transport.firmware_alive();
++        }
++        // A card whose "alive" cause does not show (its interrupts are in
++        // a mode this driver did not expect) still gets its buffers, so
++        // the notification can come.
++        if !interrupt && !offered && now_ms() + ALIVE_TIMEOUT_MS >= deadline + ALIVE_CAUSE_MS {
++            offered = true;
++            transport.firmware_alive();
++        }
++        let alive: Option<Packet> = transport.receive().into_iter().find(|packet| packet.group == 0 && packet.command == UCODE_ALIVE_NTFY);
++        if let Some(packet) = alive {
++            let status = packet.data.get(0..2).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
++            break if status == ALIVE_STATUS_OK {
++                Ok(())
++            } else {
++                Err(format!("its alive status is {status:#x}"))
++            };
++        }
++        if now_ms() >= deadline {
++            break Err(if interrupt {
++                String::from("it started but sent no alive notification")
++            } else if transport.receive_progress() {
++                String::from("it filled receive buffers but none held its alive notification")
++            } else if transport.rf_kill() {
++                String::from("the radio's switch is off")
++            } else {
++                String::from("no answer from the chip's loader")
++            });
++        }
++        sleep();
++    };
++    WAITING.fetch_sub(1, Ordering::AcqRel);
++    if result.is_ok() {
++        transport.firmware_started();
++        ostd::notice!("{}: the firmware runs", transport.name);
++    }
++    result
++}
+diff --git a/kernel/comps/iwlwifi/src/trans.rs b/kernel/comps/iwlwifi/src/trans.rs
+new file mode 100755
+index 0000000..065cf94
+--- /dev/null
++++ b/kernel/comps/iwlwifi/src/trans.rs
+@@ -0,0 +1,869 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The card on the PCI bus: its registers, the memory it shares with the
++//! host and the start of its firmware, as Linux's `pcie` transport does
++//! for the second generation (AX200 on).
++//!
++//! The host does not write the firmware into the chip. It leaves the
++//! program's sections in memory with a block that says where they are and
++//! where the queues are (the "context information"), and the chip's own
++//! loader takes them from there. Two queues exist before the firmware
++//! runs: one of buffers the chip fills with what it has to say (answers,
++//! notifications, received frames), and one of commands for it.
++
++use alloc::{string::String, vec::Vec};
++use core::sync::atomic::{AtomicBool, Ordering};
++
++use aster_pci::{
++    capability::{msi::CapabilityMsiData, msix::CapabilityMsixData},
++    cfg_space::BarAccess,
++    common_device::PciCommonDevice,
++};
++use ostd::{
++    irq::IrqLine,
++    mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent},
++};
++
++use crate::{
++    csr,
++    fw::{Firmware, Section},
++    ids::{self, Family, Mac},
++};
++
++/// Receive buffers: a page each, this many slots in the ring (a power of
++/// two), one of which stays empty.
++const RX_RING: usize = 512;
++const RX_BUFFERS: usize = RX_RING - 1;
++const RX_BUFFER: usize = PAGE_SIZE;
++/// Buffers are allocated this many at a time.
++const RX_CHUNK: usize = 32;
++/// The command queue of each family (Linux's sizes).
++const COMMANDS_AX200: usize = 32;
++const COMMANDS_AX210: usize = 128;
++/// A command's descriptor: the count of its pieces, 25 pieces of ten
++/// bytes (length, address), four unused.
++const TFD: usize = 256;
++/// A command with its header: a page at most.
++pub(crate) const MAX_COMMAND: usize = PAGE_SIZE;
++/// The first piece of a command holds this much of it.
++const FIRST_PIECE: usize = 20;
++/// A section table of the context information.
++const MAX_IMAGE_SECTIONS: usize = 64;
++
++/// Marks an unused part of a receive buffer.
++const FRAME_INVALID: u32 = 0x5555_0000;
++/// In a packet's sequence: not the answer to a command.
++const SEQ_RX_FRAME: u16 = 0x8000;
++
++/// What the chip says: an answer to a command, a notification or a frame.
++#[derive(Clone, Debug)]
++pub(crate) struct Packet {
++    pub group: u8,
++    pub command: u8,
++    pub sequence: u16,
++    /// After the header.
++    pub data: Vec<u8>,
++}
++
++impl Packet {
++    /// The answer to the command sent with `sequence`.
++    pub(crate) fn answers(&self, sequence: u16) -> bool {
++        self.sequence & SEQ_RX_FRAME == 0 && self.sequence == sequence
++    }
++}
++
++/// What the card's interrupt causes said since they were last read.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Causes {
++    /// The firmware started: the receive buffers are handed to it.
++    pub alive: bool,
++    /// The chip or its firmware stopped with an error.
++    pub error: bool,
++    /// The radio's switch moved.
++    pub rf_kill: bool,
++    /// Something was read: an interrupt or the timer found work.
++    pub any: bool,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Error {
++    /// The chip does not answer on the bus.
++    Absent,
++    /// The management engine or the platform did not hand the card over.
++    NotReady,
++    /// The chip's clocks did not start.
++    NoClock,
++    /// A radio this driver has no firmware name for.
++    UnknownRadio,
++    Memory,
++    /// The firmware's sections do not fit the chip's loader.
++    Firmware,
++    /// The radio's switch is off.
++    RfKill,
++}
++
++struct RxQueue {
++    /// The buffers offered to the chip: an address each, with the
++    /// buffer's number in its low bits (AX200) or beside it (AX210).
++    free: DmaCoherent,
++    /// The buffers the chip filled, by their numbers.
++    used: DmaCoherent,
++    /// How far the chip got in `used`.
++    status: DmaCoherent,
++    buffers: Vec<DmaCoherent>,
++    /// The next slot of `used` to look at.
++    read: usize,
++    /// The next slot of `free` to fill, and what the chip was told.
++    write: usize,
++    write_told: usize,
++}
++
++struct CommandQueue {
++    size: usize,
++    /// Where the write pointer starts over.
++    wrap: usize,
++    descriptors: DmaCoherent,
++    /// A page a command.
++    buffers: DmaCoherent,
++    write: usize,
++}
++
++pub(crate) struct Transport {
++    mmio: BarAccess,
++    pub(crate) mac: &'static Mac,
++    pub(crate) name: String,
++    pub(crate) hw_rev: u32,
++    pub(crate) hw_rf_id: u32,
++    /// MSI-X (the causes have registers of their own) or the older way.
++    msix: bool,
++    /// An interrupt arrived: until one does, the timer looks.
++    pub(crate) interrupt_seen: alloc::sync::Arc<AtomicBool>,
++    rx: Option<RxQueue>,
++    commands: Option<CommandQueue>,
++    /// The firmware's sections and the blocks that describe them, kept
++    /// while the chip may read them.
++    images: Vec<DmaCoherent>,
++    context: Vec<DmaCoherent>,
++    _msix: Option<CapabilityMsixData>,
++    _msi: Option<CapabilityMsiData>,
++    _device: PciCommonDevice,
++}
++
++fn pages(bytes: usize) -> usize {
++    bytes.div_ceil(PAGE_SIZE).max(1)
++}
++
++fn dma(bytes: usize) -> Result<DmaCoherent, Error> {
++    DmaCoherent::alloc(pages(bytes), true).map_err(|_| Error::Memory)
++}
++
++impl Transport {
++    fn r32(&self, at: usize) -> u32 {
++        self.mmio.read_once::<u32>(at).unwrap_or(u32::MAX)
++    }
++
++    fn w32(&self, at: usize, value: u32) {
++        let _ = self.mmio.write_once::<u32>(at, value);
++    }
++
++    fn w8(&self, at: usize, value: u8) {
++        let _ = self.mmio.write_once::<u8>(at, value);
++    }
++
++    /// The low half first, as Linux writes them.
++    fn w64(&self, at: usize, value: u64) {
++        self.w32(at, value as u32);
++        self.w32(at + 4, (value >> 32) as u32);
++    }
++
++    fn set_bits(&self, at: usize, bits: u32) {
++        self.w32(at, self.r32(at) | bits);
++    }
++
++    fn clear_bits(&self, at: usize, bits: u32) {
++        self.w32(at, self.r32(at) & !bits);
++    }
++
++    /// Waits until `(register & mask) == bits`, for `timeout_ms` at most.
++    fn poll(&self, at: usize, bits: u32, mask: u32, timeout_ms: u64) -> bool {
++        let deadline = crate::now_ms() + timeout_ms + 1;
++        loop {
++            if self.r32(at) & mask == bits & mask {
++                return true;
++            }
++            if crate::now_ms() >= deadline {
++                return false;
++            }
++            core::hint::spin_loop();
++        }
++    }
++
++    fn ax210(&self) -> bool {
++        self.mac.family == Family::Ax210
++    }
++
++    /// Keeps the chip awake for the periphery registers.
++    fn grab(&self) -> bool {
++        self.set_bits(csr::GP_CNTRL, csr::GP_CNTRL_MAC_ACCESS_REQ);
++        self.poll(csr::GP_CNTRL, csr::GP_CNTRL_MAC_CLOCK_READY, csr::GP_CNTRL_MAC_CLOCK_READY | csr::GP_CNTRL_GOING_TO_SLEEP, 15)
++    }
++
++    fn release(&self) {
++        self.clear_bits(csr::GP_CNTRL, csr::GP_CNTRL_MAC_ACCESS_REQ);
++    }
++
++    fn prph_address(&self, address: u32) -> u32 {
++        let mask = if self.ax210() { 0x00ff_ffff } else { 0x000f_ffff };
++        (address & mask) | (3 << 24)
++    }
++
++    /// A periphery register; the chip must be awake (`grab`).
++    fn read_prph(&self, address: u32) -> u32 {
++        self.w32(csr::HBUS_TARG_PRPH_RADDR, self.prph_address(address));
++        self.r32(csr::HBUS_TARG_PRPH_RDAT)
++    }
++
++    fn write_prph(&self, address: u32, value: u32) {
++        self.w32(csr::HBUS_TARG_PRPH_WADDR, self.prph_address(address));
++        self.w32(csr::HBUS_TARG_PRPH_WDAT, value);
++    }
++
++    /// The registers of the second processor moved in the AX210 family.
++    fn umac(&self, address: u32) -> u32 {
++        if self.ax210() { address + csr::UMAC_PRPH_OFFSET_AX210 } else { address }
++    }
++
++    fn write_prph_awake(&self, address: u32, value: u32) -> bool {
++        if !self.grab() {
++            return false;
++        }
++        self.write_prph(address, value);
++        self.release();
++        true
++    }
++
++    /// Claims the card from the platform's management engine.
++    fn set_hw_ready(&self) -> bool {
++        self.set_bits(csr::HW_IF_CONFIG, csr::HW_IF_CONFIG_PCI_OWN_SET);
++        let ready = self.poll(csr::HW_IF_CONFIG, csr::HW_IF_CONFIG_PCI_OWN_SET, csr::HW_IF_CONFIG_PCI_OWN_SET, 1);
++        if ready {
++            self.set_bits(csr::MBOX_SET, csr::MBOX_SET_OS_ALIVE);
++        }
++        ready
++    }
++
++    fn prepare_card(&self) -> Result<(), Error> {
++        if self.set_hw_ready() {
++            return Ok(());
++        }
++        self.set_bits(csr::DBG_LINK_PWR_MGMT, csr::RESET_LINK_PWR_MGMT_DISABLED);
++        crate::sleep_ms(2);
++        for _ in 0..10 {
++            // The management engine is asked to let go, for 150 ms.
++            self.set_bits(csr::HW_IF_CONFIG, csr::HW_IF_CONFIG_WAKE_ME);
++            let deadline = crate::now_ms() + 150;
++            while crate::now_ms() < deadline {
++                if self.set_hw_ready() {
++                    return Ok(());
++                }
++                crate::sleep_ms(1);
++            }
++            crate::sleep_ms(25);
++        }
++        Err(Error::NotReady)
++    }
++
++    /// Starts the chip's clocks.
++    fn activate(&self) -> Result<(), Error> {
++        // The AX200's self-repair needs a moment before and after.
++        let discrete = !self.mac.integrated && !self.ax210();
++        if discrete {
++            crate::delay_ms(2);
++        }
++        self.set_bits(csr::GP_CNTRL, csr::GP_CNTRL_INIT_DONE);
++        let ready = self.poll(csr::GP_CNTRL, csr::GP_CNTRL_MAC_CLOCK_READY, csr::GP_CNTRL_MAC_CLOCK_READY, 25);
++        if discrete {
++            crate::delay_ms(1);
++        }
++        if ready { Ok(()) } else { Err(Error::NoClock) }
++    }
++
++    fn sw_reset(&self) -> Result<(), Error> {
++        self.set_bits(csr::RESET, csr::RESET_SW_RESET);
++        crate::sleep_ms(6);
++        self.prepare_card()
++    }
++
++    /// The radio's switch is off.
++    pub(crate) fn rf_kill(&self) -> bool {
++        self.r32(csr::GP_CNTRL) & csr::GP_CNTRL_HW_RF_KILL_SW == 0
++    }
++
++    /// Claims the card and finds out what it is. From the driver's task.
++    pub(crate) fn new(mut device: PciCommonDevice, mac: &'static Mac, name: String, wake: fn()) -> Result<Self, Error> {
++        let location = *device.location();
++        // Memory decoding and bus mastering; no retries on a time-out,
++        // which would disturb the chip's low-power states.
++        location.write16(0x04, location.read16(0x04) | 0x06);
++        location.write8(0x41, 0);
++        // MSI-X vector 0 for every cause, or the one message of MSI.
++        let interrupt_seen = alloc::sync::Arc::new(AtomicBool::new(false));
++        let handler = |seen: alloc::sync::Arc<AtomicBool>, irq: &mut IrqLine, name: &str| {
++            let counter = aster_pci::irq_stats::interrupt_counter(irq.num(), name);
++            irq.on_active(move |_| {
++                counter.count();
++                seen.store(true, Ordering::Relaxed);
++                wake();
++            });
++        };
++        let msix = match device.acquire_msix_capability() {
++            Ok(Some(mut msix)) => match IrqLine::alloc() {
++                Ok(irq) => {
++                    msix.set_interrupt_vector(irq, 0);
++                    if let Some(irq) = msix.irq_mut(0) {
++                        handler(interrupt_seen.clone(), irq, &name);
++                    }
++                    Some(msix)
++                }
++                Err(_) => None,
++            },
++            _ => None,
++        };
++        let msi = if msix.is_some() {
++            None
++        } else {
++            match (device.acquire_msi_capability(), IrqLine::alloc()) {
++                (Some(mut msi), Ok(mut irq)) => {
++                    handler(interrupt_seen.clone(), &mut irq, &name);
++                    msi.set_interrupt_vector(irq);
++                    Some(msi)
++                }
++                _ => None,
++            }
++        };
++        let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
++            return Err(Error::Absent);
++        };
++        let mut transport = Self {
++            mmio,
++            mac,
++            name,
++            hw_rev: 0,
++            hw_rf_id: 0,
++            msix: msix.is_some(),
++            interrupt_seen,
++            rx: None,
++            commands: None,
++            images: Vec::new(),
++            context: Vec::new(),
++            _msix: msix,
++            _msi: msi,
++            _device: device,
++        };
++        transport.hw_rev = transport.r32(csr::HW_REV);
++        if transport.hw_rev == u32::MAX {
++            return Err(Error::Absent);
++        }
++        transport.disable_interrupts();
++        transport.prepare_card()?;
++        transport.activate()?;
++        // An integrated MAC does not know its radio: the companion chip
++        // says what it is.
++        transport.hw_rf_id = transport.r32(csr::HW_RF_ID);
++        if ids::rf_type(transport.hw_rf_id) == 0 {
++            if !transport.grab() {
++                return Err(Error::NoClock);
++            }
++            let control = transport.read_prph(transport.umac(csr::WFPM_CTRL_REG));
++            transport.write_prph(transport.umac(csr::WFPM_CTRL_REG), control | csr::WFPM_AUX_CTL_AUX_IF_MAC_OWNER);
++            let crf = transport.read_prph(if transport.ax210() { csr::SD_REG_VER_GEN2 } else { csr::SD_REG_VER });
++            let cdb = transport.read_prph(transport.umac(csr::WFPM_OTP_CFG1)) & csr::WFPM_OTP_CFG1_IS_CDB != 0;
++            transport.release();
++            ostd::info!("{}: companion radio {:#x}", transport.name, crf);
++            transport.hw_rf_id = ids::rf_id_from_crf(crf, cdb).ok_or(Error::UnknownRadio)?;
++        }
++        Ok(transport)
++    }
++
++    fn disable_interrupts(&self) {
++        if self.msix {
++            // Every cause masked.
++            self.w32(csr::MSIX_FH_INT_MASK_AD, u32::MAX);
++            self.w32(csr::MSIX_HW_INT_MASK_AD, u32::MAX);
++        } else {
++            self.w32(csr::INT_MASK, 0);
++            self.w32(csr::INT, u32::MAX);
++            self.w32(csr::FH_INT_STATUS, u32::MAX);
++        }
++    }
++
++    /// The causes this driver listens to: the data path's and the chip's.
++    const FH_CAUSES: u32 = csr::MSIX_FH_CAUSES_Q0 | csr::MSIX_FH_CAUSES_D2S_CH0 | csr::MSIX_FH_CAUSES_D2S_CH1 | csr::MSIX_FH_CAUSES_S2D | csr::MSIX_FH_CAUSES_FH_ERR;
++    const HW_CAUSES: u32 = csr::MSIX_HW_CAUSES_ALIVE
++        | csr::MSIX_HW_CAUSES_WAKEUP
++        | csr::MSIX_HW_CAUSES_RESET_DONE
++        | csr::MSIX_HW_CAUSES_CT_KILL
++        | csr::MSIX_HW_CAUSES_RF_KILL
++        | csr::MSIX_HW_CAUSES_PERIODIC
++        | csr::MSIX_HW_CAUSES_SW_ERR
++        | csr::MSIX_HW_CAUSES_SCD
++        | csr::MSIX_HW_CAUSES_FH_TX
++        | csr::MSIX_HW_CAUSES_HW_ERR
++        | csr::MSIX_HW_CAUSES_HAP;
++    /// The older way's causes (`CSR_INT`): the same bits where they exist.
++    const INT_CAUSES: u32 = (1 << 31) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 25) | (1 << 7) | (1 << 3) | (1 << 2) | (1 << 1) | 1;
++
++    /// Tells the chip how it interrupts: every cause on vector 0, kept
++    /// until this driver clears it.
++    fn configure_interrupts(&self) {
++        let mode = if self.msix { csr::UREG_CHICK_MSIX_ENABLE } else { csr::UREG_CHICK_MSI_ENABLE };
++        if !self.write_prph_awake(self.umac(csr::UREG_CHICK), mode) {
++            ostd::warn!("{}: the chip did not wake to take its interrupt mode", self.name);
++        }
++        if !self.msix {
++            return;
++        }
++        let vector = csr::MSIX_NON_AUTO_CLEAR_CAUSE;
++        self.w8(csr::MSIX_RX_IVAR, vector);
++        for bit in 0..32 {
++            // The data path's causes from bit 16 on have entries 0 to 15;
++            // the chip's have the ones from 16 on.
++            if Self::FH_CAUSES & !csr::MSIX_FH_CAUSES_Q0 & (1 << bit) != 0 {
++                self.w8(csr::MSIX_IVAR + bit - 16, vector);
++            }
++            if Self::HW_CAUSES & (1 << bit) != 0 {
++                self.w8(csr::MSIX_IVAR + bit + 16, vector);
++            }
++        }
++    }
++
++    /// Lets causes interrupt: a set bit in `fh` or `hw` is one let through.
++    fn enable_causes(&self, fh: u32, hw: u32) {
++        if self.msix {
++            self.w32(csr::MSIX_FH_INT_MASK_AD, !fh);
++            self.w32(csr::MSIX_HW_INT_MASK_AD, !hw);
++        } else {
++            let mut mask = 0;
++            if fh & csr::MSIX_FH_CAUSES_Q0 != 0 {
++                mask |= (1 << 31) | (1 << 28) | (1 << 3);
++            }
++            mask |= hw & Self::INT_CAUSES;
++            self.w32(csr::INT_MASK, mask);
++        }
++    }
++
++    pub(crate) fn enable_interrupts(&self) {
++        self.enable_causes(Self::FH_CAUSES, Self::HW_CAUSES);
++    }
++
++    /// Reads and clears what the card signals. Called on an interrupt and,
++    /// while none has arrived, from the timer.
++    pub(crate) fn causes(&self) -> Causes {
++        let (fh, hw) = if self.msix {
++            let (fh, hw) = (self.r32(csr::MSIX_FH_INT_CAUSES_AD), self.r32(csr::MSIX_HW_INT_CAUSES_AD));
++            if fh == u32::MAX && hw == u32::MAX {
++                // The card is gone (or asleep past reading).
++                return Causes { error: true, any: true, ..Causes::default() };
++            }
++            self.w32(csr::MSIX_FH_INT_CAUSES_AD, fh);
++            self.w32(csr::MSIX_HW_INT_CAUSES_AD, hw);
++            // The vector masked itself when it fired.
++            self.w32(csr::MSIX_AUTOMASK_ST_AD, 1);
++            (fh, hw)
++        } else {
++            let inta = self.r32(csr::INT);
++            if inta == u32::MAX {
++                return Causes { error: true, any: true, ..Causes::default() };
++            }
++            self.w32(csr::INT, inta);
++            let fh_status = self.r32(csr::FH_INT_STATUS);
++            self.w32(csr::FH_INT_STATUS, fh_status);
++            let fh = if inta & ((1 << 31) | (1 << 28) | (1 << 3)) != 0 || fh_status != 0 { csr::MSIX_FH_CAUSES_Q0 } else { 0 };
++            (fh, inta)
++        };
++        Causes {
++            alive: hw & csr::MSIX_HW_CAUSES_ALIVE != 0,
++            error: fh & csr::MSIX_FH_CAUSES_FH_ERR != 0 || hw & (csr::MSIX_HW_CAUSES_SW_ERR | csr::MSIX_HW_CAUSES_HW_ERR) != 0,
++            rf_kill: hw & csr::MSIX_HW_CAUSES_RF_KILL != 0,
++            any: fh != 0 || hw != 0,
++        }
++    }
++
++    /// The card's basic functions, as Linux's `apm_init`.
++    fn apm_init(&self) -> Result<(), Error> {
++        self.set_bits(csr::GIO_CHICKEN_BITS, csr::GIO_CHICKEN_L1A_NO_L0S_RX);
++        self.set_bits(csr::DBG_HPET_MEM, csr::DBG_HPET_MEM_VAL);
++        self.set_bits(csr::HW_IF_CONFIG, csr::HW_IF_CONFIG_HAP_WAKE);
++        self.set_bits(csr::GIO, csr::GIO_L0S_DISABLED);
++        self.activate()
++    }
++
++    /// Resets the card to the state its loader starts from.
++    fn start_hw(&self) -> Result<(), Error> {
++        self.prepare_card()?;
++        if !self.ax210() {
++            // A mark the firmware leaves across resets, cleared where the
++            // platform allows.
++            const HPM_DEBUG: u32 = 0x00a0_3440;
++            const PREG_PRPH_WPROT_22000: u32 = 0x00a0_4d00;
++            const BIT_12: u32 = 1 << 12;
++            let hpm = self.read_prph(HPM_DEBUG);
++            if hpm & 0xffff_fff0 != 0xa5a5_a5a0 && hpm & BIT_12 != 0 && self.read_prph(PREG_PRPH_WPROT_22000) & BIT_12 == 0 {
++                self.write_prph(HPM_DEBUG, hpm & !BIT_12);
++            }
++        }
++        self.sw_reset()?;
++        if !self.ax210() && self.mac.integrated {
++            // The platform's power gating, forced through once.
++            const HPM_HIPM_GEN_CFG: u32 = 0x00a0_3458;
++            const CR_PG_EN: u32 = 1 << 0;
++            const CR_SLP_EN: u32 = 1 << 1;
++            const CR_FORCE_ACTIVE: u32 = 1 << 10;
++            self.activate()?;
++            if self.grab() {
++                let value = self.read_prph(HPM_HIPM_GEN_CFG);
++                self.write_prph(HPM_HIPM_GEN_CFG, value | CR_FORCE_ACTIVE);
++                crate::delay_ms(1);
++                let value = self.read_prph(HPM_HIPM_GEN_CFG);
++                self.write_prph(HPM_HIPM_GEN_CFG, value | CR_PG_EN | CR_SLP_EN);
++                crate::delay_ms(1);
++                let value = self.read_prph(HPM_HIPM_GEN_CFG);
++                self.write_prph(HPM_HIPM_GEN_CFG, value & !CR_FORCE_ACTIVE);
++                self.release();
++            }
++            self.sw_reset()?;
++        }
++        self.apm_init()?;
++        self.configure_interrupts();
++        Ok(())
++    }
++
++    fn rx_buffer(rx: &RxQueue, number: usize) -> (&DmaCoherent, usize) {
++        let index = number - 1;
++        (&rx.buffers[index / RX_CHUNK], (index % RX_CHUNK) * RX_BUFFER)
++    }
++
++    /// Offers buffer `number` (from 1) to the chip in the next free slot.
++    fn offer(&self, rx: &mut RxQueue, number: usize) {
++        let (chunk, offset) = Self::rx_buffer(rx, number);
++        let address = (chunk.daddr() + offset) as u64;
++        if self.ax210() {
++            // The number, six unused bytes, the address.
++            let _ = rx.free.write_val(rx.write * 16, &(number as u16));
++            let _ = rx.free.write_val(rx.write * 16 + 8, &address);
++        } else {
++            let _ = rx.free.write_val(rx.write * 8, &(address | number as u64));
++        }
++        rx.write = (rx.write + 1) % RX_RING;
++    }
++
++    /// Tells the chip how far the free buffers go: in steps of eight.
++    fn tell_rx(&self, rx: &mut RxQueue) {
++        let told = rx.write & !7;
++        if told != rx.write_told {
++            rx.write_told = told;
++            self.w32(csr::RFH_Q0_FRBDCB_WIDX_TRG, told as u32);
++        }
++    }
++
++    fn make_queues(&mut self) -> Result<(), Error> {
++        let (free_entry, used_entry) = if self.ax210() { (16, 32) } else { (8, 4) };
++        let mut rx = RxQueue {
++            free: dma(RX_RING * free_entry)?,
++            used: dma(RX_RING * used_entry)?,
++            status: dma(PAGE_SIZE)?,
++            buffers: Vec::new(),
++            read: 0,
++            write: 0,
++            write_told: 0,
++        };
++        for _ in 0..RX_BUFFERS.div_ceil(RX_CHUNK) {
++            rx.buffers.push(dma(RX_CHUNK * RX_BUFFER)?);
++        }
++        for number in 1..=RX_BUFFERS {
++            self.offer(&mut rx, number);
++        }
++        self.rx = Some(rx);
++        let size = if self.ax210() { COMMANDS_AX210 } else { COMMANDS_AX200 };
++        let wrap = if self.ax210() { 65536 } else { 256 };
++        self.commands = Some(CommandQueue { size, wrap, descriptors: dma(size * TFD)?, buffers: dma(size * MAX_COMMAND)?, write: 0 });
++        Ok(())
++    }
++
++    /// Copies the firmware's sections to memory the chip reads, and
++    /// writes their addresses into the tables of a context block at
++    /// `tables` (the second processor's, the first's, the pages).
++    fn place_sections(&mut self, firmware: &Firmware, file: &[u8], block: &DmaCoherent, tables: usize) -> Result<(), Error> {
++        let (lmac, umac, paging) = firmware.groups();
++        let place = |sections: &[Section], table: usize, images: &mut Vec<DmaCoherent>| -> Result<(), Error> {
++            if sections.len() > MAX_IMAGE_SECTIONS {
++                return Err(Error::Firmware);
++            }
++            for (index, section) in sections.iter().enumerate() {
++                let bytes = file.get(section.data.clone()).ok_or(Error::Firmware)?;
++                let image = dma(bytes.len())?;
++                image.write_bytes(0, bytes).map_err(|_| Error::Memory)?;
++                block.write_val(table + index * 8, &(image.daddr() as u64)).map_err(|_| Error::Memory)?;
++                images.push(image);
++            }
++            Ok(())
++        };
++        place(umac, tables, &mut self.images)?;
++        place(lmac, tables + MAX_IMAGE_SECTIONS * 8, &mut self.images)?;
++        place(paging, tables + 2 * MAX_IMAGE_SECTIONS * 8, &mut self.images)
++    }
++
++    /// The latency the chip may ask the platform for. False: the chip is
++    /// one that must be kept busy while its loader runs instead.
++    fn set_ltr(&self) -> bool {
++        if !self.mac.integrated {
++            self.w32(csr::LTR_LONG_VAL_AD, csr::LTR_LONG_VAL);
++            return true;
++        }
++        if !self.ax210() {
++            if self.grab() {
++                self.write_prph(csr::HPM_MAC_LTR_CSR, csr::HPM_MAC_LTR_ENABLE_ALL);
++                self.write_prph(csr::HPM_UMAC_LTR, csr::LTR_LONG_VAL);
++                self.release();
++            }
++            return true;
++        }
++        self.w32(csr::MSIX_HW_INT_CAUSES_AD, csr::MSIX_HW_CAUSES_IML);
++        false
++    }
++
++    /// Hands the firmware to the chip's loader and starts it. The
++    /// firmware says it runs with the "alive" cause and notification.
++    pub(crate) fn start_firmware(&mut self, firmware: &Firmware, file: &[u8]) -> Result<(), Error> {
++        self.images.clear();
++        self.context.clear();
++        self.start_hw()?;
++        self.disable_interrupts();
++        if self.rf_kill() {
++            return Err(Error::RfKill);
++        }
++        self.w32(csr::UCODE_DRV_GP1_CLR, csr::UCODE_SW_BIT_RFKILL);
++        self.w32(csr::UCODE_DRV_GP1_CLR, csr::UCODE_DRV_GP1_CMD_BLOCKED);
++        self.w32(csr::INT, u32::MAX);
++        self.apm_init()?;
++        self.make_queues()?;
++        self.set_bits(csr::MAC_SHADOW_REG_CTRL, csr::MAC_SHADOW_REG_CTRL_ENABLE);
++        let (free, used, status, descriptors, command_ring) = {
++            let (rx, commands) = (self.rx.as_ref().ok_or(Error::Memory)?, self.commands.as_ref().ok_or(Error::Memory)?);
++            (rx.free.daddr() as u64, rx.used.daddr() as u64, rx.status.daddr() as u64, commands.descriptors.daddr() as u64, commands.size)
++        };
++        // Rings are sized by the power of two: commands in units of eight.
++        let rx_ring_bits = RX_RING.trailing_zeros();
++        let command_ring_bits = command_ring.trailing_zeros() - 3;
++        if !self.ax210() {
++            // The context information (`struct iwl_context_info`).
++            const SIZE: usize = 1792;
++            let block = dma(SIZE)?;
++            let put16 = |at: usize, value: u16| block.write_val(at, &value).map_err(|_| Error::Memory);
++            let put32 = |at: usize, value: u32| block.write_val(at, &value).map_err(|_| Error::Memory);
++            let put64 = |at: usize, value: u64| block.write_val(at, &value).map_err(|_| Error::Memory);
++            put16(0, self.hw_rev as u16)?;
++            put16(4, (SIZE / 4) as u16)?;
++            // Long descriptors, the receive ring's size, 4 KiB buffers.
++            put32(8, 0x0100 | (rx_ring_bits << 4) | (0x4 << 9))?;
++            put64(24, free)?;
++            put64(32, used)?;
++            put64(40, status)?;
++            put64(48, descriptors)?;
++            block.write_val(56, &(command_ring_bits as u8)).map_err(|_| Error::Memory)?;
++            self.place_sections(firmware, file, &block, 192)?;
++            // The firmware's start only, until it says it runs.
++            self.enable_causes(Self::FH_CAUSES, csr::MSIX_HW_CAUSES_ALIVE);
++            self.w64(csr::CTXT_INFO_BA, block.daddr() as u64);
++            self.context.push(block);
++            self.set_ltr();
++            if !self.write_prph_awake(csr::UREG_CPU_INIT_RUN, 1) {
++                return Err(Error::NoClock);
++            }
++        } else {
++            let iml_range = firmware.iml.clone().ok_or(Error::Firmware)?;
++            let iml_bytes = file.get(iml_range).ok_or(Error::Firmware)?;
++            // The scratch block (`struct iwl_prph_scratch`): the control
++            // part, then the section tables.
++            const SCRATCH: usize = 1724;
++            const SCRATCH_TABLES: usize = 124;
++            let scratch = dma(SCRATCH)?;
++            let put = |block: &DmaCoherent, at: usize, value: u64| block.write_val(at, &value).map_err(|_| Error::Memory);
++            scratch.write_val(0, &(self.hw_rev as u16)).map_err(|_| Error::Memory)?;
++            scratch.write_val(4, &((SCRATCH / 4) as u16)).map_err(|_| Error::Memory)?;
++            // 4 KiB buffers, message rings with 256-byte descriptors.
++            const RB_SIZE_4K: u32 = 1 << 16;
++            const MTR_MODE: u32 = 1 << 17;
++            const MTR_FORMAT_256B: u32 = 0x000c_0000;
++            scratch.write_val(8, &(RB_SIZE_4K | MTR_MODE | MTR_FORMAT_256B)).map_err(|_| Error::Memory)?;
++            put(&scratch, 48, free)?;
++            self.place_sections(firmware, file, &scratch, SCRATCH_TABLES)?;
++            // What the chip writes back, and the rings' indices after it.
++            let info = dma(PAGE_SIZE)?;
++            // The context itself (`struct iwl_context_info_v2`).
++            let block = dma(104)?;
++            put(&block, 8, info.daddr() as u64)?;
++            put(&block, 16, status)?;
++            put(&block, 24, (info.daddr() + PAGE_SIZE / 2) as u64)?;
++            put(&block, 32, (info.daddr() + 3 * PAGE_SIZE / 4) as u64)?;
++            put(&block, 52, descriptors)?;
++            put(&block, 60, used)?;
++            block.write_val(68, &(command_ring_bits as u16)).map_err(|_| Error::Memory)?;
++            block.write_val(70, &(rx_ring_bits as u16)).map_err(|_| Error::Memory)?;
++            put(&block, 88, scratch.daddr() as u64)?;
++            // Up to the end of the section tables.
++            block.write_val(96, &((SCRATCH_TABLES + 3 * MAX_IMAGE_SECTIONS * 8) as u32)).map_err(|_| Error::Memory)?;
++            let iml = dma(iml_bytes.len())?;
++            iml.write_bytes(0, iml_bytes).map_err(|_| Error::Memory)?;
++            self.enable_causes(Self::FH_CAUSES, csr::MSIX_HW_CAUSES_ALIVE);
++            self.w64(csr::CTXT_INFO_ADDR, block.daddr() as u64);
++            self.w64(csr::IML_DATA_ADDR, iml.daddr() as u64);
++            self.w32(csr::IML_SIZE_ADDR, iml_bytes.len() as u32);
++            self.set_bits(csr::CTXT_INFO_BOOT_CTRL, csr::AUTO_FUNC_BOOT_ENA);
++            self.context.extend([scratch, info, block, iml]);
++            let keep_busy = !self.set_ltr();
++            if !self.write_prph_awake(self.umac(csr::UREG_CPU_INIT_RUN), 1) {
++                return Err(Error::NoClock);
++            }
++            if keep_busy {
++                // The loader of these chips stalls if the bus goes idle:
++                // reading keeps it awake until it says it is done.
++                let deadline = crate::now_ms() + 100;
++                while crate::now_ms() < deadline && self.r32(csr::MSIX_HW_INT_CAUSES_AD) & csr::MSIX_HW_CAUSES_IML == 0 {
++                    let _ = self.r32(csr::LTR_LAST_MSG);
++                }
++            }
++        }
++        if self.rf_kill() {
++            return Err(Error::RfKill);
++        }
++        Ok(())
++    }
++
++    /// The firmware runs: it gets the receive buffers, and every cause
++    /// may interrupt.
++    pub(crate) fn firmware_alive(&mut self) {
++        if let Some(mut rx) = self.rx.take() {
++            self.tell_rx(&mut rx);
++            self.rx = Some(rx);
++        }
++    }
++
++    /// The chip has written to the ring of filled buffers at some time.
++    pub(crate) fn receive_progress(&self) -> bool {
++        self.rx.as_ref().is_some_and(|rx| rx.read != 0 || rx.status.read_val::<u16>(0).unwrap_or(0) & 0x0fff != 0)
++    }
++
++    /// The chip took the firmware: the copies and the context go.
++    pub(crate) fn firmware_started(&mut self) {
++        self.images.clear();
++        self.context.clear();
++        self.enable_interrupts();
++    }
++
++    /// What the chip left in the receive buffers since the last call.
++    pub(crate) fn receive(&mut self) -> Vec<Packet> {
++        let mut packets = Vec::new();
++        let Some(mut rx) = self.rx.take() else { return packets };
++        // How far the chip got: its index in the ring of used buffers.
++        let closed: u16 = rx.status.read_val(0).unwrap_or(0);
++        let closed = (closed & 0x0fff) as usize % RX_RING;
++        while rx.read != closed {
++            let number = if self.ax210() {
++                rx.used.read_val::<u16>(rx.read * 32 + 4).unwrap_or(0) as usize
++            } else {
++                (rx.used.read_val::<u32>(rx.read * 4).unwrap_or(0) & 0x0fff) as usize
++            };
++            rx.read = (rx.read + 1) % RX_RING;
++            if number == 0 || number > RX_BUFFERS {
++                ostd::warn!("{}: the chip returned a buffer it was not given ({})", self.name, number);
++                continue;
++            }
++            let mut bytes = alloc::vec![0u8; RX_BUFFER];
++            {
++                let (chunk, offset) = Self::rx_buffer(&rx, number);
++                let _ = chunk.read_bytes(offset, &mut bytes);
++            }
++            let mut at = 0;
++            while at + 8 <= RX_BUFFER {
++                let length_and_flags = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
++                if length_and_flags == FRAME_INVALID {
++                    break;
++                }
++                // The length counts from the header on.
++                let length = (length_and_flags & 0x3fff) as usize;
++                if length < 4 || at + 4 + length > RX_BUFFER {
++                    break;
++                }
++                packets.push(Packet {
++                    command: bytes[at + 4],
++                    group: bytes[at + 5],
++                    sequence: u16::from_le_bytes([bytes[at + 6], bytes[at + 7]]),
++                    data: bytes[at + 8..at + 4 + length].to_vec(),
++                });
++                // Packets start at multiples of 64 bytes; the AX210
++                // family puts one in a buffer.
++                at += (4 + length + 0x3f) & !0x3f;
++                if self.ax210() {
++                    break;
++                }
++            }
++            self.offer(&mut rx, number);
++        }
++        self.tell_rx(&mut rx);
++        self.rx = Some(rx);
++        packets
++    }
++
++    /// Queues a command for the firmware; its answer comes back with the
++    /// sequence returned. None: it does not fit.
++    pub(crate) fn send_command(&mut self, group: u8, command: u8, version: u8, payload: &[u8]) -> Option<u16> {
++        const HEADER: usize = 8;
++        let total = HEADER + payload.len();
++        let queue = self.commands.as_mut()?;
++        if total > MAX_COMMAND {
++            return None;
++        }
++        let index = queue.write % queue.size;
++        // The queue is 0; the index is the low byte.
++        let sequence = (queue.write & 0xff) as u16;
++        let mut bytes = Vec::with_capacity(total);
++        bytes.extend_from_slice(&[command, group]);
++        bytes.extend_from_slice(&sequence.to_le_bytes());
++        bytes.extend_from_slice(&(payload.len() as u16).to_le_bytes());
++        bytes.extend_from_slice(&[0, version]);
++        bytes.extend_from_slice(payload);
++        let buffer = index * MAX_COMMAND;
++        queue.buffers.write_bytes(buffer, &bytes).ok()?;
++        // The descriptor: the first 20 bytes, then the rest.
++        let address = (queue.buffers.daddr() + buffer) as u64;
++        let first = total.min(FIRST_PIECE);
++        let mut descriptor = [0u8; TFD];
++        let pieces: u16 = if total > first { 2 } else { 1 };
++        descriptor[0..2].copy_from_slice(&pieces.to_le_bytes());
++        descriptor[2..4].copy_from_slice(&(first as u16).to_le_bytes());
++        descriptor[4..12].copy_from_slice(&address.to_le_bytes());
++        if total > first {
++            descriptor[12..14].copy_from_slice(&((total - first) as u16).to_le_bytes());
++            descriptor[14..22].copy_from_slice(&(address + first as u64).to_le_bytes());
++        }
++        queue.descriptors.write_bytes(index * TFD, &descriptor).ok()?;
++        // The pointer counts past the ring, as far as the family's queues
++        // may be long; the chip takes it modulo the ring.
++        queue.write = (queue.write + 1) % queue.wrap;
++        let pointer = queue.write as u32;
++        self.w32(csr::HBUS_TARG_WRPTR, pointer);
++        Some(sequence)
++    }
++
++    /// Stops the chip: reset, interrupts off.
++    pub(crate) fn stop(&mut self) {
++        self.disable_interrupts();
++        self.set_bits(csr::RESET, csr::RESET_SW_RESET);
++        crate::delay_ms(6);
++        self.rx = None;
++        self.commands = None;
++        self.images.clear();
++        self.context.clear();
++    }
++}
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 0f22838..efb7d4e 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -23,6 +23,7 @@ extern crate aster_usb as _;
+ extern crate aster_ahci as _;
+ extern crate aster_wlan as _;
+ extern crate aster_firmware as _;
++extern crate aster_iwlwifi as _;
+ extern crate aster_ethernet as _;
+ 
+ #[ostd::main]

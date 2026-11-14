@@ -1,11 +1,14 @@
 pub mod authproto;
 mod cef;
 pub mod drives;
+pub mod firewall;
 pub mod install;
 pub mod login;
 pub mod power;
 pub mod settings;
+pub mod ssh;
 pub mod update;
+pub mod wifi;
 pub mod session;
 
 use std::io::{self, BufRead, Read, Write};

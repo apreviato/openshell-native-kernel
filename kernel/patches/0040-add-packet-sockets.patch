@@ -1,0 +1,598 @@
+diff --git a/kernel/core/src/net/mod.rs b/kernel/core/src/net/mod.rs
+index 51c8b02..899bbba 100644
+--- a/kernel/core/src/net/mod.rs
++++ b/kernel/core/src/net/mod.rs
+@@ -10,6 +10,7 @@ pub(crate) fn init() {
+     iface::init();
+     route::init();
+     socket::netlink::init();
++    socket::packet::init();
+     socket::vsock::init();
+ }
+ 
+diff --git a/kernel/core/src/net/socket/mod.rs b/kernel/core/src/net/socket/mod.rs
+index ab1c368..d7653ea 100644
+--- a/kernel/core/src/net/socket/mod.rs
++++ b/kernel/core/src/net/socket/mod.rs
+@@ -21,6 +21,7 @@ use crate::{
+ pub(crate) mod ip;
+ pub(crate) mod netlink;
+ pub(crate) mod options;
++pub(crate) mod packet;
+ pub(crate) mod unix;
+ pub(crate) mod util;
+ pub(crate) mod vsock;
+diff --git a/kernel/core/src/net/socket/packet/mod.rs b/kernel/core/src/net/socket/packet/mod.rs
+new file mode 100755
+index 0000000..8b387a0
+--- /dev/null
++++ b/kernel/core/src/net/socket/packet/mod.rs
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Packet sockets (`AF_PACKET`): whole link-layer frames of an interface,
++//! received and sent by a program that has `CAP_NET_RAW`.
++//!
++//! A `SOCK_RAW` socket reads and writes frames with their Ethernet header;
++//! a `SOCK_DGRAM` one without it, with the header's addresses and protocol
++//! in the socket address (`sockaddr_ll`) instead. A socket hears the frames
++//! of its protocol (an EtherType, or `ETH_P_ALL`) that arrive on the
++//! interface it is bound to, or on any interface while unbound; a socket
++//! made with protocol 0 hears nothing until it is bound to one.
++//!
++//! wpa_supplicant opens these to its Wi-Fi interface for the frames of its
++//! own protocols; DHCP clients and packet dumpers are the other users.
++//! Outgoing frames are not echoed to packet sockets, and there are no
++//! filters (`SO_ATTACH_FILTER`) or rings.
++
++use core::sync::atomic::{AtomicUsize, Ordering};
++
++use aster_softirq::BottomHalfDisabled;
++
++use super::{
++    Socket, new_socket_common,
++    options::{Error as SocketError, SocketOption, macros::sock_option_mut},
++    private::SocketPrivate,
++    util::{MessageHeader, RecvFlags, RecvOutput, SendFlags, SocketAddr},
++};
++use crate::{
++    events::IoEvents,
++    fs::file::FileCommon,
++    net::iface::iter_all_ifaces,
++    prelude::*,
++    process::signal::{PollHandle, Pollable, Pollee},
++    util::{MultiRead, MultiWrite},
++};
++
++/// Every protocol (`ETH_P_ALL`).
++const ETH_P_ALL: u16 = 0x0003;
++/// `ARPHRD_ETHER`.
++const HARDWARE_ETHERNET: u16 = 1;
++/// A frame's kind in `sockaddr_ll`: for this host, a broadcast, a
++/// multicast, or for another host.
++const PACKET_HOST: u8 = 0;
++const PACKET_BROADCAST: u8 = 1;
++const PACKET_MULTICAST: u8 = 2;
++const PACKET_OTHERHOST: u8 = 3;
++
++const ETHERNET_HEADER: usize = 14;
++/// The longest frame a program sends: Ethernet's, with a VLAN tag.
++const MAX_FRAME: usize = 1522;
++/// What a socket holds unread before frames are dropped.
++const QUEUE_FRAMES: usize = 256;
++const QUEUE_BYTES: usize = 512 * 1024;
++
++/// The address of a packet socket or of a frame's other end.
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++pub(crate) struct PacketSocketAddr {
++    /// The EtherType, in host order.
++    pub protocol: u16,
++    /// The interface; 0: any.
++    pub ifindex: u32,
++    pub hardware_type: u16,
++    pub packet_type: u8,
++    /// The other end's hardware address.
++    pub address: [u8; 6],
++}
++
++struct Frame {
++    ifindex: u32,
++    /// With its Ethernet header.
++    bytes: Vec<u8>,
++}
++
++struct State {
++    protocol: u16,
++    ifindex: u32,
++    queue: VecDeque<Frame>,
++    queued_bytes: usize,
++}
++
++pub(crate) struct PacketSocket {
++    /// `SOCK_DGRAM`: frames without their Ethernet header.
++    cooked: bool,
++    state: SpinLock<State, BottomHalfDisabled>,
++    pollee: Pollee,
++    common: FileCommon,
++}
++
++/// The open packet sockets, which the interfaces' received frames go to.
++static SOCKETS: SpinLock<Vec<Weak<PacketSocket>>, BottomHalfDisabled> = SpinLock::new(Vec::new());
++/// How many there are: without any, received frames are not copied.
++static OPEN: AtomicUsize = AtomicUsize::new(0);
++
++impl PacketSocket {
++    /// A socket for `protocol` (an EtherType in host order; 0: none yet).
++    pub(crate) fn new(is_nonblocking: bool, cooked: bool, protocol: u16) -> Arc<Self> {
++        let socket = Arc::new(Self {
++            cooked,
++            state: SpinLock::new(State { protocol, ifindex: 0, queue: VecDeque::new(), queued_bytes: 0 }),
++            pollee: Pollee::new(),
++            common: new_socket_common(is_nonblocking),
++        });
++        SOCKETS.lock().push(Arc::downgrade(&socket));
++        if OPEN.fetch_add(1, Ordering::AcqRel) == 0 {
++            aster_bigtcp::iface::tap_frames(true);
++        }
++        socket
++    }
++
++    fn check_io_events(&self) -> IoEvents {
++        let mut events = IoEvents::OUT;
++        if !self.state.lock().queue.is_empty() {
++            events |= IoEvents::IN;
++        }
++        events
++    }
++
++    fn try_recv(&self, writer: &mut dyn MultiWrite, flags: RecvFlags) -> Result<(RecvOutput, SocketAddr)> {
++        // The frame leaves the queue (or is copied, for a peek) before it
++        // is written to the program's memory, which may sleep.
++        let frame = {
++            let mut state = self.state.lock();
++            if flags.receive_behavior().will_consume_data() {
++                let frame = state.queue.pop_front();
++                if let Some(frame) = &frame {
++                    state.queued_bytes -= frame.bytes.len();
++                }
++                frame
++            } else {
++                state.queue.front().map(|frame| Frame { ifindex: frame.ifindex, bytes: frame.bytes.clone() })
++            }
++        };
++        let Some(frame) = frame else {
++            return_errno_with_message!(Errno::EAGAIN, "no frame is waiting");
++        };
++        self.pollee.invalidate();
++        let header = &frame.bytes[..ETHERNET_HEADER];
++        let payload = if self.cooked { &frame.bytes[ETHERNET_HEADER..] } else { &frame.bytes[..] };
++        let own = iter_all_ifaces().find(|iface| iface.index() == frame.ifindex).and_then(|iface| iface.ethernet_addr());
++        let packet_type = if header[..6] == [0xff; 6] {
++            PACKET_BROADCAST
++        } else if header[0] & 1 != 0 {
++            PACKET_MULTICAST
++        } else if own.is_some_and(|own| own.0 == header[..6]) {
++            PACKET_HOST
++        } else {
++            PACKET_OTHERHOST
++        };
++        let address = PacketSocketAddr {
++            protocol: u16::from_be_bytes([header[12], header[13]]),
++            ifindex: frame.ifindex,
++            hardware_type: HARDWARE_ETHERNET,
++            packet_type,
++            address: header[6..12].try_into().unwrap(),
++        };
++        let copied = payload.len().min(writer.sum_lens());
++        writer.write(&mut VmReader::from(payload))?;
++        let output = RecvOutput::new_for_packet(flags, copied, payload.len());
++        Ok((output, SocketAddr::Packet(address)))
++    }
++
++    /// A frame that arrived on an interface.
++    fn deliver(&self, ifindex: u32, frame: &[u8]) {
++        {
++            let mut state = self.state.lock();
++            let protocol = u16::from_be_bytes([frame[12], frame[13]]);
++            let wanted = match state.protocol {
++                0 => false,
++                ETH_P_ALL => true,
++                own => own == protocol,
++            };
++            if !wanted || (state.ifindex != 0 && state.ifindex != ifindex) {
++                return;
++            }
++            if state.queue.len() >= QUEUE_FRAMES || state.queued_bytes + frame.len() > QUEUE_BYTES {
++                return;
++            }
++            state.queued_bytes += frame.len();
++            state.queue.push_back(Frame { ifindex, bytes: frame.to_vec() });
++        }
++        self.pollee.notify(IoEvents::IN);
++    }
++}
++
++impl Drop for PacketSocket {
++    fn drop(&mut self) {
++        SOCKETS.lock().retain(|socket| socket.strong_count() > 0);
++        if OPEN.fetch_sub(1, Ordering::AcqRel) == 1 {
++            aster_bigtcp::iface::tap_frames(false);
++        }
++    }
++}
++
++/// Hands a frame an interface received to the packet sockets that want it.
++/// Runs wherever the network stack polls its interfaces.
++fn tap(ifindex: u32, frame: &[u8]) {
++    if frame.len() < ETHERNET_HEADER {
++        return;
++    }
++    // The sockets are told outside the list's lock: one that closes
++    // meanwhile takes it.
++    let sockets: Vec<Arc<PacketSocket>> = SOCKETS.lock().iter().filter_map(Weak::upgrade).collect();
++    for socket in sockets {
++        socket.deliver(ifindex, frame);
++    }
++}
++
++pub(in crate::net) fn init() {
++    aster_bigtcp::iface::set_frame_tap(tap);
++}
++
++impl Socket for PacketSocket {
++    fn bind(&self, socket_addr: SocketAddr) -> Result<()> {
++        let SocketAddr::Packet(address) = socket_addr else {
++            return_errno_with_message!(Errno::EINVAL, "not a packet socket address");
++        };
++        if address.ifindex != 0 && !iter_all_ifaces().any(|iface| iface.index() == address.ifindex) {
++            return_errno_with_message!(Errno::ENODEV, "no such interface");
++        }
++        let mut state = self.state.lock();
++        state.ifindex = address.ifindex;
++        // Protocol 0 keeps the socket's own.
++        if address.protocol != 0 {
++            state.protocol = address.protocol;
++        }
++        // What was queued for the old binding is not for this one.
++        state.queue.clear();
++        state.queued_bytes = 0;
++        Ok(())
++    }
++
++    fn addr(&self) -> Result<SocketAddr> {
++        let (ifindex, protocol) = {
++            let state = self.state.lock();
++            (state.ifindex, state.protocol)
++        };
++        let address = iter_all_ifaces()
++            .find(|iface| ifindex != 0 && iface.index() == ifindex)
++            .and_then(|iface| iface.ethernet_addr())
++            .map_or([0; 6], |address| address.0);
++        Ok(SocketAddr::Packet(PacketSocketAddr {
++            protocol,
++            ifindex,
++            hardware_type: HARDWARE_ETHERNET,
++            packet_type: PACKET_HOST,
++            address,
++        }))
++    }
++
++    fn sendmsg(&self, reader: &mut dyn MultiRead, message_header: MessageHeader, _flags: SendFlags) -> Result<usize> {
++        let destination = match message_header.addr {
++            Some(SocketAddr::Packet(address)) => Some(address),
++            Some(_) => return_errno_with_message!(Errno::EINVAL, "not a packet socket address"),
++            None => None,
++        };
++        let (bound_ifindex, bound_protocol) = {
++            let state = self.state.lock();
++            (state.ifindex, state.protocol)
++        };
++        let ifindex = destination.map_or(bound_ifindex, |address| address.ifindex);
++        let Some(iface) = iter_all_ifaces().find(|iface| ifindex != 0 && iface.index() == ifindex) else {
++            return_errno_with_message!(Errno::ENXIO, "the frame has no interface to leave by");
++        };
++        let Some(own) = iface.ethernet_addr() else {
++            return_errno_with_message!(Errno::EOPNOTSUPP, "the interface has no link-layer frames");
++        };
++        let length = reader.sum_lens();
++        let header = if self.cooked { ETHERNET_HEADER } else { 0 };
++        if length + header > MAX_FRAME || (!self.cooked && length < ETHERNET_HEADER) {
++            return_errno_with_message!(Errno::EMSGSIZE, "the frame does not fit the link");
++        }
++        let mut frame = vec![0u8; header + length];
++        if self.cooked {
++            // The header is the socket's to write: to the address given,
++            // from the interface, with the given protocol or the socket's.
++            let Some(destination) = destination else {
++                return_errno_with_message!(Errno::EDESTADDRREQ, "the frame has no destination");
++            };
++            let protocol = if destination.protocol != 0 { destination.protocol } else { bound_protocol };
++            frame[0..6].copy_from_slice(&destination.address);
++            frame[6..12].copy_from_slice(&own.0);
++            frame[12..14].copy_from_slice(&protocol.to_be_bytes());
++        }
++        reader.read(&mut VmWriter::from(&mut frame[header..]))?;
++        if !iface.send_frame(&frame) {
++            return_errno_with_message!(Errno::ENOBUFS, "the interface did not take the frame");
++        }
++        Ok(length)
++    }
++
++    fn recvmsg(&self, writer: &mut dyn MultiWrite, flags: RecvFlags) -> Result<(RecvOutput, MessageHeader)> {
++        let (output, address) =
++            self.block_on_unless(IoEvents::IN, None, flags.contains(RecvFlags::MSG_DONTWAIT), || self.try_recv(writer, flags))?;
++        Ok((output, MessageHeader::new(Some(address), Vec::new())))
++    }
++
++    fn get_option(&self, option: &mut dyn SocketOption) -> Result<()> {
++        sock_option_mut!(match option {
++            socket_errors @ SocketError => {
++                socket_errors.set(None);
++                return Ok(());
++            }
++            _ => (),
++        });
++        return_errno_with_message!(Errno::ENOPROTOOPT, "the socket option is not supported");
++    }
++
++    fn common(&self) -> &FileCommon {
++        &self.common
++    }
++}
++
++impl SocketPrivate for PacketSocket {
++    fn is_nonblocking(&self) -> bool {
++        self.common.is_nonblocking()
++    }
++}
++
++impl Pollable for PacketSocket {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        self.pollee.poll_with(mask, poller, || self.check_io_events())
++    }
++}
+diff --git a/kernel/core/src/net/socket/util/socket_addr.rs b/kernel/core/src/net/socket/util/socket_addr.rs
+index d4fdf9c..22d394e 100644
+--- a/kernel/core/src/net/socket/util/socket_addr.rs
++++ b/kernel/core/src/net/socket/util/socket_addr.rs
+@@ -3,7 +3,10 @@
+ use aster_bigtcp::wire::{Ipv4Address, Ipv6Address, PortNum};
+ 
+ use crate::{
+-    net::socket::{netlink::NetlinkSocketAddr, unix::UnixSocketAddr, vsock::VsockSocketAddr},
++    net::socket::{
++        netlink::NetlinkSocketAddr, packet::PacketSocketAddr, unix::UnixSocketAddr,
++        vsock::VsockSocketAddr,
++    },
+     prelude::*,
+ };
+ 
+@@ -13,5 +16,6 @@ pub(crate) enum SocketAddr {
+     IPv4(Ipv4Address, PortNum),
+     IPv6(Ipv6Address, PortNum),
+     Netlink(NetlinkSocketAddr),
++    Packet(PacketSocketAddr),
+     Vsock(VsockSocketAddr),
+ }
+diff --git a/kernel/core/src/syscall/socket.rs b/kernel/core/src/syscall/socket.rs
+index 72b6706..0346903 100644
+--- a/kernel/core/src/syscall/socket.rs
++++ b/kernel/core/src/syscall/socket.rs
+@@ -9,6 +9,7 @@ use crate::{
+             NetlinkGenericSocket, NetlinkRouteSocket, NetlinkUeventSocket, StandardNetlinkProtocol,
+             is_valid_protocol,
+         },
++        packet::PacketSocket,
+         unix::{UnixDatagramSocket, UnixStreamSocket},
+         vsock::VsockStreamSocket,
+     },
+@@ -96,6 +97,19 @@ pub(super) fn sys_socket(
+                 }
+             }
+         }
++        (CSocketAddrFamily::AF_PACKET, SockType::SOCK_RAW | SockType::SOCK_DGRAM) => {
++            // Whole frames of the network are for programs with `CAP_NET_RAW`.
++            let posix_thread = ctx.posix_thread;
++            crate::security::lsm::hooks::on_capable(crate::security::lsm::hooks::CapableContext::new(
++                crate::process::UserNamespace::get_init_singleton().as_ref(),
++                posix_thread,
++                crate::process::credentials::capabilities::CapSet::NET_RAW,
++            ))?;
++            // The protocol is an EtherType in network byte order.
++            let protocol = u16::from_be(protocol as u16);
++            PacketSocket::new(is_nonblocking, sock_type == SockType::SOCK_DGRAM, protocol)
++                as Arc<dyn FileLike>
++        }
+         (CSocketAddrFamily::AF_VSOCK, SockType::SOCK_STREAM) => {
+             VsockStreamSocket::new(is_nonblocking)? as Arc<dyn FileLike>
+         }
+diff --git a/kernel/core/src/util/net/addr/family.rs b/kernel/core/src/util/net/addr/family.rs
+index e777750..6efda67 100644
+--- a/kernel/core/src/util/net/addr/family.rs
++++ b/kernel/core/src/util/net/addr/family.rs
+@@ -7,6 +7,7 @@ use ostd::{mm::VmIo, task::Task};
+ use super::{
+     ip::{CSocketAddrInet, CSocketAddrInet6},
+     netlink::CSocketAddrNetlink,
++    packet::CSocketAddrLl,
+     unix,
+     vsock::CSocketAddrVm,
+ };
+@@ -178,6 +179,13 @@ pub(crate) fn read_socket_addr_from_user(addr: Vaddr, addr_len: usize) -> Result
+             let addr = CSocketAddrNetlink::from_first_bytes(storage.as_bytes());
+             SocketAddr::Netlink(addr.into())
+         }
++        Ok(CSocketAddrFamily::AF_PACKET) => {
++            if addr_len < size_of::<CSocketAddrLl>() {
++                return_errno_with_message!(Errno::EINVAL, "the socket address length is too small");
++            }
++            let addr = CSocketAddrLl::from_first_bytes(storage.as_bytes());
++            SocketAddr::Packet(addr.into())
++        }
+         Ok(CSocketAddrFamily::AF_VSOCK) => {
+             if addr_len < size_of::<CSocketAddrVm>() {
+                 return_errno_with_message!(Errno::EINVAL, "the socket address length is too small");
+@@ -273,6 +281,9 @@ pub(crate) fn write_socket_addr_with_max_len(
+         SocketAddr::Netlink(addr) => {
+             write_c_socket_address_util::<CSocketAddrNetlink, _>(*addr, dest, max_len as usize)?
+         }
++        SocketAddr::Packet(addr) => {
++            write_c_socket_address_util::<CSocketAddrLl, _>(*addr, dest, max_len as usize)?
++        }
+         SocketAddr::Vsock(addr) => {
+             write_c_socket_address_util::<CSocketAddrVm, _>(*addr, dest, max_len as usize)?
+         }
+diff --git a/kernel/core/src/util/net/addr/mod.rs b/kernel/core/src/util/net/addr/mod.rs
+index 9a528c3..8b15c32 100644
+--- a/kernel/core/src/util/net/addr/mod.rs
++++ b/kernel/core/src/util/net/addr/mod.rs
+@@ -8,5 +8,6 @@ pub(crate) use family::{
+ mod family;
+ mod ip;
+ mod netlink;
++mod packet;
+ mod unix;
+ mod vsock;
+diff --git a/kernel/core/src/util/net/addr/packet.rs b/kernel/core/src/util/net/addr/packet.rs
+new file mode 100755
+index 0000000..563851b
+--- /dev/null
++++ b/kernel/core/src/util/net/addr/packet.rs
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: MPL-2.0
++
++use super::CSocketAddrFamily;
++use crate::{net::socket::packet::PacketSocketAddr, prelude::*};
++
++/// Linux's `struct sockaddr_ll`, the address of a packet socket.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Pod)]
++pub(crate) struct CSocketAddrLl {
++    /// Address family (AF_PACKET).
++    sll_family: u16,
++    /// The EtherType, in network byte order.
++    sll_protocol: u16,
++    sll_ifindex: i32,
++    /// The hardware type (`ARPHRD_ETHER`).
++    sll_hatype: u16,
++    sll_pkttype: u8,
++    /// The length of the hardware address.
++    sll_halen: u8,
++    sll_addr: [u8; 8],
++}
++
++impl From<PacketSocketAddr> for CSocketAddrLl {
++    fn from(value: PacketSocketAddr) -> Self {
++        let mut sll_addr = [0u8; 8];
++        sll_addr[..6].copy_from_slice(&value.address);
++        Self {
++            sll_family: CSocketAddrFamily::AF_PACKET as _,
++            sll_protocol: value.protocol.to_be(),
++            sll_ifindex: value.ifindex as i32,
++            sll_hatype: value.hardware_type,
++            sll_pkttype: value.packet_type,
++            sll_halen: 6,
++            sll_addr,
++        }
++    }
++}
++
++impl From<CSocketAddrLl> for PacketSocketAddr {
++    fn from(value: CSocketAddrLl) -> Self {
++        let mut address = [0u8; 6];
++        address.copy_from_slice(&value.sll_addr[..6]);
++        Self {
++            protocol: u16::from_be(value.sll_protocol),
++            ifindex: value.sll_ifindex.max(0) as u32,
++            hardware_type: value.sll_hatype,
++            packet_type: value.sll_pkttype,
++            address,
++        }
++    }
++}
+diff --git a/kernel/libs/aster-bigtcp/src/iface/iface.rs b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+index db7cf08..81b0b41 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/iface.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+@@ -34,6 +34,13 @@ pub trait Iface<E>: internal::IfaceInternal<E> + Send + Sync {
+         None
+     }
+ 
++    /// Sends a whole link-layer frame as it is (packet sockets). Returns
++    /// whether the device took it; interfaces without link-layer frames
++    /// take none.
++    fn send_frame(&self, _frame: &[u8]) -> bool {
++        false
++    }
++
+     /// The device's link to its network came up or went down (a Wi-Fi
+     /// interface's): an interface that asks for its address asks again,
+     /// or drops the one it had.
+diff --git a/kernel/libs/aster-bigtcp/src/iface/mod.rs b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+index c715802..6eca72f 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/mod.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+@@ -27,6 +27,28 @@ pub fn config_generation() -> u64 {
+     CONFIG_GENERATION.load(core::sync::atomic::Ordering::Acquire)
+ }
+ 
++/// Hands every Ethernet frame an interface receives to `tap`, with the
++/// interface's index, while [`tap_frames`] says so (packet sockets).
++pub fn set_frame_tap(tap: fn(u32, &[u8])) {
++    FRAME_TAP.call_once(|| tap);
++}
++
++/// Whether received frames go to the tap: only while something listens,
++/// as each frame is copied for it.
++pub fn tap_frames(on: bool) {
++    TAPPING.store(on, core::sync::atomic::Ordering::Release);
++}
++
++pub(crate) fn frame_tap() -> Option<fn(u32, &[u8])> {
++    if !TAPPING.load(core::sync::atomic::Ordering::Acquire) {
++        return None;
++    }
++    FRAME_TAP.get().copied()
++}
++
++static FRAME_TAP: spin::Once<fn(u32, &[u8])> = spin::Once::new();
++static TAPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
+ pub(crate) fn bump_config_generation() {
+     CONFIG_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+ }
+diff --git a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+index 2613e6c..8595411 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+@@ -190,6 +190,17 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for EtherIface<D, E> {
+         self.lease.lock().clone()
+     }
+ 
++    fn send_frame(&self, frame: &[u8]) -> bool {
++        let Some(packet) = self.frame_packet(frame) else {
++            return false;
++        };
++        self.driver.with(|device| {
++            let sent = self.common.counters().send(device, packet).is_ok();
++            device.notify_poll_end();
++            sent
++        })
++    }
++
+     fn link_changed(&self, up: bool) {
+         if let Some(dhcp) = &self.dhcp {
+             if let Some(event) = dhcp.lock().link_changed(up, now_ms()) {
+@@ -211,6 +222,12 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
+         packet: RxPacket<LinkLayer>,
+         iface_cx: &mut Context,
+     ) -> Option<PhyProcessResult> {
++        if let Some(tap) = crate::iface::frame_tap() {
++            let mut bytes = vec![0u8; packet.len()];
++            let length = packet.reader().read(&mut VmWriter::from(&mut bytes[..]));
++            tap(self.common.index(), &bytes[..length]);
++        }
++
+         // Parse the Ethernet header. Ignore the packet if the header is ill-formed.
+         let (packet, repr) = ether::parse(packet)?;
+ 

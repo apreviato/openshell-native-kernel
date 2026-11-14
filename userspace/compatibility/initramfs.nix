@@ -82,6 +82,80 @@ let
             ctl.!default { type pulse fallback "sysdefault" }
           '';
         };
+        # Wi-Fi and Bluetooth. wpa_supplicant runs the kernel's Wi-Fi
+        # interfaces through nl80211, as on OpenShell Live
+        # (installed-session.sh starts it; the supervisor speaks to it for
+        # the session, userspace/shell/src/wifi.rs). The chips' firmware is
+        # what probes/wireless-firmware.list names out of linux-firmware,
+        # with the licence texts it names, in /lib/firmware.
+        wireless =
+          let
+            lines = lib.filter (line: line != "" && !lib.hasPrefix "#" line) (
+              lib.splitString "\n" (builtins.readFile (probes + "/wireless-firmware.list"))
+            );
+            isLicence = lib.hasPrefix "licence ";
+            licences = map (
+              line:
+              let
+                words = lib.splitString " " line;
+              in
+              pkgs.fetchurl {
+                name = builtins.elemAt words 1;
+                url = "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/LICENSES/${builtins.elemAt words 1}?h=${pkgs.linux-firmware.version}";
+                sha256 = builtins.elemAt words 2;
+              }
+            ) (lib.filter isLicence lines);
+            patterns = lib.filter (line: !isLicence line) lines;
+          in
+          {
+            supplicant = pkgs.wpa_supplicant;
+            firmware = pkgs.runCommand "openshell-wireless-firmware-${pkgs.linux-firmware.version}" { } ''
+              mkdir -p "$out/lib/firmware"
+              cd ${pkgs.linux-firmware}/lib/firmware
+              for pattern in ${lib.escapeShellArgs patterns}; do
+                found=
+                for file in $pattern; do
+                  [ -e "$file" ] || continue
+                  found=1
+                  mkdir -p "$out/lib/firmware/$(dirname "$file")"
+                  # linux-firmware links the names drivers ask for to the
+                  # files: the image gets the files under those names.
+                  cp -L "$file" "$out/lib/firmware/$file"
+                done
+                if [ -z "$found" ]; then
+                  echo "linux-firmware ${pkgs.linux-firmware.version} has no $pattern" >&2
+                  exit 1
+                fi
+              done
+              ${lib.concatMapStrings (licence: ''
+                install -m 0644 ${licence} "$out/lib/firmware/${licence.name}"
+              '') licences}
+            '';
+          };
+        # Remote access (Settings ▸ Remote access), as on OpenShell Live:
+        # x11vnc shares the session's screen (hostd starts it, as the
+        # session user), and OpenSSH's server answers while the supervisor
+        # keeps its mark (installed-session.sh, userspace/shell/src/ssh.rs).
+        remote = {
+          vnc = pkgs.x11vnc;
+          ssh = pkgs.openssh;
+        };
+        # Printing (Settings ▸ Printers), as on Live: CUPS's scheduler
+        # (installed-session.sh starts it) and its tools, which hostd runs
+        # as the session user. The scheduler takes its filters and backends
+        # from one tree, as NixOS gives it: CUPS's own with those of
+        # cups-filters and Ghostscript, which turn a PDF or an image into
+        # what a printer that takes neither prints (PWG and Apple raster,
+        # PCL, PostScript).
+        printing = rec {
+          cups = pkgs.cups;
+          programs = pkgs.buildEnv {
+            name = "openshell-cups-programs";
+            paths = [ pkgs.cups.out pkgs.libcupsfilters pkgs.cups-filters pkgs.ghostscript ];
+            pathsToLink = [ "/lib" "/share/cups" "/bin" ];
+            ignoreCollisions = true;
+          };
+        };
         # The session's X server (probes/openshell-x.sh): Xorg with the
         # modesetting driver on the kernel's DRM device, the evdev driver,
         # and Xvfb where there is no screen.
@@ -439,6 +513,8 @@ let
       ++ lib.optional (!media) graphics.mesa
       ++ graphics.tools
       ++ [ graphics.sound.pulseaudio graphics.sound.alsaUtils graphics.sound.asoundConf ]
+      ++ [ graphics.wireless.supplicant graphics.wireless.firmware ]
+      ++ [ graphics.remote.vnc graphics.remote.ssh graphics.printing.cups graphics.printing.programs ]
     )
     ++ lib.optionals (apps != null) apps.packages
     ++ lib.optionals (wine != null) ([ wine.package wine.runner ] ++ lib.optional (!media) wine.probe)
@@ -523,6 +599,29 @@ let
       done
       install -m 0644 ${probes}/openshell-sound.pa "$out/opt/openshell-compat/sound.pa"
       ln -sfn ${graphics.sound.asoundConf} "$out/etc/asound.conf"
+      # Wi-Fi (graphics.wireless): the supplicant, its client to look into
+      # it by hand, and the chips' firmware where the kernel reads it (/lib
+      # is /usr/lib).
+      for program in wpa_supplicant wpa_cli; do
+        ln -s ${graphics.wireless.supplicant}/bin/$program "$out/opt/openshell-compat/bin/"
+      done
+      chmod u+w "$out/usr/lib"
+      ln -sfn ${graphics.wireless.firmware}/lib/firmware "$out/usr/lib/firmware"
+      # Remote access (graphics.remote): the screen's server for hostd, and
+      # the SSH server with the tool that makes its host keys.
+      ln -s ${graphics.remote.vnc}/bin/x11vnc "$out/opt/openshell-compat/bin/"
+      for program in sshd ssh-keygen; do
+        ln -s ${graphics.remote.ssh}/bin/$program "$out/opt/openshell-compat/bin/"
+      done
+      # Printing (graphics.printing): the scheduler, the tools hostd runs,
+      # and the tree of filters and backends installed-session.sh names in
+      # the scheduler's configuration.
+      for program in cupsd lp lpstat lpoptions lpadmin cancel; do
+        program_path=$(find ${graphics.printing.cups}/bin ${graphics.printing.cups}/sbin -name "$program" 2> /dev/null | head -n1)
+        [ -n "$program_path" ] || { echo "CUPS has no $program" >&2; exit 1; }
+        ln -s "$program_path" "$out/opt/openshell-compat/bin/"
+      done
+      ln -s ${graphics.printing.programs} "$out/opt/openshell-compat/cups"
       ln -s /etc/fonts/fonts.conf "$out/opt/openshell-compat/fonts.conf"
       ln -s ${pkgs.openbox}/etc/xdg "$out/opt/openshell-compat/xdg"
       install -m 0644 ${probes}/cef-smoke.mjs ${probes}/shell-smoke.mjs ${probes}/session-smoke.mjs ${probes}/linux-sandbox.mjs "$out/opt/openshell-compat/"
@@ -548,6 +647,8 @@ let
       ln -s ${pkgs.adwaita-icon-theme}/share/icons "$out/usr/share/icons"
       # The time zones, where /etc/localtime points (the supervisor's settings.rs).
       ln -s ${pkgs.tzdata}/share/zoneinfo "$out/usr/share/zoneinfo"
+      # CUPS's data, where Debian has it: hostd prints its test page from there.
+      ln -s ${graphics.printing.programs}/share/cups "$out/usr/share/cups"
       # The keyboard layouts and their names (Settings ▸ Keyboard reads
       # rules/base.lst; setxkbmap and X compile from the same data).
       mkdir -p "$out/usr/share/X11"
@@ -583,6 +684,10 @@ in
   launcher = graphics.launcher or null;
   mesa = graphics.mesa or null;
   fonts = graphics.fonts or null;
+  # The Wi-Fi and Bluetooth chips' firmware, to check it alone.
+  wirelessFirmware = graphics.wireless.firmware or null;
+  # Printing's tree of filters and backends, to check it alone.
+  printingPrograms = graphics.printing.programs or null;
   graphicsTools = if graphics != null then pkgs.symlinkJoin {
     name = "openshell-graphics-tools";
     paths = graphics.tools;

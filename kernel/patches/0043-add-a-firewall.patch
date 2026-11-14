@@ -1,0 +1,601 @@
+diff --git a/kernel/core/src/fs/fs_impls/procfs/net.rs b/kernel/core/src/fs/fs_impls/procfs/net.rs
+index 686a934..f171384 100644
+--- a/kernel/core/src/fs/fs_impls/procfs/net.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/net.rs
+@@ -2,7 +2,9 @@
+ 
+ //! `/proc/net`: `pnp`, the DNS servers of the kernel's DHCP leases in
+ //! resolv.conf's format, as Linux's autoconfiguration gives them, `route`,
+-//! the IPv4 routes, and `dev`, each interface's traffic, as Linux lists them.
++//! the IPv4 routes, and `dev`, each interface's traffic, as Linux lists
++//! them; and `firewall`, the firewall's rules, which root reads and writes
++//! (the network library's `iface::firewall` says how).
+ 
+ use aster_util::printer::VmPrinter;
+ 
+@@ -32,6 +34,7 @@ impl NetDirOps {
+         ("pnp", InodeType::File, PnpFileOps::new_inode),
+         ("route", InodeType::File, RouteFileOps::new_inode),
+         ("dev", InodeType::File, DevFileOps::new_inode),
++        ("firewall", InodeType::File, FirewallFileOps::new_inode),
+     ];
+ }
+ 
+@@ -53,6 +56,39 @@ impl ProcDirOps for NetDirOps {
+     }
+ }
+ 
++/// The most rules' text taken in one write.
++const MAX_FIREWALL_TEXT: usize = 32 * 1024;
++
++struct FirewallFileOps;
++
++impl FirewallFileOps {
++    fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        ProcFile::new(Self, parent, mkmod!(u+rw))
++    }
++}
++
++impl ProcFileOps for FirewallFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        write!(printer, "{}", aster_bigtcp::iface::firewall_text())?;
++        Ok(printer.bytes_written())
++    }
++
++    /// One write is the whole set of rules, which replaces the one in
++    /// force; a text that is not one changes nothing.
++    fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        let length = reader.remain();
++        if offset != 0 || length > MAX_FIREWALL_TEXT {
++            return_errno_with_message!(Errno::EINVAL, "the firewall's rules are written whole, in one write");
++        }
++        let mut bytes = vec![0u8; length];
++        reader.read_fallible(&mut VmWriter::from(bytes.as_mut_slice()))?;
++        let text = core::str::from_utf8(&bytes).map_err(|_| Error::with_message(Errno::EINVAL, "the rules are not text"))?;
++        aster_bigtcp::iface::set_firewall(text).map_err(|()| Error::with_message(Errno::EINVAL, "the text is not a set of firewall rules"))?;
++        Ok(length)
++    }
++}
++
+ struct PnpFileOps;
+ 
+ impl PnpFileOps {
+diff --git a/kernel/libs/aster-bigtcp/src/iface/firewall.rs b/kernel/libs/aster-bigtcp/src/iface/firewall.rs
+new file mode 100755
+index 0000000..0143b96
+--- /dev/null
++++ b/kernel/libs/aster-bigtcp/src/iface/firewall.rs
+@@ -0,0 +1,386 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The firewall: which new connections and datagrams from the network the
++//! host takes, as ufw's rules decide them on OpenShell Live.
++//!
++//! What the host started is answered: a TCP connection that exists passes
++//! (only the request that opens one is judged), and so does a UDP datagram
++//! from an address the host sent to in the last minutes. Everything from
++//! the host itself passes. A new connection or an unasked datagram goes
++//! through the rules in order, the first that matches deciding (allow,
++//! deny, reject, or limit: allow, but no more than six new ones in thirty
++//! seconds from one address), and then through the default. Pings are
++//! answered, as ufw's defaults have them.
++//!
++//! The rules are text, one line each, which the kernel reads and writes in
++//! `/proc/net/firewall` (root's alone):
++//!
++//! ```text
++//! default deny
++//! rule allow tcp 22 22 any
++//! rule limit tcp 5900 5900 192.168.1.0/24
++//! rule deny any 6000 6007 any
++//! ```
++//!
++//! An empty text turns the firewall off.
++
++use alloc::{
++    collections::{BTreeMap, VecDeque},
++    format,
++    string::String,
++    vec::Vec,
++};
++
++/// The most rules kept.
++pub const MAX_RULES: usize = 256;
++/// How long an address the host sent a datagram to may answer.
++const FLOW_MS: u64 = 180_000;
++/// The most such addresses remembered.
++const MAX_FLOWS: usize = 4096;
++/// `limit`: this many new connections from one address in this long.
++const LIMIT_COUNT: usize = 6;
++const LIMIT_MS: u64 = 30_000;
++/// The most addresses a limit follows at once.
++const MAX_LIMITED: usize = 1024;
++
++/// An address of either family, as its bytes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++pub enum Address {
++    V4([u8; 4]),
++    V6([u8; 16]),
++}
++
++impl Address {
++    fn bytes(&self) -> &[u8] {
++        match self {
++            Address::V4(bytes) => bytes,
++            Address::V6(bytes) => bytes,
++        }
++    }
++
++    fn parse(text: &str) -> Option<Self> {
++        if text.contains(':') {
++            return parse_v6(text).map(Address::V6);
++        }
++        let mut bytes = [0u8; 4];
++        let mut parts = text.split('.');
++        for byte in &mut bytes {
++            let part = parts.next()?;
++            if part.is_empty() || part.len() > 3 || !part.bytes().all(|digit| digit.is_ascii_digit()) {
++                return None;
++            }
++            *byte = part.parse().ok()?;
++        }
++        parts.next().is_none().then_some(Address::V4(bytes))
++    }
++}
++
++fn parse_v6(text: &str) -> Option<[u8; 16]> {
++    let group = |part: &str| {
++        (!part.is_empty() && part.len() <= 4 && part.bytes().all(|digit| digit.is_ascii_hexdigit())).then(|| u16::from_str_radix(part, 16).ok())?
++    };
++    let groups = |text: &str| -> Option<Vec<u16>> {
++        if text.is_empty() {
++            return Some(Vec::new());
++        }
++        text.split(':').map(group).collect()
++    };
++    let (head, tail) = match text.split_once("::") {
++        Some((head, tail)) => {
++            if tail.contains("::") {
++                return None;
++            }
++            (groups(head)?, Some(groups(tail)?))
++        }
++        None => (groups(text)?, None),
++    };
++    let mut words = [0u16; 8];
++    match tail {
++        None if head.len() == 8 => words.copy_from_slice(&head),
++        Some(tail) if head.len() + tail.len() < 8 => {
++            words[..head.len()].copy_from_slice(&head);
++            words[8 - tail.len()..].copy_from_slice(&tail);
++        }
++        _ => return None,
++    }
++    let mut bytes = [0u8; 16];
++    for (pair, word) in bytes.chunks_exact_mut(2).zip(words) {
++        pair.copy_from_slice(&word.to_be_bytes());
++    }
++    Some(bytes)
++}
++
++fn write_address(out: &mut String, address: &Address) {
++    use core::fmt::Write;
++
++    match address {
++        Address::V4(bytes) => {
++            let _ = write!(out, "{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]);
++        }
++        Address::V6(bytes) => {
++            for (index, pair) in bytes.chunks_exact(2).enumerate() {
++                let _ = write!(out, "{}{:x}", if index == 0 { "" } else { ":" }, u16::from_be_bytes([pair[0], pair[1]]));
++            }
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Action {
++    Allow,
++    Deny,
++    Reject,
++    Limit,
++}
++
++impl Action {
++    fn name(self) -> &'static str {
++        match self {
++            Action::Allow => "allow",
++            Action::Deny => "deny",
++            Action::Reject => "reject",
++            Action::Limit => "limit",
++        }
++    }
++
++    fn parse(text: &str) -> Option<Self> {
++        [Action::Allow, Action::Deny, Action::Reject, Action::Limit].into_iter().find(|action| action.name() == text)
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Protocol {
++    Any,
++    Tcp,
++    Udp,
++}
++
++impl Protocol {
++    fn name(self) -> &'static str {
++        match self {
++            Protocol::Any => "any",
++            Protocol::Tcp => "tcp",
++            Protocol::Udp => "udp",
++        }
++    }
++}
++
++/// A rule: what to do with new connections or datagrams of a protocol to
++/// a range of ports, from a network (or from anywhere).
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Rule {
++    pub action: Action,
++    pub protocol: Protocol,
++    pub ports: (u16, u16),
++    /// The network's address and the length of its prefix.
++    pub from: Option<(Address, u8)>,
++}
++
++impl Rule {
++    fn matches(&self, tcp: bool, port: u16, source: &Address) -> bool {
++        let protocol = match self.protocol {
++            Protocol::Any => true,
++            Protocol::Tcp => tcp,
++            Protocol::Udp => !tcp,
++        };
++        protocol
++            && (self.ports.0..=self.ports.1).contains(&port)
++            && self.from.as_ref().is_none_or(|(network, prefix)| in_network(source, network, *prefix))
++    }
++}
++
++fn in_network(address: &Address, network: &Address, prefix: u8) -> bool {
++    let (address, network) = (address.bytes(), network.bytes());
++    if address.len() != network.len() {
++        return false;
++    }
++    let whole = usize::from(prefix / 8);
++    if address[..whole] != network[..whole] {
++        return false;
++    }
++    let bits = prefix % 8;
++    bits == 0 || (address[whole] ^ network[whole]) >> (8 - bits) == 0
++}
++
++/// The rules and what happens to what none of them matches.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Ruleset {
++    /// Allow, deny or reject.
++    pub default: Action,
++    pub rules: Vec<Rule>,
++}
++
++impl Ruleset {
++    /// Reads the rules' text: `None` for an empty one (the firewall off),
++    /// an error for anything it does not know.
++    pub fn parse(text: &str) -> Result<Option<Self>, ()> {
++        let mut default = None;
++        let mut rules = Vec::new();
++        for line in text.lines() {
++            let mut words = line.split(' ');
++            match words.next() {
++                Some("") if line.is_empty() => continue,
++                Some("default") => {
++                    let action = words.next().and_then(Action::parse).filter(|action| *action != Action::Limit).ok_or(())?;
++                    if default.replace(action).is_some() {
++                        return Err(());
++                    }
++                }
++                Some("rule") => {
++                    let action = words.next().and_then(Action::parse).ok_or(())?;
++                    let protocol = match words.next().ok_or(())? {
++                        "any" => Protocol::Any,
++                        "tcp" => Protocol::Tcp,
++                        "udp" => Protocol::Udp,
++                        _ => return Err(()),
++                    };
++                    let mut port = || {
++                        let word = words.next()?;
++                        (!word.is_empty() && word.len() <= 5 && word.bytes().all(|digit| digit.is_ascii_digit())).then(|| word.parse::<u16>().ok())?.filter(|port| *port != 0)
++                    };
++                    let ports = (port().ok_or(())?, port().ok_or(())?);
++                    if ports.0 > ports.1 {
++                        return Err(());
++                    }
++                    let from = match words.next().ok_or(())? {
++                        "any" => None,
++                        network => {
++                            let (address, prefix) = match network.split_once('/') {
++                                Some((address, prefix)) => {
++                                    let valid = !prefix.is_empty() && prefix.len() <= 3 && prefix.bytes().all(|digit| digit.is_ascii_digit());
++                                    (address, Some(valid.then(|| prefix.parse::<u8>().ok()).flatten().ok_or(())?))
++                                }
++                                None => (network, None),
++                            };
++                            let address = Address::parse(address).ok_or(())?;
++                            let bits = (address.bytes().len() * 8) as u8;
++                            let prefix = prefix.unwrap_or(bits);
++                            if prefix > bits {
++                                return Err(());
++                            }
++                            Some((address, prefix))
++                        }
++                    };
++                    if rules.len() >= MAX_RULES {
++                        return Err(());
++                    }
++                    rules.push(Rule { action, protocol, ports, from });
++                }
++                _ => return Err(()),
++            }
++            if words.next().is_some() {
++                return Err(());
++            }
++        }
++        match default {
++            Some(default) => Ok(Some(Self { default, rules })),
++            None if rules.is_empty() => Ok(None),
++            None => Err(()),
++        }
++    }
++
++    /// The rules as their text.
++    pub fn text(&self) -> String {
++        let mut out = format!("default {}\n", self.default.name());
++        for rule in &self.rules {
++            out.push_str(&format!("rule {} {} {} {} ", rule.action.name(), rule.protocol.name(), rule.ports.0, rule.ports.1));
++            match &rule.from {
++                None => out.push_str("any"),
++                Some((address, prefix)) => {
++                    write_address(&mut out, address);
++                    out.push_str(&format!("/{prefix}"));
++                }
++            }
++            out.push('\n');
++        }
++        out
++    }
++}
++
++/// What becomes of a connection request or a datagram.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Verdict {
++    Accept,
++    /// Ignored, without a word.
++    Drop,
++    /// Refused: the sender is told.
++    Reject,
++}
++
++/// The firewall in force: its rules, and what it remembers of the
++/// traffic to apply them.
++#[derive(Debug)]
++pub struct Firewall {
++    ruleset: Ruleset,
++    /// The addresses the host sent datagrams to, from which local port,
++    /// and when last.
++    flows: BTreeMap<(u16, Address, u16), u64>,
++    /// For each limiting rule and address: when its last connections came.
++    limited: BTreeMap<(usize, Address), VecDeque<u64>>,
++}
++
++impl Firewall {
++    pub fn new(ruleset: Ruleset) -> Self {
++        Self { ruleset, flows: BTreeMap::new(), limited: BTreeMap::new() }
++    }
++
++    pub fn ruleset(&self) -> &Ruleset {
++        &self.ruleset
++    }
++
++    fn judge(&mut self, tcp: bool, port: u16, source: &Address, now_ms: u64) -> Verdict {
++        let found = self.ruleset.rules.iter().enumerate().find(|(_, rule)| rule.matches(tcp, port, source));
++        let action = found.map_or(self.ruleset.default, |(_, rule)| rule.action);
++        match action {
++            Action::Allow => Verdict::Accept,
++            Action::Deny => Verdict::Drop,
++            Action::Reject => Verdict::Reject,
++            Action::Limit => {
++                let index = found.map_or(0, |(index, _)| index);
++                if self.limited.len() >= MAX_LIMITED && !self.limited.contains_key(&(index, *source)) {
++                    self.limited.retain(|_, times| times.back().is_some_and(|last| now_ms < last + LIMIT_MS));
++                    if self.limited.len() >= MAX_LIMITED {
++                        // Too many addresses knocking at once: none is let in.
++                        return Verdict::Drop;
++                    }
++                }
++                let times = self.limited.entry((index, *source)).or_default();
++                while times.front().is_some_and(|first| now_ms >= first + LIMIT_MS) {
++                    times.pop_front();
++                }
++                if times.len() >= LIMIT_COUNT {
++                    return Verdict::Drop;
++                }
++                times.push_back(now_ms);
++                Verdict::Accept
++            }
++        }
++    }
++
++    /// A request for a new TCP connection to `port`.
++    pub fn tcp_connection(&mut self, source: &Address, port: u16, now_ms: u64) -> Verdict {
++        self.judge(true, port, source, now_ms)
++    }
++
++    /// A datagram to `port` from `source`'s `source_port`.
++    pub fn udp_datagram(&mut self, source: &Address, source_port: u16, port: u16, now_ms: u64) -> Verdict {
++        if self.flows.get(&(port, *source, source_port)).is_some_and(|last| now_ms < last + FLOW_MS) {
++            return Verdict::Accept;
++        }
++        self.judge(false, port, source, now_ms)
++    }
++
++    /// The host sent a datagram from `port` to `remote`: its answers pass.
++    pub fn udp_sent(&mut self, port: u16, remote: &Address, remote_port: u16, now_ms: u64) {
++        if self.flows.len() >= MAX_FLOWS && !self.flows.contains_key(&(port, *remote, remote_port)) {
++            self.flows.retain(|_, last| now_ms < *last + FLOW_MS);
++            if self.flows.len() >= MAX_FLOWS {
++                // More live flows than fit: the oldest goes.
++                if let Some(oldest) = self.flows.iter().min_by_key(|(_, last)| **last).map(|(key, _)| *key) {
++                    self.flows.remove(&oldest);
++                }
++            }
++        }
++        self.flows.insert((port, *remote, remote_port), now_ms);
++    }
++}
+diff --git a/kernel/libs/aster-bigtcp/src/iface/mod.rs b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+index 6eca72f..5711e3f 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/mod.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+@@ -2,6 +2,7 @@
+ 
+ mod common;
+ mod dhcp;
++pub mod firewall;
+ #[expect(clippy::module_inception)]
+ mod iface;
+ mod packet_slice;
+@@ -49,6 +50,69 @@ pub(crate) fn frame_tap() -> Option<fn(u32, &[u8])> {
+ static FRAME_TAP: spin::Once<fn(u32, &[u8])> = spin::Once::new();
+ static TAPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+ 
++/// The firewall in force, if it is on (`firewall`).
++static FIREWALL: ostd::sync::SpinLock<Option<firewall::Firewall>, ostd::sync::LocalIrqDisabled> = ostd::sync::SpinLock::new(None);
++/// Whether it is on: read before every judgement, without the lock.
++static FIREWALL_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++/// Puts the rules of `text` in force (an empty text: the firewall off).
++/// Nothing changes if the text is not a set of rules.
++pub fn set_firewall(text: &str) -> Result<(), ()> {
++    let ruleset = firewall::Ruleset::parse(text)?;
++    let mut current = FIREWALL.lock();
++    FIREWALL_ON.store(ruleset.is_some(), core::sync::atomic::Ordering::Release);
++    *current = ruleset.map(firewall::Firewall::new);
++    Ok(())
++}
++
++/// The rules in force, as their text (empty: the firewall is off).
++pub fn firewall_text() -> alloc::string::String {
++    FIREWALL.lock().as_ref().map(|firewall| firewall.ruleset().text()).unwrap_or_default()
++}
++
++fn firewall_address(address: smoltcp::wire::IpAddress) -> firewall::Address {
++    match address {
++        smoltcp::wire::IpAddress::Ipv4(address) => firewall::Address::V4(address.octets()),
++        smoltcp::wire::IpAddress::Ipv6(address) => firewall::Address::V6(address.octets()),
++    }
++}
++
++fn firewall_now() -> u64 {
++    time::get_network_timestamp().total_millis() as u64
++}
++
++/// What becomes of a request for a new TCP connection from elsewhere.
++pub(crate) fn firewall_tcp(source: smoltcp::wire::IpAddress, port: u16) -> firewall::Verdict {
++    if !FIREWALL_ON.load(core::sync::atomic::Ordering::Acquire) {
++        return firewall::Verdict::Accept;
++    }
++    match FIREWALL.lock().as_mut() {
++        Some(firewall) => firewall.tcp_connection(&firewall_address(source), port, firewall_now()),
++        None => firewall::Verdict::Accept,
++    }
++}
++
++/// What becomes of a UDP datagram from elsewhere.
++pub(crate) fn firewall_udp(source: smoltcp::wire::IpAddress, source_port: u16, port: u16) -> firewall::Verdict {
++    if !FIREWALL_ON.load(core::sync::atomic::Ordering::Acquire) {
++        return firewall::Verdict::Accept;
++    }
++    match FIREWALL.lock().as_mut() {
++        Some(firewall) => firewall.udp_datagram(&firewall_address(source), source_port, port, firewall_now()),
++        None => firewall::Verdict::Accept,
++    }
++}
++
++/// The host sent a UDP datagram to elsewhere: the answers pass.
++pub(crate) fn firewall_udp_sent(port: u16, remote: smoltcp::wire::IpAddress, remote_port: u16) {
++    if !FIREWALL_ON.load(core::sync::atomic::Ordering::Acquire) {
++        return;
++    }
++    if let Some(firewall) = FIREWALL.lock().as_mut() {
++        firewall.udp_sent(port, &firewall_address(remote), remote_port, firewall_now());
++    }
++}
++
+ pub(crate) fn bump_config_generation() {
+     CONFIG_GENERATION.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+ }
+diff --git a/kernel/libs/aster-bigtcp/src/iface/poll.rs b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+index fa57e09..744665e 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/poll.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+@@ -13,6 +13,7 @@ use smoltcp::{
+ 
+ use super::{
+     common::{IfaceCounters, PhyProcessResult, PollPhy, TxPacketWithDst},
++    firewall::Verdict,
+     packet_slice::PacketSlice,
+     poll_iface::PollableIfaceMut,
+     wire::{
+@@ -244,8 +245,20 @@ impl<E: Ext> PollContext<'_, E> {
+ 
+         // Process packets that request to create new connections second.
+         if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none() {
++            // The firewall judges the requests from elsewhere, not the
++            // host's own: one it denies gets no answer, one it rejects
++            // the reset a closed port gives.
++            let verdict = if self.iface.context().is_unicast_local(ip_repr.src_addr()) {
++                Verdict::Accept
++            } else {
++                super::firewall_tcp(ip_repr.src_addr(), tcp_repr.dst_port)
++            };
++            if verdict == Verdict::Drop {
++                return None;
++            }
+             let listener_key = ListenerKey::new(ip_repr.dst_addr(), tcp_repr.dst_port);
+-            if let Some(listener) = self.sockets.lookup_listener(&listener_key) {
++            let listener = self.sockets.lookup_listener(&listener_key);
++            if let Some(listener) = listener.filter(|_| verdict == Verdict::Accept) {
+                 let (processed, new_tcp_conn) =
+                     listener.process(&mut self.iface, ip_repr, tcp_repr, payload.clone());
+ 
+@@ -288,7 +301,18 @@ impl<E: Ext> PollContext<'_, E> {
+         // Parse the UDP header. Ignore the packet if the header is ill-formed.
+         let (packet, udp_repr) = udp::parse(packet, &ip_repr.inner, verify_checksum)?;
+ 
+-        if !self.process_udp(&ip_repr.inner, &udp_repr, packet.reader().into()) {
++        // The firewall judges the datagrams from elsewhere: one it denies
++        // is ignored, one it rejects gets what a closed port answers.
++        let verdict = if self.iface.context().is_unicast_local(ip_repr.inner.src_addr()) {
++            Verdict::Accept
++        } else {
++            super::firewall_udp(ip_repr.inner.src_addr(), udp_repr.src_port, udp_repr.dst_port)
++        };
++        if verdict == Verdict::Drop {
++            return None;
++        }
++
++        if verdict == Verdict::Reject || !self.process_udp(&ip_repr.inner, &udp_repr, packet.reader().into()) {
+             return self.generate_icmp_unreachable(
+                 phy,
+                 &ip_repr.inner,
+@@ -425,6 +449,9 @@ impl<E: Ext> PollContext<'_, E> {
+     ) -> Option<TxPacketWithDst> {
+         let checksum_caps = self.iface.context().checksum_caps();
+ 
++        // Whoever the host writes to may answer through the firewall.
++        super::firewall_udp_sent(udp_repr.src_port, ip_repr.dst_addr(), udp_repr.dst_port);
++
+         let packet = Self::copy_payload(phy, payload)?;
+         let packet = udp::emit(packet, ip_repr, udp_repr, checksum_caps.udp.tx());
+         let packet = ip::emit(packet, ip_repr, checksum_caps.ipv4.tx());
