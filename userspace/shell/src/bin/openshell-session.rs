@@ -141,6 +141,32 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
 struct Mounter;
 
 impl Mounter {
+    /// An NTFS volume: ntfs-3g mounts it (FUSE) with CAP_SYS_ADMIN, as
+    /// Debian's `mount.ntfs-3g` does as root, and serves it in the
+    /// background until it is unmounted (the kernel then ends its
+    /// connection and it writes what it kept and leaves).
+    fn serve_ntfs(source: &str, target: &Path, options: &str) -> io::Result<()> {
+        let mut status = Err(io::Error::from(io::ErrorKind::Other));
+        Self::with_admin(|| {
+            status = Command::new(drives::NTFS_SERVER)
+                .arg(source)
+                .arg(target)
+                .arg("-o")
+                .arg(options)
+                .env_clear()
+                .env("PATH", "/opt/openshell-compat/bin:/bin:/usr/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            0
+        })?;
+        match status? {
+            exit if exit.success() => Ok(()),
+            exit => Err(io::Error::other(format!("ntfs-3g could not mount the volume ({exit})"))),
+        }
+    }
+
     fn with_admin(call: impl FnOnce() -> i32) -> io::Result<()> {
         let raised = set_capabilities(KEPT_CAPABILITIES | HELD_CAPABILITIES).is_ok();
         let result = if call() == 0 { Ok(()) } else { Err(io::Error::last_os_error()) };
@@ -153,6 +179,9 @@ impl Mounter {
 
 impl MountOps for Mounter {
     fn mount(&mut self, source: &str, target: &Path, fstype: &str, flags: u64, data: &str) -> io::Result<()> {
+        if fstype == drives::NTFS_TYPE {
+            return Self::serve_ntfs(source, target, data);
+        }
         let source = c_path(Path::new(source))?;
         let target = c_path(target)?;
         let fstype = std::ffi::CString::new(fstype).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;

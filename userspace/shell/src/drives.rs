@@ -186,12 +186,22 @@ fn exfat_label(boot: &[u8], read_at: &mut dyn FnMut(u64, &mut [u8]) -> bool) -> 
     Some(String::from_utf16_lossy(&units))
 }
 
+/// The program that serves NTFS volumes (through FUSE), as Debian mounts
+/// them with `mount.ntfs-3g`.
+pub const NTFS_SERVER: &str = "/opt/openshell-compat/bin/ntfs-3g";
+
+/// The "filesystem type" of a volume a program serves: [`MountOps::mount`]
+/// runs [`NTFS_SERVER`], which mounts it and serves it until it is unmounted.
+pub const NTFS_TYPE: &str = "ntfs-3g";
+
 /// The filesystem type the kernel mounts a volume as, with its options.
 pub fn mount_type(volume: &Volume, uid: u32, gid: u32) -> Result<(&'static str, String), String> {
     match volume.fstype.as_str() {
         // udisks2's options: the files the user's, not shown to others.
         "vfat" => Ok(("vfat", format!("uid={uid},gid={gid},dmask=0077,fmask=0177,shortname=mixed,utf8,flush"))),
         "exfat" => Ok(("exfat", format!("uid={uid},gid={gid},dmask=0077,fmask=0177"))),
+        // udisks2's for ntfs-3g: names Windows can read back.
+        "ntfs" => Ok((NTFS_TYPE, format!("uid={uid},gid={gid},dmask=0077,fmask=0177,windows_names"))),
         "ext2" => Ok(("ext2", String::new())),
         "" => Err("the drive holds no file system that can be read".into()),
         other => Err(format!("{other} drives cannot be opened yet")),
@@ -619,7 +629,9 @@ mod tests {
         let unnamed = Volume { fstype: "vfat".into(), ..Default::default() };
         assert_eq!(mount_folder(media, &unnamed, "/dev/sdb", &|_| false), Path::new("/media/ana/sdb"));
         assert!(mount_type(&volume, 1000, 1000).unwrap().1.contains("uid=1000"));
-        assert!(mount_type(&Volume { fstype: "ntfs".into(), ..Default::default() }, 0, 0).is_err());
+        let ntfs = mount_type(&Volume { fstype: "ntfs".into(), ..Default::default() }, 1000, 1000).unwrap();
+        assert_eq!(ntfs, (NTFS_TYPE, "uid=1000,gid=1000,dmask=0077,fmask=0177,windows_names".to_owned()));
+        assert!(mount_type(&Volume { fstype: "btrfs".into(), ..Default::default() }, 0, 0).is_err());
         assert_eq!(valid_device("/dev/sda1"), Some("sda1"));
         assert_eq!(valid_device("/dev/../etc"), None);
         assert_eq!(valid_device("/etc/passwd"), None);

@@ -156,6 +156,63 @@ let
             ignoreCollisions = true;
           };
         };
+        # NTFS drives (Windows disks, many USB drives), as Debian opens
+        # them: ntfs-3g through the kernel's FUSE (/dev/fuse); the
+        # supervisor runs it when Files opens such a drive (drives.rs).
+        ntfs = pkgs.ntfs3g;
+        # Service discovery (mDNS/DNS-SD), as on Live: the D-Bus system bus
+        # and Avahi, which installed-session.sh starts; CUPS's tools find
+        # the network's printers through them (Settings ▸ Printers).
+        discovery = {
+          avahi = pkgs.avahi;
+          # Names on the local network (<name>.local, a printer's), as
+          # Debian's libnss-mdns resolves them: glibc asks the name service
+          # daemon (nsncd, as NixOS runs it), the one program that loads
+          # nss-mdns, which asks Avahi.
+          nss = pkgs.nssmdns;
+          nameService = pkgs.nsncd;
+          nsswitch = pkgs.writeText "nsswitch.conf" ''
+            passwd: files
+            group: files
+            shadow: files
+            hosts: files mdns4_minimal [NOTFOUND=return] dns
+            networks: files
+            protocols: files
+            services: files
+            ethers: files
+            rpc: files
+          '';
+          # The system bus's settings: the package's, without the include of
+          # /etc/dbus-1/system.conf (this file is that one) and without
+          # syslog (there is none); policies come from /etc/dbus-1/system.d.
+          busConfig = pkgs.runCommand "openshell-dbus-system" { } ''
+            mkdir -p "$out/etc/dbus-1"
+            sed -e '\|<include ignore_missing="yes">/etc/dbus-1/system.conf</include>|d' \
+                -e '/<syslog\/>/d' -e '/<fork\/>/d' \
+              ${pkgs.dbus}/share/dbus-1/system.conf > "$out/etc/dbus-1/system.conf"
+            grep -q '<includedir>/etc/dbus-1/system.d</includedir>' "$out/etc/dbus-1/system.conf"
+          '';
+          # Debian's defaults: no IPv6 (the kernel has none yet), the host
+          # name published, its hardware and workstation not.
+          avahiConfig = pkgs.writeText "avahi-daemon.conf" ''
+            [server]
+            use-ipv4=yes
+            use-ipv6=no
+            ratelimit-interval-usec=1000000
+            ratelimit-burst=1000
+
+            [wide-area]
+            enable-wide-area=no
+
+            [publish]
+            publish-hinfo=no
+            publish-workstation=no
+
+            [reflector]
+
+            [rlimits]
+          '';
+        };
         # The session's X server (probes/openshell-x.sh): Xorg with the
         # modesetting driver on the kernel's DRM device, the evdev driver,
         # and Xvfb where there is no screen.
@@ -164,6 +221,7 @@ let
           export OPENSHELL_XORG_MODULES=${pkgs.xorg-server}/lib/xorg/modules,${pkgs.xf86-input-evdev}/lib/xorg/modules
           export OPENSHELL_XORG_FONTS=${pkgs.font-misc-misc}/share/fonts/X11/misc,${pkgs.font-cursor-misc}/share/fonts/X11/misc
           export OPENSHELL_XVFB=${pkgs.xvfb}/bin/Xvfb
+          export OPENSHELL_CONSOLE_PYTHON=${python}/bin/python3
           ${builtins.readFile (probes + "/openshell-x.sh")}
         '';
         # Match the Desktop's CSS and the font families shipped by OpenShell Live.
@@ -515,6 +573,9 @@ let
       ++ [ graphics.sound.pulseaudio graphics.sound.alsaUtils graphics.sound.asoundConf ]
       ++ [ graphics.wireless.supplicant graphics.wireless.firmware ]
       ++ [ graphics.remote.vnc graphics.remote.ssh graphics.printing.cups graphics.printing.programs ]
+      ++ [ pkgs.dbus graphics.discovery.avahi graphics.discovery.busConfig graphics.discovery.avahiConfig ]
+      ++ [ graphics.discovery.nss graphics.discovery.nameService graphics.discovery.nsswitch ]
+      ++ [ graphics.ntfs ]
     )
     ++ lib.optionals (apps != null) apps.packages
     ++ lib.optionals (wine != null) ([ wine.package wine.runner ] ++ lib.optional (!media) wine.probe)
@@ -613,6 +674,8 @@ let
       for program in sshd ssh-keygen; do
         ln -s ${graphics.remote.ssh}/bin/$program "$out/opt/openshell-compat/bin/"
       done
+      # The PAM modules the server's configuration names (installed-session.sh).
+      ln -s ${pkgs.linux-pam}/lib/security "$out/opt/openshell-compat/pam"
       # Printing (graphics.printing): the scheduler, the tools hostd runs,
       # and the tree of filters and backends installed-session.sh names in
       # the scheduler's configuration.
@@ -622,6 +685,21 @@ let
         ln -s "$program_path" "$out/opt/openshell-compat/bin/"
       done
       ln -s ${graphics.printing.programs} "$out/opt/openshell-compat/cups"
+      # Service discovery (graphics.discovery): the system bus with Avahi's
+      # policy, and Avahi's settings where it reads them.
+      for program in ${pkgs.dbus}/bin/dbus-daemon ${pkgs.dbus}/bin/dbus-uuidgen \
+          ${graphics.discovery.avahi}/bin/avahi-daemon ${graphics.discovery.avahi}/bin/avahi-browse; do
+        ln -sf "$program" "$out/opt/openshell-compat/bin/"
+      done
+      mkdir -p "$out/etc/dbus-1/system.d" "$out/etc/avahi/services"
+      ln -s ${graphics.discovery.busConfig}/etc/dbus-1/system.conf "$out/etc/dbus-1/system.conf"
+      ln -s ${graphics.discovery.avahi}/share/dbus-1/system.d/avahi-dbus.conf "$out/etc/dbus-1/system.d/"
+      ln -s ${graphics.discovery.avahiConfig} "$out/etc/avahi/avahi-daemon.conf"
+      ln -sf ${graphics.discovery.nameService}/bin/nsncd "$out/opt/openshell-compat/bin/"
+      ln -s ${graphics.discovery.nss}/lib "$out/opt/openshell-compat/nss"
+      ln -sfn ${graphics.discovery.nsswitch} "$out/etc/nsswitch.conf"
+      # NTFS drives (graphics.ntfs): the FUSE server the supervisor runs.
+      ln -s ${graphics.ntfs}/bin/ntfs-3g "$out/opt/openshell-compat/bin/"
       ln -s /etc/fonts/fonts.conf "$out/opt/openshell-compat/fonts.conf"
       ln -s ${pkgs.openbox}/etc/xdg "$out/opt/openshell-compat/xdg"
       install -m 0644 ${probes}/cef-smoke.mjs ${probes}/shell-smoke.mjs ${probes}/session-smoke.mjs ${probes}/linux-sandbox.mjs "$out/opt/openshell-compat/"
@@ -632,7 +710,7 @@ let
       for program in ${apps.xpra}/bin/xpra ${pkgs.dbus}/bin/dbus-run-session ${pkgs.dbus}/bin/dbus-daemon \
           ${lib.optionalString (!media) "${apps.gtkProbe}/bin/openshell-gtk-probe ${apps.qtProbe}/bin/openshell-qt-probe"} \
           ${pkgs.xsettingsd}/bin/xsettingsd ${pkgs.xrdb}/bin/xrdb; do
-        ln -s "$program" "$out/opt/openshell-compat/bin/"
+        ln -sf "$program" "$out/opt/openshell-compat/bin/"
       done
       # The upstream root comes from the store, read-only.
       chmod u+w "$out" "$out/etc"

@@ -1,0 +1,71 @@
+diff --git a/kernel/comps/drm/src/file.rs b/kernel/comps/drm/src/file.rs
+index 8acc5d0..bcef6b2 100644
+--- a/kernel/comps/drm/src/file.rs
++++ b/kernel/comps/drm/src/file.rs
+@@ -316,10 +316,25 @@ impl FileOps for DrmFile {
+     fn read_at(
+         &self,
+         _offset: usize,
+-        _writer: &mut VmWriter,
+-        _status_flags: StatusFlags,
++        writer: &mut VmWriter,
++        status_flags: StatusFlags,
+     ) -> Result<usize> {
+-        return_errno_with_message!(Errno::EINVAL, "reading from a DRM file is not supported")
++        // A DRM file is read for its events (vertical blanks, finished page
++        // flips). This driver produces none, so a read finds the event list
++        // empty, as Linux's does when nothing was asked for: it fails with
++        // `EAGAIN` with `O_NONBLOCK`, and waits (until a signal) without it.
++        // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/gpu/drm/drm_file.c#L555>.
++        if writer.avail() == 0 {
++            return Ok(0);
++        }
++        let no_event = || -> Result<usize> {
++            return_errno_with_message!(Errno::EAGAIN, "there is no DRM event to read")
++        };
++        if status_flags.contains(StatusFlags::O_NONBLOCK) {
++            no_event()
++        } else {
++            self.wait_events(IoEvents::IN, None, no_event)
++        }
+     }
+ 
+     fn write_at(
+@@ -334,8 +349,12 @@ impl FileOps for DrmFile {
+ 
+ impl Pollable for DrmFile {
+     fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+-        let events = IoEvents::IN | IoEvents::OUT;
+-        events & mask
++        // Always writable, and readable only with an event waiting (never,
++        // see `read_at`). Saying readable made Xorg, which waits on the
++        // device for events, wake at once, fail to read and wait again: one
++        // processor busy all the time.
++        // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/gpu/drm/drm_file.c#L645>.
++        IoEvents::OUT & mask
+     }
+ }
+ 
+diff --git a/kernel/core/src/net/socket/ip/stream/connected.rs b/kernel/core/src/net/socket/ip/stream/connected.rs
+index cb51ee7..1064f32 100644
+--- a/kernel/core/src/net/socket/ip/stream/connected.rs
++++ b/kernel/core/src/net/socket/ip/stream/connected.rs
+@@ -113,12 +113,18 @@ impl ConnectedStream {
+         reader: &mut dyn MultiRead,
+         _flags: SendFlags,
+     ) -> Result<(usize, NeedIfacePoll)> {
++        let is_empty = reader.is_empty();
+         let result = self
+             .tcp_conn
+             .send(|socket_buffer| reader.read(&mut VmWriter::from(socket_buffer)));
+ 
+         match result {
+             Ok((sent_bytes, need_poll)) => Ok((sent_bytes.get(), need_poll)),
++            // Writing nothing to a connection that can still send succeeds
++            // with zero bytes, as on Linux (`tcp_sendmsg` copies nothing and
++            // returns 0). `EAGAIN` here made Node, which writes empty buffers,
++            // wait for room, be told there is room, and write again forever.
++            Err(IoError::NoProgress) if is_empty => Ok((0, NeedIfacePoll::FALSE)),
+             Err(IoError::NoProgress) => {
+                 return_errno_with_message!(Errno::EAGAIN, "the send buffer is full")
+             }

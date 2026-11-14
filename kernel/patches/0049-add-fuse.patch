@@ -1,0 +1,1433 @@
+diff --git a/kernel/core/comps/virtio/src/device/filesystem/device/channel.rs b/kernel/core/comps/virtio/src/device/filesystem/device/channel.rs
+new file mode 100755
+index 0000000..09bb3bf
+--- /dev/null
++++ b/kernel/core/comps/virtio/src/device/filesystem/device/channel.rs
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! A FUSE connection whose server runs in user space (`/dev/fuse`).
++//!
++//! The server's file is the device the requests go to: the server reads
++//! each request whole and writes each reply whole, in any order; a request
++//! that has no reply (`FUSE_FORGET`) ends once it is read. When the file is
++//! closed, the requests still waiting end with `ENOTCONN`, as do the later
++//! ones, and the mount answers so until it is taken away.
++
++use alloc::{
++    boxed::Box,
++    collections::{BTreeMap, VecDeque},
++    vec,
++    vec::Vec,
++};
++
++use aster_fuse::{FuseError, ReplyHeader};
++use ostd::{
++    mm::{Fallible, FallibleVmRead, FallibleVmWrite, VmReader, VmWriter},
++    sync::{LocalIrqDisabled, SpinLock},
++};
++use spin::Once;
++
++use super::request::FuseRequest;
++
++/// `ENOTCONN`, as FUSE replies carry errors (negated).
++const ENOTCONN: i32 = 107;
++/// `EIO`.
++const EIO: i32 = 5;
++
++/// The longest reply a server may write (a `FUSE_READ` of the largest size
++/// this side asks for, with room to spare).
++const MAX_REPLY_LEN: usize = 4 << 20;
++
++/// A connection to a FUSE server in user space.
++pub struct FuseChannel {
++    state: SpinLock<ChannelState, LocalIrqDisabled>,
++    /// Told when a request waits to be read, or the connection ends (the
++    /// file's readers wake).
++    on_change: Once<Box<dyn Fn() + Send + Sync>>,
++}
++
++struct ChannelState {
++    /// Requests the server has not read yet, oldest first.
++    pending: VecDeque<FuseRequest>,
++    /// Requests read and waiting for their reply, by their unique ID.
++    in_flight: BTreeMap<u64, FuseRequest>,
++    aborted: bool,
++}
++
++/// Why a read or a write of the server's file failed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ChannelError {
++    /// No request is waiting (`EAGAIN`).
++    Empty,
++    /// The connection ended (`ENODEV`).
++    Aborted,
++    /// The buffer cannot hold the request (`EINVAL`); the request failed.
++    TooSmall,
++    /// The reply is malformed or too long (`EINVAL`).
++    Invalid,
++    /// No request waits for this reply (`ENOENT`).
++    UnknownRequest,
++    /// The user buffer could not be accessed (`EFAULT`).
++    Fault,
++}
++
++impl FuseChannel {
++    pub(super) fn new() -> Self {
++        Self {
++            state: SpinLock::new(ChannelState {
++                pending: VecDeque::new(),
++                in_flight: BTreeMap::new(),
++                aborted: false,
++            }),
++            on_change: Once::new(),
++        }
++    }
++
++    /// Sets what is told when a request waits or the connection ends.
++    pub fn set_on_change(&self, notify: Box<dyn Fn() + Send + Sync>) {
++        self.on_change.call_once(|| notify);
++    }
++
++    fn notify(&self) {
++        if let Some(notify) = self.on_change.get() {
++            notify();
++        }
++    }
++
++    /// Queues a request for the server.
++    pub(super) fn push(&self, request: FuseRequest) -> Result<(), FuseError> {
++        {
++            let mut state = self.state.lock();
++            if state.aborted {
++                drop(state);
++                request.fail(-ENOTCONN);
++                return Err(FuseError::RemoteError(-ENOTCONN));
++            }
++            state.pending.push_back(request);
++        }
++        self.notify();
++        Ok(())
++    }
++
++    /// Whether a request waits to be read.
++    pub fn has_request(&self) -> bool {
++        !self.state.lock().pending.is_empty()
++    }
++
++    /// Whether the connection ended.
++    pub fn is_aborted(&self) -> bool {
++        self.state.lock().aborted
++    }
++
++    /// Writes the oldest request into `writer`, whole.
++    pub fn read_request(&self, writer: &mut VmWriter<'_, Fallible>) -> Result<usize, ChannelError> {
++        let request = {
++            let mut state = self.state.lock();
++            if state.aborted {
++                return Err(ChannelError::Aborted);
++            }
++            let Some(request) = state.pending.pop_front() else {
++                return Err(ChannelError::Empty);
++            };
++            request
++        };
++
++        // The request's bytes: its header and arguments, then the data of a
++        // write.
++        let mut bytes = vec![0u8; request.request_len()];
++        let mut at = 0;
++        for buf in request.request_bufs() {
++            at += buf
++                .device_reader()
++                .read(&mut VmWriter::from(&mut bytes[at..]));
++        }
++        bytes.truncate(at);
++
++        // As Linux: a buffer too small fails the request.
++        if writer.avail() < bytes.len() {
++            request.fail(-EIO);
++            return Err(ChannelError::TooSmall);
++        }
++        if writer.write_fallible(&mut VmReader::from(&bytes[..])).is_err() {
++            request.fail(-EIO);
++            return Err(ChannelError::Fault);
++        }
++
++        if request.expects_reply() {
++            let mut state = self.state.lock();
++            if state.aborted {
++                drop(state);
++                request.fail(-ENOTCONN);
++            } else {
++                state.in_flight.insert(request.unique().as_u64(), request);
++            }
++        } else {
++            request.finish_reply(0);
++        }
++        Ok(bytes.len())
++    }
++
++    /// Takes a reply from `reader` (a header, then the payload) and ends its
++    /// request with it.
++    pub fn write_reply(&self, reader: &mut VmReader<'_, Fallible>) -> Result<usize, ChannelError> {
++        let total = reader.remain();
++        if total < size_of::<ReplyHeader>() || total > MAX_REPLY_LEN {
++            return Err(ChannelError::Invalid);
++        }
++        let mut bytes = vec![0u8; total];
++        reader
++            .read_fallible(&mut VmWriter::from(&mut bytes[..]))
++            .map_err(|_| ChannelError::Fault)?;
++        let header: ReplyHeader = VmReader::from(&bytes[..])
++            .read_val()
++            .map_err(|_| ChannelError::Invalid)?;
++        if header.len() as usize != total {
++            return Err(ChannelError::Invalid);
++        }
++        // A notification (unique 0): none is asked for, so it is let pass.
++        let unique = header.unique().as_u64();
++        if unique == 0 {
++            return Ok(total);
++        }
++
++        let Some(request) = self.state.lock().in_flight.remove(&unique) else {
++            return Err(ChannelError::UnknownRequest);
++        };
++
++        let reply_bufs = request.waiter().reply_bufs();
++        let Ok(header_buf) = reply_bufs.reply_header_buf() else {
++            request.fail(-EIO);
++            return Err(ChannelError::Invalid);
++        };
++        header_buf
++            .device_writer()
++            .write(&mut VmReader::from(&bytes[..size_of::<ReplyHeader>()]));
++        let mut payload = &bytes[size_of::<ReplyHeader>()..];
++        for buf in reply_bufs.payload_bufs() {
++            if payload.is_empty() {
++                break;
++            }
++            let written = buf.device_writer().write(&mut VmReader::from(payload));
++            payload = &payload[written..];
++        }
++        if !payload.is_empty() {
++            // Longer than what the request has room for.
++            request.fail(-EIO);
++            return Err(ChannelError::Invalid);
++        }
++
++        request.finish_reply(total);
++        Ok(total)
++    }
++
++    /// Ends the connection (the server's file closed): every request that
++    /// waits, and every later one, fails with `ENOTCONN`.
++    pub fn abort(&self) {
++        let (pending, in_flight) = {
++            let mut state = self.state.lock();
++            state.aborted = true;
++            (
++                core::mem::take(&mut state.pending),
++                core::mem::take(&mut state.in_flight),
++            )
++        };
++        let failed: Vec<FuseRequest> = pending.into_iter().chain(in_flight.into_values()).collect();
++        for request in failed {
++            request.fail(-ENOTCONN);
++        }
++        self.notify();
++    }
++}
+diff --git a/kernel/core/comps/virtio/src/device/filesystem/device/mod.rs b/kernel/core/comps/virtio/src/device/filesystem/device/mod.rs
+index 67528e6..1afd3ce 100644
+--- a/kernel/core/comps/virtio/src/device/filesystem/device/mod.rs
++++ b/kernel/core/comps/virtio/src/device/filesystem/device/mod.rs
+@@ -6,6 +6,7 @@
+ //! queues, tracks in-flight requests, and sends typed FUSE operations to the
+ //! server.
+ 
++mod channel;
+ mod queue;
+ mod request;
+ mod session;
+@@ -31,7 +32,10 @@ use request::{FuseRequest, RequestBufs};
+ use spin::Once;
+ use waiter::{FuseWaiter, ReplyBufs};
+ 
+-pub use self::session::{AttrVersion, FuseSession};
++pub use self::{
++    channel::{ChannelError, FuseChannel},
++    session::{AttrVersion, FuseSession},
++};
+ use crate::{
+     device::filesystem::{
+         pool,
+@@ -65,9 +69,13 @@ static FILESYSTEM_DEVICES: Once<SpinLock<Vec<Arc<FileSystemDevice>>, LocalIrqDis
+ /// guards. The request path takes virtio-fs locks in this order:
+ /// VFS sleepable guard -> selected request queue `SpinLock`.
+ pub struct FileSystemDevice {
+-    transport: SpinLock<DeviceTransport, LocalIrqDisabled>,
+-    hiprio_queue: Arc<FsRequestQueue>,
++    /// The virtio transport; none for a server in user space.
++    transport: Option<SpinLock<DeviceTransport, LocalIrqDisabled>>,
++    hiprio_queue: Option<Arc<FsRequestQueue>>,
+     request_queues: Vec<Arc<FsRequestQueue>>,
++    /// The connection to a server in user space (`/dev/fuse`), which takes
++    /// the requests instead of the queues.
++    channel: Option<Arc<FuseChannel>>,
+     to_device_pool: VirtiofsDmaPool<ToDevice>,
+     from_device_pool: VirtiofsDmaPool<FromDevice>,
+     next_unique: AtomicU64,
+@@ -86,9 +94,10 @@ impl FileSystemDevice {
+         let (to_device_arena_pool, from_device_arena_pool) = pool::dma_arena_pools_singleton();
+ 
+         Self {
+-            transport: SpinLock::new(transport),
+-            hiprio_queue,
++            transport: Some(SpinLock::new(transport)),
++            hiprio_queue: Some(hiprio_queue),
+             request_queues,
++            channel: None,
+             to_device_pool: VirtiofsDmaPool::new(to_device_arena_pool),
+             from_device_pool: VirtiofsDmaPool::new(from_device_arena_pool),
+             // Start request IDs at 1 and keep 0 unused. In FUSE,
+@@ -100,6 +109,37 @@ impl FileSystemDevice {
+         }
+     }
+ 
++    /// A device whose requests go to a FUSE server in user space, through
++    /// the returned channel (`/dev/fuse`).
++    pub fn new_channel() -> Arc<Self> {
++        let (to_device_arena_pool, from_device_arena_pool) = pool::dma_arena_pools_singleton();
++        Arc::new(Self {
++            transport: None,
++            hiprio_queue: None,
++            request_queues: Vec::new(),
++            channel: Some(Arc::new(FuseChannel::new())),
++            to_device_pool: VirtiofsDmaPool::new(to_device_arena_pool),
++            from_device_pool: VirtiofsDmaPool::new(from_device_arena_pool),
++            next_unique: AtomicU64::new(1),
++            tag: String::from("fuse"),
++            notify_supported: false,
++        })
++    }
++
++    /// The connection to the server in user space, if the device is one.
++    pub fn channel(&self) -> Option<&Arc<FuseChannel>> {
++        self.channel.as_ref()
++    }
++
++    /// Submits a request without a reply on the high-priority path.
++    fn submit_hiprio(&self, request: FuseRequest) -> Result<(), FuseError> {
++        match (&self.channel, &self.hiprio_queue) {
++            (Some(channel), _) => channel.push(request),
++            (None, Some(queue)) => queue.add_request(request),
++            (None, None) => Err(FuseError::MalformedResponse),
++        }
++    }
++
+     /// Submits a FUSE operation and returns a waiter for request completion.
+     ///
+     /// # Locking
+@@ -117,6 +157,10 @@ impl FileSystemDevice {
+         let request = self.prepare_request(nodeid, operation, data_bufs, complete_fn)?;
+         let waiter = request.waiter().clone();
+ 
++        if let Some(channel) = &self.channel {
++            channel.push(request)?;
++            return Ok(waiter);
++        }
+         let queue = self.select_request_queue(request.nodeid());
+         self.submit(queue, request)?;
+ 
+@@ -124,7 +168,9 @@ impl FileSystemDevice {
+     }
+ 
+     fn init_completion_taskless(&self) {
+-        self.hiprio_queue.init_completion_taskless();
++        if let Some(hiprio_queue) = &self.hiprio_queue {
++            hiprio_queue.init_completion_taskless();
++        }
+ 
+         for queue in &self.request_queues {
+             queue.init_completion_taskless();
+diff --git a/kernel/core/comps/virtio/src/device/filesystem/device/request.rs b/kernel/core/comps/virtio/src/device/filesystem/device/request.rs
+index e7a5797..9d7e9ce 100644
+--- a/kernel/core/comps/virtio/src/device/filesystem/device/request.rs
++++ b/kernel/core/comps/virtio/src/device/filesystem/device/request.rs
+@@ -71,6 +71,31 @@ impl FuseRequest {
+         self.waiter.wake_completed(completion);
+     }
+ 
++    /// Ends the request with the error `error` (negated, as FUSE replies
++    /// carry it) without a reply: the server's connection ended.
++    pub(super) fn fail(mut self, error: i32) {
++        let completion = FuseCompletion::RemoteError(error);
++        if let Some(complete_fn) = self.complete_fn.take() {
++            complete_fn(completion);
++        }
++        self.waiter.wake_completed(completion);
++    }
++
++    /// The request's unique ID, which its reply carries.
++    pub(super) fn unique(&self) -> FuseUnique {
++        self.unique
++    }
++
++    /// The length of the request: its header, arguments and data.
++    pub(super) fn request_len(&self) -> usize {
++        self.request_bufs.iter().map(FuseRequestBuf::len).sum()
++    }
++
++    /// Whether the server answers the request (`FUSE_FORGET` it does not).
++    pub(super) fn expects_reply(&self) -> bool {
++        !self.waiter.reply_bufs().is_empty()
++    }
++
+     /// Returns the FUSE node ID used to choose the request queue.
+     pub(super) fn nodeid(&self) -> FuseNodeId {
+         self.nodeid
+diff --git a/kernel/core/comps/virtio/src/device/filesystem/device/session.rs b/kernel/core/comps/virtio/src/device/filesystem/device/session.rs
+index 3bdc248..e8bade5 100644
+--- a/kernel/core/comps/virtio/src/device/filesystem/device/session.rs
++++ b/kernel/core/comps/virtio/src/device/filesystem/device/session.rs
+@@ -22,7 +22,8 @@ use aster_fuse::{
+         write::{WriteOperation, WriteReq},
+     },
+ };
+-use ostd::{info, mm::io::util::HasVmReaderWriter};
++use ostd::{info, mm::io::util::HasVmReaderWriter, sync::SpinLock};
++use spin::Once;
+ use smallvec::smallvec;
+ 
+ use super::{super::DEVICE_NAME, FileSystemDevice, FuseWaiter};
+@@ -40,6 +41,16 @@ pub struct FuseSession {
+     device: Arc<FileSystemDevice>,
+     /// Attribute cache version shared by all inodes in this session.
+     attr_version: AtomicU64,
++    /// What `FUSE_INIT` settled, once its reply came (`None`: it failed).
++    init: Once<Option<InitInfo>>,
++    /// The `FUSE_INIT` request a server in user space has not answered yet
++    /// ([`Self::new_deferred`]).
++    pending_init: SpinLock<Option<Arc<FuseWaiter>>>,
++}
++
++/// What `FUSE_INIT` settled.
++#[derive(Clone, Copy, Debug)]
++struct InitInfo {
+     /// The maximum write size accepted by the server.
+     max_write: u32,
+     /// The feature flags selected by `FUSE_INIT`.
+@@ -65,12 +76,19 @@ impl FuseSession {
+         let init_reply = waiter.parse_reply::<InitOperation>(payload_len)?;
+ 
+         let max_write = init_reply.max_write().max(MIN_MAX_WRITE);
++        let init = Once::new();
++        init.call_once(|| {
++            Some(InitInfo {
++                max_write,
++                negotiated_flags: init_reply.flags(),
++                negotiated_flags2: init_reply.flags2(),
++            })
++        });
+         let session = Arc::new(Self {
+             device,
+             attr_version: AtomicU64::new(1),
+-            max_write,
+-            negotiated_flags: init_reply.flags(),
+-            negotiated_flags2: init_reply.flags2(),
++            init,
++            pending_init: SpinLock::new(None),
+         });
+ 
+         info!(
+@@ -83,9 +101,9 @@ impl FuseSession {
+             init_reply.major(),
+             init_reply.minor(),
+             requested_flags.bits(),
+-            session.negotiated_flags.bits(),
++            init_reply.flags().bits(),
+             init_reply.flags2().bits(),
+-            session.max_write,
++            max_write,
+             init_reply.max_readahead(),
+             init_reply.time_gran(),
+             init_reply.max_pages(),
+@@ -95,6 +113,71 @@ impl FuseSession {
+         Ok(session)
+     }
+ 
++    /// Starts a session with a FUSE server in user space: `FUSE_INIT` is
++    /// sent and its reply awaited by the first operation, as the server
++    /// starts reading only after the mount returns (Linux's
++    /// `fuse_send_init`).
++    pub fn new_deferred(device: Arc<FileSystemDevice>) -> Result<Arc<Self>, FuseError> {
++        let mut operation = InitOperation::new(InitReq::new(
++            FUSE_KERNEL_VERSION,
++            FUSE_KERNEL_MINOR_VERSION,
++            0,
++            Self::init_flags(),
++            FuseInitFlags2::empty(),
++        ));
++        let waiter = device.submit_fuse_op(FUSE_ROOT_ID, &mut operation, None, None)?;
++        Ok(Arc::new(Self {
++            device,
++            attr_version: AtomicU64::new(1),
++            init: Once::new(),
++            pending_init: SpinLock::new(Some(waiter)),
++        }))
++    }
++
++    /// What `FUSE_INIT` settled, waiting for its reply if it has not come.
++    fn init_info(&self) -> Result<InitInfo, FuseError> {
++        // A session that never got its answer behaves as one whose server
++        // went away.
++        let failed = || FuseError::RemoteError(-107);
++        if let Some(info) = self.init.get() {
++            return (*info).ok_or_else(failed);
++        }
++        let Some(waiter) = self.pending_init.lock().clone() else {
++            return Err(failed());
++        };
++        let info = waiter
++            .wait()
++            .payload_len()
++            .and_then(|payload_len| waiter.parse_reply::<InitOperation>(payload_len))
++            .ok()
++            .map(|init_reply| InitInfo {
++                max_write: init_reply.max_write().max(MIN_MAX_WRITE),
++                negotiated_flags: init_reply.flags() & Self::init_flags(),
++                negotiated_flags2: init_reply.flags2(),
++            });
++        (*self.init.call_once(|| info)).ok_or_else(failed)
++    }
++
++    /// Ends the connection to a server in user space (the mount went
++    /// away): its reads fail with `ENODEV`, and libfuse ends the file
++    /// system (its `destroy`, where ntfs-3g writes what it kept), as when
++    /// Linux unmounts a FUSE mount.
++    pub fn abort(&self) {
++        if let Some(channel) = self.device.channel() {
++            channel.abort();
++        }
++    }
++
++    /// Whether `FUSE_INIT` was answered and succeeded, without waiting.
++    pub fn is_initialized(&self) -> bool {
++        self.init.get().is_some_and(Option::is_some)
++    }
++
++    /// Whether `FUSE_INIT` was answered and succeeded (requests may go).
++    pub fn is_ready(&self) -> bool {
++        self.init_info().is_ok()
++    }
++
+     /// Sends one FUSE operation and waits for the typed reply.
+     ///
+     /// # Locking
+@@ -106,6 +189,7 @@ impl FuseSession {
+         nodeid: FuseNodeId,
+         mut operation: Op,
+     ) -> Result<Op::Output, FuseError> {
++        self.init_info()?;
+         let waiter = self
+             .device
+             .submit_fuse_op(nodeid, &mut operation, None, None)?;
+@@ -145,17 +229,23 @@ impl FuseSession {
+ 
+     /// Returns the FUSE feature flags selected after negotiation.
+     pub fn negotiated_flags(&self) -> FuseInitFlags {
+-        self.negotiated_flags
++        self.init_info()
++            .map(|info| info.negotiated_flags)
++            .unwrap_or(FuseInitFlags::empty())
+     }
+ 
+     /// Returns the extended FUSE feature flags selected after negotiation.
+     pub fn negotiated_flags2(&self) -> FuseInitFlags2 {
+-        self.negotiated_flags2
++        self.init_info()
++            .map(|info| info.negotiated_flags2)
++            .unwrap_or(FuseInitFlags2::empty())
+     }
+ 
+     /// Returns the maximum write size accepted by the server.
+     pub fn max_write(&self) -> u32 {
+-        self.max_write
++        self.init_info()
++            .map(|info| info.max_write)
++            .unwrap_or(MIN_MAX_WRITE)
+     }
+ 
+     fn init_flags() -> FuseInitFlags {
+@@ -197,6 +287,7 @@ impl FuseSession {
+         data_bufs: FuseReplyBufs,
+         complete_fn: Option<FuseCompleteFn>,
+     ) -> Result<Arc<FuseWaiter>, FuseError> {
++        self.init_info()?;
+         let mut operation = ReadOperation::new(read_request);
+         self.device.submit_fuse_op(
+             nodeid,
+@@ -213,6 +304,7 @@ impl FuseSession {
+         read_request: ReadReq,
+         data_buf: FuseReplyBuf,
+     ) -> Result<Vec<FuseDirEntry>, FuseError> {
++        self.init_info()?;
+         let mut operation = ReaddirOperation::new(read_request);
+         let waiter = self.device.submit_fuse_op(
+             nodeid,
+@@ -230,6 +322,7 @@ impl FuseSession {
+ 
+     /// Sends a `FUSE_READLINK` request and waits for the reply.
+     pub fn readlink(&self, nodeid: FuseNodeId) -> Result<String, FuseError> {
++        self.init_info()?;
+         let data_buf = self.alloc_read_buf(MAX_READLINK_LEN)?;
+         let mut operation = ReadlinkOperation;
+         let waiter = self.device.submit_fuse_op(
+@@ -276,6 +369,7 @@ impl FuseSession {
+         data_bufs: FuseRequestBufs,
+         complete_fn: Option<FuseCompleteFn>,
+     ) -> Result<Arc<FuseWaiter>, FuseError> {
++        self.init_info()?;
+         let mut operation = WriteOperation::new(write_request);
+         self.device.submit_fuse_op(
+             nodeid,
+@@ -291,7 +385,7 @@ impl FuseSession {
+     /// response, so this method only submits the request and never waits for
+     /// completion.
+     pub fn forget(&self, nodeid: FuseNodeId, nlookup: u64) -> Result<(), FuseError> {
+-        if nodeid == FUSE_ROOT_ID || nlookup == 0 {
++        if nodeid == FUSE_ROOT_ID || nlookup == 0 || self.init_info().is_err() {
+             return Ok(());
+         }
+ 
+@@ -299,8 +393,7 @@ impl FuseSession {
+         let request = self
+             .device
+             .prepare_request(nodeid, &mut operation, None, None)?;
+-        self.device
+-            .submit(self.device.hiprio_queue.as_ref(), request)?;
++        self.device.submit_hiprio(request)?;
+ 
+         Ok(())
+     }
+diff --git a/kernel/core/comps/virtio/src/device/filesystem/device/virtio_ops.rs b/kernel/core/comps/virtio/src/device/filesystem/device/virtio_ops.rs
+index 1809134..0888b2d 100644
+--- a/kernel/core/comps/virtio/src/device/filesystem/device/virtio_ops.rs
++++ b/kernel/core/comps/virtio/src/device/filesystem/device/virtio_ops.rs
+@@ -39,12 +39,12 @@ impl FileSystemDevice {
+     }
+ 
+     /// Initializes one virtio-fs device from its virtio transport.
+-    pub(crate) fn init(mut device_transport: DeviceTransport) -> Result<(), VirtioDeviceError> {
+-        let config_manager = VirtioFsConfig::new_manager(device_transport.as_ref());
++    pub(crate) fn init(mut devicetransport: DeviceTransport) -> Result<(), VirtioDeviceError> {
++        let config_manager = VirtioFsConfig::new_manager(devicetransport.as_ref());
+         let config = config_manager.read_config();
+ 
+         let negotiated_features = FileSystemFeatures::from_bits_truncate(Self::negotiate_features(
+-            device_transport.read_device_features(),
++            devicetransport.read_device_features(),
+         ));
+         let notify_supported = negotiated_features.contains(FileSystemFeatures::NOTIFICATION);
+         // Queue layout:
+@@ -53,7 +53,7 @@ impl FileSystemDevice {
+         // - Remaining queues: request queues.
+         let request_queue_start_idx = if notify_supported { 2 } else { 1 };
+ 
+-        let total_queues = device_transport.num_queues();
++        let total_queues = devicetransport.num_queues();
+         if total_queues <= request_queue_start_idx {
+             return Err(VirtioDeviceError::UnsupportedConfig);
+         }
+@@ -71,7 +71,7 @@ impl FileSystemDevice {
+         let device = {
+             let hiprio_queue = FsRequestQueue::new(Self::new_queue(
+                 HIPRIO_QUEUE_INDEX,
+-                device_transport.as_mut(),
++                devicetransport.as_mut(),
+             )?);
+ 
+             let mut request_queues = Vec::with_capacity(request_queue_count);
+@@ -79,12 +79,12 @@ impl FileSystemDevice {
+                 let queue_index = request_queue_start_idx + idx as u16;
+                 request_queues.push(FsRequestQueue::new(Self::new_queue(
+                     queue_index,
+-                    device_transport.as_mut(),
++                    devicetransport.as_mut(),
+                 )?));
+             }
+ 
+             Arc::new(Self::new(
+-                device_transport,
++                devicetransport,
+                 hiprio_queue,
+                 request_queues,
+                 config.parse_tag().to_string(),
+@@ -96,7 +96,7 @@ impl FileSystemDevice {
+         device.init_completion_taskless();
+ 
+         // Register configuration callback.
+-        let mut transport = device.transport.lock();
++        let mut transport = device.transport.as_ref().unwrap().lock();
+         transport.register_cfg_callback(Box::new(|_: &TrapFrame| {
+             debug!("Virtio-FS device configuration space changed");
+         }))?;
+@@ -105,7 +105,7 @@ impl FileSystemDevice {
+         let hiprio_queue_callback = {
+             let device = device.clone();
+             move |_: &TrapFrame| {
+-                device.handle_queue_irq(device.hiprio_queue.as_ref());
++                device.handle_queue_irq(device.hiprio_queue.as_ref().unwrap());
+             }
+         };
+         transport.register_queue_callback(
+diff --git a/kernel/core/comps/virtio/src/device/filesystem/pool.rs b/kernel/core/comps/virtio/src/device/filesystem/pool.rs
+index 49d29f5..f93fc22 100644
+--- a/kernel/core/comps/virtio/src/device/filesystem/pool.rs
++++ b/kernel/core/comps/virtio/src/device/filesystem/pool.rs
+@@ -147,6 +147,13 @@ impl FuseRequestBuf {
+         self.0.as_ref()
+     }
+ 
++    /// The request as its device reads it (`/dev/fuse`'s server).
++    pub(crate) fn device_reader(&self) -> VmReader<'_, Infallible> {
++        let mut reader = self.0.mem_obj().device_reader();
++        reader.skip(self.0.offset().start).limit(self.len());
++        reader
++    }
++
+     /// Synchronizes the whole buffer from memory to the device.
+     pub(crate) fn sync_to_device(&self) -> Result<()> {
+         self.0.mem_obj().sync_to_device(self.0.offset().clone())
+@@ -173,6 +180,13 @@ pub struct FuseReplyBuf(Arc<Slice<DmaBuffer<FromDevice>>>);
+ pub type FuseReplyBufs = SmallVec<[FuseReplyBuf; 1]>;
+ 
+ impl FuseReplyBuf {
++    /// The reply as its device writes it (`/dev/fuse`'s server).
++    pub(crate) fn device_writer(&self) -> VmWriter<'_, Infallible> {
++        let mut writer = self.0.mem_obj().device_writer();
++        writer.skip(self.0.offset().start).limit(DmaBuf::len(self.0.as_ref()));
++        writer
++    }
++
+     /// Maps `segment` as a DMA buffer for FUSE reply payloads.
+     pub fn new_map(segment: USegment) -> Result<Self> {
+         let len = segment.size();
+diff --git a/kernel/core/src/device/misc/fuse.rs b/kernel/core/src/device/misc/fuse.rs
+new file mode 100755
+index 0000000..052444d
+--- /dev/null
++++ b/kernel/core/src/device/misc/fuse.rs
+@@ -0,0 +1,226 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `/dev/fuse`: file systems served by a program (FUSE).
++//!
++//! Each open of the device is a connection: the program mounts a `fuse`
++//! (or `fuseblk`) file system naming the open file (`fd=N`), then reads the
++//! kernel's requests from it and writes its replies, as with Linux's FUSE
++//! (libfuse 2 and 3: ntfs-3g, sshfs, rclone, AppImages...). The protocol
++//! and the inodes are virtio-fs's; only the transport differs.
++
++use aster_virtio::device::filesystem::device::{ChannelError, FileSystemDevice};
++use alloc::collections::BTreeMap;
++
++use device_id::{DeviceId, MinorId};
++use ostd::mm::FallibleVmRead;
++
++use crate::{
++    device::{Device, DeviceType, registry::char},
++    events::IoEvents,
++    fs::{
++        devtmpfs::DevtmpfsNodeMeta,
++        file::{InodeHandle, PerOpenFileOps, StatusFlags, mkmod},
++        vfs::inode::FileOps,
++    },
++    prelude::*,
++    process::{
++        posix_thread::AsPosixThread,
++        signal::{PollHandle, Pollable, Pollee},
++    },
++};
++
++/// `/dev/fuse`'s minor number (misc devices, major 10), as on Linux.
++const FUSE_MINOR: u32 = 229;
++
++#[derive(Debug)]
++struct FuseDevice {
++    id: DeviceId,
++}
++
++impl Device for FuseDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        self.id
++    }
++
++    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
++        // Everyone's, as on Linux: mounting stays root's (or fusermount's).
++        Some(DevtmpfsNodeMeta::with_mode("fuse", mkmod!(a+rw)).unwrap())
++    }
++
++    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        Ok(Box::new(FuseConnectionFile::new()))
++    }
++}
++
++/// One open of `/dev/fuse`: a connection to the program serving a mount.
++pub(crate) struct FuseConnectionFile {
++    device: Arc<FileSystemDevice>,
++    pollee: Pollee,
++    /// Replies that arrive in pieces, by thread: `writev` hands the file
++    /// one buffer at a time, and libfuse writes a reply's header and its
++    /// payload in separate ones. Linux's device takes the whole array as one
++    /// message; here a thread's pieces are joined until the reply's length
++    /// (in its header) is complete.
++    partial_replies: Mutex<BTreeMap<u32, Vec<u8>>>,
++}
++
++impl FuseConnectionFile {
++    fn new() -> Self {
++        let device = FileSystemDevice::new_channel();
++        let pollee = Pollee::new();
++        let notified = pollee.clone();
++        device
++            .channel()
++            .unwrap()
++            .set_on_change(Box::new(move || notified.notify(IoEvents::IN)));
++        Self {
++            device,
++            pollee,
++            partial_replies: Mutex::new(BTreeMap::new()),
++        }
++    }
++
++    fn check_io_events(&self) -> IoEvents {
++        let channel = self.device.channel().unwrap();
++        let mut events = IoEvents::OUT;
++        if channel.has_request() {
++            events |= IoEvents::IN;
++        }
++        if channel.is_aborted() {
++            events |= IoEvents::IN | IoEvents::ERR;
++        }
++        events
++    }
++}
++
++impl Pollable for FuseConnectionFile {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        self.pollee
++            .poll_with(mask, poller, || self.check_io_events())
++    }
++}
++
++fn channel_error(error: ChannelError) -> Error {
++    match error {
++        ChannelError::Empty => Error::with_message(Errno::EAGAIN, "no FUSE request waits"),
++        ChannelError::Aborted => Error::with_message(Errno::ENODEV, "the FUSE connection ended"),
++        ChannelError::TooSmall => {
++            Error::with_message(Errno::EINVAL, "the buffer cannot hold the FUSE request")
++        }
++        ChannelError::Invalid => Error::with_message(Errno::EINVAL, "the FUSE reply is malformed"),
++        ChannelError::UnknownRequest => {
++            Error::with_message(Errno::ENOENT, "no FUSE request waits for this reply")
++        }
++        ChannelError::Fault => Error::with_message(Errno::EFAULT, "the buffer cannot be accessed"),
++    }
++}
++
++impl FileOps for FuseConnectionFile {
++    fn read_at(
++        &self,
++        _offset: usize,
++        writer: &mut VmWriter,
++        status_flags: StatusFlags,
++    ) -> Result<usize> {
++        let channel = self.device.channel().unwrap();
++        let mut try_read = || {
++            let result = channel.read_request(writer).map_err(channel_error);
++            self.pollee.invalidate();
++            result
++        };
++        if status_flags.contains(StatusFlags::O_NONBLOCK) {
++            try_read()
++        } else {
++            self.wait_events(IoEvents::IN, None, try_read)
++        }
++    }
++
++    fn write_at(
++        &self,
++        _offset: usize,
++        reader: &mut VmReader,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        /// The longest reply taken (as the channel's own limit).
++        const MAX_REPLY_LEN: usize = 4 << 20;
++        /// The bytes of `fuse_out_header`.
++        const HEADER_LEN: usize = 16;
++
++        let piece_len = reader.remain();
++        let tid = current_thread!().as_posix_thread().unwrap().tid();
++        let message = {
++            let mut partial_replies = self.partial_replies.lock();
++            let pending = partial_replies.entry(tid).or_default();
++            if pending.len() + piece_len > MAX_REPLY_LEN {
++                partial_replies.remove(&tid);
++                return_errno_with_message!(Errno::EINVAL, "the FUSE reply is too long");
++            }
++            let start = pending.len();
++            pending.resize(start + piece_len, 0);
++            if reader
++                .read_fallible(&mut VmWriter::from(&mut pending[start..]))
++                .is_err()
++            {
++                partial_replies.remove(&tid);
++                return_errno_with_message!(Errno::EFAULT, "the reply cannot be read");
++            }
++            if pending.len() < HEADER_LEN {
++                return Ok(piece_len);
++            }
++            let declared = u32::from_ne_bytes(pending[..4].try_into().unwrap()) as usize;
++            if pending.len() < declared {
++                return Ok(piece_len);
++            }
++            partial_replies.remove(&tid).unwrap()
++        };
++
++        self.device
++            .channel()
++            .unwrap()
++            .write_reply(&mut VmReader::from(&message[..]).to_fallible())
++            .map_err(channel_error)?;
++        Ok(piece_len)
++    }
++}
++
++impl PerOpenFileOps for FuseConnectionFile {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno_with_message!(Errno::ESPIPE, "/dev/fuse is not seekable")
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++}
++
++impl Drop for FuseConnectionFile {
++    /// The program closed its connection: the mount's requests fail with
++    /// `ENOTCONN` from now on, as on Linux.
++    fn drop(&mut self) {
++        self.device.channel().unwrap().abort();
++    }
++}
++
++/// The FUSE connection that the file descriptor `fd` (from a mount's
++/// `fd=` option) opened.
++pub(crate) fn connection_of_fd(fd: i32, ctx: &crate::context::Context) -> Result<Arc<FileSystemDevice>> {
++    let file = {
++        let file_table = ctx.thread_local.borrow_file_table();
++        let file_table = file_table.unwrap().read();
++        file_table.get_file(fd.try_into()?)?.clone()
++    };
++    file.downcast_ref::<InodeHandle>()
++        .and_then(|handle| handle.downcast_open_file::<FuseConnectionFile>().ok().flatten())
++        .map(|connection| connection.device.clone())
++        .ok_or_else(|| Error::with_message(Errno::EINVAL, "the file is not a /dev/fuse connection"))
++}
++
++pub(super) fn init_in_first_kthread() {
++    let major = super::MISC_MAJOR.get().unwrap().get();
++    let id = DeviceId::new(major, MinorId::new(FUSE_MINOR));
++    char::register(Arc::new(FuseDevice { id })).unwrap();
++}
+diff --git a/kernel/core/src/device/misc/mod.rs b/kernel/core/src/device/misc/mod.rs
+index aa0e0e6..1257c9d 100644
+--- a/kernel/core/src/device/misc/mod.rs
++++ b/kernel/core/src/device/misc/mod.rs
+@@ -9,6 +9,7 @@ use spin::Once;
+ 
+ use super::registry::char::{MajorIdOwner, acquire_major};
+ 
++pub(crate) mod fuse;
+ mod hwrng;
+ #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
+ pub(crate) mod tdxguest;
+@@ -19,6 +20,7 @@ pub(super) fn init_in_first_kthread() {
+     MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
+ 
+     hwrng::init_in_first_kthread();
++    fuse::init_in_first_kthread();
+ 
+     #[cfg(target_arch = "x86_64")]
+     ostd::if_tdx_enabled!({
+diff --git a/kernel/core/src/fs/fs_impls/virtiofs/fs.rs b/kernel/core/src/fs/fs_impls/virtiofs/fs.rs
+index f58f59f..7e83b3f 100644
+--- a/kernel/core/src/fs/fs_impls/virtiofs/fs.rs
++++ b/kernel/core/src/fs/fs_impls/virtiofs/fs.rs
+@@ -24,9 +24,14 @@ use crate::{
+     prelude::*,
+ };
+ 
+-/// Filesystem magic reported for virtio-fs in `statfs`.
++/// Filesystem magic reported for virtio-fs and FUSE in `statfs` (Linux's
++/// `FUSE_SUPER_MAGIC`).
+ const VIRTIOFS_MAGIC: u64 = 0x6573_5546;
+ 
++/// How long a FUSE mount's `statfs` answer is reused (its server is asked
++/// again after that).
++const FUSE_STATFS_TTL_MS: u64 = 2000;
++
+ /// Block size reported to `statfs` for virtio-fs.
+ const BLOCK_SIZE: usize = 4096;
+ 
+@@ -76,9 +81,96 @@ impl FsType for VirtioFsType {
+     }
+ }
+ 
++/// The `fuse` and `fuseblk` filesystem types: a server in user space,
++/// through `/dev/fuse` (`crate::device::misc::fuse`).
++pub(super) struct FuseFsType {
++    name: &'static str,
++}
++
++pub(super) static FUSE_TYPE: FuseFsType = FuseFsType { name: "fuse" };
++pub(super) static FUSEBLK_TYPE: FuseFsType = FuseFsType { name: "fuseblk" };
++
++/// The options a FUSE mount needs, as libfuse writes them (`fd=`,
++/// `rootmode=`, `user_id=`, `group_id=`); the others are accepted.
++struct FuseMountOptions {
++    fd: i32,
++    root_mode: u32,
++    user_id: u32,
++    group_id: u32,
++}
++
++impl FuseMountOptions {
++    fn parse(args: &str) -> Result<Self> {
++        let (mut fd, mut root_mode, mut user_id, mut group_id) = (None, None, None, None);
++        for option in args.split(',') {
++            let Some((key, value)) = option.split_once('=') else {
++                continue;
++            };
++            let invalid = || Error::with_message(Errno::EINVAL, "a FUSE mount option is invalid");
++            match key {
++                "fd" => fd = Some(value.parse::<i32>().map_err(|_| invalid())?),
++                "rootmode" => root_mode = Some(u32::from_str_radix(value, 8).map_err(|_| invalid())?),
++                "user_id" => user_id = Some(value.parse::<u32>().map_err(|_| invalid())?),
++                "group_id" => group_id = Some(value.parse::<u32>().map_err(|_| invalid())?),
++                _ => {}
++            }
++        }
++        match (fd, root_mode, user_id, group_id) {
++            (Some(fd), Some(root_mode), Some(user_id), Some(group_id)) => Ok(Self {
++                fd,
++                root_mode,
++                user_id,
++                group_id,
++            }),
++            _ => return_errno_with_message!(
++                Errno::EINVAL,
++                "a FUSE mount needs fd, rootmode, user_id and group_id"
++            ),
++        }
++    }
++}
++
++impl FsType for FuseFsType {
++    type Key = String;
++
++    fn name(&self) -> &'static str {
++        self.name
++    }
++
++    fn properties(&self) -> FsProperties {
++        FsProperties::empty()
++    }
++
++    fn create(&self, fs_creation_ctx: &mut FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
++        let options = FuseMountOptions::parse(fs_creation_ctx.args().unwrap_or(""))?;
++        let ctx = fs_creation_ctx
++            .ctx()
++            .ok_or_else(|| Error::with_message(Errno::EINVAL, "a FUSE mount needs a process"))?;
++        let device = crate::device::misc::fuse::connection_of_fd(options.fd, ctx)?;
++        let source = fs_creation_ctx.source().unwrap_or(self.name).to_string();
++        Ok(VirtioFs::new_fuse(device, source, self.name, &options)? as Arc<dyn FileSystem>)
++    }
++
++    fn obtain_key_and_cache(
++        &self,
++        _fs_creation_ctx: &mut FsCreationCtx,
++    ) -> Option<(String, &FsCache<String>)> {
++        // Every FUSE mount is a file system of its own.
++        None
++    }
++
++    fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
++        None
++    }
++}
++
+ /// A mounted virtio-fs filesystem.
+ pub(super) struct VirtioFs {
+-    sb: SuperBlock,
++    sb: Mutex<SuperBlock>,
++    /// The type's name: `virtiofs`, `fuse` or `fuseblk`.
++    kind: &'static str,
++    /// When the server last answered `statfs` (a FUSE mount), in ms.
++    statfs_at: core::sync::atomic::AtomicU64,
+     root: Arc<VirtioFsInode>,
+     tag: String,
+     session: Arc<FuseSession>,
+@@ -113,7 +205,9 @@ impl VirtioFs {
+             let inode_cache = InodeCache::new(&root);
+ 
+             Self {
+-                sb,
++                sb: Mutex::new(sb),
++                kind: "virtiofs",
++                statfs_at: core::sync::atomic::AtomicU64::new(0),
+                 root,
+                 tag,
+                 session,
+@@ -123,13 +217,52 @@ impl VirtioFs {
+         }))
+     }
+ 
++    /// A FUSE mount: the server answers `FUSE_INIT` once the mount returned
++    /// and it reads its requests, so nothing is asked now. The root's
++    /// attributes come from the mount options until the first look at it
++    /// asks the server, as on Linux (`fuse_get_root_inode`).
++    fn new_fuse(
++        device: Arc<FileSystemDevice>,
++        source: String,
++        kind: &'static str,
++        options: &FuseMountOptions,
++    ) -> Result<Arc<Self>> {
++        let session = FuseSession::new_deferred(device)?;
++
++        let anon_device_id = AnonDeviceId::acquire().expect("no device ID is available for FUSE");
++        let container_dev_id = anon_device_id.id();
++        let sb = SuperBlock::new(VIRTIOFS_MAGIC, BLOCK_SIZE, NAME_MAX, container_dev_id);
++        let root_entry = fuse_root_entry(options);
++
++        Ok(Arc::new_cyclic(|weak_fs| {
++            let root = VirtioFsInode::new_root(
++                root_entry,
++                weak_fs.clone(),
++                container_dev_id,
++                session.bump_attr_version(),
++            );
++            let inode_cache = InodeCache::new(&root);
++
++            Self {
++                sb: Mutex::new(sb),
++                kind,
++                statfs_at: core::sync::atomic::AtomicU64::new(0),
++                root,
++                tag: source,
++                session,
++                inode_cache,
++                fs_event_subscriber_stats: FsEventSubscriberStats::new(),
++            }
++        }))
++    }
++
+     pub(super) fn session(&self) -> &Arc<FuseSession> {
+         &self.session
+     }
+ 
+     /// Returns the device ID of this virtio-fs mount.
+     pub(super) fn container_device_id(&self) -> DeviceId {
+-        self.sb.container_dev_id
++        self.sb.lock().container_dev_id
+     }
+ 
+     /// Reads an inode from a FUSE entry reply via the inode cache.
+@@ -156,6 +289,32 @@ impl VirtioFs {
+     }
+ }
+ 
++/// The root's entry of a FUSE mount before the server is asked: node 1,
++/// the type and owner the mount options give, attributes valid for no time.
++fn fuse_root_entry(options: &FuseMountOptions) -> EntryReply {
++    let mut bytes = [0u8; size_of::<EntryReply>()];
++    let mut put = |at: usize, value: &[u8]| bytes[at..at + value.len()].copy_from_slice(value);
++    // `fuse_entry_out`: nodeid, generation, entry_valid, attr_valid, their
++    // nanoseconds, then `fuse_attr` from offset 40.
++    put(0, &FUSE_ROOT_ID.as_u64().to_ne_bytes());
++    put(40, &1u64.to_ne_bytes()); // ino
++    put(40 + 60, &options.root_mode.to_ne_bytes()); // mode
++    put(40 + 64, &2u32.to_ne_bytes()); // nlink
++    put(40 + 68, &options.user_id.to_ne_bytes()); // uid
++    put(40 + 72, &options.group_id.to_ne_bytes()); // gid
++    put(40 + 80, &(BLOCK_SIZE as u32).to_ne_bytes()); // blksize
++    EntryReply::from_bytes(&bytes)
++}
++
++impl Drop for VirtioFs {
++    /// A FUSE mount went away: its server hears it (see `FuseSession::abort`).
++    fn drop(&mut self) {
++        if self.kind != "virtiofs" {
++            self.session.abort();
++        }
++    }
++}
++
+ impl From<(DeviceId, Kstatfs)> for SuperBlock {
+     fn from((container_dev_id, statfs): (DeviceId, Kstatfs)) -> Self {
+         let mut sb = SuperBlock::new(VIRTIOFS_MAGIC, BLOCK_SIZE, NAME_MAX, container_dev_id);
+@@ -174,7 +333,7 @@ impl From<(DeviceId, Kstatfs)> for SuperBlock {
+ 
+ impl FileSystem for VirtioFs {
+     fn name(&self) -> &'static str {
+-        "virtiofs"
++        self.kind
+     }
+ 
+     fn source(&self) -> Option<&str> {
+@@ -191,7 +350,24 @@ impl FileSystem for VirtioFs {
+     }
+ 
+     fn sb(&self) -> SuperBlock {
+-        self.sb.clone()
++        // A FUSE server's space changes as it is used: asked again now and
++        // then (never before it answered `FUSE_INIT`, so as not to wait for
++        // it while it still mounts).
++        if self.kind != "virtiofs" && self.session.is_initialized() {
++            use core::sync::atomic::Ordering;
++            let now = crate::time::clocks::MonotonicCoarseClock::get()
++                .read_time()
++                .as_millis() as u64;
++            let last = self.statfs_at.load(Ordering::Relaxed);
++            if last == 0 || now.saturating_sub(last) >= FUSE_STATFS_TTL_MS {
++                self.statfs_at.store(now.max(1), Ordering::Relaxed);
++                if let Ok(statfs) = self.session.do_fuse_op(FUSE_ROOT_ID, StatfsOperation) {
++                    let container_dev_id = self.sb.lock().container_dev_id;
++                    *self.sb.lock() = SuperBlock::from((container_dev_id, statfs.st()));
++                }
++            }
++        }
++        self.sb.lock().clone()
+     }
+ 
+     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+diff --git a/kernel/core/src/fs/fs_impls/virtiofs/inode/mod.rs b/kernel/core/src/fs/fs_impls/virtiofs/inode/mod.rs
+index 4328b31..7318f1b 100644
+--- a/kernel/core/src/fs/fs_impls/virtiofs/inode/mod.rs
++++ b/kernel/core/src/fs/fs_impls/virtiofs/inode/mod.rs
+@@ -210,6 +210,20 @@ pub(super) enum WriteOffset {
+     Append,
+ }
+ 
++impl VirtioFsInode {
++    /// One name of the inode went away (`all`: a directory, all of them),
++    /// as Linux's `fuse_unlink` and `fuse_rmdir` drop the link count they
++    /// keep.
++    fn drop_link(&self, all: bool) {
++        let mut inner = self.inner.write();
++        inner.metadata.nr_hard_links = if all {
++            0
++        } else {
++            inner.metadata.nr_hard_links.saturating_sub(1)
++        };
++    }
++}
++
+ struct InodeInner {
+     page_cache: Option<PageCache>,
+     metadata: Metadata,
+@@ -269,7 +283,14 @@ impl Inode for VirtioFsInode {
+     }
+ 
+     fn metadata(&self) -> Result<Metadata> {
+-        self.revalidate_attr(None)?;
++        match self.revalidate_attr(None) {
++            Ok(()) => {}
++            // A server that forgot a removed node (libfuse does at once;
++            // virtiofsd keeps it while it is referenced): its last known
++            // attributes, as Linux keeps the inode's.
++            Err(error) if error.error() == Errno::ENOENT => {}
++            Err(error) => return Err(error),
++        }
+         Ok(self.inner.read().metadata)
+     }
+ 
+@@ -465,6 +486,7 @@ impl Inode for VirtioFsInode {
+ 
+         self.expire_attr_cache();
+         child.expire_attr_cache();
++        child.drop_link(false);
+ 
+         Ok(())
+     }
+@@ -482,6 +504,7 @@ impl Inode for VirtioFsInode {
+ 
+         self.expire_attr_cache();
+         child.expire_attr_cache();
++        child.drop_link(true);
+ 
+         Ok(())
+     }
+diff --git a/kernel/core/src/fs/fs_impls/virtiofs/mod.rs b/kernel/core/src/fs/fs_impls/virtiofs/mod.rs
+index 2262217..fc6480c 100644
+--- a/kernel/core/src/fs/fs_impls/virtiofs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/virtiofs/mod.rs
+@@ -19,6 +19,8 @@ use crate::{
+ 
+ pub(super) fn init() {
+     crate::fs::vfs::registry::register(&fs::VIRTIOFS_TYPE).unwrap();
++    crate::fs::vfs::registry::register(&fs::FUSE_TYPE).unwrap();
++    crate::fs::vfs::registry::register(&fs::FUSEBLK_TYPE).unwrap();
+ }
+ 
+ impl From<FuseError> for Error {
+diff --git a/kernel/core/src/syscall/mount.rs b/kernel/core/src/syscall/mount.rs
+index f68f988..cad856c 100644
+--- a/kernel/core/src/syscall/mount.rs
++++ b/kernel/core/src/syscall/mount.rs
+@@ -210,7 +210,15 @@ fn do_new_mount(
+         let fs_type_str = fs_type_cstr
+             .to_str()
+             .map_err(|_| Error::with_message(Errno::ENODEV, "invalid file system type"))?;
+-        crate::fs::vfs::registry::look_up(fs_type_str).ok_or_else(|| {
++        crate::fs::vfs::registry::look_up(fs_type_str)
++            .or_else(|| {
++                // `fuse.sshfs`, `fuseblk.ntfs`: FUSE with the server's name.
++                let (base, _subtype) = fs_type_str.split_once('.')?;
++                matches!(base, "fuse" | "fuseblk")
++                    .then(|| crate::fs::vfs::registry::look_up(base))
++                    .flatten()
++            })
++            .ok_or_else(|| {
+             Error::with_message(
+                 Errno::ENODEV,
+                 "the filesystem is not configured in the kernel",
+diff --git a/kernel/libs/dma-pool/src/arena.rs b/kernel/libs/dma-pool/src/arena.rs
+index 9777439..1989c05 100644
+--- a/kernel/libs/dma-pool/src/arena.rs
++++ b/kernel/libs/dma-pool/src/arena.rs
+@@ -127,6 +127,21 @@ impl<D: DmaDirection> DmaArena<D> {
+         Ok(arena_start + byte_range.start..arena_start + byte_range.end)
+     }
+ 
++    /// Reads the arena as its device does, whatever the direction (a device
++    /// implemented in software).
++    pub fn device_reader(&self) -> VmReader<'_, Infallible> {
++        let mut reader = self.pool.storage.device_reader();
++        reader.skip(self.byte_range().start).limit(self.size());
++        reader
++    }
++
++    /// Writes the arena as its device does, whatever the direction.
++    pub fn device_writer(&self) -> VmWriter<'_, Infallible> {
++        let mut writer = self.pool.storage.device_writer();
++        writer.skip(self.byte_range().start).limit(self.size());
++        writer
++    }
++
+     /// Synchronizes `byte_range` from the device into memory.
+     pub fn sync_from_device(&self, byte_range: Range<usize>) -> Result<()> {
+         self.pool
+diff --git a/kernel/libs/dma-pool/src/buffer.rs b/kernel/libs/dma-pool/src/buffer.rs
+index 37b2277..67aedce 100644
+--- a/kernel/libs/dma-pool/src/buffer.rs
++++ b/kernel/libs/dma-pool/src/buffer.rs
+@@ -25,6 +25,25 @@ pub enum DmaBuffer<D: DmaDirection> {
+ }
+ 
+ impl<D: DmaDirection> DmaBuffer<D> {
++    /// Reads the buffer as its device does, whatever the direction (a device
++    /// implemented in software).
++    pub fn device_reader(&self) -> VmReader<'_, Infallible> {
++        match self {
++            Self::Direct(stream) => stream.device_reader(),
++            Self::Pooled(segment) => segment.device_reader(),
++            Self::Arena(arena) => arena.device_reader(),
++        }
++    }
++
++    /// Writes the buffer as its device does, whatever the direction.
++    pub fn device_writer(&self) -> VmWriter<'_, Infallible> {
++        match self {
++            Self::Direct(stream) => stream.device_writer(),
++            Self::Pooled(segment) => segment.device_writer(),
++            Self::Arena(arena) => arena.device_writer(),
++        }
++    }
++
+     /// Synchronizes the streaming DMA mapping data from the device.
+     pub fn sync_from_device(&self, byte_range: Range<usize>) -> Result<()> {
+         match self {
+diff --git a/kernel/libs/dma-pool/src/lib.rs b/kernel/libs/dma-pool/src/lib.rs
+index 8813f3a..d514959 100644
+--- a/kernel/libs/dma-pool/src/lib.rs
++++ b/kernel/libs/dma-pool/src/lib.rs
+@@ -233,6 +233,21 @@ impl<D: DmaDirection> DmaSegment<D> {
+         )
+     }
+ 
++    /// Reads the segment as its device does, whatever the direction (a
++    /// device implemented in software).
++    pub fn device_reader(&self) -> VmReader<'_, Infallible> {
++        let mut reader = self.page.storage.reader();
++        reader.skip(self.offset).limit(self.page.segment_size);
++        reader
++    }
++
++    /// Writes the segment as its device does, whatever the direction.
++    pub fn device_writer(&self) -> VmWriter<'_, Infallible> {
++        let mut writer = self.page.storage.writer();
++        writer.skip(self.offset).limit(self.page.segment_size);
++        writer
++    }
++
+     pub fn reader(&self) -> Result<VmReader<'_, Infallible>, ostd::Error> {
+         if !D::CAN_READ_FROM_DEVICE {
+             return Err(ostd::Error::AccessDenied);
+diff --git a/ostd/src/mm/dma/dma_stream.rs b/ostd/src/mm/dma/dma_stream.rs
+index d5906e1..d928f09 100644
+--- a/ostd/src/mm/dma/dma_stream.rs
++++ b/ostd/src/mm/dma/dma_stream.rs
+@@ -401,6 +401,35 @@ impl<D: DmaDirection> HasSize for DmaStream<D> {
+     }
+ }
+ 
++impl<D: DmaDirection> DmaStream<D> {
++    /// Reads the buffer as its device does, whatever the direction: for a
++    /// device implemented in software, which reads what the CPU prepared for
++    /// it (FUSE's `/dev/fuse`).
++    pub fn device_reader(&self) -> VmReader<'_, Infallible> {
++        match &self.inner {
++            Inner::Segment(seg) | Inner::Both(_, _, seg) => seg.reader(),
++            Inner::Kva(kva, _) => {
++                // SAFETY: As in `HasVmReaderWriter::reader` below; only the
++                // direction check is left out.
++                unsafe { VmReader::from_kernel_space(kva.start() as *const u8, kva.size()) }
++            }
++        }
++    }
++
++    /// Writes the buffer as its device does, whatever the direction (see
++    /// [`Self::device_reader`]).
++    pub fn device_writer(&self) -> VmWriter<'_, Infallible> {
++        match &self.inner {
++            Inner::Segment(seg) | Inner::Both(_, _, seg) => seg.writer(),
++            Inner::Kva(kva, _) => {
++                // SAFETY: As in `HasVmReaderWriter::writer` below; only the
++                // direction check is left out.
++                unsafe { VmWriter::from_kernel_space(kva.start() as *mut u8, kva.size()) }
++            }
++        }
++    }
++}
++
+ impl<D: DmaDirection> HasVmReaderWriter for DmaStream<D> {
+     type Types = VmReaderWriterResult;
+ 

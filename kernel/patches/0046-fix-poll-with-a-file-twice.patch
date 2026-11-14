@@ -1,0 +1,42 @@
+diff --git a/kernel/core/src/syscall/poll.rs b/kernel/core/src/syscall/poll.rs
+index 99b751d..484133a 100644
+--- a/kernel/core/src/syscall/poll.rs
++++ b/kernel/core/src/syscall/poll.rs
+@@ -172,9 +172,24 @@ impl PollFiles<'_> {
+     fn register_poller(&self, timeout: Option<&Duration>) -> PollerResult {
+         let mut poller = Poller::new(timeout);
+ 
++        // A file may be in the set more than once (OpenSSH waits on its
++        // socket for input in one entry and for output in another). The
++        // poller is registered with a file once, for every event any of its
++        // entries asks for: registering it again would replace the events
++        // of the earlier entries, which would then never wake it.
++        let mut wanted: BTreeMap<usize, IoEvents> = BTreeMap::new();
++        for (index, poll_fd) in self.poll_fds.iter().enumerate() {
++            if let Some(file) = self.file_at(index) {
++                *wanted.entry(file_key(file)).or_insert(IoEvents::empty()) |= poll_fd.events();
++            }
++        }
++
+         for (index, poll_fd) in self.poll_fds.iter().enumerate() {
+             let events = if let Some(file) = self.file_at(index) {
+-                file.poll(poll_fd.events(), Some(poller.as_handle_mut()))
++                let mask = wanted.get(&file_key(file)).copied().unwrap_or(poll_fd.events());
++                // What this entry asked for, of what the file has.
++                file.poll(mask, Some(poller.as_handle_mut()))
++                    & (poll_fd.events() | IoEvents::ALWAYS_POLL)
+             } else {
+                 poll_fd.revents_for_missing_file()
+             };
+@@ -230,6 +245,11 @@ impl PollFiles<'_> {
+     }
+ }
+ 
++/// The identity of an open file, for entries that name it more than once.
++fn file_key(file: &dyn FileLike) -> usize {
++    file as *const dyn FileLike as *const () as usize
++}
++
+ // https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/poll.h
+ #[repr(C)]
+ #[derive(Clone, Copy, Debug, Pod)]

@@ -27,6 +27,29 @@ if [ "${1:-}" = --seat ]; then
             chmod 0600 "$device"
         fi
     done
+    # Xorg shares the console (-sharevts below) and so leaves it as it is:
+    # its text would go on drawing over the desktop, and the keys typed
+    # would go on reaching it and showing there. As Xorg does with a VT of
+    # its own: the console in graphics mode (KDSETMODE KD_GRAPHICS), which
+    # stops its drawing, and its keyboard off (KDSKBMODE K_OFF); X reads
+    # the keyboard through evdev. Only where X has the screen (DRM).
+    if [ -e "$card" ] && [ -n "${OPENSHELL_CONSOLE_PYTHON:-}" ]; then
+        "$OPENSHELL_CONSOLE_PYTHON" -I -c '
+import fcntl, os, sys
+KDSETMODE, KD_GRAPHICS, KDSKBMODE, K_OFF = 0x4B3A, 1, 0x4B45, 4
+for path in sys.argv[1:]:
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        continue
+    for request, value in ((KDSETMODE, KD_GRAPHICS), (KDSKBMODE, K_OFF)):
+        try:
+            fcntl.ioctl(fd, request, value)
+        except OSError as error:
+            print(f"{path}: console mode {request:#x}: {error}", file=sys.stderr)
+    os.close(fd)
+' /dev/tty1 || true
+    fi
     exit 0
 fi
 

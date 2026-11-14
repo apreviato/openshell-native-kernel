@@ -329,10 +329,8 @@ ssh_prepare() {
     # not signed in yet runs as this one, in an empty folder.
     grep -q '^sshd:' /etc/passwd || echo 'sshd:x:74:74:SSH server:/var/empty:/bin/false' >> /etc/passwd
     grep -q '^sshd:' /etc/group || echo 'sshd:x:74:' >> /etc/group
-    # The account as the server looks for it: the session's home, a shell,
-    # and the hash of its password (the supervisor's, login.rs: SHA-512
-    # crypt, which crypt(3) checks). Without a password only keys let in
-    # (~/.ssh/authorized_keys).
+    # The account as the server looks for it: the session's home and a
+    # shell. Without a password only keys let in (~/.ssh/authorized_keys).
     account=$(awk -F: '$3 == 65534 { print $1; exit }' /etc/passwd)
     [ -n "$account" ] || return 1
     account_shell=/bin/sh
@@ -341,19 +339,34 @@ ssh_prepare() {
         awk -F: -v OFS=: -v home="$state/home" -v shell="$account_shell" '$3 == 65534 { $6 = home; $7 = shell } { print }' /etc/passwd > /etc/passwd.ssh || return 1
         mv /etc/passwd.ssh /etc/passwd
     fi
-    account_hash=$(head -n1 "$data/openshell/account/password" 2> /dev/null || true)
-    case "$account_hash" in
-        '$6$'*) ;;
-        *) account_hash='!' ;;
-    esac
-    (
-        umask 077
-        {
-            grep -v "^$account:" /etc/shadow 2> /dev/null || true
-            printf '%s:%s:19000:0:99999:7:::\n' "$account" "$account_hash"
-        } > /etc/shadow.ssh
-        mv /etc/shadow.ssh /etc/shadow
-    ) || return 1
+    # The password is checked as the lock screen checks it (login.rs): the
+    # supervisor's SHA-512 crypt hash, against BusyBox's cryptpw. This
+    # OpenSSH checks passwords only through PAM, which hands the password to
+    # this script on its input (pam_exec); account and session need nothing
+    # more. /etc/shadow is left alone.
+    [ -d "$root/pam" ] || return 1
+    cat > "$ssh_run/check-password" <<EOF
+#!/bin/sh
+[ "\$PAM_USER" = "$account" ] || exit 1
+stored=\$(head -n1 "$data/openshell/account/password" 2> /dev/null)
+case "\$stored" in
+    '\$6\$'*) ;;
+    *) exit 1 ;;
+esac
+salt=\${stored#\\\$6\\\$}
+salt=\${salt%%\\\$*}
+computed=\$(tr -d '\\000' | /bin/cryptpw -m sha512 -P 0 -S "\$salt") || exit 1
+[ -n "\$computed" ] && [ "\$computed" = "\$stored" ]
+EOF
+    chmod 0700 "$ssh_run/check-password"
+    mkdir -p /etc/pam.d
+    cat > /etc/pam.d/sshd <<EOF
+auth required $root/pam/pam_exec.so quiet expose_authtok $ssh_run/check-password
+auth optional $root/pam/pam_permit.so
+account required $root/pam/pam_permit.so
+password required $root/pam/pam_deny.so
+session required $root/pam/pam_permit.so
+EOF
     # IPv4 only: the kernel's sockets do not listen on every IPv6 address yet.
     cat > "$ssh_run/sshd_config" <<EOF
 Port 22
@@ -362,7 +375,7 @@ ListenAddress 0.0.0.0
 HostKey $ssh_keys/ssh_host_ed25519_key
 HostKey $ssh_keys/ssh_host_rsa_key
 PidFile $ssh_run/sshd.pid
-UsePAM no
+UsePAM yes
 PermitRootLogin no
 AllowUsers $account
 PasswordAuthentication yes
@@ -408,6 +421,86 @@ if [ -n "${settings:-}" ] && [ -x "$root/bin/sshd" ]; then
     ) >> "$data/openshell/session-logs/ssh.log" 2>&1 &
     ssh_service=$!
 fi
+# The computer's name, as Debian's live system has one: the name its DHCP
+# requests already carry (the kernel's), which it knows itself by through
+# /etc/hosts (programs that look up their own name get an answer at once)
+# and which Avahi publishes as <name>.local.
+case "$(hostname 2> /dev/null)" in
+    '' | '(none)' | localhost) hostname openshell 2> /dev/null || echo openshell > /proc/sys/kernel/hostname ;;
+esac
+host_name=$(hostname 2> /dev/null)
+if [ -n "$host_name" ] && ! grep -q "[[:space:]]$host_name\$" /etc/hosts 2> /dev/null; then
+    # On a line of its own (the image's file has no last newline).
+    {
+        [ -s /etc/hosts ] && [ -n "$(tail -c 1 /etc/hosts)" ] && echo
+        printf '127.0.1.1\t%s\n' "$host_name"
+    } >> /etc/hosts
+fi
+# Service discovery (mDNS/DNS-SD), as on Live: the D-Bus system bus and
+# Avahi, through which CUPS's tools find the network's printers (Settings ▸
+# Printers lists them, `lpstat -e`) and which makes this computer known as
+# <name>.local. Each runs as its own user, as on Debian, and starts again if
+# it ends; Avahi follows interfaces and addresses as they come (the
+# kernel's route notifications).
+discovery_service=
+name_service=
+if [ -x "$root/bin/dbus-daemon" ] && [ -x "$root/bin/avahi-daemon" ] && [ -f /etc/dbus-1/system.conf ]; then
+    grep -q '^messagebus:' /etc/passwd || echo 'messagebus:x:71:71:D-Bus system bus:/run/dbus:/bin/false' >> /etc/passwd
+    grep -q '^messagebus:' /etc/group || echo 'messagebus:x:71:' >> /etc/group
+    grep -q '^avahi:' /etc/passwd || echo 'avahi:x:70:70:Avahi mDNS/DNS-SD:/run/avahi-daemon:/bin/false' >> /etc/passwd
+    grep -q '^avahi:' /etc/group || echo 'avahi:x:70:' >> /etc/group
+    # Avahi's bus policy names Debian's group for network administrators.
+    grep -q '^netdev:' /etc/group || echo 'netdev:x:72:' >> /etc/group
+    # The bus and Avahi read this computer's identity.
+    [ -s /etc/machine-id ] || "$root/bin/dbus-uuidgen" --ensure=/etc/machine-id
+    # /var/run is /run, as on Debian: nss-mdns asks Avahi at
+    # /var/run/avahi-daemon/socket, glibc the name service at
+    # /var/run/nscd/socket.
+    [ -e /var/run ] || ln -s /run /var/run
+    # Nothing of an earlier boot (sockets, pid files).
+    rm -rf /run/dbus /run/avahi-daemon
+    mkdir -p /run/dbus /run/avahi-daemon
+    chown avahi:avahi /run/avahi-daemon
+    : > "$data/openshell/session-logs/discovery.log"
+    # <name>.local for every program: glibc asks the name service daemon
+    # (its socket in /var/run/nscd), which alone loads nss-mdns.
+    if [ -x "$root/bin/nsncd" ] && [ -d "$root/nss" ]; then
+        mkdir -p /var/run/nscd
+        (
+            set +e
+            while :; do
+                LD_LIBRARY_PATH="$root/nss" "$root/bin/nsncd"
+                sleep 5
+            done
+        ) >> "$data/openshell/session-logs/discovery.log" 2>&1 &
+        name_service=$!
+    fi
+    (
+        set +e
+        (
+            while :; do
+                # The file is the system bus's (`<type>system</type>`);
+                # `--system` would ask for it a second time.
+                "$root/bin/dbus-daemon" --nofork --nopidfile --config-file=/etc/dbus-1/system.conf
+                rm -f /run/dbus/system_bus_socket
+                sleep 5
+            done
+        ) &
+        bus_loop=$!
+        # Asked to end (the session ends): the bus's loop too.
+        trap 'kill "$bus_loop" 2> /dev/null; exit 0' TERM
+        while :; do
+            for i in $(seq 1 100); do
+                [ -S /run/dbus/system_bus_socket ] && break
+                sleep 0.2
+            done
+            "$root/bin/avahi-daemon" --no-rlimits
+            rm -f /run/avahi-daemon/pid
+            sleep 5
+        done
+    ) >> "$data/openshell/session-logs/discovery.log" 2>&1 &
+    discovery_service=$!
+fi
 # Printing: CUPS's scheduler, for this computer's programs only (the
 # loopback address and its socket), with the session's person as its
 # administrator, who adds and removes printers in Settings: nobody else has
@@ -423,8 +516,14 @@ if [ -x "$root/bin/cupsd" ] && [ -d "$root/cups/lib/cups" ]; then
     fi
     # Nothing of an earlier boot (its socket, its certificates).
     rm -rf /run/cups
-    mkdir -p "$cups_state" /run/cups /var/spool /var/cache
+    mkdir -p "$cups_state" /run/cups /var/spool/cups/tmp /var/cache/cups
     chmod 0755 "$cups_state" /run/cups
+    # The jobs' folder and its scratch space, as CUPS keeps them: the
+    # scheduler refuses to start without them.
+    chgrp nogroup /var/spool/cups /var/spool/cups/tmp /var/cache/cups
+    chmod 0710 /var/spool/cups
+    chmod 1770 /var/spool/cups/tmp
+    chmod 0770 /var/cache/cups
     # CUPS's tools look for the scheduler's socket and their settings in
     # /etc/cups, and the scheduler keeps its files there.
     if [ ! -L /etc/cups ]; then
@@ -449,6 +548,7 @@ AccessLog stderr
 ErrorLog stderr
 PageLog stderr
 SetEnv PATH $root/cups/lib/cups/filter:$root/cups/bin:$root/bin:/bin:/usr/bin
+SetEnv FONTCONFIG_FILE $root/fonts.conf
 User nobody
 Group nogroup
 FileDevice No
@@ -485,7 +585,18 @@ EOF
     (
         set +e
         while :; do
-            "$root/bin/cupsd" -f -c "$cups_state/cupsd.conf" -s "$cups_state/cups-files.conf" >> "$data/openshell/session-logs/cups.log" 2>&1
+            "$root/bin/cupsd" -f -c "$cups_state/cupsd.conf" -s "$cups_state/cups-files.conf" >> "$data/openshell/session-logs/cups.log" 2>&1 &
+            cupsd=$!
+            # The socket is everyone's, as systemd's socket unit makes it on
+            # Debian: the scheduler leaves it as its umask made it, root's
+            # alone, and the session's tools could not reach it.
+            for i in $(seq 1 100); do
+                [ -S /run/cups/cups.sock ] && break
+                kill -0 "$cupsd" 2> /dev/null || break
+                sleep 0.2
+            done
+            chmod 0666 /run/cups/cups.sock 2> /dev/null
+            wait "$cupsd"
             rm -f /run/cups/cups.sock
             sleep 5
         done
@@ -515,6 +626,37 @@ if [ -n "$cups_service" ]; then
     kill "$cups_service" 2>/dev/null || true
     killall cupsd 2>/dev/null || true
 fi
+if [ -n "$discovery_service" ]; then
+    # Its loop ends once the daemon it waits for does.
+    kill "$discovery_service" 2>/dev/null || true
+    killall avahi-daemon 2>/dev/null || true
+    sleep 0.5
+    killall dbus-daemon 2>/dev/null || true
+fi
+if [ -n "$name_service" ]; then
+    kill "$name_service" 2>/dev/null || true
+    killall nsncd 2>/dev/null || true
+fi
+# The session ended otherwise (it failed): the console in text mode again,
+# with its keyboard, as openshell-x --seat left it for X (KDSETMODE
+# KD_TEXT, KDSKBMODE K_UNICODE), so what is written there shows.
+case "$status" in
+    64|65) ;;
+    *)
+        if [ -x "$root/python" ] && [ -e /dev/tty1 ]; then
+            "$root/python" -I -c '
+import fcntl, os
+try:
+    fd = os.open("/dev/tty1", os.O_RDWR | os.O_NOCTTY)
+    fcntl.ioctl(fd, 0x4B3A, 0)
+    fcntl.ioctl(fd, 0x4B45, 3)
+    os.close(fd)
+except OSError:
+    pass
+' 2> /dev/null || true
+        fi
+        ;;
+esac
 # The session asked to power off or restart (userspace/shell/src/power.rs,
 # POWEROFF_STATUS and REBOOT_STATUS): the supervisor cannot, init can, once
 # the data partition is written out.

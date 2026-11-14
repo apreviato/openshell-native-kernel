@@ -1,0 +1,2405 @@
+diff --git a/kernel/core/src/net/iface/init.rs b/kernel/core/src/net/iface/init.rs
+index 720896d..9525764 100644
+--- a/kernel/core/src/net/iface/init.rs
++++ b/kernel/core/src/net/iface/init.rs
+@@ -39,6 +39,7 @@ const DHCP_HOST_NAME: &[u8] = b"openshell";
+ /// address.
+ pub(in crate::net) fn init_in_first_kthread() {
+     aster_wlan::set_hooks(aster_wlan::Hooks { ifindex: wlan_ifindex, link_changed: wlan_link_changed });
++    aster_bigtcp::iface::set_address_hook(address_changed);
+     aster_network::set_device_hook(device_changed);
+     for (name, _) in aster_network::all_devices() {
+         device_changed(&name, true);
+@@ -73,6 +74,11 @@ fn device_changed(name: &str, added: bool) {
+     aster_network::register_send_callback(name, callback);
+     namespace.add_iface(iface.clone());
+     super::poll::spawn_background_poll_thread(iface.clone());
++    let index = iface.index();
++    crate::thread::work_queue::submit_work_func(
++        move || crate::net::socket::netlink::link_changed(index),
++        crate::thread::work_queue::WorkPriority::Normal,
++    );
+     if aster_wlan::interface_state(name).is_some() {
+         // A Wi-Fi interface asks once it has a link (`wlan_link_changed`).
+         iface.link_changed(false);
+@@ -98,9 +104,27 @@ fn wlan_link_changed(name: &str, connected: bool) {
+             ostd::notice!("{}: asking for an address (DHCP)", name);
+         }
+         iface.link_changed(connected);
++        let index = iface.index();
++        crate::thread::work_queue::submit_work_func(
++            move || crate::net::socket::netlink::link_changed(index),
++            crate::thread::work_queue::WorkPriority::Normal,
++        );
+     }
+ }
+ 
++/// An interface's address changed: the route sockets hear it (from a
++/// worker, as the change is seen while the interface is polled).
++fn address_changed(
++    index: u32,
++    old: Option<aster_bigtcp::wire::Ipv4Cidr>,
++    new: Option<aster_bigtcp::wire::Ipv4Cidr>,
++) {
++    crate::thread::work_queue::submit_work_func(
++        move || crate::net::socket::netlink::address_changed(index, old, new),
++        crate::thread::work_queue::WorkPriority::Normal,
++    );
++}
++
+ /// An interface's flags now: a Wi-Fi interface is up when a program
+ /// brought it up, and running while it has a link.
+ pub(in crate::net) fn current_flags(iface: &Arc<Iface>) -> InterfaceFlags {
+diff --git a/kernel/core/src/net/socket/ip/common.rs b/kernel/core/src/net/socket/ip/common.rs
+index f646a57..c1323ab 100644
+--- a/kernel/core/src/net/socket/ip/common.rs
++++ b/kernel/core/src/net/socket/ip/common.rs
+@@ -17,9 +17,10 @@ pub(super) fn resolve_bind_iface_and_config(
+ ) -> Result<(Arc<Iface>, BindPortConfig)> {
+     check_port_privilege(endpoint.port)?;
+ 
+-    // Every IPv4 address (0.0.0.0), for TCP (datagram sockets refuse it
+-    // before): the port is taken on the loopback interface, and a socket
+-    // that then listens does so on every interface (`stream::listen`).
++    // Every IPv4 address (0.0.0.0): the port is taken on the loopback
++    // interface first; a TCP socket that then listens does so on every
++    // interface (`stream::listen`), a datagram socket takes the port on
++    // every interface (`datagram::unbound`).
+     let iface = match endpoint.addr {
+         IpAddress::Ipv4(address) if address.is_unspecified() => loopback_iface()?,
+         address => route::lookup_local_iface(address)?,
+@@ -30,6 +31,11 @@ pub(super) fn resolve_bind_iface_and_config(
+     Ok((iface, bind_port_config))
+ }
+ 
++/// The interface a packet to `destination` leaves through.
++pub(super) fn output_iface(destination: IpAddress) -> Result<Arc<Iface>> {
++    route::lookup_iface(destination)
++}
++
+ /// The loopback interface of the current network namespace.
+ pub(super) fn loopback_iface() -> Result<Arc<Iface>> {
+     crate::net::iface::iter_all_ifaces()
+diff --git a/kernel/core/src/net/socket/ip/datagram/bound.rs b/kernel/core/src/net/socket/ip/datagram/bound.rs
+old mode 100644
+new mode 100755
+index 39d16d9..e7d310e
+--- a/kernel/core/src/net/socket/ip/datagram/bound.rs
++++ b/kernel/core/src/net/socket/ip/datagram/bound.rs
+@@ -2,105 +2,216 @@
+ 
+ use aster_bigtcp::{
+     errors::udp::{RecvError, SendError},
+-    wire::IpEndpoint,
++    iface::InterfaceType,
++    socket::ReceiveBehavior,
++    wire::{IpAddress, IpEndpoint},
+ };
+ 
+ use crate::{
+     events::IoEvents,
+     net::{
+-        iface::{BoundUdpPort, Iface, UdpSocket},
+-        socket::util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
++        iface::{Iface, UdpSocket},
++        socket::{
++            ip::common::output_iface,
++            util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
++        },
+     },
+     prelude::*,
+     util::{MultiRead, MultiWrite},
+ };
+ 
+ pub(super) struct BoundDatagram {
+-    bound_socket: UdpSocket,
++    /// The socket's sockets: one, or, for a socket bound to every address
++    /// (0.0.0.0), one on each interface with the same port, the loopback
++    /// interface's first (`UnboundDatagram::bind`). `connect` keeps only
++    /// the one on the interface towards the peer, as Linux then receives
++    /// only on the source address the route chose.
++    sockets: Vec<UdpSocket>,
++    /// Bound to every address: `getsockname` reports 0.0.0.0 until a
++    /// `connect` picks the source address.
++    every_address: bool,
++    /// The source address a `connect` picked for a socket on every address.
++    connected_local: Option<IpAddress>,
+     remote_endpoint: Option<IpEndpoint>,
+ }
+ 
++/// Where a datagram arrived (`IP_PKTINFO`).
++#[derive(Clone, Copy, Debug)]
++pub(super) struct ArrivalInfo {
++    /// The interface's index.
++    pub(super) iface: u32,
++    /// The address the datagram was sent to.
++    pub(super) destination: IpAddress,
++    /// The interface's own address (a reply's source).
++    pub(super) local: IpAddress,
++}
++
++/// How a datagram leaves: the interface (`IP_PKTINFO`, `IP_MULTICAST_IF`)
++/// and its hop limit.
++#[derive(Clone, Copy, Debug, Default)]
++pub(super) struct SendRoute {
++    pub(super) iface: Option<u32>,
++    pub(super) hop_limit: Option<u8>,
++}
++
+ impl BoundDatagram {
+-    pub(super) fn new(bound_socket: UdpSocket) -> Self {
++    pub(super) fn new(sockets: Vec<UdpSocket>, every_address: bool) -> Self {
++        debug_assert!(!sockets.is_empty());
+         Self {
+-            bound_socket,
++            sockets,
++            every_address,
++            connected_local: None,
+             remote_endpoint: None,
+         }
+     }
+ 
+     pub(super) fn iface(&self) -> &Arc<Iface> {
+-        self.bound_socket.iface()
++        self.sockets[0].iface()
+     }
+ 
+-    pub(super) fn bound_port(&self) -> &BoundUdpPort {
+-        self.bound_socket.bound_port()
++    /// Sets `SO_REUSEADDR` on the port of every interface.
++    pub(super) fn set_can_reuse(&self, can_reuse: bool) {
++        for socket in self.sockets.iter() {
++            socket.bound_port().set_can_reuse(can_reuse);
++        }
+     }
+-}
+ 
+-impl datagram_common::Bound for BoundDatagram {
+-    type Endpoint = IpEndpoint;
++    /// The interfaces the socket receives on (the multicast groups it joins
++    /// are taken on them).
++    pub(super) fn ifaces(&self) -> impl Iterator<Item = &Arc<Iface>> {
++        self.sockets.iter().map(|socket| socket.iface())
++    }
+ 
+-    fn local_endpoint(&self) -> Self::Endpoint {
+-        self.bound_socket.local_endpoint()
++    /// The interface a datagram to `remote` leaves through.
++    pub(super) fn iface_towards(&self, remote: &IpAddress, route: SendRoute) -> &Arc<Iface> {
++        self.socket_towards(remote, route).iface()
+     }
+ 
+-    fn remote_endpoint(&self) -> Option<&Self::Endpoint> {
+-        self.remote_endpoint.as_ref()
++    /// The socket that sends to `remote`: the one on the interface asked
++    /// for, or on the one the route goes through. A broadcast or a group
++    /// without a route goes out of the first interface with an address
++    /// that is not the loopback one.
++    fn socket_towards(&self, remote: &IpAddress, route: SendRoute) -> &UdpSocket {
++        if self.sockets.len() == 1 {
++            return &self.sockets[0];
++        }
++        let wanted = route
++            .iface
++            .or_else(|| output_iface(*remote).ok().map(|iface| iface.index()));
++        wanted
++            .and_then(|index| self.sockets.iter().find(|socket| socket.iface().index() == index))
++            .or_else(|| {
++                self.sockets.iter().find(|socket| {
++                    socket.iface().type_() != InterfaceType::LOOPBACK
++                        && socket.iface().ipv4_cidr().is_some()
++                })
++            })
++            .unwrap_or(&self.sockets[0])
+     }
+ 
+-    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) {
+-        self.remote_endpoint = Some(*endpoint)
++    /// The size of the next datagram (`FIONREAD`); 0 without one.
++    pub(super) fn next_datagram_len(&self) -> usize {
++        self.sockets
++            .iter()
++            .find_map(|socket| {
++                socket
++                    .recv(ReceiveBehavior::Peek, |packet, _| packet.len())
++                    .ok()
++            })
++            .unwrap_or(0)
+     }
+ 
+-    fn try_recv(
++    /// Receives the first datagram any interface has, with where it came to.
++    pub(super) fn try_recv_with_arrival(
+         &self,
+         writer: &mut dyn MultiWrite,
+         flags: RecvFlags,
+-    ) -> Result<(RecvOutput, Self::Endpoint)> {
+-        let result = self
+-            .bound_socket
+-            .recv(flags.receive_behavior(), |packet, udp_metadata| {
+-                let message_len = packet.len();
+-                let copied_res = writer
+-                    .write(&mut VmReader::from(packet))
+-                    .map_err(Into::into);
+-                let endpoint = udp_metadata.endpoint;
+-                (copied_res, endpoint, message_len)
+-            });
+-
+-        match result {
+-            Ok((Ok(copied_len), endpoint, message_len)) => {
+-                let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
+-                Ok((output, endpoint))
+-            }
+-            Ok((Err(e), _, _)) => Err(e),
+-            Err(RecvError::Exhausted) => {
+-                return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
+-            }
+-            Err(RecvError::Truncated) => {
+-                unreachable!("`recv` should never fail with `RecvError::Truncated`")
++    ) -> Result<(RecvOutput, IpEndpoint, ArrivalInfo)> {
++        let behavior = flags.receive_behavior();
++        for socket in self.sockets.iter() {
++            // A connected socket takes only its peer's datagrams, as on
++            // Linux; the others are dropped. Each pass removes one.
++            loop {
++                let result = socket.recv(behavior, |packet, udp_metadata| {
++                    let endpoint = udp_metadata.endpoint;
++                    if self
++                        .remote_endpoint
++                        .is_some_and(|remote| !Self::is_from_peer(&remote, &endpoint))
++                    {
++                        return None;
++                    }
++                    let message_len = packet.len();
++                    let copied = writer
++                        .write(&mut VmReader::from(packet))
++                        .map_err(Into::into);
++                    Some((copied, endpoint, message_len, udp_metadata.local_address))
++                });
++                match result {
++                    Ok(Some((Ok(copied_len), endpoint, message_len, destination))) => {
++                        let output = RecvOutput::new_for_packet(flags, copied_len, message_len);
++                        let iface = socket.iface();
++                        let local = iface
++                            .ipv4_cidr()
++                            .map(|cidr| IpAddress::Ipv4(cidr.address()))
++                            .unwrap_or(IpAddress::Ipv4(aster_bigtcp::wire::Ipv4Address::UNSPECIFIED));
++                        let destination = destination.unwrap_or(local);
++                        let arrival = ArrivalInfo {
++                            iface: iface.index(),
++                            destination,
++                            local: if destination.is_multicast() || destination.is_broadcast() {
++                                local
++                            } else {
++                                destination
++                            },
++                        };
++                        return Ok((output, endpoint, arrival));
++                    }
++                    Ok(Some((Err(error), _, _, _))) => return Err(error),
++                    Ok(None) => {
++                        // Not from the peer: a peek leaves it at the head,
++                        // so it is dropped before looking again.
++                        if behavior == ReceiveBehavior::Peek {
++                            let _ = socket.recv(ReceiveBehavior::Recv, |_, _| ());
++                        }
++                    }
++                    Err(RecvError::Exhausted) => break,
++                    Err(RecvError::Truncated) => {
++                        unreachable!("`recv` should never fail with `RecvError::Truncated`")
++                    }
++                }
+             }
+         }
++        return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty")
+     }
+ 
+-    fn try_send(
++    fn is_from_peer(remote: &IpEndpoint, source: &IpEndpoint) -> bool {
++        // A peer that is a broadcast or a group answers from its own
++        // address: everything is taken then.
++        if remote.addr.is_broadcast() || remote.addr.is_multicast() {
++            return true;
++        }
++        remote.addr == source.addr && remote.port == source.port
++    }
++
++    /// Sends a datagram to `remote` out of the interface `route` names.
++    pub(super) fn try_send_routed(
+         &self,
+         reader: &mut dyn MultiRead,
+-        remote: &Self::Endpoint,
+-        _flags: SendFlags,
++        remote: &IpEndpoint,
++        route: SendRoute,
+     ) -> Result<usize> {
+-        let result = self
+-            .bound_socket
+-            .send(reader.sum_lens(), *remote, |socket_buffer| {
+-                // FIXME: If copy failed, we should not send any packet.
+-                // But current smoltcp API seems not to support this behavior.
+-                reader
+-                    .read(&mut VmWriter::from(socket_buffer))
+-                    .inspect_err(|e| {
+-                        warn!("unexpected UDP packet {e:#?} will be sent");
+-                    })
+-                    .map_err(Into::into)
+-            });
++        let socket = self.socket_towards(&remote.addr, route);
++        socket.set_hop_limit(route.hop_limit);
++        let result = socket.send(reader.sum_lens(), *remote, |socket_buffer| {
++            // FIXME: If copy failed, we should not send any packet.
++            // But current smoltcp API seems not to support this behavior.
++            reader
++                .read(&mut VmWriter::from(socket_buffer))
++                .inspect_err(|e| {
++                    warn!("unexpected UDP packet {e:#?} will be sent");
++                })
++                .map_err(Into::into)
++        });
+ 
+         match result {
+             Ok(inner) => inner,
+@@ -115,20 +226,79 @@ impl datagram_common::Bound for BoundDatagram {
+             }
+         }
+     }
++}
+ 
+-    fn check_io_events(&self) -> IoEvents {
+-        self.bound_socket.raw_with(|socket| {
+-            let mut events = IoEvents::empty();
++impl datagram_common::Bound for BoundDatagram {
++    type Endpoint = IpEndpoint;
+ 
+-            if socket.can_recv() {
+-                events |= IoEvents::IN;
+-            }
++    fn local_endpoint(&self) -> Self::Endpoint {
++        let endpoint = self.sockets[0].local_endpoint();
++        match self.connected_local {
++            Some(addr) => IpEndpoint::new(addr, endpoint.port),
++            None => endpoint,
++        }
++    }
+ 
+-            if socket.can_send() {
+-                events |= IoEvents::OUT;
+-            }
++    fn remote_endpoint(&self) -> Option<&Self::Endpoint> {
++        self.remote_endpoint.as_ref()
++    }
++
++    fn set_remote_endpoint(&mut self, endpoint: &Self::Endpoint) {
++        self.remote_endpoint = Some(*endpoint);
++        if !self.every_address || self.connected_local.is_some() {
++            return;
++        }
++        // On every address: the interface towards the peer stays, with its
++        // address as the socket's (what `getsockname` reports from now on).
++        let keep = self.socket_towards(&endpoint.addr, SendRoute::default()).iface().index();
++        self.sockets.retain(|socket| socket.iface().index() == keep);
++        self.connected_local = self.sockets[0]
++            .iface()
++            .ipv4_cidr()
++            .map(|cidr| IpAddress::Ipv4(cidr.address()));
++    }
++
++    fn try_recv(
++        &self,
++        writer: &mut dyn MultiWrite,
++        flags: RecvFlags,
++    ) -> Result<(RecvOutput, Self::Endpoint)> {
++        self.try_recv_with_arrival(writer, flags)
++            .map(|(output, endpoint, _)| (output, endpoint))
++    }
+ 
+-            events
+-        })
++    fn try_send(
++        &self,
++        reader: &mut dyn MultiRead,
++        remote: &Self::Endpoint,
++        _flags: SendFlags,
++    ) -> Result<usize> {
++        self.try_send_routed(reader, remote, SendRoute::default())
++    }
++
++    fn check_io_events(&self) -> IoEvents {
++        let mut events = IoEvents::empty();
++        if self
++            .sockets
++            .iter()
++            .any(|socket| socket.raw_with(|socket| socket.can_recv()))
++        {
++            events |= IoEvents::IN;
++        }
++        // Writable when the socket that sends can: the peer's, or else every
++        // one (a send may leave through any of them).
++        let can_send = match self.remote_endpoint {
++            Some(remote) => self
++                .socket_towards(&remote.addr, SendRoute::default())
++                .raw_with(|socket| socket.can_send()),
++            None => self
++                .sockets
++                .iter()
++                .all(|socket| socket.raw_with(|socket| socket.can_send())),
++        };
++        if can_send {
++            events |= IoEvents::OUT;
++        }
++        events
+     }
+ }
+diff --git a/kernel/core/src/net/socket/ip/datagram/mod.rs b/kernel/core/src/net/socket/ip/datagram/mod.rs
+index 513c6a0..f19cfca 100644
+--- a/kernel/core/src/net/socket/ip/datagram/mod.rs
++++ b/kernel/core/src/net/socket/ip/datagram/mod.rs
+@@ -1,10 +1,18 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use aster_bigtcp::wire::IpEndpoint;
+-use bound::BoundDatagram;
++use aster_bigtcp::wire::{IpAddress, IpEndpoint};
++use bound::{ArrivalInfo, BoundDatagram, SendRoute};
+ use unbound::{BindOptions, UnboundDatagram};
+ 
+-use super::{addr::UNSPECIFIED_LOCAL_ENDPOINT, ioctl::ipv4_ioctl};
++use super::{
++    addr::UNSPECIFIED_LOCAL_ENDPOINT,
++    ioctl::ipv4_ioctl,
++    multicast::{CPacketInfo, IpControlMessage, MulticastInterface, MulticastState},
++    options::{
++        AddMembership, DropMembership, McastJoinGroup, McastLeaveGroup, MulticastAll,
++        MulticastIf, MulticastLoop, MulticastTtl, Pktinfo, RecvTtl,
++    },
++};
+ use crate::{
+     events::IoEvents,
+     fs::file::FileCommon,
+@@ -17,11 +25,14 @@ use crate::{
+                 options::{IpOptionSet, SetIpLevelOption},
+             },
+             new_socket_common,
+-            options::{Error as SocketError, SocketOption, macros::sock_option_mut},
++            options::{
++                Error as SocketError, SocketOption,
++                macros::{sock_option_mut, sock_option_ref},
++            },
+             private::SocketPrivate,
+             util::{
+-                MessageHeader, RecvFlags, RecvOutput, SendFlags, SocketAddr,
+-                datagram_common::{Bound, Inner, select_remote_and_bind},
++                ControlMessage, MessageHeader, RecvFlags, RecvOutput, SendFlags, SocketAddr,
++                datagram_common::{Inner, select_remote_and_bind},
+                 options::{
+                     GetSocketLevelOption, SetSocketLevelOption, SocketOptionSet, SocketTimeouts,
+                 },
+@@ -41,6 +52,8 @@ pub(crate) struct DatagramSocket {
+     // Lock order: `inner` first, `options` second
+     inner: RwMutex<Inner<UnboundDatagram, BoundDatagram>>,
+     options: RwLock<OptionSet>,
++    /// Multicast groups and options, and `IP_PKTINFO`.
++    multicast: Mutex<MulticastState>,
+     timeouts: SocketTimeouts,
+ 
+     pollee: Pollee,
+@@ -68,6 +81,7 @@ impl DatagramSocket {
+         Arc::new(Self {
+             inner: RwMutex::new(Inner::Unbound(unbound_datagram)),
+             options: RwLock::new(OptionSet::new()),
++            multicast: Mutex::new(MulticastState::new()),
+             timeouts: SocketTimeouts::new(),
+             pollee: Pollee::new(),
+             common: new_socket_common(is_nonblocking),
+@@ -78,22 +92,115 @@ impl DatagramSocket {
+         &self,
+         writer: &mut dyn MultiWrite,
+         flags: RecvFlags,
+-    ) -> Result<(RecvOutput, SocketAddr)> {
+-        let result = self
+-            .inner
+-            .read()
+-            .try_recv(writer, flags)
+-            .map(|(output, remote_endpoint)| (output, remote_endpoint.into()))?;
++    ) -> Result<(RecvOutput, SocketAddr, ArrivalInfo)> {
++        let result = match &*self.inner.read() {
++            Inner::Unbound(_) => {
++                return_errno_with_message!(Errno::EAGAIN, "the socket is not bound")
++            }
++            Inner::Bound(bound_datagram) => bound_datagram.try_recv_with_arrival(writer, flags),
++        };
++        // Even when nothing came: datagrams not from a connected peer may
++        // have been dropped, and the socket is no longer readable.
+         self.pollee.invalidate();
+ 
+-        Ok(result)
++        let (output, remote_endpoint, arrival) = result?;
++        Ok((output, remote_endpoint.into(), arrival))
++    }
++
++    /// How a datagram to `remote` leaves: by the interface an `IP_PKTINFO`
++    /// message or `IP_MULTICAST_IF` names, with the hop limit of its kind.
++    fn send_route(&self, remote: &IpAddress, interface: Option<u32>) -> SendRoute {
++        let unicast_ttl = self.options.read().ip.ttl().get();
++        let multicast = self.multicast.lock();
++        SendRoute {
++            iface: interface.or_else(|| multicast.interface_for(remote)),
++            hop_limit: Some(multicast.hop_limit_for(remote, unicast_ttl)),
++        }
++    }
++
++    /// Reads a multicast option (`IP_MULTICAST_*`, `IP_PKTINFO`, ...);
++    /// false: it is not one.
++    fn get_multicast_option(&self, option: &mut dyn SocketOption) -> Result<bool> {
++        let multicast = self.multicast.lock();
++        sock_option_mut!(match option {
++            pktinfo @ Pktinfo => {
++                pktinfo.set(multicast.packet_info());
++            }
++            recvttl @ RecvTtl => {
++                recvttl.set(multicast.receive_ttl());
++            }
++            interface @ MulticastIf => {
++                interface.set(MulticastInterface {
++                    address: multicast.interface_address(),
++                    index: 0,
++                });
++            }
++            ttl @ MulticastTtl => {
++                ttl.set(multicast.ttl() as i32);
++            }
++            looped @ MulticastLoop => {
++                looped.set(multicast.looped());
++            }
++            all @ MulticastAll => {
++                all.set(multicast.all());
++            }
++            _ => return Ok(false),
++        });
++        Ok(true)
++    }
++
++    /// Sets a multicast option, joins or leaves a group; false: it is not
++    /// a multicast option.
++    fn set_multicast_option(&self, option: &dyn SocketOption) -> Result<bool> {
++        let mut multicast = self.multicast.lock();
++        sock_option_ref!(match option {
++            pktinfo @ Pktinfo => {
++                multicast.set_packet_info(*pktinfo.get().unwrap());
++            }
++            recvttl @ RecvTtl => {
++                multicast.set_receive_ttl(*recvttl.get().unwrap());
++            }
++            interface @ MulticastIf => {
++                multicast.set_interface(interface.get().unwrap())?;
++            }
++            ttl @ MulticastTtl => {
++                // -1: the default (1), as on Linux.
++                let ttl = match *ttl.get().unwrap() {
++                    -1 => 1,
++                    ttl @ 0..=255 => ttl as u8,
++                    _ => return_errno_with_message!(Errno::EINVAL, "the multicast TTL is invalid"),
++                };
++                multicast.set_ttl(ttl);
++            }
++            looped @ MulticastLoop => {
++                multicast.set_looped(*looped.get().unwrap());
++            }
++            all @ MulticastAll => {
++                multicast.set_all(*all.get().unwrap());
++            }
++            join @ AddMembership => {
++                multicast.join(join.get().unwrap())?;
++            }
++            leave @ DropMembership => {
++                multicast.leave(leave.get().unwrap())?;
++            }
++            join @ McastJoinGroup => {
++                multicast.join(&join.get().unwrap().0)?;
++            }
++            leave @ McastLeaveGroup => {
++                multicast.leave(&leave.get().unwrap().0)?;
++            }
++            _ => return Ok(false),
++        });
++        Ok(true)
+     }
+ 
+     fn try_send(
+         &self,
+         reader: &mut dyn MultiRead,
+         remote: Option<&IpEndpoint>,
+-        flags: SendFlags,
++        _flags: SendFlags,
++        interface: Option<u32>,
+     ) -> Result<usize> {
+         let (sent_bytes, iface_to_poll) = select_remote_and_bind(
+             &self.inner,
+@@ -110,8 +217,11 @@ impl DatagramSocket {
+                     .bind_ephemeral(remote_endpoint, &self.pollee)
+             },
+             |bound_datagram, remote_endpoint| {
+-                let sent_bytes = bound_datagram.try_send(reader, remote_endpoint, flags)?;
+-                let iface_to_poll = bound_datagram.iface().clone();
++                let route = self.send_route(&remote_endpoint.addr, interface);
++                let sent_bytes = bound_datagram.try_send_routed(reader, remote_endpoint, route)?;
++                let iface_to_poll = bound_datagram
++                    .iface_towards(&remote_endpoint.addr, route)
++                    .clone();
+                 Ok((sent_bytes, iface_to_poll))
+             },
+         )?;
+@@ -136,11 +246,21 @@ impl SocketPrivate for DatagramSocket {
+     }
+ 
+     fn protocol_ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
++        use crate::util::ioctl::common_defs::GetNumBytesToRead;
++
++        // `FIONREAD` (`SIOCINQ`): the size of the next datagram, as on Linux.
++        if let Some(cmd) = GetNumBytesToRead::try_from_raw(raw_ioctl) {
++            let len = match &*self.inner.read() {
++                Inner::Unbound(_) => 0,
++                Inner::Bound(bound_datagram) => bound_datagram.next_datagram_len(),
++            };
++            cmd.write(&(len.min(i32::MAX as usize) as i32))?;
++            return Ok(0);
++        }
++
+         // Handle common IPv4/IPv6 ioctl commands.
+         // TODO: Handle IPv6 ioctls once UDP sockets support IPv6.
+         ipv4_ioctl(raw_ioctl)
+-
+-        // Handle ioctl commands that require UDP-specific handling.
+     }
+ }
+ 
+@@ -217,13 +337,15 @@ impl Socket for DatagramSocket {
+             }
+         }
+ 
+-        if !control_messages.is_empty() {
+-            // TODO: Support sending control message
+-            warn!("sending control message is not supported");
+-        }
++        // `IP_PKTINFO` names the interface the datagram leaves by; other
++        // messages are ignored.
++        let interface = control_messages.iter().find_map(|message| match message {
++            ControlMessage::Ip(message) => message.interface(),
++            _ => None,
++        });
+ 
+         // TODO: Block if the send buffer is full
+-        self.try_send(reader, endpoint.as_ref(), flags)
++        self.try_send(reader, endpoint.as_ref(), flags, interface)
+     }
+ 
+     fn recvmsg(
+@@ -236,14 +358,22 @@ impl Socket for DatagramSocket {
+             warn!("unsupported flags: {:?}", flags);
+         }
+ 
+-        let (output, peer_addr) =
++        let (output, peer_addr, arrival) =
+             self.block_on_unless(IoEvents::IN, self.timeouts.recv_timeout(), flags.contains(RecvFlags::MSG_DONTWAIT), || {
+                 self.try_recv(writer, flags)
+             })?;
+ 
+-        // TODO: Receive control message
++        // Where the datagram arrived, if the socket asked (`IP_PKTINFO`).
++        let mut control_messages = Vec::new();
++        if self.multicast.lock().packet_info() {
++            control_messages.push(ControlMessage::Ip(IpControlMessage::PacketInfo(CPacketInfo {
++                ifindex: arrival.iface as i32,
++                spec_dst: ipv4_octets(arrival.local),
++                addr: ipv4_octets(arrival.destination),
++            })));
++        }
+ 
+-        let message_header = MessageHeader::new(Some(peer_addr), Vec::new());
++        let message_header = MessageHeader::new(Some(peer_addr), control_messages);
+ 
+         Ok((output, message_header))
+     }
+@@ -257,6 +387,9 @@ impl Socket for DatagramSocket {
+             }
+             _ => (),
+         });
++        if self.get_multicast_option(option)? {
++            return Ok(());
++        }
+ 
+         let inner = self.inner.read();
+         let options = self.options.read();
+@@ -275,6 +408,10 @@ impl Socket for DatagramSocket {
+     }
+ 
+     fn set_option(&self, option: &dyn SocketOption) -> Result<()> {
++        if self.set_multicast_option(option)? {
++            return Ok(());
++        }
++
+         let inner = self.inner.read();
+         let mut options = self.options.write();
+ 
+@@ -313,6 +450,19 @@ impl Socket for DatagramSocket {
+     }
+ }
+ 
++impl Drop for DatagramSocket {
++    fn drop(&mut self) {
++        self.multicast.lock().leave_all();
++    }
++}
++
++fn ipv4_octets(addr: IpAddress) -> [u8; 4] {
++    match addr {
++        IpAddress::Ipv4(addr) => addr.octets(),
++        IpAddress::Ipv6(_) => [0; 4],
++    }
++}
++
+ impl GetSocketLevelOption for (&Inner<UnboundDatagram, BoundDatagram>, &SocketTimeouts) {
+     fn socket_type(&self) -> SockType {
+         SockType::SOCK_DGRAM
+@@ -333,7 +483,7 @@ impl SetSocketLevelOption for (&Inner<UnboundDatagram, BoundDatagram>, &SocketTi
+             return;
+         };
+ 
+-        bound.bound_port().set_can_reuse(reuse_addr);
++        bound.set_can_reuse(reuse_addr);
+     }
+ 
+     fn socket_timeouts(&self) -> Option<&SocketTimeouts> {
+diff --git a/kernel/core/src/net/socket/ip/datagram/unbound.rs b/kernel/core/src/net/socket/ip/datagram/unbound.rs
+old mode 100644
+new mode 100755
+index d711d0d..f53231e
+--- a/kernel/core/src/net/socket/ip/datagram/unbound.rs
++++ b/kernel/core/src/net/socket/ip/datagram/unbound.rs
+@@ -1,12 +1,15 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use aster_bigtcp::{socket::UdpSocket, wire::IpEndpoint};
++use aster_bigtcp::{
++    iface::BindPortConfig,
++    wire::{IpAddress, IpEndpoint},
++};
+ 
+ use super::{bound::BoundDatagram, observer::DatagramObserver};
+ use crate::{
+     events::IoEvents,
+     net::{
+-        iface::BoundUdpPort,
++        iface::{BoundUdpPort, UdpSocket},
+         socket::{
+             ip::common::{
+                 get_ephemeral_endpoint, map_unspecified_to_localhost, resolve_bind_iface_and_config,
+@@ -44,17 +47,13 @@ impl datagram_common::Unbound for UnboundDatagram {
+         pollee: &Pollee,
+         options: BindOptions,
+     ) -> Result<Self::Bound> {
+-        let bound_port = bind_port(endpoint, options.can_reuse)?;
+-
+-        let bound_socket =
+-            match UdpSocket::new_bind(bound_port, DatagramObserver::new(pollee.clone())) {
+-                Ok(bound_socket) => bound_socket,
+-                Err((_, err)) => {
+-                    unreachable!("`new_bind` fails with {:?}, which should not happen", err)
+-                }
+-            };
++        if endpoint.addr.is_unspecified() {
++            return bind_every_address(endpoint, pollee, options.can_reuse);
++        }
+ 
+-        Ok(BoundDatagram::new(bound_socket))
++        let (iface, config) = resolve_bind_iface_and_config(endpoint, options.can_reuse)?;
++        let bound_port = iface.bind_udp(config)?;
++        Ok(BoundDatagram::new(vec![new_socket(bound_port, pollee)], false))
+     }
+ 
+     fn bind_ephemeral(
+@@ -74,17 +73,72 @@ impl datagram_common::Unbound for UnboundDatagram {
+     }
+ }
+ 
+-fn bind_port(endpoint: &IpEndpoint, can_reuse: bool) -> Result<BoundUdpPort> {
+-    // Every address (0.0.0.0) is a TCP listener's only: a datagram socket
+-    // lives on one interface, and programs that bind one to every address
+-    // (Chromium's DNS client, mDNS) fall back to an unbound socket when it
+-    // is refused, as they did before.
+-    if endpoint.addr.is_unspecified() {
++/// How many ports the kernel tries for a socket on every address before
++/// giving up: a port it picks may be taken on another interface.
++const EPHEMERAL_ATTEMPTS: usize = 16;
++
++/// Every address (0.0.0.0): a socket on each interface, all with the same
++/// port, the loopback interface's first. A port taken on any interface
++/// fails the bind (`EADDRINUSE`, unless both sockets set `SO_REUSEADDR`),
++/// as on Linux; a port the kernel picks (0) is picked again until every
++/// interface has it free. Interfaces that appear later are not covered.
++fn bind_every_address(
++    endpoint: &IpEndpoint,
++    pollee: &Pollee,
++    can_reuse: bool,
++) -> Result<BoundDatagram> {
++    if !matches!(endpoint.addr, IpAddress::Ipv4(_)) {
+         return_errno_with_message!(
+             Errno::EADDRNOTAVAIL,
+-            "datagram sockets do not take every address yet"
++            "datagram sockets on every IPv6 address are not supported"
+         );
+     }
+-    let (iface, config) = resolve_bind_iface_and_config(endpoint, can_reuse)?;
+-    Ok(iface.bind_udp(config)?)
++
++    let attempts = if endpoint.port == 0 { EPHEMERAL_ATTEMPTS } else { 1 };
++    let mut last_error = None;
++    for _ in 0..attempts {
++        // The unspecified address takes the loopback interface first.
++        let (first_iface, config) = resolve_bind_iface_and_config(endpoint, can_reuse)?;
++        let first = first_iface.bind_udp(config)?;
++        let port = first.port();
++
++        let mut ports = vec![first];
++        let mut taken = None;
++        for iface in crate::net::iface::iter_all_ifaces() {
++            if Arc::ptr_eq(&iface, &first_iface) {
++                continue;
++            }
++            let config = BindPortConfig::new(IpEndpoint::new(endpoint.addr, port), can_reuse);
++            match iface.bind_udp(config) {
++                Ok(bound_port) => ports.push(bound_port),
++                Err(error) => {
++                    taken = Some(error);
++                    break;
++                }
++            }
++        }
++
++        match taken {
++            None => {
++                let sockets = ports
++                    .into_iter()
++                    .map(|bound_port| new_socket(bound_port, pollee))
++                    .collect();
++                return Ok(BoundDatagram::new(sockets, true));
++            }
++            // The ports taken so far are released as `ports` drops.
++            Some(error) => last_error = Some(error),
++        }
++    }
++
++    Err(last_error.unwrap().into())
++}
++
++fn new_socket(bound_port: BoundUdpPort, pollee: &Pollee) -> UdpSocket {
++    match UdpSocket::new_bind(bound_port, DatagramObserver::new(pollee.clone())) {
++        Ok(bound_socket) => bound_socket,
++        Err((_, err)) => {
++            unreachable!("`new_bind` fails with {:?}, which should not happen", err)
++        }
++    }
+ }
+diff --git a/kernel/core/src/net/socket/ip/mod.rs b/kernel/core/src/net/socket/ip/mod.rs
+index d0dc8b1..4fe8ef3 100644
+--- a/kernel/core/src/net/socket/ip/mod.rs
++++ b/kernel/core/src/net/socket/ip/mod.rs
+@@ -4,6 +4,7 @@ mod addr;
+ mod common;
+ mod datagram;
+ mod ioctl;
++pub(crate) mod multicast;
+ pub(crate) mod options;
+ mod stream;
+ 
+diff --git a/kernel/core/src/net/socket/ip/multicast.rs b/kernel/core/src/net/socket/ip/multicast.rs
+new file mode 100755
+index 0000000..88b76bc
+--- /dev/null
++++ b/kernel/core/src/net/socket/ip/multicast.rs
+@@ -0,0 +1,282 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! IPv4 multicast for datagram sockets: the groups a socket is in
++//! (`IP_ADD_MEMBERSHIP`, `MCAST_JOIN_GROUP`), how its datagrams to a group
++//! leave (`IP_MULTICAST_IF`, `IP_MULTICAST_TTL`, `IP_MULTICAST_LOOP`), and
++//! where a datagram arrived (`IP_PKTINFO`, as a control message).
++
++use aster_bigtcp::{
++    iface::{InterfaceType, multicast},
++    wire::{IpAddress, Ipv4Address},
++};
++
++use crate::{
++    net::{
++        iface::Iface,
++        route,
++        socket::util::{CControlHeader, RecvFlags},
++    },
++    prelude::*,
++    util::net::CSocketOptionLevel,
++};
++
++/// A group to join or leave on an interface, as `ip_mreqn`, `ip_mreq` and
++/// `group_req` give it: by the interface's index, or by its address, or
++/// neither (the interface the route to the group goes through).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct GroupRequest {
++    pub(crate) group: Ipv4Address,
++    pub(crate) address: Ipv4Address,
++    pub(crate) index: u32,
++}
++
++/// A group request in `group_req`'s layout (`MCAST_JOIN_GROUP`).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct McastGroupRequest(pub(crate) GroupRequest);
++
++/// The interface `IP_MULTICAST_IF` names, by address or index (0: none).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct MulticastInterface {
++    pub(crate) address: Ipv4Address,
++    pub(crate) index: u32,
++}
++
++/// The most groups one socket joins (`IP_MAX_MEMBERSHIPS` in Linux).
++const MAX_MEMBERSHIPS: usize = 20;
++
++/// Linux's default for `IP_MULTICAST_TTL`: datagrams to a group stay on the
++/// local network.
++const DEFAULT_MULTICAST_TTL: u8 = 1;
++
++/// A datagram socket's multicast settings.
++#[derive(Debug)]
++pub(crate) struct MulticastState {
++    /// The groups joined, each with its interface's index.
++    groups: Vec<(Ipv4Address, u32)>,
++    /// `IP_MULTICAST_IF`: the interface datagrams to a group leave by.
++    interface: Option<u32>,
++    ttl: u8,
++    looped: bool,
++    /// `IP_PKTINFO`: received datagrams say where they arrived.
++    packet_info: bool,
++    /// `IP_RECVTTL`, accepted; the hop limit of a received datagram is not
++    /// kept, so no `IP_TTL` message follows it.
++    receive_ttl: bool,
++    /// `IP_MULTICAST_ALL`, accepted: datagrams to every group the computer
++    /// is in reach the socket (the only behaviour there is).
++    all: bool,
++}
++
++impl MulticastState {
++    pub(crate) const fn new() -> Self {
++        Self {
++            groups: Vec::new(),
++            interface: None,
++            ttl: DEFAULT_MULTICAST_TTL,
++            looped: true,
++            packet_info: false,
++            receive_ttl: false,
++            all: true,
++        }
++    }
++
++    pub(crate) fn join(&mut self, request: &GroupRequest) -> Result<()> {
++        check_group(request.group)?;
++        let iface = request_iface(request)?;
++        if self.groups.contains(&(request.group, iface.index())) {
++            return_errno_with_message!(Errno::EADDRINUSE, "the group is already joined");
++        }
++        if self.groups.len() >= MAX_MEMBERSHIPS {
++            return_errno_with_message!(Errno::ENOBUFS, "the socket is in too many groups");
++        }
++        multicast::join(iface.index(), request.group);
++        self.groups.push((request.group, iface.index()));
++        Ok(())
++    }
++
++    pub(crate) fn leave(&mut self, request: &GroupRequest) -> Result<()> {
++        check_group(request.group)?;
++        // Leaving names the interface as joining did; with none named, the
++        // group on any interface.
++        let named = request.index != 0 || !request.address.is_unspecified();
++        let index = if named { Some(request_iface(request)?.index()) } else { None };
++        let Some(position) = self.groups.iter().position(|(group, iface)| {
++            *group == request.group && index.is_none_or(|index| index == *iface)
++        }) else {
++            return_errno_with_message!(Errno::EADDRNOTAVAIL, "the group is not joined");
++        };
++        let (group, iface) = self.groups.remove(position);
++        multicast::leave(iface, group);
++        Ok(())
++    }
++
++    /// Leaves every group (the socket closes).
++    pub(crate) fn leave_all(&mut self) {
++        for (group, iface) in self.groups.drain(..) {
++            multicast::leave(iface, group);
++        }
++    }
++
++    pub(crate) fn set_interface(&mut self, interface: &MulticastInterface) -> Result<()> {
++        self.interface = if interface.index == 0 && interface.address.is_unspecified() {
++            None
++        } else {
++            Some(
++                request_iface(&GroupRequest {
++                    group: Ipv4Address::UNSPECIFIED,
++                    address: interface.address,
++                    index: interface.index,
++                })?
++                .index(),
++            )
++        };
++        Ok(())
++    }
++
++    /// The address of the `IP_MULTICAST_IF` interface (0.0.0.0: none).
++    pub(crate) fn interface_address(&self) -> Ipv4Address {
++        self.interface
++            .and_then(|index| {
++                crate::net::iface::iter_all_ifaces().find(|iface| iface.index() == index)
++            })
++            .and_then(|iface| iface.ipv4_cidr())
++            .map(|cidr| cidr.address())
++            .unwrap_or(Ipv4Address::UNSPECIFIED)
++    }
++
++    /// The interface a datagram to `remote` leaves by, if one is set.
++    pub(crate) fn interface_for(&self, remote: &IpAddress) -> Option<u32> {
++        if remote.is_multicast() { self.interface } else { None }
++    }
++
++    /// The hop limit of a datagram to `remote`, given the socket's
++    /// `IP_TTL` for the others.
++    pub(crate) fn hop_limit_for(&self, remote: &IpAddress, unicast_ttl: u8) -> u8 {
++        if remote.is_multicast() { self.ttl } else { unicast_ttl }
++    }
++
++    pub(crate) fn ttl(&self) -> u8 {
++        self.ttl
++    }
++
++    pub(crate) fn set_ttl(&mut self, ttl: u8) {
++        self.ttl = ttl;
++    }
++
++    pub(crate) fn looped(&self) -> bool {
++        self.looped
++    }
++
++    /// `IP_MULTICAST_LOOP`. A datagram to a group the computer is in also
++    /// reaches the local sockets whatever this says.
++    pub(crate) fn set_looped(&mut self, looped: bool) {
++        self.looped = looped;
++    }
++
++    pub(crate) fn packet_info(&self) -> bool {
++        self.packet_info
++    }
++
++    pub(crate) fn set_packet_info(&mut self, on: bool) {
++        self.packet_info = on;
++    }
++
++    pub(crate) fn receive_ttl(&self) -> bool {
++        self.receive_ttl
++    }
++
++    pub(crate) fn set_receive_ttl(&mut self, on: bool) {
++        self.receive_ttl = on;
++    }
++
++    pub(crate) fn all(&self) -> bool {
++        self.all
++    }
++
++    pub(crate) fn set_all(&mut self, all: bool) {
++        self.all = all;
++    }
++}
++
++fn check_group(group: Ipv4Address) -> Result<()> {
++    if !group.is_multicast() {
++        return_errno_with_message!(Errno::EINVAL, "the address is not a multicast group");
++    }
++    Ok(())
++}
++
++/// The interface a request names: by index, by address, or (neither) the
++/// one the route to the group goes through, else the first that is not the
++/// loopback one.
++fn request_iface(request: &GroupRequest) -> Result<Arc<Iface>> {
++    let mut ifaces = crate::net::iface::iter_all_ifaces();
++    let found = if request.index != 0 {
++        ifaces.find(|iface| iface.index() == request.index)
++    } else if !request.address.is_unspecified() {
++        ifaces.find(|iface| {
++            iface
++                .ipv4_cidr()
++                .is_some_and(|cidr| cidr.address() == request.address)
++        })
++    } else {
++        route::lookup_iface(IpAddress::Ipv4(request.group))
++            .ok()
++            .or_else(|| ifaces.find(|iface| iface.type_() != InterfaceType::LOOPBACK))
++    };
++    found.ok_or_else(|| Error::with_message(Errno::ENODEV, "there is no such interface"))
++}
++
++/// Control messages of level `SOL_IP`.
++#[derive(Debug)]
++pub(crate) enum IpControlMessage {
++    /// `IP_PKTINFO`: where a datagram arrived, or (sent) the interface and
++    /// source address it leaves with.
++    PacketInfo(CPacketInfo),
++}
++
++/// `struct in_pktinfo`.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Pod)]
++pub(crate) struct CPacketInfo {
++    pub(crate) ifindex: i32,
++    /// The local address (a reply's source).
++    pub(crate) spec_dst: [u8; 4],
++    /// The address the datagram was sent to.
++    pub(crate) addr: [u8; 4],
++}
++
++/// `IP_PKTINFO` as a control message type.
++const IP_PKTINFO: i32 = 8;
++
++impl IpControlMessage {
++    pub(crate) fn read_from(header: &CControlHeader, reader: &mut VmReader) -> Result<Option<Self>> {
++        if header.type_() != IP_PKTINFO {
++            warn!("unsupported IP control message type in {:?}", header);
++            reader.skip(header.payload_len());
++            return Ok(None);
++        }
++        if header.payload_len() < size_of::<CPacketInfo>() {
++            return_errno_with_message!(Errno::EINVAL, "the IP_PKTINFO message is too short");
++        }
++        let info = reader.read_val::<CPacketInfo>()?;
++        reader.skip(header.payload_len() - size_of::<CPacketInfo>());
++        Ok(Some(Self::PacketInfo(info)))
++    }
++
++    pub(crate) fn write_to(&self, writer: &mut VmWriter) -> Result<(CControlHeader, RecvFlags)> {
++        let Self::PacketInfo(info) = self;
++        if CControlHeader::payload_len_from_total(writer.avail())? < size_of::<CPacketInfo>() {
++            return_errno_with_message!(Errno::EINVAL, "the control message buffer is too small");
++        }
++        let header = CControlHeader::new(CSocketOptionLevel::SOL_IP, IP_PKTINFO, size_of::<CPacketInfo>());
++        writer.write_val(&header)?;
++        writer.write_val(info)?;
++        Ok((header, RecvFlags::empty()))
++    }
++
++    /// The interface a sent `IP_PKTINFO` names (0: none).
++    pub(crate) fn interface(&self) -> Option<u32> {
++        let Self::PacketInfo(info) = self;
++        (info.ifindex > 0).then_some(info.ifindex as u32)
++    }
++}
+diff --git a/kernel/core/src/net/socket/ip/options.rs b/kernel/core/src/net/socket/ip/options.rs
+index 291fd60..955359c 100644
+--- a/kernel/core/src/net/socket/ip/options.rs
++++ b/kernel/core/src/net/socket/ip/options.rs
+@@ -110,6 +110,16 @@ impl_socket_options!(
+     pub(crate) struct Ttl(IpTtl);
+     pub(crate) struct Hdrincl(bool);
+     pub(crate) struct Recverr(bool);
++    pub(crate) struct Pktinfo(bool);
++    pub(crate) struct RecvTtl(bool);
++    pub(crate) struct MulticastIf(super::multicast::MulticastInterface);
++    pub(crate) struct MulticastTtl(i32);
++    pub(crate) struct MulticastLoop(bool);
++    pub(crate) struct MulticastAll(bool);
++    pub(crate) struct AddMembership(super::multicast::GroupRequest);
++    pub(crate) struct DropMembership(super::multicast::GroupRequest);
++    pub(crate) struct McastJoinGroup(super::multicast::McastGroupRequest);
++    pub(crate) struct McastLeaveGroup(super::multicast::McastGroupRequest);
+ );
+ 
+ #[derive(Clone, Copy, Debug)]
+diff --git a/kernel/core/src/net/socket/ip/stream/mod.rs b/kernel/core/src/net/socket/ip/stream/mod.rs
+index 0db2626..2b992a0 100644
+--- a/kernel/core/src/net/socket/ip/stream/mod.rs
++++ b/kernel/core/src/net/socket/ip/stream/mod.rs
+@@ -459,6 +459,24 @@ impl SocketPrivate for StreamSocket {
+     }
+ 
+     fn protocol_ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
++        use crate::util::ioctl::common_defs::GetNumBytesToRead;
++
++        // `FIONREAD` (`SIOCINQ`): the bytes waiting to be read, as on Linux
++        // (`EINVAL` on a listening socket).
++        if let Some(cmd) = GetNumBytesToRead::try_from_raw(raw_ioctl) {
++            let len = match self.read_updated_state().as_ref() {
++                State::Connected(connected_stream) => {
++                    connected_stream.raw_with(|socket| socket.recv_queue())
++                }
++                State::Listen(_) => {
++                    return_errno_with_message!(Errno::EINVAL, "the socket is listening")
++                }
++                _ => 0,
++            };
++            cmd.write(&(len.min(i32::MAX as usize) as i32))?;
++            return Ok(0);
++        }
++
+         // Handle common IPv4/IPv6 ioctl commands.
+         match self.family {
+             IpAddressFamily::IPv4 => ipv4_ioctl(raw_ioctl),
+diff --git a/kernel/core/src/net/socket/netlink/common/mod.rs b/kernel/core/src/net/socket/netlink/common/mod.rs
+index 38bf8a3..8cd91c6 100644
+--- a/kernel/core/src/net/socket/netlink/common/mod.rs
++++ b/kernel/core/src/net/socket/netlink/common/mod.rs
+@@ -16,8 +16,9 @@ use crate::{
+             macros::{sock_option_mut, sock_option_ref},
+         },
+         private::SocketPrivate,
++        unix::{CUserCred, UnixControlMessage},
+         util::{
+-            MessageHeader, RecvFlags, RecvOutput, SendFlags, SocketAddr,
++            ControlMessage, MessageHeader, RecvFlags, RecvOutput, SendFlags, SocketAddr,
+             datagram_common::{Bound, Inner, select_remote_and_bind},
+             options::{
+                 GetSocketLevelOption, SetSocketLevelOption, SocketOptionSet, SocketTimeouts,
+@@ -186,9 +187,18 @@ where
+             self.try_recv(writer, flags)
+         })?;
+ 
+-        // TODO: Receive control message
++        // The messages come from the kernel: with `SO_PASSCRED`, they say so
++        // (pid 0, root), as on Linux. Avahi and udev's tools trust a netlink
++        // message only with these credentials.
++        let control_messages = if self.options.read().socket.pass_cred() {
++            vec![ControlMessage::Unix(UnixControlMessage::credentials(
++                CUserCred::new_kernel(),
++            ))]
++        } else {
++            Vec::new()
++        };
+ 
+-        let message_header = MessageHeader::new(Some(addr), Vec::new());
++        let message_header = MessageHeader::new(Some(addr), control_messages);
+ 
+         Ok((output, message_header))
+     }
+diff --git a/kernel/core/src/net/socket/netlink/message/attr/noattr.rs b/kernel/core/src/net/socket/netlink/message/attr/noattr.rs
+index e8d8cdf..3092424 100644
+--- a/kernel/core/src/net/socket/netlink/message/attr/noattr.rs
++++ b/kernel/core/src/net/socket/netlink/message/attr/noattr.rs
+@@ -4,7 +4,7 @@ use super::{Attribute, CAttrHeader};
+ use crate::{net::socket::netlink::message::ContinueRead, prelude::*, util::MultiRead};
+ 
+ /// A special type indicates that a segment cannot have attributes.
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) enum NoAttr {}
+ 
+ impl Attribute for NoAttr {
+diff --git a/kernel/core/src/net/socket/netlink/message/mod.rs b/kernel/core/src/net/socket/netlink/message/mod.rs
+index 1d8de9e..eb55042 100644
+--- a/kernel/core/src/net/socket/netlink/message/mod.rs
++++ b/kernel/core/src/net/socket/netlink/message/mod.rs
+@@ -28,7 +28,7 @@ use crate::{
+ ///
+ /// A netlink message can be transmitted to and from user space using a single send/receive syscall.
+ /// It consists of one or more [`ProtocolSegment`]s.
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) struct Message<T> {
+     segments: Vec<T>,
+ }
+diff --git a/kernel/core/src/net/socket/netlink/message/segment/common.rs b/kernel/core/src/net/socket/netlink/message/segment/common.rs
+index e2dd6c5..3dee92b 100644
+--- a/kernel/core/src/net/socket/netlink/message/segment/common.rs
++++ b/kernel/core/src/net/socket/netlink/message/segment/common.rs
+@@ -7,7 +7,7 @@ use crate::{
+     util::{MultiRead, MultiWrite},
+ };
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) struct SegmentCommon<Body, Attr> {
+     header: CMsgSegHdr,
+     body: Body,
+diff --git a/kernel/core/src/net/socket/netlink/mod.rs b/kernel/core/src/net/socket/netlink/mod.rs
+index b4d59b3..1ba8ce5 100644
+--- a/kernel/core/src/net/socket/netlink/mod.rs
++++ b/kernel/core/src/net/socket/netlink/mod.rs
+@@ -53,6 +53,7 @@ pub(crate) use kobject_uevent::NetlinkUeventSocket;
+ pub(crate) use options::{AddMembership, DropMembership};
+ pub(super) use receiver::NETLINK_DEFAULT_BUF_SIZE;
+ pub(crate) use route::NetlinkRouteSocket;
++pub(in crate::net) use route::{address_changed, link_changed};
+ pub(crate) use table::{StandardNetlinkProtocol, is_valid_protocol};
+ 
+ pub(in crate::net) fn init() {
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/addr.rs b/kernel/core/src/net/socket/netlink/route/kernel/addr.rs
+index f38df85..d58bb28 100644
+--- a/kernel/core/src/net/socket/netlink/route/kernel/addr.rs
++++ b/kernel/core/src/net/socket/netlink/route/kernel/addr.rs
+@@ -78,7 +78,7 @@ fn iface_to_new_addrs(
+     addr_segments.into_iter().flatten()
+ }
+ 
+-fn iface_to_new_addr(
++pub(super) fn iface_to_new_addr(
+     request_header: &CMsgSegHdr,
+     iface: &Arc<Iface>,
+     ip_cidr: IpCidr,
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/events.rs b/kernel/core/src/net/socket/netlink/route/kernel/events.rs
+new file mode 100755
+index 0000000..aa8e25d
+--- /dev/null
++++ b/kernel/core/src/net/socket/netlink/route/kernel/events.rs
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Notifications to the route sockets that joined a group, as Linux sends
++//! them: an address that comes or goes (`RTM_NEWADDR`, `RTM_DELADDR` to
++//! `RTNLGRP_IPV4_IFADDR`) and an interface that appears or changes state
++//! (`RTM_NEWLINK` to `RTNLGRP_LINK`). Avahi, Chromium's network-change
++//! notifier and other programs keep their interface lists this way: without
++//! them they never saw an address that arrived after they started (a Wi-Fi
++//! network joined, a late DHCP lease).
++
++use aster_bigtcp::wire::{IpCidr, Ipv4Cidr};
++
++use super::{addr::iface_to_new_addr, link::iface_to_new_link};
++use crate::{
++    net::{
++        iface::iter_all_ifaces,
++        socket::netlink::{
++            GroupIdSet,
++            message::{CMsgSegHdr, CSegmentType, SegHdrCommonFlags},
++            route::message::{RtnlMessage, RtnlSegment},
++            table::{NetlinkRouteProtocol, SupportedNetlinkProtocol},
++        },
++    },
++    prelude::*,
++};
++
++/// `RTNLGRP_LINK`.
++const GROUP_LINK: u32 = 1;
++/// `RTNLGRP_IPV4_IFADDR`.
++const GROUP_IPV4_ADDRESS: u32 = 5;
++
++/// The header of a message the kernel sends on its own.
++fn event_header(type_: CSegmentType) -> CMsgSegHdr {
++    CMsgSegHdr {
++        len: 0,
++        type_: type_ as _,
++        flags: SegHdrCommonFlags::empty().bits(),
++        seq: 0,
++        pid: 0,
++    }
++}
++
++fn send(group: u32, segment: RtnlSegment) {
++    let _ = NetlinkRouteProtocol::multicast(
++        GroupIdSet::new(1 << (group - 1)),
++        RtnlMessage::new(vec![segment]),
++    );
++}
++
++/// The IPv4 address of the interface with the index `index` changed from
++/// `old` to `new`.
++pub(in crate::net) fn address_changed(index: u32, old: Option<Ipv4Cidr>, new: Option<Ipv4Cidr>) {
++    let Some(iface) = iter_all_ifaces().find(|iface| iface.index() == index) else {
++        return;
++    };
++    if let Some(old) = old
++        && Some(old) != new
++    {
++        let mut segment = iface_to_new_addr(&event_header(CSegmentType::NEWADDR), &iface, IpCidr::Ipv4(old));
++        segment.header_mut().type_ = CSegmentType::DELADDR as _;
++        send(GROUP_IPV4_ADDRESS, RtnlSegment::NewAddr(segment));
++    }
++    if let Some(new) = new
++        && Some(new) != old
++    {
++        let segment = iface_to_new_addr(&event_header(CSegmentType::NEWADDR), &iface, IpCidr::Ipv4(new));
++        send(GROUP_IPV4_ADDRESS, RtnlSegment::NewAddr(segment));
++    }
++    link_changed(index);
++}
++
++/// The interface with the index `index` appeared or its state (up, link)
++/// changed.
++pub(in crate::net) fn link_changed(index: u32) {
++    let Some(iface) = iter_all_ifaces().find(|iface| iface.index() == index) else {
++        return;
++    };
++    let segment = iface_to_new_link(&event_header(CSegmentType::NEWLINK), &iface);
++    send(GROUP_LINK, RtnlSegment::NewLink(segment));
++}
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/link.rs b/kernel/core/src/net/socket/netlink/route/kernel/link.rs
+index 655ca50..500a2e5 100644
+--- a/kernel/core/src/net/socket/netlink/route/kernel/link.rs
++++ b/kernel/core/src/net/socket/netlink/route/kernel/link.rs
+@@ -123,7 +123,7 @@ fn validate_dumplink_request(body: &LinkSegmentBody) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn iface_to_new_link(request_header: &CMsgSegHdr, iface: &Arc<Iface>) -> LinkSegment {
++pub(super) fn iface_to_new_link(request_header: &CMsgSegHdr, iface: &Arc<Iface>) -> LinkSegment {
+     let header = CMsgSegHdr {
+         len: 0,
+         type_: CSegmentType::NEWLINK as _,
+diff --git a/kernel/core/src/net/socket/netlink/route/kernel/mod.rs b/kernel/core/src/net/socket/netlink/route/kernel/mod.rs
+index 516c086..8a485ad 100644
+--- a/kernel/core/src/net/socket/netlink/route/kernel/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/kernel/mod.rs
+@@ -16,6 +16,7 @@ use crate::{
+ };
+ 
+ mod addr;
++pub(super) mod events;
+ mod link;
+ mod route;
+ mod util;
+diff --git a/kernel/core/src/net/socket/netlink/route/message/attr/addr.rs b/kernel/core/src/net/socket/netlink/route/message/attr/addr.rs
+index 3b864ff..a7ad6b6 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/attr/addr.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/attr/addr.rs
+@@ -54,7 +54,7 @@ pub(crate) enum AddrProtocol {
+     KernelLinkLocal = 3,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) enum AddrAttr {
+     Address(IpAddr),
+     Broadcast(Ipv4Addr),
+diff --git a/kernel/core/src/net/socket/netlink/route/message/attr/link.rs b/kernel/core/src/net/socket/netlink/route/message/attr/link.rs
+index 8ea4563..cf09250 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/attr/link.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/attr/link.rs
+@@ -83,7 +83,7 @@ enum LinkAttrClass {
+     PARENT_DEV_BUS_NAME = 57,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) enum LinkAttr {
+     // FIXME: Linux link-layer addresses have device-specific lengths.
+     // Using `EthernetAddress` may be inappropriate
+diff --git a/kernel/core/src/net/socket/netlink/route/message/attr/route.rs b/kernel/core/src/net/socket/netlink/route/message/attr/route.rs
+index 96f427e..6d2c3cf 100755
+--- a/kernel/core/src/net/socket/netlink/route/message/attr/route.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/attr/route.rs
+@@ -35,7 +35,7 @@ enum RouteAttrClass {
+     MARK = 16,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) enum RouteAttr {
+     /// The destination (a network's address, or the address looked up).
+     Dst(IpAddr),
+diff --git a/kernel/core/src/net/socket/netlink/route/message/mod.rs b/kernel/core/src/net/socket/netlink/route/message/mod.rs
+index 6603d48..0352742 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/mod.rs
+@@ -24,7 +24,10 @@ pub(super) use segment::{
+     },
+ };
+ 
+-use crate::net::socket::netlink::message::Message;
++use crate::net::socket::netlink::{message::Message, table::MulticastMessage};
+ 
+ /// A netlink route message.
+ pub(in netlink) type RtnlMessage = Message<RtnlSegment>;
++
++/// Route messages go to groups too (address and link events).
++impl MulticastMessage for RtnlMessage {}
+diff --git a/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs b/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs
+index 249fd35..b1115d5 100644
+--- a/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/message/segment/mod.rs
+@@ -49,7 +49,7 @@ use crate::{
+ };
+ 
+ /// The netlink route segment, which is the basic unit of a netlink route message.
+-#[derive(Debug)]
++#[derive(Clone, Debug)]
+ pub(crate) enum RtnlSegment {
+     NewLink(LinkSegment),
+     GetLink(LinkSegment),
+diff --git a/kernel/core/src/net/socket/netlink/route/mod.rs b/kernel/core/src/net/socket/netlink/route/mod.rs
+index 92e2de6..fbae198 100644
+--- a/kernel/core/src/net/socket/netlink/route/mod.rs
++++ b/kernel/core/src/net/socket/netlink/route/mod.rs
+@@ -10,4 +10,6 @@ mod bound;
+ mod kernel;
+ mod message;
+ 
++pub(in crate::net) use kernel::events::{address_changed, link_changed};
++
+ pub(crate) type NetlinkRouteSocket = NetlinkSocket<NetlinkRouteProtocol>;
+diff --git a/kernel/core/src/net/socket/unix/cred.rs b/kernel/core/src/net/socket/unix/cred.rs
+index 73836c8..8ac47e8 100644
+--- a/kernel/core/src/net/socket/unix/cred.rs
++++ b/kernel/core/src/net/socket/unix/cred.rs
+@@ -98,6 +98,15 @@ impl CUserCred {
+         }
+     }
+ 
++    /// The kernel's credentials, as its netlink messages carry them.
++    pub(in crate::net) const fn new_kernel() -> Self {
++        Self {
++            pid: 0,
++            uid: Uid::new_root(),
++            gid: Gid::new_root(),
++        }
++    }
++
+     pub(in crate::net) const fn new_overflow() -> Self {
+         Self {
+             pid: 0,
+diff --git a/kernel/core/src/net/socket/unix/ctrl_msg.rs b/kernel/core/src/net/socket/unix/ctrl_msg.rs
+index cd12ebb..bdd64ee 100644
+--- a/kernel/core/src/net/socket/unix/ctrl_msg.rs
++++ b/kernel/core/src/net/socket/unix/ctrl_msg.rs
+@@ -32,6 +32,11 @@ enum Message {
+ }
+ 
+ impl UnixControlMessage {
++    /// An `SCM_CREDENTIALS` message with `cred`.
++    pub(in crate::net) fn credentials(cred: CUserCred) -> Self {
++        Self(Message::Cred(CredMessage { cred }))
++    }
++
+     pub(crate) fn read_from(
+         header: &CControlHeader,
+         reader: &mut VmReader,
+@@ -296,8 +301,10 @@ impl AuxiliaryData {
+         let mut cred = None;
+ 
+         for ctrl_msg in ctrl_msgs.into_iter() {
+-            let ControlMessage::Unix(unix_ctrl_msg) = ctrl_msg;
+-            // TODO: What should we do if there are control messages of other protocols?
++            // Messages of other levels are ignored, as Linux's `__scm_send` does.
++            let ControlMessage::Unix(unix_ctrl_msg) = ctrl_msg else {
++                continue;
++            };
+ 
+             match unix_ctrl_msg.0 {
+                 Message::Files(FileMessage {
+diff --git a/kernel/core/src/net/socket/unix/ns/path.rs b/kernel/core/src/net/socket/unix/ns/path.rs
+index 5bf4b57..92d2338 100644
+--- a/kernel/core/src/net/socket/unix/ns/path.rs
++++ b/kernel/core/src/net/socket/unix/ns/path.rs
+@@ -4,7 +4,7 @@ use ostd::task::Task;
+ 
+ use crate::{
+     fs::{
+-        file::{InodeType, Permission, mkmod},
++        file::{InodeMode, InodeType, Permission},
+         vfs::path::{FsPath, Path},
+     },
+     prelude::*,
+@@ -48,7 +48,11 @@ pub(crate) fn create_socket_file(path_name: &str) -> Result<Path> {
+             .lookup_unresolved_no_follow(&fs_path)?
+             .into_parent_and_filename()?;
+ 
+-        parent.new_child(&file_name, InodeType::Socket, mkmod!(u+rw))
++        // As Linux makes it: everything the process's umask lets through.
++        // Daemons that serve every user (Avahi) set the umask to 0 first;
++        // a fixed rw------- kept everyone else out.
++        let mode = InodeMode::from_bits_truncate(0o777 & !fs_ref.umask().get());
++        parent.new_child(&file_name, InodeType::Socket, mode)
+     })();
+ 
+     result.map_err(|err| {
+diff --git a/kernel/core/src/net/socket/util/message_header.rs b/kernel/core/src/net/socket/util/message_header.rs
+index c435767..f3826a6 100644
+--- a/kernel/core/src/net/socket/util/message_header.rs
++++ b/kernel/core/src/net/socket/util/message_header.rs
+@@ -3,7 +3,11 @@
+ use align_ext::AlignExt;
+ 
+ use super::{RecvFlags, SocketAddr};
+-use crate::{net::socket::unix::UnixControlMessage, prelude::*, util::net::CSocketOptionLevel};
++use crate::{
++    net::socket::{ip::multicast::IpControlMessage, unix::UnixControlMessage},
++    prelude::*,
++    util::net::CSocketOptionLevel,
++};
+ 
+ /// Message header used for sendmsg/recvmsg.
+ #[derive(Debug)]
+@@ -39,6 +43,7 @@ impl MessageHeader {
+ #[derive(Debug)]
+ pub(crate) enum ControlMessage {
+     Unix(UnixControlMessage),
++    Ip(IpControlMessage),
+ }
+ 
+ impl ControlMessage {
+@@ -93,6 +98,10 @@ impl ControlMessage {
+                 let msg = UnixControlMessage::read_from(header, reader)?;
+                 Ok(msg.map(Self::Unix))
+             }
++            CSocketOptionLevel::SOL_IP => {
++                let msg = IpControlMessage::read_from(header, reader)?;
++                Ok(msg.map(Self::Ip))
++            }
+             _ => {
+                 warn!("unsupported control message level in {:?}", header);
+                 reader.skip(header.payload_len());
+@@ -132,6 +141,7 @@ impl ControlMessage {
+     fn write_to(&self, writer: &mut VmWriter) -> Result<(CControlHeader, RecvFlags)> {
+         match self {
+             Self::Unix(msg) => msg.write_to(writer),
++            Self::Ip(msg) => msg.write_to(writer),
+         }
+     }
+ }
+diff --git a/kernel/core/src/util/net/options/ip.rs b/kernel/core/src/util/net/options/ip.rs
+index d03b782..44aa9a4 100644
+--- a/kernel/core/src/util/net/options/ip.rs
++++ b/kernel/core/src/util/net/options/ip.rs
+@@ -8,7 +8,14 @@ use ostd::mm::VmIo;
+ use super::RawSocketOption;
+ use crate::{
+     context::current_userspace,
+-    net::socket::ip::options::{Hdrincl, IpTtl, Recverr, Tos, Ttl},
++    net::socket::ip::{
++        multicast::{GroupRequest, McastGroupRequest, MulticastInterface},
++        options::{
++            AddMembership, DropMembership, Hdrincl, IpTtl, McastJoinGroup, McastLeaveGroup,
++            MulticastAll, MulticastIf, MulticastLoop, MulticastTtl, Pktinfo, RecvTtl, Recverr,
++            Tos, Ttl,
++        },
++    },
+     prelude::*,
+ };
+ 
+@@ -75,6 +82,16 @@ pub(crate) fn new_ip_option(name: i32) -> Result<Box<dyn RawSocketOption>> {
+         CIpOptionName::TTL => Ok(Box::new(Ttl::new())),
+         CIpOptionName::HDRINCL => Ok(Box::new(Hdrincl::new())),
+         CIpOptionName::RECVERR => Ok(Box::new(Recverr::new())),
++        CIpOptionName::PKTINFO => Ok(Box::new(Pktinfo::new())),
++        CIpOptionName::RECVTTL => Ok(Box::new(RecvTtl::new())),
++        CIpOptionName::MULTICAST_IF => Ok(Box::new(MulticastIf::new())),
++        CIpOptionName::MULTICAST_TTL => Ok(Box::new(MulticastTtl::new())),
++        CIpOptionName::MULTICAST_LOOP => Ok(Box::new(MulticastLoop::new())),
++        CIpOptionName::MULTICAST_ALL => Ok(Box::new(MulticastAll::new())),
++        CIpOptionName::ADD_MEMBERSHIP => Ok(Box::new(AddMembership::new())),
++        CIpOptionName::DROP_MEMBERSHIP => Ok(Box::new(DropMembership::new())),
++        CIpOptionName::MCAST_JOIN_GROUP => Ok(Box::new(McastJoinGroup::new())),
++        CIpOptionName::MCAST_LEAVE_GROUP => Ok(Box::new(McastLeaveGroup::new())),
+         _ => return_errno_with_message!(Errno::ENOPROTOOPT, "unsupported ip level option"),
+     }
+ }
+@@ -114,6 +131,101 @@ impl_raw_ip_socket_option!(Ttl);
+ impl_raw_ip_socket_option!(Tos);
+ impl_raw_ip_socket_option!(Hdrincl);
+ impl_raw_ip_socket_option!(Recverr);
++impl_raw_ip_socket_option!(Pktinfo);
++impl_raw_ip_socket_option!(RecvTtl);
++impl_raw_ip_socket_option!(MulticastIf);
++impl_raw_ip_socket_option!(MulticastTtl);
++impl_raw_ip_socket_option!(MulticastLoop);
++impl_raw_ip_socket_option!(MulticastAll);
++impl_raw_ip_socket_option!(AddMembership);
++impl_raw_ip_socket_option!(DropMembership);
++impl_raw_ip_socket_option!(McastJoinGroup);
++impl_raw_ip_socket_option!(McastLeaveGroup);
++
++/// `ip_mreqn` (12 bytes) or `ip_mreq` (8 bytes).
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.18/source/net/ipv4/ip_sockglue.c#L1192>.
++impl ReadIpOption for GroupRequest {
++    fn read_ip_option(addr: Vaddr, max_len: u32) -> Result<Self> {
++        if max_len < 8 {
++            return_errno_with_message!(Errno::EINVAL, "the group request is too short");
++        }
++        let group = current_userspace!().read_val::<[u8; 4]>(addr)?;
++        let address = current_userspace!().read_val::<[u8; 4]>(addr + 4)?;
++        let index = if max_len >= 12 { current_userspace!().read_val::<i32>(addr + 8)? } else { 0 };
++        Ok(GroupRequest {
++            group: group.into(),
++            address: address.into(),
++            index: index.max(0) as u32,
++        })
++    }
++}
++
++/// `struct group_req`: the interface's index, then a `sockaddr_storage`
++/// (at offset 8) holding the group as a `sockaddr_in`.
++impl ReadIpOption for McastGroupRequest {
++    fn read_ip_option(addr: Vaddr, max_len: u32) -> Result<Self> {
++        const GROUP_REQ_LEN: u32 = 136;
++        const AF_INET: u16 = 2;
++        if max_len < GROUP_REQ_LEN {
++            return_errno_with_message!(Errno::EINVAL, "the group request is too short");
++        }
++        let index = current_userspace!().read_val::<u32>(addr)?;
++        if current_userspace!().read_val::<u16>(addr + 8)? != AF_INET {
++            return_errno_with_message!(Errno::EINVAL, "only IPv4 groups are supported");
++        }
++        let group = current_userspace!().read_val::<[u8; 4]>(addr + 12)?;
++        Ok(McastGroupRequest(GroupRequest {
++            group: group.into(),
++            address: [0u8; 4].into(),
++            index,
++        }))
++    }
++}
++
++/// `ip_mreqn`, `ip_mreq` (its second address) or an `in_addr`.
++///
++/// Reference: <https://elixir.bootlin.com/linux/v6.18/source/net/ipv4/ip_sockglue.c#L1145>.
++impl ReadIpOption for MulticastInterface {
++    fn read_ip_option(addr: Vaddr, max_len: u32) -> Result<Self> {
++        let (address, index) = if max_len >= 12 {
++            (current_userspace!().read_val::<[u8; 4]>(addr + 4)?, current_userspace!().read_val::<i32>(addr + 8)?)
++        } else if max_len >= 8 {
++            (current_userspace!().read_val::<[u8; 4]>(addr + 4)?, 0)
++        } else if max_len >= 4 {
++            (current_userspace!().read_val::<[u8; 4]>(addr)?, 0)
++        } else {
++            return_errno_with_message!(Errno::EINVAL, "the interface is too short");
++        };
++        Ok(MulticastInterface {
++            address: address.into(),
++            index: index.max(0) as u32,
++        })
++    }
++}
++
++impl crate::util::net::options::utils::WriteToUser for GroupRequest {
++    fn write_to_user(&self, _addr: Vaddr, _max_len: u32) -> Result<usize> {
++        return_errno_with_message!(Errno::ENOPROTOOPT, "group requests cannot be read back")
++    }
++}
++
++impl crate::util::net::options::utils::WriteToUser for McastGroupRequest {
++    fn write_to_user(&self, _addr: Vaddr, _max_len: u32) -> Result<usize> {
++        return_errno_with_message!(Errno::ENOPROTOOPT, "group requests cannot be read back")
++    }
++}
++
++/// The interface's address, as an `in_addr`.
++impl crate::util::net::options::utils::WriteToUser for MulticastInterface {
++    fn write_to_user(&self, addr: Vaddr, max_len: u32) -> Result<usize> {
++        if max_len < 4 {
++            return_errno_with_message!(Errno::EINVAL, "the buffer is too short");
++        }
++        current_userspace!().write_val(addr, &self.address.octets())?;
++        Ok(4)
++    }
++}
+ 
+ impl ReadIpOption for i32 {
+     fn read_ip_option(addr: Vaddr, max_len: u32) -> Result<Self> {
+diff --git a/kernel/libs/aster-bigtcp/src/iface/common.rs b/kernel/libs/aster-bigtcp/src/iface/common.rs
+index bb0cbf4..0b97033 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/common.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/common.rs
+@@ -347,7 +347,7 @@ impl<E: Ext> IfaceCommon<E> {
+         let mut sockets = self.sockets.lock();
+         let mut socket_actions = Vec::new();
+ 
+-        let mut context = PollContext::new(interface.as_mut(), &sockets, &mut socket_actions);
++        let mut context = PollContext::new(self.index, interface.as_mut(), &sockets, &mut socket_actions);
+         context.poll_ingress(device, phy, &self.counters);
+         context.poll_egress(device, phy, &self.counters);
+ 
+@@ -540,6 +540,13 @@ impl PortTable {
+             }
+         };
+ 
++        // Every address (0.0.0.0) and one address share a port only between
++        // sockets that both allow reuse, as on Linux.
++        if !config.is_backlog() && self.collides_across_addresses(addr, port, protocol, config_can_reuse)
++        {
++            return Err(BindError::InUse);
++        }
++
+         let key = PortKey {
+             addr,
+             port,
+@@ -571,6 +578,44 @@ impl PortTable {
+         Ok((port, config_can_reuse))
+     }
+ 
++    /// Whether `addr:port` collides with a socket on another address of the
++    /// same port where one of the two is every address (the unspecified
++    /// address), unless both allow reuse.
++    fn collides_across_addresses(
++        &self,
++        addr: NormalizedAddress,
++        port: u16,
++        protocol: PortProtocol,
++        can_reuse: bool,
++    ) -> bool {
++        let every_v4 = NormalizedAddress::from(IpAddress::Ipv4(crate::wire::Ipv4Address::UNSPECIFIED));
++        let every_v6 = NormalizedAddress::from(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED));
++        let blocks = |state: &PortState| !(can_reuse && state.can_reuse());
++
++        if addr != every_v4 && addr != every_v6 {
++            // One address: a socket on every address of the same port.
++            return [every_v4, every_v6].into_iter().any(|every| {
++                self.used_ports
++                    .get(&PortKey {
++                        addr: every,
++                        port,
++                        protocol,
++                    })
++                    .is_some_and(blocks)
++            });
++        }
++
++        // Every address (rare: servers): any socket on one address of the
++        // port.
++        self.used_ports.iter().any(|(key, state)| {
++            key.port == port
++                && key.protocol == protocol
++                && key.addr != every_v4
++                && key.addr != every_v6
++                && blocks(state)
++        })
++    }
++
+     /// Allocates an ephemeral port.
+     ///
+     /// We follow the port range that many Linux kernels use by default, which is 32768-60999.
+@@ -604,7 +649,9 @@ impl PortTable {
+         let mut port = start_port;
+         loop {
+             key.port = port;
+-            if !self.used_ports.contains_key(&key) {
++            if !self.used_ports.contains_key(&key)
++                && !self.collides_across_addresses(addr, port, protocol, false)
++            {
+                 self.next_ephemeral_port = next_ephemeral_port_after(port);
+                 return Some(port);
+             }
+diff --git a/kernel/libs/aster-bigtcp/src/iface/mod.rs b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+index 5711e3f..923564a 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/mod.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+@@ -5,6 +5,7 @@ mod dhcp;
+ pub mod firewall;
+ #[expect(clippy::module_inception)]
+ mod iface;
++pub mod multicast;
+ mod packet_slice;
+ mod phy;
+ mod poll;
+@@ -48,6 +49,27 @@ pub(crate) fn frame_tap() -> Option<fn(u32, &[u8])> {
+ }
+ 
+ static FRAME_TAP: spin::Once<fn(u32, &[u8])> = spin::Once::new();
++
++/// Told when an interface's IPv4 address changes: its index, the old
++/// address and the new one (route sockets' `RTM_NEWADDR`/`RTM_DELADDR`).
++pub fn set_address_hook(hook: fn(u32, Option<smoltcp::wire::Ipv4Cidr>, Option<smoltcp::wire::Ipv4Cidr>)) {
++    ADDRESS_HOOK.call_once(|| hook);
++}
++
++pub(crate) fn address_changed(
++    index: u32,
++    old: Option<smoltcp::wire::Ipv4Cidr>,
++    new: Option<smoltcp::wire::Ipv4Cidr>,
++) {
++    if old != new
++        && let Some(hook) = ADDRESS_HOOK.get()
++    {
++        hook(index, old, new);
++    }
++}
++
++static ADDRESS_HOOK: spin::Once<fn(u32, Option<smoltcp::wire::Ipv4Cidr>, Option<smoltcp::wire::Ipv4Cidr>)> =
++    spin::Once::new();
+ static TAPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+ 
+ /// The firewall in force, if it is on (`firewall`).
+diff --git a/kernel/libs/aster-bigtcp/src/iface/multicast.rs b/kernel/libs/aster-bigtcp/src/iface/multicast.rs
+new file mode 100755
+index 0000000..c278759
+--- /dev/null
++++ b/kernel/libs/aster-bigtcp/src/iface/multicast.rs
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The IPv4 multicast groups this computer takes part in, by interface.
++//!
++//! Sockets join and leave groups (`IP_ADD_MEMBERSHIP`); an interface takes
++//! the datagrams sent to a group while some socket is in it on that
++//! interface, and every socket bound to the group's port (on every address
++//! or on the group's) receives them, as on Linux with `IP_MULTICAST_ALL`.
++//!
++//! Membership is not announced with IGMP: the link-local groups (mDNS,
++//! SSDP's 239.255.255.250 on most home networks) reach every station
++//! anyway, and switches without IGMP snooping flood the others.
++
++use alloc::collections::BTreeMap;
++
++use ostd::sync::{LocalIrqDisabled, SpinLock};
++use smoltcp::wire::{EthernetAddress, Ipv4Address};
++
++static GROUPS: SpinLock<BTreeMap<(u32, Ipv4Address), usize>, LocalIrqDisabled> =
++    SpinLock::new(BTreeMap::new());
++
++/// The all-hosts group (224.0.0.1), which every interface is in.
++const ALL_HOSTS: Ipv4Address = Ipv4Address::new(224, 0, 0, 1);
++
++/// Takes part in `group` on the interface with the index `iface`; each
++/// join is undone by one [`leave`].
++pub fn join(iface: u32, group: Ipv4Address) {
++    *GROUPS.lock().entry((iface, group)).or_insert(0) += 1;
++}
++
++/// Undoes one [`join`].
++pub fn leave(iface: u32, group: Ipv4Address) {
++    let mut groups = GROUPS.lock();
++    if let Some(count) = groups.get_mut(&(iface, group)) {
++        *count -= 1;
++        if *count == 0 {
++            groups.remove(&(iface, group));
++        }
++    }
++}
++
++/// Whether the interface with the index `iface` takes datagrams sent to
++/// `group`.
++pub fn is_member(iface: u32, group: Ipv4Address) -> bool {
++    group == ALL_HOSTS || GROUPS.lock().contains_key(&(iface, group))
++}
++
++/// The Ethernet address frames to `group` go to (RFC 1112, section 6.4):
++/// 01:00:5e followed by the group's low 23 bits.
++pub(crate) fn ethernet_address(group: Ipv4Address) -> EthernetAddress {
++    let octets = group.octets();
++    EthernetAddress([0x01, 0x00, 0x5e, octets[1] & 0x7f, octets[2], octets[3]])
++}
+diff --git a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+index 8595411..d6c4920 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+@@ -34,7 +34,13 @@ pub struct EtherIface<D, E: Ext> {
+     driver: D,
+     common: IfaceCommon<E>,
+     ether_addr: EthernetAddress,
+-    arp_table: SpinLock<BTreeMap<Ipv4Address, EthernetAddress>, BottomHalfDisabled>,
++    /// Neighbours' Ethernet addresses, with when they were learnt.
++    arp_table: SpinLock<BTreeMap<Ipv4Address, (EthernetAddress, u64)>, BottomHalfDisabled>,
++    /// Packets waiting for a neighbour's address (`ARP_QUEUE_LEN` each).
++    unresolved: SpinLock<BTreeMap<Ipv4Address, Vec<TxPacketWithDst>>, BottomHalfDisabled>,
++    /// Packets whose neighbour answered, sent after the poll (outside the
++    /// device's lock).
++    resolved: SpinLock<Vec<TxPacket<LinkLayer>>, BottomHalfDisabled>,
+     /// Asking for an address (an interface without a fixed one).
+     dhcp: Option<SpinLock<DhcpClient, BottomHalfDisabled>>,
+     lease: SpinLock<Option<DhcpLease>, BottomHalfDisabled>,
+@@ -46,6 +52,18 @@ fn now_ms() -> u64 {
+     get_network_timestamp().total_millis() as u64
+ }
+ 
++/// How long a neighbour's address is trusted before it is asked again
++/// (Linux re-checks after about 30 s of reachability; asking again costs
++/// one round trip, the packets meanwhile wait).
++const ARP_LIFETIME_MS: u64 = 5 * 60 * 1000;
++
++/// Packets kept for one neighbour while its address is asked (Linux keeps
++/// a few, `unres_qlen`); older ones are dropped first.
++const ARP_QUEUE_LEN: usize = 3;
++
++/// Neighbours whose address is being asked at once.
++const ARP_PENDING_NEIGHBOURS: usize = 16;
++
+ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+     pub fn new(
+         driver: D,
+@@ -79,6 +97,8 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+             common,
+             ether_addr,
+             arp_table: SpinLock::new(BTreeMap::new()),
++            unresolved: SpinLock::new(BTreeMap::new()),
++            resolved: SpinLock::new(Vec::new()),
+             dhcp: None,
+             lease: SpinLock::new(None),
+             pending: SpinLock::new(Vec::new()),
+@@ -106,6 +126,8 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+             common,
+             ether_addr,
+             arp_table: SpinLock::new(BTreeMap::new()),
++            unresolved: SpinLock::new(BTreeMap::new()),
++            resolved: SpinLock::new(Vec::new()),
+             dhcp: Some(SpinLock::new(DhcpClient::new(ether_addr.0, seed, host_name))),
+             lease: SpinLock::new(None),
+             pending: SpinLock::new(Vec::new()),
+@@ -124,6 +146,20 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+         Some(builder.build())
+     }
+ 
++    /// Sends the packets whose neighbour answered during the poll.
++    fn send_resolved(&self) {
++        let ready = core::mem::take(&mut *self.resolved.lock());
++        if ready.is_empty() {
++            return;
++        }
++        self.driver.with(|device| {
++            for packet in ready {
++                let _ = self.common.counters().send(device, packet);
++            }
++            device.notify_poll_end();
++        });
++    }
++
+     /// Applies what the DHCP client said: the address and routes change.
+     fn apply_dhcp_events(&self) {
+         let events = core::mem::take(&mut *self.pending.lock());
+@@ -131,7 +167,10 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+             let mut interface = self.common.interface();
+             match event {
+                 DhcpEvent::Configure(lease) => {
+-                    interface.set_ipv4(Some(Ipv4Cidr::new(Ipv4Address::from(lease.address), lease.prefix_len)));
++                    self.forget_neighbours();
++                    let old = interface.ipv4_cidr();
++                    let new = Ipv4Cidr::new(Ipv4Address::from(lease.address), lease.prefix_len);
++                    interface.set_ipv4(Some(new));
+                     interface.set_ipv4_gateway(lease.router.map(Ipv4Address::from));
+                     drop(interface);
+                     ostd::notice!(
+@@ -143,12 +182,16 @@ impl<D: WithDevice, E: Ext> EtherIface<D, E> {
+                         lease.dns.iter().map(|dns| Ipv4Address::from(*dns)).collect::<Vec<_>>()
+                     );
+                     *self.lease.lock() = Some(lease);
++                    crate::iface::address_changed(self.common.index(), old, Some(new));
+                 }
+                 DhcpEvent::Deconfigure => {
++                    self.forget_neighbours();
++                    let old = interface.ipv4_cidr();
+                     interface.set_ipv4(None);
+                     interface.set_ipv4_gateway(None);
+                     drop(interface);
+                     *self.lease.lock() = None;
++                    crate::iface::address_changed(self.common.index(), old, None);
+                 }
+             }
+             crate::iface::bump_config_generation();
+@@ -183,6 +226,7 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for EtherIface<D, E> {
+             self.common.set_phy_next_poll(Some(next));
+         }
+         self.common.poll(&self.driver, self);
++        self.send_resolved();
+         self.apply_dhcp_events();
+     }
+ 
+@@ -232,7 +276,12 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
+         let (packet, repr) = ether::parse(packet)?;
+ 
+         // Ignore the Ethernet frame if it is not sent to us.
+-        if !repr.dst_addr.is_broadcast() && repr.dst_addr != self.ether_addr {
++        // Multicast frames are taken (the drivers ask the card for all of
++        // them) and the IP layer keeps those to the interface's groups.
++        if !repr.dst_addr.is_broadcast()
++            && !repr.dst_addr.is_multicast()
++            && repr.dst_addr != self.ether_addr
++        {
+             return None;
+         }
+ 
+@@ -285,7 +334,20 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
+     ) -> Option<TxPacket<LinkLayer>> {
+         match self.resolve_ether_or_generate_arp(packet.dst_addr, iface_cx) {
+             Ok(ether_repr) => Some(ether::emit(packet.packet, &ether_repr)),
+-            Err(Some(arp_repr)) => Self::emit_arp(&arp_repr, packet.packet.reset_to_fresh()),
++            Err(Some(arp_repr)) => {
++                // The packet waits for the answer in a buffer of its own; the
++                // question goes out in a new one.
++                let ArpRepr::EthernetIpv4 { target_protocol_addr, .. } = arp_repr else {
++                    return None;
++                };
++                match self.alloc_tx_buffer(0) {
++                    Ok(buffer) => {
++                        self.wait_for_neighbour(target_protocol_addr, packet);
++                        Self::emit_arp(&arp_repr, buffer)
++                    }
++                    Err(_) => Self::emit_arp(&arp_repr, packet.packet.reset_to_fresh()),
++                }
++            }
+             Err(None) => None,
+         }
+     }
+@@ -296,6 +358,44 @@ impl<D: WithDevice + 'static, E: Ext> PollPhy for EtherIface<D, E> {
+ }
+ 
+ impl<D, E: Ext> EtherIface<D, E> {
++    /// Another network (a new lease, or none): its neighbours may reuse the
++    /// addresses of the last one (192.168.1.1) with other Ethernet addresses.
++    fn forget_neighbours(&self) {
++        self.arp_table.lock().clear();
++        self.unresolved.lock().clear();
++    }
++
++    /// Learns a neighbour's address, and readies the packets waiting for it.
++    fn learn_neighbour(&self, ip: Ipv4Address, ether: EthernetAddress) {
++        self.arp_table.lock().insert(ip, (ether, now_ms()));
++        let Some(waiting) = self.unresolved.lock().remove(&ip) else {
++            return;
++        };
++        let repr = EthernetRepr {
++            src_addr: self.ether_addr,
++            dst_addr: ether,
++            ethertype: EthernetProtocol::Ipv4,
++        };
++        let mut resolved = self.resolved.lock();
++        for packet in waiting {
++            resolved.push(ether::emit(packet.packet, &repr));
++        }
++    }
++
++    /// Keeps a packet until its neighbour's address arrives.
++    fn wait_for_neighbour(&self, ip: Ipv4Address, packet: TxPacketWithDst) {
++        let mut unresolved = self.unresolved.lock();
++        if !unresolved.contains_key(&ip) && unresolved.len() >= ARP_PENDING_NEIGHBOURS {
++            let oldest = *unresolved.keys().next().unwrap();
++            unresolved.remove(&oldest);
++        }
++        let waiting = unresolved.entry(ip).or_default();
++        if waiting.len() >= ARP_QUEUE_LEN {
++            waiting.remove(0);
++        }
++        waiting.push(packet);
++    }
++
+     fn process_arp(&self, arp_repr: &ArpRepr, iface_cx: &mut Context) -> Option<ArpRepr> {
+         match arp_repr {
+             ArpRepr::EthernetIpv4 {
+@@ -311,12 +411,9 @@ impl<D, E: Ext> EtherIface<D, E> {
+                     return None;
+                 }
+ 
+-                // Insert the mapping between the Ethernet address and the IP address.
+-                //
+-                // TODO: Remove the mapping if it expires.
+-                self.arp_table
+-                    .lock()
+-                    .insert(*source_protocol_addr, *source_hardware_addr);
++                // Insert the mapping between the Ethernet address and the IP
++                // address (it ages: `ARP_LIFETIME_MS`), and send what waited.
++                self.learn_neighbour(*source_protocol_addr, *source_hardware_addr);
+ 
+                 None
+             }
+@@ -340,6 +437,12 @@ impl<D, E: Ext> EtherIface<D, E> {
+                     return None;
+                 }
+ 
++                // The neighbour asking is about to talk to us: learn it, as
++                // Linux does, so that our answer needs no question of ours.
++                if iface_cx.in_same_network(&IpAddress::Ipv4(*source_protocol_addr)) {
++                    self.learn_neighbour(*source_protocol_addr, *source_hardware_addr);
++                }
++
+                 Some(ArpRepr::EthernetIpv4 {
+                     operation: ArpOperation::Reply,
+                     source_hardware_addr: self.ether_addr,
+@@ -357,6 +460,17 @@ impl<D, E: Ext> EtherIface<D, E> {
+         dst_addr: IpAddress,
+         iface_cx: &mut Context,
+     ) -> Result<EthernetRepr, Option<ArpRepr>> {
++        // A multicast group: its Ethernet address, no next hop.
++        if let IpAddress::Ipv4(group) = dst_addr
++            && group.is_multicast()
++        {
++            return Ok(EthernetRepr {
++                src_addr: self.ether_addr,
++                dst_addr: crate::iface::multicast::ethernet_address(group),
++                ethertype: EthernetProtocol::Ipv4,
++            });
++        }
++
+         // Resolve the next-hop IP address.
+         let next_hop_ip = match iface_cx.route(&dst_addr, iface_cx.now()) {
+             Some(IpAddress::Ipv4(next_hop_ip)) => next_hop_ip,
+@@ -372,7 +486,12 @@ impl<D, E: Ext> EtherIface<D, E> {
+         // Resolve the next-hop Ethernet address.
+         let next_hop_ether = if next_hop_ip.is_broadcast() {
+             EthernetAddress::BROADCAST
+-        } else if let Some(next_hop_ether) = self.arp_table.lock().get(&next_hop_ip) {
++        } else if let Some((next_hop_ether, _)) = self
++            .arp_table
++            .lock()
++            .get(&next_hop_ip)
++            .filter(|(_, learnt)| now_ms().saturating_sub(*learnt) < ARP_LIFETIME_MS)
++        {
+             *next_hop_ether
+         } else {
+             // If the next-hop Ethernet address cannot be resolved, we drop the original packet and
+diff --git a/kernel/libs/aster-bigtcp/src/iface/poll.rs b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+index 3c2b722..4b93ac5 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/poll.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+@@ -31,7 +31,22 @@ use crate::{
+     socket_table::{ConnectionKey, ListenerKey, SocketTable},
+ };
+ 
++/// Service discovery that ufw's default rules let in with the firewall on:
++/// mDNS (224.0.0.251:5353, printers and shares) and SSDP
++/// (239.255.255.250:1900, UPnP devices).
++fn is_discovery(dst_addr: IpAddress, dst_port: u16) -> bool {
++    matches!(
++        (dst_addr, dst_port),
++        (IpAddress::Ipv4(group), 5353) if group == Ipv4Address::new(224, 0, 0, 251)
++    ) || matches!(
++        (dst_addr, dst_port),
++        (IpAddress::Ipv4(group), 1900) if group == Ipv4Address::new(239, 255, 255, 250)
++    )
++}
++
+ pub(super) struct PollContext<'a, E: Ext> {
++    /// The interface's index (its multicast groups are kept by index).
++    index: u32,
+     iface: PollableIfaceMut<'a, E>,
+     sockets: &'a SocketTable<E>,
+     actions: &'a mut Vec<SocketTableAction<E>>,
+@@ -48,11 +63,13 @@ pub(super) enum SocketTableAction<E: Ext> {
+ 
+ impl<'a, E: Ext> PollContext<'a, E> {
+     pub(super) fn new(
++        index: u32,
+         iface: PollableIfaceMut<'a, E>,
+         sockets: &'a SocketTable<E>,
+         actions: &'a mut Vec<SocketTableAction<E>>,
+     ) -> Self {
+         Self {
++            index,
+             iface,
+             sockets,
+             actions,
+@@ -61,6 +78,14 @@ impl<'a, E: Ext> PollContext<'a, E> {
+ }
+ 
+ impl<E: Ext> PollContext<'_, E> {
++    /// Whether `dst_addr` is a multicast group the interface is in.
++    fn is_member(&self, dst_addr: IpAddress) -> bool {
++        match dst_addr {
++            IpAddress::Ipv4(group) => group.is_multicast() && super::multicast::is_member(self.index, group),
++            IpAddress::Ipv6(_) => false,
++        }
++    }
++
+     pub(super) fn poll_ingress(
+         &mut self,
+         device: &mut dyn AnyNetworkDevice,
+@@ -118,7 +143,7 @@ impl<E: Ext> PollContext<'_, E> {
+         let can_process = {
+             let cx = self.iface.context();
+             let dst_addr = ip_repr.inner.dst_addr();
+-            cx.is_broadcast(&dst_addr) || cx.is_unicast_local(dst_addr)
++            cx.is_broadcast(&dst_addr) || cx.is_unicast_local(dst_addr) || self.is_member(dst_addr)
+         };
+         if !can_process {
+             return self.generate_icmp_unreachable(
+@@ -309,7 +334,9 @@ impl<E: Ext> PollContext<'_, E> {
+ 
+         // The firewall judges the datagrams from elsewhere: one it denies
+         // is ignored, one it rejects gets what a closed port answers.
+-        let verdict = if self.iface.context().is_unicast_local(ip_repr.inner.src_addr()) {
++        let verdict = if self.iface.context().is_unicast_local(ip_repr.inner.src_addr())
++            || is_discovery(ip_repr.inner.dst_addr(), udp_repr.dst_port)
++        {
+             Verdict::Accept
+         } else {
+             super::firewall_udp(ip_repr.inner.src_addr(), udp_repr.src_port, udp_repr.dst_port)
+@@ -463,8 +490,10 @@ impl<E: Ext> PollContext<'_, E> {
+         let packet = ip::emit(packet, ip_repr, checksum_caps.ipv4.tx());
+ 
+         let mut dst_addr = ip_repr.dst_addr();
+-        if !self.iface.context().is_unicast(dst_addr) {
++        if !self.iface.context().is_unicast(dst_addr) && !dst_addr.is_multicast() {
+             // Force the link layer to emit a broadcast link-layer address.
++            // A multicast group keeps its address: the link layer sends to
++            // the group's Ethernet address.
+             dst_addr = IpAddress::Ipv4(Ipv4Address::BROADCAST);
+         }
+ 
+@@ -539,9 +568,10 @@ impl<E: Ext> PollContext<'_, E> {
+ 
+             let mut deferred = None;
+ 
++            let index = self.index;
+             let (reply, became_dead) =
+                 TcpConnectionBg::dispatch(&socket, &mut self.iface, |iface, ip_repr, tcp_repr| {
+-                    let mut this = PollContext::new(iface, self.sockets, self.actions);
++                    let mut this = PollContext::new(index, iface, self.sockets, self.actions);
+ 
+                     if !this.iface.context().is_unicast_local(ip_repr.dst_addr()) {
+                         tx_packet = this.emit_tcp(phy, ip_repr, tcp_repr);
+@@ -625,12 +655,16 @@ impl<E: Ext> PollContext<'_, E> {
+ 
+             let mut deferred = None;
+ 
++            let index = self.index;
+             let (cx, pending) = self.iface.inner_mut();
+             socket.dispatch(cx, |cx, ip_repr, udp_repr, udp_payload| {
+                 let iface = PollableIfaceMut::new(cx, pending);
+-                let mut this = PollContext::new(iface, self.sockets, &mut actions);
++                let mut this = PollContext::new(index, iface, self.sockets, &mut actions);
+ 
+-                let is_broadcast = this.iface.context().is_broadcast(&ip_repr.dst_addr());
++                // A broadcast, or a datagram to a group this computer is in,
++                // goes out and to the local sockets too (`IP_MULTICAST_LOOP`).
++                let is_broadcast = this.iface.context().is_broadcast(&ip_repr.dst_addr())
++                    || this.is_member(ip_repr.dst_addr());
+                 if is_broadcast || !this.iface.context().is_unicast_local(ip_repr.dst_addr()) {
+                     tx_packet = this.emit_udp(phy, ip_repr, udp_repr, udp_payload);
+                     if !is_broadcast {
+diff --git a/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs b/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs
+index cccbf4c..b60cd80 100644
+--- a/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs
++++ b/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs
+@@ -78,7 +78,12 @@ impl<E: Ext> UdpSocketBg<E> {
+         //
+         // `RawUdpSocket::accepts` accepts all incoming broadcast and multicast packets, which is not
+         // what we want.
+-        ip_repr.dst_addr() == *self.bound.addr() && udp_repr.dst_port == self.bound.port()
++        //
++        // A socket bound to the unspecified address takes what comes to any
++        // address of its interface: its own, broadcasts, and the multicast
++        // groups the interface is in (the interface checked those before).
++        udp_repr.dst_port == self.bound.port()
++            && (self.bound.addr().is_unspecified() || ip_repr.dst_addr() == *self.bound.addr())
+     }
+ 
+     /// Tries to generate an outgoing packet and dispatches the generated packet.
+@@ -133,7 +138,14 @@ impl<E: Ext> UdpSocket<E> {
+         let socket = {
+             let mut socket = new_udp_socket();
+ 
+-            if let Err(err) = socket.bind(local_endpoint) {
++            // The unspecified address: every address of the interface, and
++            // what is sent leaves from the interface's own.
++            let binding = if local_endpoint.addr.is_unspecified() {
++                socket.bind(local_endpoint.port)
++            } else {
++                socket.bind(local_endpoint)
++            };
++            if let Err(err) = binding {
+                 return Err((bound, err));
+             }
+ 
+@@ -209,6 +221,12 @@ impl<E: Ext> UdpSocket<E> {
+         Ok(result)
+     }
+ 
++    /// Sets the hop limit (TTL) of the datagrams sent from now on; `None`:
++    /// the default.
++    pub fn set_hop_limit(&self, hop_limit: Option<u8>) {
++        self.0.inner.socket.lock().set_hop_limit(hop_limit);
++    }
++
+     /// Calls `f` with an immutable reference to the associated [`RawUdpSocket`].
+     //
+     // NOTE: If a mutable reference is required, add a method above that correctly updates the next

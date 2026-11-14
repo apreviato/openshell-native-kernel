@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 994c665..6778d07 100644
+index 994c665..9e1a9de 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -329,6 +329,17 @@ dependencies = [
+@@ -329,6 +329,18 @@ dependencies = [
   "zerocopy",
  ]
  
@@ -10,6 +10,7 @@ index 994c665..6778d07 100644
 +name = "aster-iwlwifi"
 +version = "0.1.0"
 +dependencies = [
++ "aster-cmdline",
 + "aster-core",
 + "aster-firmware",
 + "aster-pci",
@@ -20,7 +21,7 @@ index 994c665..6778d07 100644
  [[package]]
  name = "aster-logger"
  version = "0.1.0"
-@@ -582,6 +593,7 @@ dependencies = [
+@@ -582,6 +594,7 @@ dependencies = [
   "aster-ethernet",
   "aster-firmware",
   "aster-i8042",
@@ -82,16 +83,17 @@ index ee8ceb1..418ff05 100644
  [target.x86_64-unknown-none.dependencies]
 diff --git a/kernel/comps/iwlwifi/Cargo.toml b/kernel/comps/iwlwifi/Cargo.toml
 new file mode 100644
-index 0000000..6cc47fe
+index 0000000..43977d9
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/Cargo.toml
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,15 @@
 +[package]
 +name = "aster-iwlwifi"
 +version = "0.1.0"
 +edition.workspace = true
 +
 +[dependencies]
++aster-cmdline.workspace = true
 +aster-core.workspace = true
 +aster-firmware.workspace = true
 +aster-pci.workspace = true
@@ -638,10 +640,10 @@ index 0000000..027d30d
 +}
 diff --git a/kernel/comps/iwlwifi/src/lib.rs b/kernel/comps/iwlwifi/src/lib.rs
 new file mode 100755
-index 0000000..66ee2b4
+index 0000000..d00234b
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/src/lib.rs
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,363 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Intel Wi-Fi: the AX200 and AX201 (Wi-Fi 6) and the AX210, AX211 and
@@ -799,8 +801,17 @@ index 0000000..66ee2b4
 +/// The cards found, until their tasks start.
 +static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
 +
++/// `iwlwifi.on`: the driver starts the cards. Off by default until it
++/// makes a card a radio: until then it would only start the card (and let
++/// it write to memory) on every Intel laptop for nothing.
++static ENABLED: AtomicBool = AtomicBool::new(false);
++aster_cmdline::define_flag_param!("iwlwifi.on", ENABLED);
++
 +#[init_component]
 +fn init() -> Result<(), ComponentInitError> {
++    if !ENABLED.load(Ordering::Relaxed) {
++        return Ok(());
++    }
 +    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
 +    PCI_BUS.lock().register_driver(driver.clone());
 +    let cards = core::mem::take(&mut *driver.found.lock());

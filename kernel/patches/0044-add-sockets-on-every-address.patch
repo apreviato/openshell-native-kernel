@@ -1,15 +1,15 @@
 diff --git a/kernel/core/src/net/socket/ip/common.rs b/kernel/core/src/net/socket/ip/common.rs
-index 94025c0..be11c64 100644
+index 94025c0..f646a57 100644
 --- a/kernel/core/src/net/socket/ip/common.rs
 +++ b/kernel/core/src/net/socket/ip/common.rs
-@@ -17,13 +17,31 @@ pub(super) fn resolve_bind_iface_and_config(
+@@ -17,13 +17,26 @@ pub(super) fn resolve_bind_iface_and_config(
  ) -> Result<(Arc<Iface>, BindPortConfig)> {
      check_port_privilege(endpoint.port)?;
  
 -    let iface = route::lookup_local_iface(endpoint.addr)?;
-+    // Every IPv4 address (0.0.0.0): the port is taken on the loopback
-+    // interface, and a socket that then listens does so on every
-+    // interface (`stream::listen`).
++    // Every IPv4 address (0.0.0.0), for TCP (datagram sockets refuse it
++    // before): the port is taken on the loopback interface, and a socket
++    // that then listens does so on every interface (`stream::listen`).
 +    let iface = match endpoint.addr {
 +        IpAddress::Ipv4(address) if address.is_unspecified() => loopback_iface()?,
 +        address => route::lookup_local_iface(address)?,
@@ -20,11 +20,6 @@ index 94025c0..be11c64 100644
      Ok((iface, bind_port_config))
  }
  
-+/// The interface a packet to `destination` leaves through.
-+pub(super) fn output_iface(destination: IpAddress) -> Result<Arc<Iface>> {
-+    route::lookup_iface(destination)
-+}
-+
 +/// The loopback interface of the current network namespace.
 +pub(super) fn loopback_iface() -> Result<Arc<Iface>> {
 +    crate::net::iface::iter_all_ifaces()
@@ -35,7 +30,7 @@ index 94025c0..be11c64 100644
  impl From<BindError> for Error {
      fn from(value: BindError) -> Self {
          match value {
-@@ -39,6 +57,7 @@ impl From<BindError> for Error {
+@@ -39,6 +52,7 @@ impl From<BindError> for Error {
  
  pub(super) fn get_ephemeral_endpoint(remote_endpoint: &IpEndpoint) -> Result<IpEndpoint> {
      let route_dst = remote_endpoint.addr;
@@ -43,190 +38,27 @@ index 94025c0..be11c64 100644
      let iface = route::lookup_iface(route_dst)?;
  
      let source = match route_dst {
-diff --git a/kernel/core/src/net/socket/ip/datagram/bound.rs b/kernel/core/src/net/socket/ip/datagram/bound.rs
-index 39d16d9..cd65cb2 100644
---- a/kernel/core/src/net/socket/ip/datagram/bound.rs
-+++ b/kernel/core/src/net/socket/ip/datagram/bound.rs
-@@ -2,14 +2,17 @@
- 
- use aster_bigtcp::{
-     errors::udp::{RecvError, SendError},
--    wire::IpEndpoint,
-+    wire::{IpAddress, IpEndpoint},
- };
- 
- use crate::{
-     events::IoEvents,
-     net::{
-         iface::{BoundUdpPort, Iface, UdpSocket},
--        socket::util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
-+        socket::{
-+            ip::common::output_iface,
-+            util::{RecvFlags, RecvOutput, SendFlags, datagram_common},
-+        },
-     },
-     prelude::*,
-     util::{MultiRead, MultiWrite},
-@@ -17,13 +20,17 @@ use crate::{
- 
- pub(super) struct BoundDatagram {
-     bound_socket: UdpSocket,
-+    /// A socket bound to every address (0.0.0.0) has one on each of the
-+    /// other interfaces as well, with the same port (`UnboundDatagram::bind`).
-+    others: Vec<UdpSocket>,
-     remote_endpoint: Option<IpEndpoint>,
- }
- 
- impl BoundDatagram {
--    pub(super) fn new(bound_socket: UdpSocket) -> Self {
-+    pub(super) fn new(bound_socket: UdpSocket, others: Vec<UdpSocket>) -> Self {
-         Self {
-             bound_socket,
-+            others,
-             remote_endpoint: None,
-         }
-     }
-@@ -32,6 +39,29 @@ impl BoundDatagram {
-         self.bound_socket.iface()
-     }
- 
-+    /// The interface a datagram to `remote` leaves through.
-+    pub(super) fn iface_towards(&self, remote: &IpAddress) -> &Arc<Iface> {
-+        self.socket_towards(remote).iface()
-+    }
-+
-+    /// The socket that sends to `remote`: where there is one on every
-+    /// interface, the one on the interface the route goes through.
-+    fn socket_towards(&self, remote: &IpAddress) -> &UdpSocket {
-+        if self.others.is_empty() {
-+            return &self.bound_socket;
-+        }
-+        match output_iface(*remote) {
-+            Ok(iface) => self
-+                .others
-+                .iter()
-+                .find(|socket| Arc::ptr_eq(socket.iface(), &iface))
-+                .unwrap_or(&self.bound_socket),
-+            // No route yet (a broadcast before there is a lease): the first
-+            // interface that is not the loopback one.
-+            Err(_) => &self.others[0],
-+        }
-+    }
-+
-     pub(super) fn bound_port(&self) -> &BoundUdpPort {
-         self.bound_socket.bound_port()
-     }
-@@ -57,9 +87,13 @@ impl datagram_common::Bound for BoundDatagram {
-         writer: &mut dyn MultiWrite,
-         flags: RecvFlags,
-     ) -> Result<(RecvOutput, Self::Endpoint)> {
--        let result = self
--            .bound_socket
--            .recv(flags.receive_behavior(), |packet, udp_metadata| {
-+        // The first socket that has a datagram, of every interface's.
-+        let mut sockets = core::iter::once(&self.bound_socket).chain(self.others.iter());
-+        let result = loop {
-+            let Some(socket) = sockets.next() else {
-+                break Err(RecvError::Exhausted);
-+            };
-+            let received = socket.recv(flags.receive_behavior(), |packet, udp_metadata| {
-                 let message_len = packet.len();
-                 let copied_res = writer
-                     .write(&mut VmReader::from(packet))
-@@ -67,6 +101,10 @@ impl datagram_common::Bound for BoundDatagram {
-                 let endpoint = udp_metadata.endpoint;
-                 (copied_res, endpoint, message_len)
-             });
-+            if !matches!(received, Err(RecvError::Exhausted)) {
-+                break received;
-+            }
-+        };
- 
-         match result {
-             Ok((Ok(copied_len), endpoint, message_len)) => {
-@@ -90,7 +128,7 @@ impl datagram_common::Bound for BoundDatagram {
-         _flags: SendFlags,
-     ) -> Result<usize> {
-         let result = self
--            .bound_socket
-+            .socket_towards(&remote.addr)
-             .send(reader.sum_lens(), *remote, |socket_buffer| {
-                 // FIXME: If copy failed, we should not send any packet.
-                 // But current smoltcp API seems not to support this behavior.
-@@ -117,7 +155,7 @@ impl datagram_common::Bound for BoundDatagram {
-     }
- 
-     fn check_io_events(&self) -> IoEvents {
--        self.bound_socket.raw_with(|socket| {
-+        let mut events = self.bound_socket.raw_with(|socket| {
-             let mut events = IoEvents::empty();
- 
-             if socket.can_recv() {
-@@ -129,6 +167,10 @@ impl datagram_common::Bound for BoundDatagram {
-             }
- 
-             events
--        })
-+        });
-+        if self.others.iter().any(|socket| socket.raw_with(|socket| socket.can_recv())) {
-+            events |= IoEvents::IN;
-+        }
-+        events
-     }
- }
-diff --git a/kernel/core/src/net/socket/ip/datagram/mod.rs b/kernel/core/src/net/socket/ip/datagram/mod.rs
-index 513c6a0..74bcc94 100644
---- a/kernel/core/src/net/socket/ip/datagram/mod.rs
-+++ b/kernel/core/src/net/socket/ip/datagram/mod.rs
-@@ -111,7 +111,7 @@ impl DatagramSocket {
-             },
-             |bound_datagram, remote_endpoint| {
-                 let sent_bytes = bound_datagram.try_send(reader, remote_endpoint, flags)?;
--                let iface_to_poll = bound_datagram.iface().clone();
-+                let iface_to_poll = bound_datagram.iface_towards(&remote_endpoint.addr).clone();
-                 Ok((sent_bytes, iface_to_poll))
-             },
-         )?;
 diff --git a/kernel/core/src/net/socket/ip/datagram/unbound.rs b/kernel/core/src/net/socket/ip/datagram/unbound.rs
-index c50b8b2..9c099e6 100644
+index c50b8b2..d711d0d 100644
 --- a/kernel/core/src/net/socket/ip/datagram/unbound.rs
 +++ b/kernel/core/src/net/socket/ip/datagram/unbound.rs
-@@ -1,6 +1,6 @@
- // SPDX-License-Identifier: MPL-2.0
+@@ -75,6 +75,16 @@ impl datagram_common::Unbound for UnboundDatagram {
+ }
  
--use aster_bigtcp::{socket::UdpSocket, wire::IpEndpoint};
-+use aster_bigtcp::{iface::BindPortConfig, socket::UdpSocket, wire::IpEndpoint};
- 
- use super::{bound::BoundDatagram, observer::DatagramObserver};
- use crate::{
-@@ -54,7 +54,26 @@ impl datagram_common::Unbound for UnboundDatagram {
-                 }
-             };
- 
--        Ok(BoundDatagram::new(bound_socket))
-+        // Every address (0.0.0.0): the first socket is the loopback
-+        // interface's; each other interface gets one with the same port.
-+        // Interfaces that appear later are not covered.
-+        let mut others = Vec::new();
-+        if endpoint.addr.is_unspecified() {
-+            let first = bound_socket.iface().clone();
-+            let port = bound_socket.local_endpoint().port;
-+            for iface in crate::net::iface::iter_all_ifaces().filter(|iface| !Arc::ptr_eq(iface, &first)) {
-+                // An interface where the port is taken by a socket of its
-+                // own address is left to that socket.
-+                let Ok(bound) = iface.bind_udp(BindPortConfig::new(IpEndpoint::new(endpoint.addr, port), options.can_reuse)) else {
-+                    continue;
-+                };
-+                if let Ok(socket) = UdpSocket::new_bind(bound, DatagramObserver::new(pollee.clone())) {
-+                    others.push(socket);
-+                }
-+            }
-+        }
-+
-+        Ok(BoundDatagram::new(bound_socket, others))
-     }
- 
-     fn bind_ephemeral(
+ fn bind_port(endpoint: &IpEndpoint, can_reuse: bool) -> Result<BoundUdpPort> {
++    // Every address (0.0.0.0) is a TCP listener's only: a datagram socket
++    // lives on one interface, and programs that bind one to every address
++    // (Chromium's DNS client, mDNS) fall back to an unbound socket when it
++    // is refused, as they did before.
++    if endpoint.addr.is_unspecified() {
++        return_errno_with_message!(
++            Errno::EADDRNOTAVAIL,
++            "datagram sockets do not take every address yet"
++        );
++    }
+     let (iface, config) = resolve_bind_iface_and_config(endpoint, can_reuse)?;
+     Ok(iface.bind_udp(config)?)
+ }
 diff --git a/kernel/core/src/net/socket/ip/stream/init.rs b/kernel/core/src/net/socket/ip/stream/init.rs
 index b77f5b4..ae0daca 100644
 --- a/kernel/core/src/net/socket/ip/stream/init.rs
@@ -280,7 +112,7 @@ index b77f5b4..ae0daca 100644
      let (iface, config) = resolve_bind_iface_and_config(endpoint, can_reuse)?;
      Ok(iface.bind_tcp(config)?)
 diff --git a/kernel/core/src/net/socket/ip/stream/listen.rs b/kernel/core/src/net/socket/ip/stream/listen.rs
-index 4d69e7b..cd6da4c 100644
+index 4d69e7b..184e506 100644
 --- a/kernel/core/src/net/socket/ip/stream/listen.rs
 +++ b/kernel/core/src/net/socket/ip/stream/listen.rs
 @@ -2,6 +2,7 @@
@@ -350,6 +182,37 @@ index 4d69e7b..cd6da4c 100644
  
          // If network packets come in simultaneously, the socket state may change in the middle.
          // However, the current pollee implementation should be able to handle this race condition.
+@@ -74,7 +98,13 @@ impl ListenStream {
+         set_option(&self.tcp_listener)
+     }
+ 
+-    pub(super) fn into_listener(self) -> TcpListener {
+-        self.tcp_listener
++    /// Closes every listener: the one of the socket's own interface and
++    /// those on the other interfaces, which would otherwise keep the port
++    /// there and take connections nobody accepts.
++    pub(super) fn close(self) {
++        for listener in core::iter::once(&self.tcp_listener).chain(self.others.iter()) {
++            listener.close();
++            listener.iface().poll();
++        }
+     }
+ }
+diff --git a/kernel/core/src/net/socket/ip/stream/mod.rs b/kernel/core/src/net/socket/ip/stream/mod.rs
+index f09c688..0db2626 100644
+--- a/kernel/core/src/net/socket/ip/stream/mod.rs
++++ b/kernel/core/src/net/socket/ip/stream/mod.rs
+@@ -1013,9 +1013,7 @@ impl Drop for StreamSocket {
+             State::Connecting(connecting_stream) => connecting_stream.into_connection(),
+             State::Connected(connected_stream) => connected_stream.into_connection(),
+             State::Listen(listen_stream) => {
+-                let listener = listen_stream.into_listener();
+-                listener.close();
+-                listener.iface().poll();
++                listen_stream.close();
+                 return;
+             }
+         };
 diff --git a/kernel/libs/aster-bigtcp/src/iface/poll.rs b/kernel/libs/aster-bigtcp/src/iface/poll.rs
 index 744665e..3c2b722 100644
 --- a/kernel/libs/aster-bigtcp/src/iface/poll.rs
@@ -388,38 +251,5 @@ index fcac220..54407a3 100644
 +            };
 +            if let Err(err) = listening {
                  return Err((bound, err.into()));
-             }
- 
-diff --git a/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs b/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs
-index cccbf4c..194a80c 100644
---- a/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs
-+++ b/kernel/libs/aster-bigtcp/src/socket/bound/udp.rs
-@@ -78,7 +78,11 @@ impl<E: Ext> UdpSocketBg<E> {
-         //
-         // `RawUdpSocket::accepts` accepts all incoming broadcast and multicast packets, which is not
-         // what we want.
--        ip_repr.dst_addr() == *self.bound.addr() && udp_repr.dst_port == self.bound.port()
-+        //
-+        // A socket bound to the unspecified address takes what comes to any
-+        // address of its interface, broadcasts included.
-+        (self.bound.addr().is_unspecified() || ip_repr.dst_addr() == *self.bound.addr())
-+            && udp_repr.dst_port == self.bound.port()
-     }
- 
-     /// Tries to generate an outgoing packet and dispatches the generated packet.
-@@ -133,7 +137,14 @@ impl<E: Ext> UdpSocket<E> {
-         let socket = {
-             let mut socket = new_udp_socket();
- 
--            if let Err(err) = socket.bind(local_endpoint) {
-+            // The unspecified address: every address of the interface, and
-+            // what is sent leaves from the interface's own.
-+            let binding = if local_endpoint.addr.is_unspecified() {
-+                socket.bind(local_endpoint.port)
-+            } else {
-+                socket.bind(local_endpoint)
-+            };
-+            if let Err(err) = binding {
-                 return Err((bound, err));
              }
  
