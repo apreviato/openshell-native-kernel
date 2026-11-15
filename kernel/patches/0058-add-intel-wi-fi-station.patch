@@ -73,7 +73,7 @@ index 0000000..1f720c6
 diff --git a/kernel/comps/iwlwifi/src/csr.rs b/kernel/comps/iwlwifi/src/csr.rs
 old mode 100755
 new mode 100644
-index 9c668eb..fa16a75
+index 9c668eb..cb8971c
 --- a/kernel/comps/iwlwifi/src/csr.rs
 +++ b/kernel/comps/iwlwifi/src/csr.rs
 @@ -40,6 +40,13 @@ pub(crate) const HBUS_TARG_PRPH_RDAT: usize = 0x450;
@@ -100,7 +100,7 @@ index 9c668eb..fa16a75
  pub(crate) const UREG_CHICK: u32 = 0x00a0_5c00;
  pub(crate) const UREG_CHICK_MSI_ENABLE: u32 = 1 << 24;
  pub(crate) const UREG_CHICK_MSIX_ENABLE: u32 = 1 << 25;
-@@ -124,3 +134,156 @@ pub(crate) const SD_REG_VER: u32 = 0x00a2_9600;
+@@ -124,3 +134,174 @@ pub(crate) const SD_REG_VER: u32 = 0x00a2_9600;
  pub(crate) const SD_REG_VER_GEN2: u32 = 0x00a2_b800;
  /// The AX210 family's second-processor registers sit this much higher.
  pub(crate) const UMAC_PRPH_OFFSET_AX210: u32 = 0x0030_0000;
@@ -250,6 +250,24 @@ index 9c668eb..fa16a75
 +    }
 +}
 +
++/// The 7000 family's power management unit (APMG) and the rest of what
++/// its host sets: the DMA clock, L1-active, the RF-kill interrupt, the
++/// power source and the early power-off reset, the oscillator of the 7260
++/// and 3160, the L0s exit timer, the interrupt timer's other mode.
++pub(crate) const APMG_CLK_EN: u32 = 0x3004;
++pub(crate) const APMG_CLK_DMA_CLK_RQT: u32 = 0x0000_0200;
++pub(crate) const APMG_PS_CTRL: u32 = 0x300c;
++pub(crate) const APMG_PS_CTRL_EARLY_PWR_OFF_RESET_DIS: u32 = 0x0040_0000;
++pub(crate) const APMG_PS_CTRL_PWR_SRC_MASK: u32 = 0x0300_0000;
++pub(crate) const APMG_PCIDEV_STT: u32 = 0x3010;
++pub(crate) const APMG_PCIDEV_STT_L1_ACT_DIS: u32 = 0x0000_0800;
++pub(crate) const APMG_RTC_INT_STT: u32 = 0x301c;
++pub(crate) const APMG_RTC_INT_STT_RFKILL: u32 = 0x1000_0000;
++pub(crate) const OSC_CLK: u32 = 0x00a0_4068;
++pub(crate) const OSC_CLK_FORCE_CONTROL: u32 = 0x8;
++pub(crate) const GIO_CHICKEN_DIS_L0S_EXIT_TIMER: u32 = 0x2000_0000;
++pub(crate) const INT_COALESCING_HOST_OPER_MODE: u32 = 1 << 31;
++
 +/// Loading the firmware: the window to the extended memory, the
 +/// processors' reset, a word the firmware keeps for the host.
 +pub(crate) const LMPM_CHICK: u32 = 0x00a0_1ff8;
@@ -260,7 +278,7 @@ index 9c668eb..fa16a75
 diff --git a/kernel/comps/iwlwifi/src/fw.rs b/kernel/comps/iwlwifi/src/fw.rs
 old mode 100755
 new mode 100644
-index 2555ee4..5a57e22
+index 2555ee4..f0bd6af
 --- a/kernel/comps/iwlwifi/src/fw.rs
 +++ b/kernel/comps/iwlwifi/src/fw.rs
 @@ -23,8 +23,11 @@ pub(crate) const PAGING_SEPARATOR: u32 = 0xaaaa_bbbb;
@@ -317,12 +335,12 @@ index 2555ee4..5a57e22
                  TLV_PAGING => firmware.paging_size = word(0)?,
                  TLV_IML => firmware.iml = Some(start..end),
                  TLV_FLAGS => firmware.flags = word(0)?,
-@@ -186,14 +210,12 @@ impl Firmware {
+@@ -186,14 +210,11 @@ impl Firmware {
      }
  
      /// The firmware has API change `bit` (`IWL_UCODE_TLV_API_*`).
 -    // For the commands that follow the firmware's start, as the two below.
-     #[allow(dead_code)]
+-    #[allow(dead_code)]
      pub(crate) fn has_api(&self, bit: u32) -> bool {
          self.api.get((bit / 32) as usize).is_some_and(|word| word >> (bit % 32) & 1 == 1)
      }
@@ -332,7 +350,18 @@ index 2555ee4..5a57e22
      pub(crate) fn has_capability(&self, bit: u32) -> bool {
          self.capabilities.get((bit / 32) as usize).is_some_and(|word| word >> (bit % 32) & 1 == 1)
      }
-@@ -215,6 +237,19 @@ impl Firmware {
+@@ -204,17 +225,25 @@ impl Firmware {
+         self.command_versions.iter().find(|entry| entry.group == group && entry.command == command).map_or(VERSION_UNKNOWN, |entry| entry.version)
+     }
+ 
+-    #[allow(dead_code)]
+-    pub(crate) fn notification_version(&self, group: u8, command: u8) -> u8 {
+-        self.command_versions.iter().find(|entry| entry.group == group && entry.command == command).map_or(VERSION_UNKNOWN, |entry| entry.notification)
+-    }
+-
+     /// The antennas the board has, a bit each (A, B, C): to send, to
+     /// receive.
+     pub(crate) fn antennas(&self) -> (u8, u8) {
          (((self.phy_config >> 16) & 0xf) as u8, ((self.phy_config >> 20) & 0xf) as u8)
      }
  
@@ -352,7 +381,7 @@ index 2555ee4..5a57e22
      /// The sections as the chip's loader takes them: the first
      /// processor's, the second's, and the pages.
      pub(crate) fn groups(&self) -> (&[Section], &[Section], &[Section]) {
-@@ -229,3 +264,65 @@ impl Firmware {
+@@ -229,3 +258,65 @@ impl Firmware {
          (lmac, umac, paging)
      }
  }
@@ -421,13 +450,17 @@ index 2555ee4..5a57e22
 diff --git a/kernel/comps/iwlwifi/src/ids.rs b/kernel/comps/iwlwifi/src/ids.rs
 old mode 100755
 new mode 100644
-index 027d30d..2997c34
+index 027d30d..5c801fe
 --- a/kernel/comps/iwlwifi/src/ids.rs
 +++ b/kernel/comps/iwlwifi/src/ids.rs
-@@ -15,6 +15,13 @@ pub(crate) const VENDOR_INTEL: u16 = 0x8086;
+@@ -15,6 +15,17 @@ pub(crate) const VENDOR_INTEL: u16 = 0x8086;
  /// How the chip is started and what its queues look like.
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  pub(crate) enum Family {
++    /// 7260, 7265, 3160, 3165 and 3168 ("7000"): the first generation
++    /// with the older single receive queue, firmware loaded without a
++    /// signature, the NVM's older layout and the LMAC scan.
++    Ac7000,
 +    /// 8260, 8265, 8275 and 4165 ("8000"): the first generation with the
 +    /// older single receive queue and the 9000 family's commands.
 +    Ac8000,
@@ -438,12 +471,22 @@ index 027d30d..2997c34
      /// AX200 and AX201 ("22000"): the context information block.
      Ax200,
      /// AX210, AX211 and AX411: the second context format, with the image
-@@ -36,7 +43,23 @@ const fn mac(device: u16, family: Family, integrated: bool) -> Mac {
+@@ -36,7 +47,33 @@ const fn mac(device: u16, family: Family, integrated: bool) -> Mac {
  }
  
  /// Linux's `iwl_hw_card_ids` for these families.
 -pub(crate) const MACS: [Mac; 15] = [
-+pub(crate) const MACS: [Mac; 27] = [
++pub(crate) const MACS: [Mac; 36] = [
++    // 7260 (AC, N), 3160, 7265 (and its D step), 3165, 3168.
++    mac(0x08b1, Family::Ac7000, false),
++    mac(0x08b2, Family::Ac7000, false),
++    mac(0x08b3, Family::Ac7000, false),
++    mac(0x08b4, Family::Ac7000, false),
++    mac(0x095a, Family::Ac7000, false),
++    mac(0x095b, Family::Ac7000, false),
++    mac(0x3165, Family::Ac7000, false),
++    mac(0x3166, Family::Ac7000, false),
++    mac(0x24fb, Family::Ac7000, false),
 +    // 8260 and 4165 (8000C firmware), 8265, 8275 and Killer 1435/1434.
 +    mac(0x24f3, Family::Ac8000, false),
 +    mac(0x24f4, Family::Ac8000, false),
@@ -463,7 +506,7 @@ index 027d30d..2997c34
      // AX200, the card (and Killer AX1650x/w).
      mac(0x2723, Family::Ax200, false),
      // AX201 and its relatives in Comet Lake, Ice Lake, Jasper Lake and
-@@ -67,7 +90,33 @@ pub(crate) fn mac_of(vendor: u16, device: u16) -> Option<&'static Mac> {
+@@ -67,7 +104,33 @@ pub(crate) fn mac_of(vendor: u16, device: u16) -> Option<&'static Mac> {
      MACS.iter().find(|mac| mac.device == device)
  }
  
@@ -497,7 +540,7 @@ index 027d30d..2997c34
  pub(crate) const MAC_TYPE_QU: u32 = 0x33;
  pub(crate) const MAC_TYPE_CC: u32 = 0x34;
  pub(crate) const MAC_TYPE_QUZ: u32 = 0x35;
-@@ -116,10 +165,19 @@ pub(crate) fn rf_id_from_crf(crf_id: u32, cdb: bool) -> Option<u32> {
+@@ -116,10 +179,34 @@ pub(crate) fn rf_id_from_crf(crf_id: u32, cdb: bool) -> Option<u32> {
  
  /// The firmware's name before its API number: "iwlwifi-Qu-c0-hr-b0".
  /// None: a MAC or a radio this driver has no firmware for.
@@ -507,6 +550,21 @@ index 027d30d..2997c34
 +    // and the 8000C one of the 8260 and 4165.
 +    if card.family == Family::Ac8000 {
 +        return Some(String::from(if card.device == 0x24fd { "iwlwifi-8265" } else { "iwlwifi-8000C" }));
++    }
++    // The 7000 family's too; the 7265's D step (its MAC's revision type)
++    // has the same device numbers as the B step and takes the 7265D one,
++    // as the 3165 does.
++    if card.family == Family::Ac7000 {
++        const HW_REV_TYPE_7265D: u32 = 0x210;
++        let name = match card.device {
++            0x08b1 | 0x08b2 => "iwlwifi-7260",
++            0x08b3 | 0x08b4 => "iwlwifi-3160",
++            0x3165 | 0x3166 => "iwlwifi-7265D",
++            0x24fb => "iwlwifi-3168",
++            _ if hw_rev & 0x0000_fff0 == HW_REV_TYPE_7265D => "iwlwifi-7265D",
++            _ => "iwlwifi-7265",
++        };
++        return Some(String::from(name));
 +    }
      let step = hw_rev & 0xf;
      let step_letter = |step: u32| if step == 0xf { 'z' } else { (b'a' + (step as u8).min(25)) as char };
@@ -518,7 +576,7 @@ index 027d30d..2997c34
          MAC_TYPE_QU => ("Qu", step_letter(step)),
          // Its radio is on the card: one firmware.
          MAC_TYPE_CC => return Some(String::from("iwlwifi-cc-a0")),
-@@ -139,22 +197,27 @@ pub(crate) fn firmware_prefix(hw_rev: u32, hw_rf_id: u32) -> Option<String> {
+@@ -139,22 +226,41 @@ pub(crate) fn firmware_prefix(hw_rev: u32, hw_rf_id: u32) -> Option<String> {
      Some(format!("iwlwifi-{mac}-{mac_step}0-{rf}{cdb}-{rf_step}0"))
  }
  
@@ -526,12 +584,14 @@ index 027d30d..2997c34
 -/// the same on every chip of both families (the later ones for AX210
 -/// change to another command set).
 -pub(crate) const FIRMWARE_API: u32 = 77;
-+/// The firmware API this driver speaks with a family: for the AX200 and
++/// The firmware API this driver speaks with a chip: for the AX200 and
 +/// AX210 families the last one whose commands are the same on every chip
 +/// of both (the later ones for AX210 change to another command set); for
-+/// the 9000 family its last release.
-+pub(crate) fn firmware_api(family: Family) -> u32 {
++/// the older families each firmware's last release.
++pub(crate) fn firmware_api(family: Family, prefix: &str) -> u32 {
 +    match family {
++        Family::Ac7000 if prefix.ends_with("7265D") || prefix.ends_with("3168") => 29,
++        Family::Ac7000 => 17,
 +        Family::Ac8000 => 36,
 +        Family::Ac9000 => 46,
 +        Family::Ax200 | Family::Ax210 => 77,
@@ -543,10 +603,22 @@ index 027d30d..2997c34
 -pub(crate) fn firmware_files(prefix: &str) -> Vec<String> {
 -    let name = format!("{prefix}-{FIRMWARE_API}.ucode");
 +pub(crate) fn firmware_files(prefix: &str, family: Family) -> Vec<String> {
-+    let name = format!("{prefix}-{}.ucode", firmware_api(family));
++    let name = format!("{prefix}-{}.ucode", firmware_api(family, prefix));
      alloc::vec![format!("intel/iwlwifi/{name}"), name]
  }
  
++/// The 3168 keeps its channels in a regulatory section of its own
++/// (`IWL_NVM_SDP`).
++pub(crate) fn nvm_sdp(card: &Mac) -> bool {
++    card.family == Family::Ac7000 && card.device == 0x24fb
++}
++
++/// The 7260 and 3160 need their interrupt timer's other mode and the
++/// oscillator forced on (`host_interrupt_operation_mode`).
++pub(crate) fn host_interrupt_operation_mode(card: &Mac) -> bool {
++    card.family == Family::Ac7000 && matches!(card.device, 0x08b1..=0x08b4)
++}
++
  /// The platform's NVM file of the AX210 family, which its firmware asks
  /// for after it starts.
 -// For the commands that follow the firmware's start.
@@ -557,28 +629,31 @@ index 027d30d..2997c34
 diff --git a/kernel/comps/iwlwifi/src/lib.rs b/kernel/comps/iwlwifi/src/lib.rs
 old mode 100755
 new mode 100644
-index d00234b..281d344
+index d00234b..2c24493
 --- a/kernel/comps/iwlwifi/src/lib.rs
 +++ b/kernel/comps/iwlwifi/src/lib.rs
-@@ -1,20 +1,22 @@
+@@ -1,20 +1,24 @@
  // SPDX-License-Identifier: MPL-2.0
  
 -//! Intel Wi-Fi: the AX200 and AX201 (Wi-Fi 6) and the AX210, AX211 and
 -//! AX411 (Wi-Fi 6E), the cards of most laptops since 2019, as Linux's
 -//! iwlwifi runs them.
-+//! Intel Wi-Fi: the 9260, 9560, 9461 and 9462 (Wi-Fi 5), the AX200 and
-+//! AX201 (Wi-Fi 6) and the AX210, AX211 and AX411 (Wi-Fi 6E), the cards
-+//! of most laptops since 2017, as Linux's iwlwifi runs them.
++//! Intel Wi-Fi: the 7260, 7265, 3160, 3165, 3168, 8260, 8265, 8275, 4165,
++//! 9260, 9560, 9461 and 9462 (Wi-Fi 5), the AX200 and AX201 (Wi-Fi 6) and
++//! the AX210, AX211 and AX411 (Wi-Fi 6E), the cards of most laptops since
++//! 2013, as Linux's iwlwifi runs them.
  //!
  //! The chip runs its maker's firmware (`iwlwifi-*.ucode`, in
 -//! linux-firmware), which this driver hands to the chip's loader and then
 -//! commands. One firmware API (77) speaks the same commands on every chip
 -//! of both families ([`ids`]), so one driver serves them all; the file
+-//! says which version of each command it takes ([`fw`]).
 +//! linux-firmware), which this driver hands to the chip's loader (the
-+//! 9000 family's host copies it in itself) and then commands. One firmware
-+//! API (77) speaks the same commands on every chip of the AX families, the
-+//! 9000 family's last one (46) older versions of them ([`ids`]); the file
- //! says which version of each command it takes ([`fw`]).
++//! older families' host copies it in itself) and then commands. One
++//! firmware API (77) speaks the same commands on every chip of the AX
++//! families, each older family's last release older versions of them
++//! ([`ids`]); the file says which version of each command it takes
++//! ([`fw`]).
  //!
 -//! What is here so far: finding the card and its radio, loading the
 -//! firmware and hearing it say it runs ([`trans`]). The kernel's log says
@@ -594,7 +669,7 @@ index d00234b..281d344
  
  #![no_std]
  #![deny(unsafe_code)]
-@@ -31,37 +33,30 @@ macro_rules! __log_prefix {
+@@ -31,37 +35,30 @@ macro_rules! __log_prefix {
  mod csr;
  mod fw;
  mod ids;
@@ -645,7 +720,7 @@ index d00234b..281d344
  
  /// The legacy group's "the firmware runs" and its good status.
  const UCODE_ALIVE_NTFY: u8 = 0x01;
-@@ -70,110 +65,33 @@ const ALIVE_STATUS_OK: u16 = 0xcafe;
+@@ -70,110 +67,35 @@ const ALIVE_STATUS_OK: u16 = 0xcafe;
  /// waited for before the receive buffers are handed over without it.
  const ALIVE_TIMEOUT_MS: u64 = 2000;
  const ALIVE_CAUSE_MS: u64 = 500;
@@ -653,6 +728,8 @@ index d00234b..281d344
 -/// else. The first command, to see that commands go and answers come.
 -const ECHO_CMD: u8 = 0x03;
 -const ECHO_TIMEOUT_MS: u64 = 1000;
++/// How often a switched-off radio's switch is looked at.
++const RF_KILL_POLL_MS: u64 = 1000;
  /// The group of most commands, and its scan request.
  const LONG_GROUP: u8 = 0x01;
  const SCAN_REQ_UMAC: u8 = 0x0d;
@@ -768,7 +845,7 @@ index d00234b..281d344
      Ok(())
  }
  
-@@ -181,9 +99,7 @@ fn init() -> Result<(), ComponentInitError> {
+@@ -181,9 +103,7 @@ fn init() -> Result<(), ComponentInitError> {
  // read when the system's files are there.
  #[init_component(kthread)]
  fn start() -> Result<(), ComponentInitError> {
@@ -779,7 +856,7 @@ index d00234b..281d344
      Ok(())
  }
  
-@@ -193,7 +109,7 @@ fn run(index: usize, device: PciCommonDevice) {
+@@ -193,7 +113,7 @@ fn run(index: usize, device: PciCommonDevice) {
      let location = *device.location();
      let name: String = format!("iwlwifi{} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
      let Some(mac) = ids::mac_of(id.vendor_id, id.device_id) else { return };
@@ -788,7 +865,7 @@ index d00234b..281d344
          Ok(transport) => transport,
          Err(error) => {
              ostd::warn!("{}: {:04x}:{:04x} did not start: {:?}", name, id.vendor_id, id.device_id, error);
-@@ -209,11 +125,11 @@ fn run(index: usize, device: PciCommonDevice) {
+@@ -209,11 +129,11 @@ fn run(index: usize, device: PciCommonDevice) {
          if mac.integrated { ", integrated" } else { "" },
          transport.hw_rf_id
      );
@@ -802,7 +879,7 @@ index d00234b..281d344
      let Some((file_name, file)) = aster_firmware::load_first(files.iter().map(String::as_str)) else {
          ostd::warn!("{}: the firmware {} is not in /lib/firmware", name, files[0]);
          return;
-@@ -237,85 +153,140 @@ fn run(index: usize, device: PciCommonDevice) {
+@@ -237,85 +157,148 @@ fn run(index: usize, device: PciCommonDevice) {
          firmware.scan_channels,
          firmware.command_version(LONG_GROUP, SCAN_REQ_UMAC)
      );
@@ -825,7 +902,7 @@ index d00234b..281d344
 +    let mut hurried = Some(WAKER.hurried());
 +    // The 9000 family calibrates its radio with a program of its own
 +    // before the runtime one.
-+    let gen1 = matches!(mac.family, ids::Family::Ac9000 | ids::Family::Ac8000);
++    let gen1 = matches!(mac.family, ids::Family::Ac9000 | ids::Family::Ac8000 | ids::Family::Ac7000);
 +    let Some(alive) = start_with_retries(&mut transport, &firmware, &file, gen1) else { return };
 +    let interrupts = transport.interrupt_seen.clone();
 +    let mut mvm = Mvm::new(transport, &firmware);
@@ -902,9 +979,6 @@ index d00234b..281d344
 -        }
 -        if causes.error {
 -            break Err(String::from("the firmware stopped with an error"));
--        }
--        if now_ms() >= deadline {
--            break Err(String::from("no answer in time"));
 +/// A card: its firmware's state, for its task and the Wi-Fi component.
 +struct Card {
 +    mvm: Mutex<Mvm>,
@@ -974,6 +1048,16 @@ index d00234b..281d344
 +/// Three tries: a chip that was left half started by the platform's own
 +/// firmware can need a second reset. The ALIVE notification, or None.
 +fn start_with_retries(transport: &mut Transport, firmware: &Firmware, file: &[u8], init: bool) -> Option<Vec<u8>> {
++    // A radio switched off (airplane mode on the laptop's own switch)
++    // starts once it is switched on.
++    if transport.rf_kill() {
++        ostd::notice!("{}: the radio's switch is off; the card starts when it is on", transport.name);
++        while transport.rf_kill() {
++            sleep_ms(RF_KILL_POLL_MS);
+         }
+-        if now_ms() >= deadline {
+-            break Err(String::from("no answer in time"));
++    }
 +    for attempt in 1..=3 {
 +        match start_firmware(transport, firmware, file, init) {
 +            Ok(notification) => return Some(notification),
@@ -1006,7 +1090,7 @@ index d00234b..281d344
      let result = loop {
          let causes = transport.causes();
          if causes.error {
-@@ -336,7 +307,7 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
+@@ -336,7 +319,7 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
          if let Some(packet) = alive {
              let status = packet.data.get(0..2).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
              break if status == ALIVE_STATUS_OK {
@@ -1015,7 +1099,7 @@ index d00234b..281d344
              } else {
                  Err(format!("its alive status is {status:#x}"))
              };
-@@ -354,10 +325,10 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
+@@ -354,10 +337,10 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
          }
          sleep();
      };
@@ -1031,10 +1115,10 @@ index d00234b..281d344
  }
 diff --git a/kernel/comps/iwlwifi/src/mvm.rs b/kernel/comps/iwlwifi/src/mvm.rs
 new file mode 100644
-index 0000000..8f69828
+index 0000000..2f2a6be
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/src/mvm.rs
-@@ -0,0 +1,1353 @@
+@@ -0,0 +1,1422 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The card as a Wi-Fi station: the commands of Linux's `iwlmvm` for
@@ -1176,6 +1260,9 @@ index 0000000..8f69828
 +const IWL_MGMT_TID: u8 = 15;
 +const MCC_SOURCE_GET_CURRENT: u8 = 0x10;
 +const BT_COEX_NW: u32 = 0x1;
++const BT_COEX_MPLUT_ENABLED: u32 = 1 << 0;
++const BT_COEX_SYNC2SCO_ENABLED: u32 = 1 << 2;
++const BT_COEX_HIGH_BAND_RET: u32 = 1 << 4;
 +const SESSION_PROTECT_CONF_ASSOC: u32 = 0;
 +const SOC_CONFIG_CMD_FLAGS_DISCRETE: u32 = 1 << 0;
 +const SOC_CONFIG_CMD_FLAGS_LOW_LATENCY: u32 = 1 << 1;
@@ -1356,6 +1443,18 @@ index 0000000..8f69828
 +    scan_version: u8,
 +    adaptive_dwell: bool,
 +    adaptive_dwell_v2: bool,
++    /// The 7000 family: the NVM's older layout (the 3168's channels in a
++    /// regulatory section of their own), the station command's version 7
++    /// (no station type), the LMAC scan of firmware without the UMAC one.
++    ac7000: bool,
++    nvm_sdp: bool,
++    station_v7: bool,
++    lmac_scan: bool,
++    /// The firmware shares the antenna with Bluetooth by its table (MPLUT).
++    bt_mplut: bool,
++    /// The channels the NVM allows, when the firmware does not keep to a
++    /// region itself (no LAR).
++    valid_channels: Option<Vec<u8>>,
 +}
 +
 +impl Mvm {
@@ -1365,8 +1464,14 @@ index 0000000..8f69828
 +        let (tx_ant, rx_ant) = firmware.antennas();
 +        let scan_slots = (firmware.scan_channels as usize).clamp(1, SCAN_MAX_CHANNELS);
 +        Self {
-+            gen1: matches!(mac.family, Family::Ac9000 | Family::Ac8000),
-+            legacy_rx: mac.family == Family::Ac8000,
++            ac7000: mac.family == Family::Ac7000,
++            nvm_sdp: ids::nvm_sdp(mac),
++            station_v7: !firmware.has_api(gen1::API_STA_TYPE) && !firmware.has_capability(gen1::CAPA_MULTI_QUEUE_RX),
++            lmac_scan: !firmware.has_capability(gen1::CAPA_UMAC_SCAN),
++            bt_mplut: firmware.has_capability(gen1::CAPA_BT_MPLUT),
++            valid_channels: None,
++            gen1: matches!(mac.family, Family::Ac9000 | Family::Ac8000 | Family::Ac7000),
++            legacy_rx: matches!(mac.family, Family::Ac8000 | Family::Ac7000),
 +            last_phy: Vec::new(),
 +            phy_db: Vec::new(),
 +            time_event: None,
@@ -1525,19 +1630,28 @@ index 0000000..8f69828
 +            TX_CMD if legacy => self.tx_response(&packet.data),
 +            gen1::CALIB_RES_NOTIF_PHY_DB if legacy && self.gen1 => self.store_phy_db(&packet.data),
 +            gen1::TIME_EVENT_NOTIFICATION if legacy && self.gen1 => self.time_event_notification(&packet.data),
-+            SCAN_COMPLETE_UMAC if legacy => {
-+                let status = packet.data.get(6).copied().unwrap_or(0);
-+                if self.scanning {
-+                    self.scanning = false;
-+                    if let Some(device) = &self.device {
-+                        device.scan_done(status != SCAN_OFFLOAD_COMPLETED);
-+                    }
-+                }
-+            }
++            SCAN_COMPLETE_UMAC if legacy => self.scan_complete(packet.data.get(6).copied().unwrap_or(0)),
++            // The LMAC scan's end (`struct iwl_periodic_scan_complete`).
++            gen1::SCAN_OFFLOAD_COMPLETE if legacy && self.lmac_scan => self.scan_complete(packet.data.get(2).copied().unwrap_or(0)),
 +            MISSED_BEACONS_NOTIFICATION if legacy => self.missed_beacons(&packet.data),
 +            MISSED_BEACONS_NOTIF if packet.group == MAC_CONF => self.missed_beacons(&packet.data),
 +            _ => {}
 +        }
++    }
++
++    fn scan_complete(&mut self, status: u8) {
++        if self.scanning {
++            self.scanning = false;
++            if let Some(device) = &self.device {
++                device.scan_done(status != SCAN_OFFLOAD_COMPLETED);
++            }
++        }
++    }
++
++    /// A channel the NVM allows (all of them where the firmware keeps to
++    /// the region itself).
++    fn channel_allowed(&self, freq: u16) -> bool {
++        self.valid_channels.as_ref().is_none_or(|valid| valid.contains(&channel_number(freq)))
 +    }
 +
 +    fn missed_beacons(&mut self, data: &[u8]) {
@@ -1558,10 +1672,11 @@ index 0000000..8f69828
 +    pub(crate) fn init(&mut self, alive: &[u8], prefix: &str, firmware: &Firmware, file: &[u8]) -> Result<(), String> {
 +        if self.gen1 {
 +            // The 9000 family's address is in its registers; the 8000
-+            // family's came from the NVM (or the MAC's own registers).
++            // family's came from the NVM (or the MAC's own registers), the
++            // 7000 family's from the NVM.
 +            if !self.legacy_rx {
 +                self.address = self.trans.mac_address();
-+            } else if self.address == [0; 6] {
++            } else if self.address == [0; 6] && !self.ac7000 {
 +                self.address = self.trans.mac_address_wfmp();
 +            }
 +            if self.address == [0; 6] || self.address[0] & 1 != 0 {
@@ -1604,7 +1719,7 @@ index 0000000..8f69828
 +            return Err(String::from("the card has no MAC address"));
 +        }
 +        self.command(0, TX_ANT_CONFIGURATION_CMD, &(self.tx_ant as u32).to_le_bytes())?;
-+        self.command(0, BT_CONFIG, &Out::default().u32(BT_COEX_NW).u32(0).0)?;
++        self.bt_config()?;
 +        self.soc_configuration()?;
 +        // Always awake: no power save.
 +        self.command(0, POWER_TABLE_CMD, &Out::default().u16(0).u16(0).0)?;
@@ -1614,6 +1729,18 @@ index 0000000..8f69828
 +        self.mac_context(FW_CTXT_ACTION_ADD)?;
 +        self.mac_added = true;
 +        Ok(())
++    }
++
++    /// Coexistence with the Bluetooth of the same card (Linux's
++    /// `iwl_mvm_send_bt_init_conf`): the firmware decides, with SCO
++    /// synchronization, the high band's own antenna use and, where the
++    /// firmware has it, its sharing table.
++    fn bt_config(&mut self) -> Result<(), String> {
++        let mut modules = BT_COEX_SYNC2SCO_ENABLED | BT_COEX_HIGH_BAND_RET;
++        if self.bt_mplut {
++            modules |= BT_COEX_MPLUT_ENABLED;
++        }
++        self.command(0, BT_CONFIG, &Out::default().u32(BT_COEX_NW).u32(modules).0).map(|_| ())
 +    }
 +
 +    /// The platform's crystal latency, for firmware that asks for it
@@ -1697,11 +1824,12 @@ index 0000000..8f69828
 +            HtCap { info: 0x000c | 0x0020 | 0x0100, ampdu_factor: 3, ampdu_density: 5, mcs }
 +        });
 +        let mut bands = Vec::new();
++        let allowed = |band: BandId| -> Vec<Channel> { channels(band).into_iter().filter(|channel| self.channel_allowed(channel.freq)).collect() };
 +        if self.band_24 {
-+            bands.push(Band { id: BandId::Ghz2, channels: channels(BandId::Ghz2), ht, vht: None, he: None });
++            bands.push(Band { id: BandId::Ghz2, channels: allowed(BandId::Ghz2), ht, vht: None, he: None });
 +        }
 +        if self.band_52 {
-+            bands.push(Band { id: BandId::Ghz5, channels: channels(BandId::Ghz5), ht, vht: None, he: None });
++            bands.push(Band { id: BandId::Ghz5, channels: allowed(BandId::Ghz5), ht, vht: None, he: None });
 +        }
 +        // The first generation's firmware takes CCMP-256 as an external
 +        // cipher only (Linux does not offer it there).
@@ -1816,7 +1944,22 @@ index 0000000..8f69828
 +        out.u8(0).u8(0).u16(0).u16(0).u8(0);
 +        // A link station, with its queues when the host owns them.
 +        out.u8(0).u16(if self.associated { self.aid } else { 0 }).u16(0).u32(self.station_queues).u16(0).u8(0).u8(0);
-+        self.command_status(0, ADD_STA, &out.0, ADD_STA_SUCCESS)
++        let command = self.station_command(out.0);
++        self.command_status(0, ADD_STA, &command, ADD_STA_SUCCESS)
++    }
++
++    /// `struct iwl_mvm_add_sta_cmd` as the firmware takes it: whole, or
++    /// version 7 (the 7000 family's firmware without station types): no
++    /// type (the second byte of a 16-bit sleep state) and nothing after
++    /// the queues.
++    fn station_command(&self, mut command: Vec<u8>) -> Vec<u8> {
++        const V7_LEN: usize = 44;
++        const STATION_TYPE: usize = 35;
++        if self.station_v7 {
++            command[STATION_TYPE] = 0;
++            command.truncate(V7_LEN);
++        }
++        command
 +    }
 +
 +    /// A queue of the access point's station for `tid`: its memory, then
@@ -1902,14 +2045,20 @@ index 0000000..8f69828
 +                BandId::Ghz5 => self.band_52,
 +                BandId::Ghz6 => false,
 +            })
-+            .filter(|&freq| channel_number(freq) != 0)
++            .filter(|&freq| channel_number(freq) != 0 && self.channel_allowed(freq))
 +            .take(self.scan_channels)
 +            .collect();
 +        if freqs.is_empty() {
 +            return Err(radio::Error::Invalid);
 +        }
-+        let command = if self.gen1 { self.scan_request_gen1(request, &freqs) } else { self.scan_request(request, &freqs) };
-+        if let Err(error) = self.command(LONG, SCAN_REQ_UMAC, &command) {
++        let (id, command) = if self.lmac_scan {
++            (gen1::SCAN_OFFLOAD_REQUEST_CMD, self.scan_request_lmac(request, &freqs))
++        } else if self.gen1 {
++            (SCAN_REQ_UMAC, self.scan_request_gen1(request, &freqs))
++        } else {
++            (SCAN_REQ_UMAC, self.scan_request(request, &freqs))
++        };
++        if let Err(error) = self.command(LONG, id, &command) {
 +            ostd::warn!("{}: scan: {}", self.name, error);
 +            return Err(radio::Error::Failed);
 +        }
@@ -2013,7 +2162,11 @@ index 0000000..8f69828
 +
 +    pub(crate) fn abort_scan(&mut self) {
 +        if self.scanning {
-+            let _ = self.command(LONG, SCAN_ABORT_UMAC, &Out::default().u32(0).u32(0).0);
++            if self.lmac_scan {
++                let _ = self.command(LONG, gen1::SCAN_OFFLOAD_ABORT_CMD, &[]);
++            } else {
++                let _ = self.command(LONG, SCAN_ABORT_UMAC, &Out::default().u32(0).u32(0).0);
++            }
 +        }
 +    }
 +
@@ -2390,10 +2543,10 @@ index 0000000..8f69828
 +}
 diff --git a/kernel/comps/iwlwifi/src/mvm/gen1.rs b/kernel/comps/iwlwifi/src/mvm/gen1.rs
 new file mode 100644
-index 0000000..4f68e4c
+index 0000000..22013da
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/src/mvm/gen1.rs
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,1075 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The 9000 family's commands (firmware API 46), and the 8000 family's
@@ -2459,6 +2612,46 @@ index 0000000..4f68e4c
 +/// The NVM's section with the radio's configuration and the SKU, read a
 +/// chunk at a time.
 +const NVM_SECTION_PHY_SKU: u16 = 12;
++/// The 7000 family's NVM (`IWL_NVM`): the hardware and software sections
++/// (the 3168's channels in a regulatory one), byte offsets of the radio's
++/// configuration, the SKU, the channels' flags and the address; the
++/// channels in the order the flags are.
++const NVM_SECTION_HW_7000: u16 = 0;
++const NVM_SECTION_SW: u16 = 1;
++const NVM_SECTION_REGULATORY_SDP: u16 = 8;
++const NVM_SW_RADIO_CFG: usize = 2;
++const NVM_SW_SKU: usize = 4;
++const NVM_SW_CHANNELS: usize = 0x20 * 2;
++const NVM_HW_ADDR: usize = 0x15 * 2;
++const NVM_CHANNEL_VALID: u16 = 1 << 0;
++const NVM_CHANNELS: [u8; 39] = [
++    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153,
++    157, 161, 165,
++];
++/// What the firmware has: station types (else the station command's
++/// version 7), the multi-queue receive path, the UMAC scan (else the LMAC
++/// one), the antenna sharing table with Bluetooth.
++pub(super) const API_STA_TYPE: u32 = 30;
++pub(super) const CAPA_UMAC_SCAN: u32 = 2;
++pub(super) const CAPA_BT_MPLUT: u32 = 67;
++pub(super) const CAPA_MULTI_QUEUE_RX: u32 = 68;
++/// The LMAC scan of the long group: request, abort, end.
++pub(super) const SCAN_OFFLOAD_REQUEST_CMD: u8 = 0x51;
++pub(super) const SCAN_OFFLOAD_ABORT_CMD: u8 = 0x52;
++pub(super) const SCAN_OFFLOAD_COMPLETE: u8 = 0x6d;
++const LMAC_SCAN_FLAG_PASS_ALL: u32 = 1 << 0;
++const LMAC_SCAN_FLAG_PASSIVE: u32 = 1 << 1;
++const LMAC_SCAN_FLAG_PRE_CONNECTION: u32 = 1 << 2;
++const LMAC_SCAN_FLAG_EXTENDED_DWELL: u32 = 1 << 7;
++const LMAC_CHANNEL_PARTIAL: u32 = 1 << 28;
++const PHY_RX_CHAIN_FORCE_SEL_POS: u16 = 4;
++const PHY_RX_CHAIN_FORCE_MIMO_SEL_POS: u16 = 7;
++const PHY_RX_CHAIN_DRIVER_FORCE: u16 = 1;
++const TX_FLG_SEQ_CTL: u32 = 1 << 13;
++const TX_FLG_BT_DIS: u32 = 1 << 12;
++const MAC_FILTER_ACCEPT_GRP: u32 = 1 << 2;
++const MAC_FILTER_IN_BEACON: u32 = 1 << 6;
++
 +/// The 8000 family's address override: six bytes after a word, unless
 +/// it is the reserved one (Linux's `iwl_set_hw_address_family_8000`).
 +const NVM_SECTION_MAC_OVERRIDE: u16 = 11;
@@ -2766,30 +2959,56 @@ index 0000000..4f68e4c
 +    /// The calibrating program's run (Linux's `iwl_run_init_mvm_ucode`):
 +    /// the NVM's facts, the antennas, the calibrations, their results.
 +    pub(crate) fn run_init_image(&mut self, firmware: &Firmware) -> Result<(), String> {
-+        match self.nvm_section(NVM_SECTION_PHY_SKU) {
-+            Ok(sku) if sku.len() >= 8 => {
-+                let radio = le32(&sku, 0);
-+                let sku = le32(&sku, 4);
-+                self.band_24 = sku & NVM_SKU_24 != 0;
-+                self.band_52 = sku & NVM_SKU_52 != 0;
-+                self.ht = sku & NVM_SKU_11N != 0;
-+                let (tx, rx) = (((radio >> 24) & 0xf) as u8, ((radio >> 28) & 0xf) as u8);
-+                if tx & self.tx_ant != 0 {
-+                    self.tx_ant &= tx;
-+                }
-+                if rx & self.rx_ant != 0 {
-+                    self.rx_ant &= rx;
-+                }
-+                if sku & NVM_SKU_MIMO_DISABLED != 0 {
-+                    self.tx_ant &= self.tx_ant.wrapping_neg();
-+                    self.rx_ant &= self.rx_ant.wrapping_neg();
-+                }
-+            }
-+            Ok(_) => ostd::info!("{}: the NVM has no PHY SKU section", self.name),
-+            Err(error) => ostd::info!("{}: {}", self.name, error),
++        if self.ac7000 {
++            // Before the 8000 family the calibrating program takes the
++            // coexistence with Bluetooth too.
++            self.bt_config()?;
++            self.read_nvm_7000();
++        } else {
++            self.read_nvm_ext();
 +        }
 +        if !self.band_24 && !self.band_52 {
 +            self.band_24 = true;
++        }
++        if self.trans.rf_kill() {
++            // The radio's switch is off: no calibrations until it is on.
++            return Err(String::from("the radio's switch is off"));
++        }
++        self.command(0, super::TX_ANT_CONFIGURATION_CMD, &(self.tx_ant as u32).to_le_bytes())?;
++        self.phy_configuration(firmware, true)?;
++        self.notification(LONG, INIT_COMPLETE_NOTIF, CALIB_TIMEOUT_MS)?;
++        ostd::info!("{}: calibrated, {} result(s) kept", self.name, self.phy_db.len());
++        Ok(())
++    }
++
++    /// What the NVM says of the bands and the antennas (`NVM_SKU_CAP_*`,
++    /// the radio's transmit and receive antennas).
++    fn apply_sku(&mut self, tx: u8, rx: u8, sku: u32) {
++        self.band_24 = sku & NVM_SKU_24 != 0;
++        self.band_52 = sku & NVM_SKU_52 != 0;
++        self.ht = sku & NVM_SKU_11N != 0;
++        if tx & self.tx_ant != 0 {
++            self.tx_ant &= tx;
++        }
++        if rx & self.rx_ant != 0 {
++            self.rx_ant &= rx;
++        }
++        if sku & NVM_SKU_MIMO_DISABLED != 0 {
++            self.tx_ant &= self.tx_ant.wrapping_neg();
++            self.rx_ant &= self.rx_ant.wrapping_neg();
++        }
++    }
++
++    /// The 8000 and 9000 families' NVM (`IWL_NVM_EXT`): the PHY SKU
++    /// section, and the 8000 family's address override.
++    fn read_nvm_ext(&mut self) {
++        match self.nvm_section(NVM_SECTION_PHY_SKU) {
++            Ok(sku) if sku.len() >= 8 => {
++                let radio = le32(&sku, 0);
++                self.apply_sku(((radio >> 24) & 0xf) as u8, ((radio >> 28) & 0xf) as u8, le32(&sku, 4));
++            }
++            Ok(_) => ostd::info!("{}: the NVM has no PHY SKU section", self.name),
++            Err(error) => ostd::info!("{}: {}", self.name, error),
 +        }
 +        if self.legacy_rx {
 +            // The 8000 family's address: the NVM's override when it has
@@ -2804,15 +3023,45 @@ index 0000000..4f68e4c
 +                }
 +            }
 +        }
-+        if self.trans.rf_kill() {
-+            // The radio's switch is off: no calibrations until it is on.
-+            return Err(String::from("the radio's switch is off"));
++    }
++
++    /// The 7000 family's NVM (`IWL_NVM`, Linux's `iwl_parse_nvm_data`):
++    /// the software section's radio configuration and SKU, the hardware
++    /// section's address (16-bit words, little endian), and without LAR
++    /// the channels it allows (the software section's, or the 3168's
++    /// regulatory section's).
++    fn read_nvm_7000(&mut self) {
++        let read = |mvm: &mut Self, section: u16| {
++            mvm.nvm_section(section).unwrap_or_else(|error| {
++                ostd::info!("{}: {}", mvm.name, error);
++                Vec::new()
++            })
++        };
++        let hardware = read(self, NVM_SECTION_HW_7000);
++        let software = read(self, NVM_SECTION_SW);
++        if software.len() >= NVM_SW_SKU + 2 {
++            let radio = le16(&software, NVM_SW_RADIO_CFG) as u32;
++            self.apply_sku(((radio >> 8) & 0xf) as u8, ((radio >> 12) & 0xf) as u8, le16(&software, NVM_SW_SKU) as u32);
 +        }
-+        self.command(0, super::TX_ANT_CONFIGURATION_CMD, &(self.tx_ant as u32).to_le_bytes())?;
-+        self.phy_configuration(firmware, true)?;
-+        self.notification(LONG, INIT_COMPLETE_NOTIF, CALIB_TIMEOUT_MS)?;
-+        ostd::info!("{}: calibrated, {} result(s) kept", self.name, self.phy_db.len());
-+        Ok(())
++        if let Some(bytes) = hardware.get(NVM_HW_ADDR..NVM_HW_ADDR + 6) {
++            let address = [bytes[1], bytes[0], bytes[3], bytes[2], bytes[5], bytes[4]];
++            if address != [0; 6] && address[0] & 1 == 0 {
++                self.address = address;
++            }
++        }
++        if self.lar {
++            return;
++        }
++        let (flags, at) = if self.nvm_sdp { (read(self, NVM_SECTION_REGULATORY_SDP), 0) } else { (software, NVM_SW_CHANNELS) };
++        let valid: Vec<u8> = NVM_CHANNELS
++            .iter()
++            .enumerate()
++            .filter(|(index, _)| le16(&flags, at + index * 2) & NVM_CHANNEL_VALID != 0)
++            .map(|(_, &channel)| channel)
++            .collect();
++        if !valid.is_empty() {
++            self.valid_channels = Some(valid);
++        }
 +    }
 +
 +    /// The radio's configuration with its valid antennas and a program's
@@ -2859,7 +3108,7 @@ index 0000000..4f68e4c
 +        self.command(0, super::TX_ANT_CONFIGURATION_CMD, &(self.tx_ant as u32).to_le_bytes())?;
 +        self.send_phy_db()?;
 +        self.phy_configuration(firmware, false)?;
-+        self.command(0, super::BT_CONFIG, &Out::default().u32(super::BT_COEX_NW).u32(0).0)?;
++        self.bt_config()?;
 +        self.soc_configuration()?;
 +        self.command(DATA_PATH, DQA_ENABLE_CMD, &0u32.to_le_bytes())?;
 +        self.add_aux_station()?;
@@ -2918,7 +3167,8 @@ index 0000000..4f68e4c
 +        out.u8(AUX_STA_ID).u8(0).u16(0).u32(0).u32(0);
 +        out.u8(0).u8(0).u16(0).u16(0).u8(0);
 +        out.u8(STA_TYPE_AUX_ACTIVITY).u16(0).u16(0).u32(1 << AUX_QUEUE).u16(0).u8(0).u8(0);
-+        self.command_status(0, ADD_STA, &out.0, ADD_STA_SUCCESS)
++        let command = self.station_command(out.0);
++        self.command_status(0, ADD_STA, &command, ADD_STA_SUCCESS)
 +    }
 +
 +    /// A queue of the host's (Linux's `iwl_mvm_enable_txq`): where it
@@ -2942,6 +3192,10 @@ index 0000000..4f68e4c
 +    /// the legacy rates, times, dwells, the address, the auxiliary
 +    /// station and every channel the card may scan.
 +    pub(super) fn scan_config_gen1(&mut self) -> Result<(), String> {
++        // The LMAC scan has its whole configuration in each request.
++        if self.lmac_scan {
++            return Ok(());
++        }
 +        let mut numbers: Vec<u8> = Vec::new();
 +        if self.band_24 {
 +            numbers.extend(channels(BandId::Ghz2).iter().map(|channel| channel_number(channel.freq)));
@@ -3048,6 +3302,68 @@ index 0000000..4f68e4c
 +            }
 +            out.bytes(&entry);
 +        }
++        out.0
++    }
++
++    /// `struct iwl_scan_req_lmac` (Linux's `iwl_mvm_scan_lmac`), for
++    /// firmware without the UMAC scan: the dwells, the receive chains,
++    /// the flags, the times, the band of the first channel, the probes'
++    /// TX commands on the auxiliary station, the names, one iteration now;
++    /// then the firmware's channel slots and the probe template.
++    pub(super) fn scan_request_lmac(&self, request: &ScanRequest, freqs: &[u16]) -> Vec<u8> {
++        let ssids: Vec<&Vec<u8>> = request.ssids.iter().take(PROBE_OPTION_MAX).collect();
++        let mut flags = LMAC_SCAN_FLAG_PASS_ALL | LMAC_SCAN_FLAG_EXTENDED_DWELL;
++        if ssids.is_empty() {
++            flags |= LMAC_SCAN_FLAG_PASSIVE;
++        }
++        if ssids.len() == 1 && !ssids[0].is_empty() {
++            flags |= LMAC_SCAN_FLAG_PRE_CONNECTION;
++        }
++        let rx = self.rx_ant as u16;
++        let chains = (rx << PHY_RX_CHAIN_VALID_POS) | (rx << PHY_RX_CHAIN_FORCE_MIMO_SEL_POS) | (rx << PHY_RX_CHAIN_FORCE_SEL_POS) | PHY_RX_CHAIN_DRIVER_FORCE;
++        let band = freqs.first().map_or(PHY_BAND_24, |&freq| if BandId::of(freq) == BandId::Ghz2 { PHY_BAND_24 } else { PHY_BAND_5 });
++        let (max_out, suspend) = self.scan_times();
++        let antenna = ((self.tx_ant & self.tx_ant.wrapping_neg()) as u32) << RATE_ANT_POS;
++        let mut out = Out::default();
++        out.u32(0).u8(freqs.len() as u8).u8(SCAN_DWELL_ACTIVE).u8(SCAN_DWELL_PASSIVE).u8(SCAN_DWELL_FRAGMENTED).u8(SCAN_DWELL_EXTENDED).u8(0);
++        out.u16(chains).u32(flags).u32(max_out).u32(suspend).u32(band as u32).u32(MAC_FILTER_ACCEPT_GRP | MAC_FILTER_IN_BEACON);
++        // The probes: 1 Mbit/s CCK on 2.4 GHz, 6 Mbit/s on 5 GHz.
++        for rate in [PLCP_1M | RATE_CCK, PLCP_6M] {
++            out.u32(TX_FLG_SEQ_CTL | TX_FLG_BT_DIS).u32(rate | antenna).u8(AUX_STA_ID).zeros(3);
++        }
++        for index in 0..PROBE_OPTION_MAX {
++            let mut entry = [0u8; 34];
++            if let Some(ssid) = ssids.get(index) {
++                let length = ssid.len().min(32);
++                entry[1] = length as u8;
++                entry[2..2 + length].copy_from_slice(&ssid[..length]);
++            }
++            out.bytes(&entry);
++        }
++        // Priority, one iteration, no delay; the schedule; no energy based
++        // scan.
++        out.u32(SCAN_PRIORITY_EXT_6).u32(1).u32(0);
++        out.u16(0).u8(1).u8(1).zeros(4);
++        out.zeros(8);
++        // This request's names are bits 1 to 20.
++        let bitmap: u32 = if ssids.is_empty() { 0 } else { ((1u32 << ssids.len()) - 1) << 1 };
++        for slot in 0..self.scan_slots {
++            match freqs.get(slot) {
++                Some(&freq) => {
++                    out.u32(LMAC_CHANNEL_PARTIAL | bitmap).u16(channel_number(freq) as u16).u16(1).u32(0);
++                }
++                None => {
++                    out.zeros(12);
++                }
++            }
++        }
++        let (template, segments) = self.probe_template(&request.elements);
++        for index in [0, 1, 2, 4] {
++            out.u16(segments[index].0).u16(segments[index].1);
++        }
++        let mut buffer = template;
++        buffer.resize(PROBE_TEMPLATE, 0);
++        out.bytes(&buffer);
 +        out.0
 +    }
 +
@@ -3309,7 +3625,7 @@ index 0000000..4f68e4c
 diff --git a/kernel/comps/iwlwifi/src/trans.rs b/kernel/comps/iwlwifi/src/trans.rs
 old mode 100755
 new mode 100644
-index 065cf94..041c7e3
+index 065cf94..727ca47
 --- a/kernel/comps/iwlwifi/src/trans.rs
 +++ b/kernel/comps/iwlwifi/src/trans.rs
 @@ -10,19 +10,21 @@
@@ -3442,7 +3758,7 @@ index 065cf94..041c7e3
      write: usize,
  }
  
-@@ -144,8 +191,13 @@ pub(crate) struct Transport {
+@@ -144,8 +191,17 @@ pub(crate) struct Transport {
      /// while the chip may read them.
      images: Vec<DmaCoherent>,
      context: Vec<DmaCoherent>,
@@ -3454,11 +3770,26 @@ index 065cf94..041c7e3
 +    pnvm: Option<DmaCoherent>,
 +    /// The first generation's rings, byte counts and firmware pages.
 +    gen1: Option<gen1::Gen1>,
++    /// The chip is kept awake (`MAC_ACCESS_REQ`) while the firmware runs:
++    /// the 7000 family's commands need it (Linux's `apmg_wake_up_wa`,
++    /// there per command in flight).
++    hold_awake: bool,
 +    _vectors: kpi_pci::Vectors,
      _device: PciCommonDevice,
  }
  
-@@ -300,48 +352,22 @@ impl Transport {
+@@ -209,6 +265,10 @@ impl Transport {
+     }
+ 
+     fn release(&self) {
++        // The 7000 family's chip stays awake while its firmware runs.
++        if self.hold_awake {
++            return;
++        }
+         self.clear_bits(csr::GP_CNTRL, csr::GP_CNTRL_MAC_ACCESS_REQ);
+     }
+ 
+@@ -300,48 +360,22 @@ impl Transport {
      }
  
      /// Claims the card and finds out what it is. From the driver's task.
@@ -3510,7 +3841,7 @@ index 065cf94..041c7e3
 -        };
 -        let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
 +        let seen = interrupt_seen.clone();
-+        let msix = mac.family != Family::Ac8000;
++        let msix = !matches!(mac.family, Family::Ac8000 | Family::Ac7000);
 +        let vectors = kpi_pci::alloc_irq_vector(&mut device, msix, &name, move || {
 +            seen.store(true, Ordering::Relaxed);
 +            crate::WAKER.wake();
@@ -3519,7 +3850,7 @@ index 065cf94..041c7e3
              return Err(Error::Absent);
          };
          let mut transport = Self {
-@@ -350,14 +376,16 @@ impl Transport {
+@@ -350,14 +384,17 @@ impl Transport {
              name,
              hw_rev: 0,
              hw_rf_id: 0,
@@ -3535,11 +3866,12 @@ index 065cf94..041c7e3
 +            scratch: None,
 +            pnvm: None,
 +            gen1: None,
++            hold_awake: false,
 +            _vectors: vectors,
              _device: device,
          };
          transport.hw_rev = transport.r32(csr::HW_REV);
-@@ -368,9 +396,10 @@ impl Transport {
+@@ -368,9 +405,10 @@ impl Transport {
          transport.prepare_card()?;
          transport.activate()?;
          // An integrated MAC does not know its radio: the companion chip
@@ -3552,7 +3884,7 @@ index 065cf94..041c7e3
              if !transport.grab() {
                  return Err(Error::NoClock);
              }
-@@ -416,6 +445,10 @@ impl Transport {
+@@ -416,6 +454,10 @@ impl Transport {
      /// Tells the chip how it interrupts: every cause on vector 0, kept
      /// until this driver clears it.
      fn configure_interrupts(&self) {
@@ -3563,7 +3895,7 @@ index 065cf94..041c7e3
          let mode = if self.msix { csr::UREG_CHICK_MSIX_ENABLE } else { csr::UREG_CHICK_MSI_ENABLE };
          if !self.write_prph_awake(self.umac(csr::UREG_CHICK), mode) {
              ostd::warn!("{}: the chip did not wake to take its interrupt mode", self.name);
-@@ -481,10 +514,15 @@ impl Transport {
+@@ -481,39 +523,51 @@ impl Transport {
              let fh = if inta & ((1 << 31) | (1 << 28) | (1 << 3)) != 0 || fh_status != 0 { csr::MSIX_FH_CAUSES_Q0 } else { 0 };
              (fh, inta)
          };
@@ -3579,7 +3911,26 @@ index 065cf94..041c7e3
              any: fh != 0 || hw != 0,
          }
      }
-@@ -501,19 +539,17 @@ impl Transport {
+ 
+     /// The card's basic functions, as Linux's `apm_init`.
+     fn apm_init(&self) -> Result<(), Error> {
++        let family_7000 = self.mac.family == Family::Ac7000;
++        if family_7000 {
++            // The L0s exit timer off (a platform NMI's workaround).
++            self.set_bits(csr::GIO_CHICKEN_BITS, csr::GIO_CHICKEN_DIS_L0S_EXIT_TIMER);
++        }
+         self.set_bits(csr::GIO_CHICKEN_BITS, csr::GIO_CHICKEN_L1A_NO_L0S_RX);
+         self.set_bits(csr::DBG_HPET_MEM, csr::DBG_HPET_MEM_VAL);
+         self.set_bits(csr::HW_IF_CONFIG, csr::HW_IF_CONFIG_HAP_WAKE);
+         self.set_bits(csr::GIO, csr::GIO_L0S_DISABLED);
+-        self.activate()
++        self.activate()?;
++        if family_7000 {
++            self.apm_init_7000()?;
++        }
++        Ok(())
+     }
+ 
      /// Resets the card to the state its loader starts from.
      fn start_hw(&self) -> Result<(), Error> {
          self.prepare_card()?;
@@ -3605,7 +3956,7 @@ index 065cf94..041c7e3
              // The platform's power gating, forced through once.
              const HPM_HIPM_GEN_CFG: u32 = 0x00a0_3458;
              const CR_PG_EN: u32 = 1 << 0;
-@@ -551,10 +587,13 @@ impl Transport {
+@@ -551,10 +605,13 @@ impl Transport {
              // The number, six unused bytes, the address.
              let _ = rx.free.write_val(rx.write * 16, &(number as u16));
              let _ = rx.free.write_val(rx.write * 16 + 8, &address);
@@ -3620,7 +3971,7 @@ index 065cf94..041c7e3
      }
  
      /// Tells the chip how far the free buffers go: in steps of eight.
-@@ -562,31 +601,48 @@ impl Transport {
+@@ -562,31 +619,48 @@ impl Transport {
          let told = rx.write & !7;
          if told != rx.write_told {
              rx.write_told = told;
@@ -3675,7 +4026,7 @@ index 065cf94..041c7e3
          Ok(())
      }
  
-@@ -634,7 +690,12 @@ impl Transport {
+@@ -634,7 +708,12 @@ impl Transport {
  
      /// Hands the firmware to the chip's loader and starts it. The
      /// firmware says it runs with the "alive" cause and notification.
@@ -3689,7 +4040,7 @@ index 065cf94..041c7e3
          self.images.clear();
          self.context.clear();
          self.start_hw()?;
-@@ -650,7 +711,7 @@ impl Transport {
+@@ -650,7 +729,7 @@ impl Transport {
          self.set_bits(csr::MAC_SHADOW_REG_CTRL, csr::MAC_SHADOW_REG_CTRL_ENABLE);
          let (free, used, status, descriptors, command_ring) = {
              let (rx, commands) = (self.rx.as_ref().ok_or(Error::Memory)?, self.commands.as_ref().ok_or(Error::Memory)?);
@@ -3698,7 +4049,7 @@ index 065cf94..041c7e3
          };
          // Rings are sized by the power of two: commands in units of eight.
          let rx_ring_bits = RX_RING.trailing_zeros();
-@@ -720,7 +781,8 @@ impl Transport {
+@@ -720,7 +799,8 @@ impl Transport {
              self.w64(csr::IML_DATA_ADDR, iml.daddr() as u64);
              self.w32(csr::IML_SIZE_ADDR, iml_bytes.len() as u32);
              self.set_bits(csr::CTXT_INFO_BOOT_CTRL, csr::AUTO_FUNC_BOOT_ENA);
@@ -3708,7 +4059,7 @@ index 065cf94..041c7e3
              let keep_busy = !self.set_ltr();
              if !self.write_prph_awake(self.umac(csr::UREG_CPU_INIT_RUN), 1) {
                  return Err(Error::NoClock);
-@@ -754,11 +816,17 @@ impl Transport {
+@@ -754,11 +834,23 @@ impl Transport {
          self.rx.as_ref().is_some_and(|rx| rx.read != 0 || rx.status.read_val::<u16>(0).unwrap_or(0) & 0x0fff != 0)
      }
  
@@ -3724,11 +4075,17 @@ index 065cf94..041c7e3
 +        if self.is_gen1() {
 +            self.tx_start_gen1()?;
 +        }
++        if self.mac.family == Family::Ac7000 {
++            if !self.grab() {
++                return Err(Error::NoClock);
++            }
++            self.hold_awake = true;
++        }
 +        Ok(())
      }
  
      /// What the chip left in the receive buffers since the last call.
-@@ -767,15 +835,17 @@ impl Transport {
+@@ -767,15 +859,17 @@ impl Transport {
          let Some(mut rx) = self.rx.take() else { return packets };
          // How far the chip got: its index in the ring of used buffers.
          let closed: u16 = rx.status.read_val(0).unwrap_or(0);
@@ -3749,7 +4106,7 @@ index 065cf94..041c7e3
                  ostd::warn!("{}: the chip returned a buffer it was not given ({})", self.name, number);
                  continue;
              }
-@@ -818,10 +888,13 @@ impl Transport {
+@@ -818,10 +912,13 @@ impl Transport {
      /// Queues a command for the firmware; its answer comes back with the
      /// sequence returned. None: it does not fit.
      pub(crate) fn send_command(&mut self, group: u8, command: u8, version: u8, payload: &[u8]) -> Option<u16> {
@@ -3764,7 +4121,7 @@ index 065cf94..041c7e3
              return None;
          }
          let index = queue.write % queue.size;
-@@ -833,7 +906,7 @@ impl Transport {
+@@ -833,7 +930,7 @@ impl Transport {
          bytes.extend_from_slice(&(payload.len() as u16).to_le_bytes());
          bytes.extend_from_slice(&[0, version]);
          bytes.extend_from_slice(payload);
@@ -3773,7 +4130,7 @@ index 065cf94..041c7e3
          queue.buffers.write_bytes(buffer, &bytes).ok()?;
          // The descriptor: the first 20 bytes, then the rest.
          let address = (queue.buffers.daddr() + buffer) as u64;
-@@ -847,7 +920,7 @@ impl Transport {
+@@ -847,7 +944,7 @@ impl Transport {
              descriptor[12..14].copy_from_slice(&((total - first) as u16).to_le_bytes());
              descriptor[14..22].copy_from_slice(&(address + first as u64).to_le_bytes());
          }
@@ -3782,7 +4139,7 @@ index 065cf94..041c7e3
          // The pointer counts past the ring, as far as the family's queues
          // may be long; the chip takes it modulo the ring.
          queue.write = (queue.write + 1) % queue.wrap;
-@@ -856,14 +929,151 @@ impl Transport {
+@@ -856,14 +953,153 @@ impl Transport {
          Some(sequence)
      }
  
@@ -3924,6 +4281,8 @@ index 065cf94..041c7e3
 +        if self.is_gen1() {
 +            self.stop_dma_gen1();
 +        }
++        self.hold_awake = false;
++        self.release();
          self.set_bits(csr::RESET, csr::RESET_SW_RESET);
          crate::delay_ms(6);
          self.rx = None;
@@ -3937,10 +4296,10 @@ index 065cf94..041c7e3
  }
 diff --git a/kernel/comps/iwlwifi/src/trans/gen1.rs b/kernel/comps/iwlwifi/src/trans/gen1.rs
 new file mode 100644
-index 0000000..2503cef
+index 0000000..d0c79f2
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/src/trans/gen1.rs
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,687 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The first generation of the transport (the 9000 family), as Linux's
@@ -3969,7 +4328,7 @@ index 0000000..2503cef
 +use crate::{
 +    csr,
 +    fw::{Firmware, Section},
-+    ids::Family,
++    ids::{self, Family},
 +};
 +
 +/// The scheduler's queues (`num_of_queues`).
@@ -4073,14 +4432,48 @@ index 0000000..2503cef
 +}
 +
 +impl Transport {
-+    /// The 9000 and 8000 families' transport.
++    /// The 9000, 8000 and 7000 families' transport.
 +    pub(super) fn is_gen1(&self) -> bool {
-+        matches!(self.mac.family, Family::Ac9000 | Family::Ac8000)
++        matches!(self.mac.family, Family::Ac9000 | Family::Ac8000 | Family::Ac7000)
 +    }
 +
-+    /// The 8000 family's single receive queue.
++    /// The 8000 and 7000 families' single receive queue.
 +    pub(super) fn legacy_rx(&self) -> bool {
-+        self.mac.family == Family::Ac8000
++        matches!(self.mac.family, Family::Ac8000 | Family::Ac7000)
++    }
++
++    /// The 7000 family's power management unit after the clocks start
++    /// (Linux's `iwl_pcie_apm_init`): the 7260's and 3160's oscillator
++    /// forced on, the DMA clock, L1-active off until the queues start, the
++    /// RF-kill interrupt cleared.
++    pub(super) fn apm_init_7000(&self) -> Result<(), Error> {
++        if !self.grab() {
++            return Err(Error::NoClock);
++        }
++        if ids::host_interrupt_operation_mode(self.mac) {
++            // Read twice before and after, as the hardware likes it.
++            let _ = (self.read_prph(csr::OSC_CLK), self.read_prph(csr::OSC_CLK));
++            self.set_bits_prph(csr::OSC_CLK, csr::OSC_CLK_FORCE_CONTROL);
++            let _ = (self.read_prph(csr::OSC_CLK), self.read_prph(csr::OSC_CLK));
++        }
++        self.write_prph(csr::APMG_CLK_EN, csr::APMG_CLK_DMA_CLK_RQT);
++        aster_linuxkpi::delay::udelay(20);
++        self.set_bits_prph(csr::APMG_PCIDEV_STT, csr::APMG_PCIDEV_STT_L1_ACT_DIS);
++        self.write_prph(csr::APMG_RTC_INT_STT, csr::APMG_RTC_INT_STT_RFKILL);
++        self.release();
++        Ok(())
++    }
++
++    /// The 7000 family's power from the main supply, not the auxiliary
++    /// one (Linux's `iwl_pcie_set_pwr`), and its early power-off reset off
++    /// (`iwl_mvm_nic_config`).
++    fn power_7000(&self) {
++        if self.mac.family != Family::Ac7000 || !self.grab() {
++            return;
++        }
++        let control = self.read_prph(csr::APMG_PS_CTRL);
++        self.write_prph(csr::APMG_PS_CTRL, (control & !csr::APMG_PS_CTRL_PWR_SRC_MASK) | csr::APMG_PS_CTRL_EARLY_PWR_OFF_RESET_DIS);
++        self.release();
 +    }
 +
 +    /// The address the factory wrote in the MAC (Linux's
@@ -4128,10 +4521,14 @@ index 0000000..2503cef
 +        let radio_type = phy_config & 0x3;
 +        let radio_step = (phy_config >> 2) & 0x3;
 +        let radio_dash = (phy_config >> 4) & 0x3;
-+        let value = (self.hw_rev & csr::HW_IF_CONFIG_MAC_STEP_DASH)
++        let mut value = (self.hw_rev & csr::HW_IF_CONFIG_MAC_STEP_DASH)
 +            | (radio_type << csr::HW_IF_CONFIG_PHY_TYPE_POS)
 +            | (radio_step << csr::HW_IF_CONFIG_PHY_STEP_POS)
 +            | (radio_dash << csr::HW_IF_CONFIG_PHY_DASH_POS);
++        // The radio's serial interface, before the 8000 family.
++        if self.mac.family == Family::Ac7000 {
++            value |= csr::HW_IF_CONFIG_RADIO_SI;
++        }
 +        let mask = csr::HW_IF_CONFIG_MAC_STEP_DASH | csr::HW_IF_CONFIG_PHY_MASK | csr::HW_IF_CONFIG_RADIO_SI | csr::HW_IF_CONFIG_MAC_SI;
 +        self.w32(csr::HW_IF_CONFIG, (self.r32(csr::HW_IF_CONFIG) & !mask) | value);
 +    }
@@ -4205,6 +4602,11 @@ index 0000000..2503cef
 +        );
 +        self.release();
 +        self.w8(csr::INT_COALESCING, csr::INT_COALESCING_DEFAULT);
++        // The 7260's and 3160's interrupt timer's other mode (a
++        // coalescing bug's workaround).
++        if ids::host_interrupt_operation_mode(self.mac) {
++            self.set_bits(csr::INT_COALESCING, csr::INT_COALESCING_HOST_OPER_MODE);
++        }
 +        if let Some(mut rx) = self.rx.take() {
 +            self.tell_rx(&mut rx);
 +            self.rx = Some(rx);
@@ -4252,6 +4654,7 @@ index 0000000..2503cef
 +        self.w32(csr::UCODE_DRV_GP1_CLR, csr::UCODE_DRV_GP1_CMD_BLOCKED);
 +        self.w32(csr::INT, u32::MAX);
 +        self.apm_init()?;
++        self.power_7000();
 +        self.nic_config(firmware.phy_config);
 +        self.make_queues()?;
 +        self.rx_init_gen1()?;
@@ -4277,6 +4680,9 @@ index 0000000..2503cef
 +            return Err(Error::Firmware);
 +        }
 +        let buffer = dma(csr::FH_TB_MAX_LENGTH)?;
++        if self.mac.family == Family::Ac7000 {
++            return self.load_image_7000(image, &buffer, file);
++        }
 +        if !self.grab() {
 +            return Err(Error::NoClock);
 +        }
@@ -4320,6 +4726,19 @@ index 0000000..2503cef
 +        })();
 +        drop(waiting);
 +        result
++    }
++
++    /// The 7000 family's program, not signed (Linux's
++    /// `iwl_pcie_load_given_ucode`): its sections up to the separator,
++    /// then the processor let go of its reset.
++    fn load_image_7000(&self, image: &[Section], buffer: &DmaCoherent, file: &[u8]) -> Result<(), Error> {
++        let waiting = crate::WAKER.waiting();
++        let result = image.iter().take_while(|section| !section.is_separator() && !section.data.is_empty()).try_for_each(|section| self.load_section(buffer, section, file));
++        drop(waiting);
++        result?;
++        self.enable_interrupts();
++        self.w32(csr::RESET, 0);
++        Ok(())
 +    }
 +
 +    /// A section, in pieces of the service channel's longest copy; those
@@ -4396,6 +4815,10 @@ index 0000000..2503cef
 +        }
 +        let chicken = self.r32(csr::FH_TX_CHICKEN_BITS);
 +        self.w32(csr::FH_TX_CHICKEN_BITS, chicken | csr::FH_TX_CHICKEN_SCD_AUTO_RETRY);
++        // L1-active again, before the 8000 family.
++        if self.mac.family == Family::Ac7000 {
++            self.clear_bits_prph(csr::APMG_PCIDEV_STT, csr::APMG_PCIDEV_STT_L1_ACT_DIS);
++        }
 +        self.release();
 +        if let Some(queue) = self.commands.as_mut() {
 +            queue.write = 0;

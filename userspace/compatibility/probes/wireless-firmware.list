@@ -12,8 +12,8 @@
 # Intel Wi-Fi (kernel/comps/iwlwifi): one firmware per chip family. The
 # AX200 to AX211 take release 77 on every chip, which speaks one set of
 # commands across them (Linux's newer release for the AX210 speaks another);
-# the 9000 family its last release, 46, and the 8000 family 36. The 7000
-# family's files are kept for when its driver comes.
+# the 9000 family its last release, 46, the 8000 family 36, the 7000 family
+# 17 (7260, 3160, the 7265's B step) or 29 (the 7265's D step, 3165, 3168).
 licence LICENCE.iwlwifi_firmware 1ig50lipldqw4gyipsik4n09jnwkf04f4hkm7dlzqlgqgh609m8n
 # AX200.
 iwlwifi-cc-a0-77.ucode
@@ -42,6 +42,7 @@ iwlwifi-8000C-36.ucode
 iwlwifi-8265-36.ucode
 # 7260, 7265, 3160, 3165 and 3168.
 iwlwifi-7260-17.ucode
+iwlwifi-7265-17.ucode
 iwlwifi-7265D-29.ucode
 iwlwifi-3160-17.ucode
 iwlwifi-3168-29.ucode
