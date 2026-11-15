@@ -1,0 +1,2247 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a656523..0622808 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -388,6 +388,19 @@ dependencies = [
+  "zerocopy",
+ ]
+ 
++[[package]]
++name = "aster-mt7921"
++version = "0.1.0"
++dependencies = [
++ "aster-cmdline",
++ "aster-core",
++ "aster-firmware",
++ "aster-pci",
++ "aster-wlan",
++ "component",
++ "ostd",
++]
++
+ [[package]]
+ name = "aster-network"
+ version = "0.1.0"
+@@ -624,6 +637,7 @@ dependencies = [
+  "aster-firmware",
+  "aster-i8042",
+  "aster-iwlwifi",
++ "aster-mt7921",
+  "aster-simpledrm",
+  "aster-uart",
+  "aster-usb",
+diff --git a/Cargo.toml b/Cargo.toml
+index 7d2c776..0760126 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -40,6 +40,7 @@ members = [
+     "kernel/comps/bluetooth",
+     "kernel/comps/firmware",
+     "kernel/comps/iwlwifi",
++    "kernel/comps/mt7921",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -105,6 +106,7 @@ default-members = [
+     "kernel/comps/bluetooth",
+     "kernel/comps/firmware",
+     "kernel/comps/iwlwifi",
++    "kernel/comps/mt7921",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -197,6 +199,7 @@ aster-wlan = { path = "kernel/comps/wlan" }
+ aster-bluetooth = { path = "kernel/comps/bluetooth" }
+ aster-firmware = { path = "kernel/comps/firmware" }
+ aster-iwlwifi = { path = "kernel/comps/iwlwifi" }
++aster-mt7921 = { path = "kernel/comps/mt7921" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+diff --git a/Components.toml b/Components.toml
+index 727db46..0ef6f12 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -27,6 +27,7 @@ wlan = { name = "aster-wlan" }
+ bluetooth = { name = "aster-bluetooth" }
+ firmware = { name = "aster-firmware" }
+ iwlwifi = { name = "aster-iwlwifi" }
++mt7921 = { name = "aster-mt7921" }
+ ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+ 
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 87e07b4..634794b 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -19,6 +19,7 @@ aster-wlan.workspace = true
+ aster-bluetooth.workspace = true
+ aster-firmware.workspace = true
+ aster-iwlwifi.workspace = true
++aster-mt7921.workspace = true
+ aster-ethernet.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+diff --git a/kernel/comps/mt7921/Cargo.toml b/kernel/comps/mt7921/Cargo.toml
+new file mode 100644
+index 0000000..91411d8
+--- /dev/null
++++ b/kernel/comps/mt7921/Cargo.toml
+@@ -0,0 +1,16 @@
++[package]
++name = "aster-mt7921"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-cmdline.workspace = true
++aster-core.workspace = true
++aster-firmware.workspace = true
++aster-pci.workspace = true
++aster-wlan.workspace = true
++component.workspace = true
++ostd.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/mt7921/src/hw.rs b/kernel/comps/mt7921/src/hw.rs
+new file mode 100644
+index 0000000..acc6879
+--- /dev/null
++++ b/kernel/comps/mt7921/src/hw.rs
+@@ -0,0 +1,742 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The chip as Linux's mt76 drives it over PCIe (`mt7921/pci.c`,
++//! `mt792x_dma.c`, `mt76_connac_mcu.c`): the chip's addresses through the
++//! bus window, the WFDMA rings, the MCU's messages and the firmware's
++//! download (ROM patch, then RAM).
++
++use alloc::{format, string::String, vec, vec::Vec};
++
++use aster_pci::cfg_space::BarAccess;
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++
++// The WFDMA's registers (bus offsets).
++pub(crate) const HOST_INT_STA: u32 = 0xd4200;
++pub(crate) const HOST_INT_ENA: u32 = 0xd4204;
++const GLO_CFG: u32 = 0xd4208;
++const RST_DTX_PTR: u32 = 0xd420c;
++const PRI_DLY_INT_CFG0: u32 = 0xd42f0;
++const GLO_CFG_EXT0: u32 = 0xd42b0;
++const WFDMA0_RST: u32 = 0xd4100;
++const TX_RING_BASE: u32 = 0xd4300;
++const RX_RING_BASE: u32 = 0xd4500;
++const TX_EXT_CTRL: u32 = 0xd4600;
++const RX_EXT_CTRL: u32 = 0xd4680;
++pub(crate) const MCU_CMD: u32 = 0xd41f0;
++const MCU2HOST_SW_INT_ENA: u32 = 0xd41f4;
++const PCIE_MAC_INT_ENABLE: u32 = 0x10188;
++const HIF_REMAP_L1: u32 = 0xfe24c;
++const HIF_REMAP_BASE_L1: u32 = 0x40000;
++// The chip's own addresses.
++const CONN_ON_LPCTL: u32 = 0x7c06_0010;
++const CONN_ON_MISC: u32 = 0x7c06_00f0;
++const HW_CHIPID: u32 = 0x7001_0200;
++const HW_REV: u32 = 0x7001_0204;
++const WFSYS_RESET: u32 = 0x1800_0140;
++const WFDMA_DUMMY_CR: u32 = 0x5400_0120;
++const DMASHDL_SW_CONTROL: u32 = 0x7c02_6004;
++const SWDEF_MODE: u32 = 0x0041_f23c;
++const SWDEF_NORMAL_MODE: u32 = 0;
++const PCIE_MAC_PM: u32 = 0x10194;
++const PCIE_MAC_PM_L0S_DIS: u32 = 1 << 8;
++// The MAC (`mt7921/regs.h`, `mt792x_regs.h`), per band where it has two.
++const MDP_DCR0: u32 = 0x820c_d000;
++const MDP_DCR0_DAMSDU_EN: u32 = 1 << 15;
++const MDP_DCR1: u32 = 0x820c_d004;
++const MDP_DCR1_MAX_RX_LEN: u32 = 0xfff8;
++const TMAC_CTCR0: [u32; 2] = [0x820e_40f4, 0x820f_40f4];
++const TMAC_CTCR0_INS_DDLMT_REFTIME: u32 = 0x3f;
++const TMAC_CTCR0_INS_DDLMT_EN: u32 = 1 << 17;
++const TMAC_CTCR0_INS_DDLMT_VHT_SMPDU_EN: u32 = 1 << 18;
++const DMA_DCR0: [u32; 2] = [0x820e_7000, 0x820f_7000];
++const DMA_DCR0_MAX_RX_LEN: u32 = 0xfff8;
++const DMA_DCR0_RXD_G5_EN: u32 = 1 << 23;
++const WTBLOFF_TOP_RSCR: [u32; 2] = [0x820e_9008, 0x820f_9008];
++const WTBLOFF_TOP_RSCR_RCPI_MODE: u32 = 0xc000_0000;
++const WTBLOFF_TOP_RSCR_RCPI_PARAM: u32 = 0x0300_0000;
++
++const GLO_TX_DMA_EN: u32 = 1 << 0;
++const GLO_TX_DMA_BUSY: u32 = 1 << 1;
++const GLO_RX_DMA_EN: u32 = 1 << 2;
++const GLO_RX_DMA_BUSY: u32 = 1 << 3;
++const GLO_TX_WB_DDONE: u32 = 1 << 6;
++const GLO_FIFO_DIS_CHECK: u32 = 1 << 11;
++const GLO_FIFO_LITTLE_ENDIAN: u32 = 1 << 12;
++const GLO_RX_WB_DDONE: u32 = 1 << 13;
++const GLO_CSR_DISP_BASE_PTR_CHAIN_EN: u32 = 1 << 15;
++const GLO_OMIT_RX_INFO_PFET2: u32 = 1 << 21;
++const GLO_OMIT_RX_INFO: u32 = 1 << 27;
++const GLO_OMIT_TX_INFO: u32 = 1 << 28;
++const GLO_CLK_GAT_DIS: u32 = 1 << 30;
++const GLO_DMA_SIZE_3: u32 = 3 << 4;
++
++pub(crate) const INT_RX_DONE_WM: u32 = 1 << 0;
++pub(crate) const INT_RX_DONE_DATA: u32 = 1 << 2;
++pub(crate) const INT_RX_DONE_WM2: u32 = 1 << 22;
++pub(crate) const INT_TX_DONE_ALL: u32 = 0x0807_fff0;
++pub(crate) const INT_MCU_CMD: u32 = 1 << 29;
++
++const DMA_CTL_SD_LEN0_SHIFT: u32 = 16;
++const DMA_CTL_LAST_SEC0: u32 = 1 << 30;
++const DMA_CTL_DMA_DONE: u32 = 1 << 31;
++
++/// The rings: data and the MCU's commands and firmware out; the MCU's
++/// events, data, and the MCU's events after the firmware runs, in.
++pub(crate) const TXQ_DATA: u32 = 0;
++pub(crate) const TXQ_FWDL: u32 = 16;
++pub(crate) const TXQ_MCU: u32 = 17;
++pub(crate) const RXQ_MCU: u32 = 0;
++pub(crate) const RXQ_DATA: u32 = 2;
++pub(crate) const RXQ_MCU_WA: u32 = 4;
++
++/// The size of a ring's buffers: a page, so that a frame is never split.
++pub(crate) const BUFFER: usize = PAGE_SIZE;
++
++// MCU commands (`mt76_connac_mcu.h`).
++const MCU_CMD_TARGET_ADDRESS_LEN_REQ: u8 = 0x01;
++const MCU_CMD_FW_START_REQ: u8 = 0x02;
++const MCU_CMD_PATCH_START_REQ: u8 = 0x05;
++const MCU_CMD_PATCH_FINISH_REQ: u8 = 0x07;
++const MCU_CMD_PATCH_SEM_CONTROL: u8 = 0x10;
++const MCU_CMD_EXT_CID: u8 = 0xed;
++const MCU_PKT_ID: u8 = 0xa0;
++const MCU_Q_QUERY: u8 = 0;
++const MCU_Q_SET: u8 = 1;
++const MCU_Q_NA: u8 = 3;
++const MCU_CMD_UNI_EXT_ACK: u8 = 0x07;
++const MCU_PQ_ID: u16 = 0x8000;
++const MT_TX_TYPE_CMD: u32 = 2;
++const MT_TX_MCU_PORT_RX_Q0: u32 = 0x20;
++const MT_HDR_FORMAT_CMD: u32 = 1;
++const TXD1_LONG_FORMAT: u32 = 1 << 31;
++/// An MCU event's header (`struct mt76_connac2_mcu_rxd`).
++pub(crate) const MCU_RXD: usize = 36;
++const PATCH_SEM_RELEASE: u32 = 0;
++const PATCH_SEM_GET: u32 = 1;
++const PATCH_IS_DL: u8 = 1;
++const PATCH_NOT_DL_SEM_SUCCESS: u8 = 2;
++const PATCH_SEC_TYPE_INFO: u32 = 2;
++const PATCH_SEC_NOT_SUPPORT: u32 = 0xffff_ffff;
++const DL_MODE_ENCRYPT: u32 = 1 << 0;
++const DL_MODE_RESET_SEC_IV: u32 = 1 << 3;
++const DL_CONFIG_ENCRY_MODE_SEL: u32 = 1 << 6;
++const DL_MODE_NEED_RSP: u32 = 1 << 31;
++const FW_FEATURE_SET_ENCRYPT: u8 = 1 << 0;
++const FW_FEATURE_ENCRY_MODE: u8 = 1 << 4;
++const FW_FEATURE_OVERRIDE_ADDR: u8 = 1 << 5;
++const FW_FEATURE_NON_DL: u8 = 1 << 6;
++const FW_START_OVERRIDE: u32 = 1 << 0;
++const SCATTER: usize = 4096;
++const MCU_TIMEOUT_MS: u64 = 3_000;
++
++/// How an MCU command is addressed (Linux's `MCU_CMD`, `MCU_CE_CMD`,
++/// `MCU_CE_QUERY`, `MCU_EXT_CMD` and `MCU_UNI_CMD`).
++#[derive(Clone, Copy, Debug)]
++pub(crate) enum Cmd {
++    Legacy(u8),
++    Ce(u8),
++    CeQuery(u8),
++    Ext(u8),
++    Uni(u16),
++}
++
++/// DMA memory the WFDMA can address: its pointers are 32 bits, so the
++/// memory must lie below 4 GiB. Asked for again until it does (ostd has no
++/// 32-bit zone; early in the boot low memory is free).
++pub(crate) fn dma32(bytes: usize) -> Option<DmaCoherent> {
++    let pages = bytes.div_ceil(PAGE_SIZE).max(1);
++    let mut rejected = Vec::new();
++    for _ in 0..64 {
++        let block = DmaCoherent::alloc(pages, true).ok()?;
++        if (block.daddr() as u64) + (pages * PAGE_SIZE) as u64 <= 1 << 32 {
++            return Some(block);
++        }
++        rejected.push(block);
++    }
++    None
++}
++
++/// A WFDMA ring: descriptors (`struct mt76_desc`: buf0, ctrl, buf1, info)
++/// and a buffer each.
++pub(crate) struct Ring {
++    regs: u32,
++    descs: DmaCoherent,
++    pub(crate) buffers: DmaCoherent,
++    pub(crate) size: usize,
++    /// TX: the next slot to fill; RX: the next slot to read.
++    head: usize,
++    /// TX: the first slot the DMA has not finished.
++    tail: usize,
++}
++
++impl Ring {
++    pub(crate) fn buffer_address(&self, slot: usize) -> u32 {
++        (self.buffers.daddr() + slot * BUFFER) as u32
++    }
++}
++
++pub(crate) struct Chip {
++    mmio: BarAccess,
++    pub(crate) name: String,
++    pub(crate) chip_id: u32,
++    pub(crate) rev: u32,
++    pub(crate) tx_data: Option<Ring>,
++    tx_mcu: Option<Ring>,
++    tx_fwdl: Option<Ring>,
++    rx_mcu: Option<Ring>,
++    pub(crate) rx_data: Option<Ring>,
++    rx_mcu_wa: Option<Ring>,
++    seq: u8,
++    /// Packets read from the MCU's rings while a command waited.
++    pub(crate) pending: Vec<Vec<u8>>,
++}
++
++impl Chip {
++    pub(crate) fn new(mmio: BarAccess, name: String) -> Self {
++        Self {
++            mmio,
++            name,
++            chip_id: 0,
++            rev: 0,
++            tx_data: None,
++            tx_mcu: None,
++            tx_fwdl: None,
++            rx_mcu: None,
++            rx_data: None,
++            rx_mcu_wa: None,
++            seq: 0,
++            pending: Vec::new(),
++        }
++    }
++
++    // ---- Registers. ----
++
++    /// A chip address as a bus offset: the low megabyte as it is, the fixed
++    /// windows of Linux's `__mt7921_reg_addr`, the rest through the L1
++    /// window.
++    fn map(&self, addr: u32) -> u32 {
++        const FIXED: [(u32, u32, u32); 45] = [
++            (0x820d_0000, 0x30000, 0x10000),
++            (0x820e_d000, 0x24800, 0x00800),
++            (0x820e_4000, 0x21000, 0x00400),
++            (0x820e_7000, 0x21e00, 0x00200),
++            (0x820e_b000, 0x24200, 0x00400),
++            (0x820e_2000, 0x20800, 0x00400),
++            (0x820e_3000, 0x20c00, 0x00400),
++            (0x820e_5000, 0x21400, 0x00800),
++            (0x0040_0000, 0x80000, 0x10000),
++            (0x0041_0000, 0x90000, 0x10000),
++            (0x4000_0000, 0x70000, 0x10000),
++            (0x5400_0000, 0x02000, 0x01000),
++            (0x5500_0000, 0x03000, 0x01000),
++            (0x5800_0000, 0x06000, 0x01000),
++            (0x5900_0000, 0x07000, 0x01000),
++            (0x7c00_0000, 0xf0000, 0x10000),
++            (0x7c02_0000, 0xd0000, 0x10000),
++            (0x7c06_0000, 0xe0000, 0x10000),
++            (0x8002_0000, 0xb0000, 0x10000),
++            (0x8102_0000, 0xc0000, 0x10000),
++            (0x820c_0000, 0x08000, 0x04000),
++            (0x820c_8000, 0x0c000, 0x02000),
++            (0x820c_c000, 0x0e000, 0x01000),
++            (0x820c_d000, 0x0f000, 0x01000),
++            (0x7403_0000, 0x10000, 0x10000),
++            (0x820c_e000, 0x21c00, 0x00200),
++            (0x820c_f000, 0x22000, 0x01000),
++            (0x820e_0000, 0x20000, 0x00400),
++            (0x820e_1000, 0x20400, 0x00200),
++            (0x820e_9000, 0x23400, 0x00200),
++            (0x820e_a000, 0x24000, 0x00200),
++            (0x820e_c000, 0x24600, 0x00200),
++            (0x820f_0000, 0xa0000, 0x00400),
++            (0x820f_1000, 0xa0600, 0x00200),
++            (0x820f_2000, 0xa0800, 0x00400),
++            (0x820f_3000, 0xa0c00, 0x00400),
++            (0x820f_4000, 0xa1000, 0x00400),
++            (0x820f_5000, 0xa1400, 0x00800),
++            (0x820f_7000, 0xa1e00, 0x00200),
++            (0x820f_9000, 0xa3400, 0x00200),
++            (0x820f_a000, 0xa4000, 0x00200),
++            (0x820f_b000, 0xa4200, 0x00400),
++            (0x820f_c000, 0xa4600, 0x00200),
++            (0x820f_d000, 0xa4800, 0x00800),
++            (0x7c06_0000, 0xe0000, 0x10000),
++        ];
++        if addr < 0x10_0000 {
++            return addr;
++        }
++        for (phys, maps, size) in FIXED {
++            if addr >= phys && addr - phys < size {
++                return maps + (addr - phys);
++            }
++        }
++        if (0x1800_0000..0x18c0_0000).contains(&addr) || (0x7000_0000..0x7800_0000).contains(&addr) || (0x7c00_0000..0x7c40_0000).contains(&addr) {
++            self.raw_write(HIF_REMAP_L1, (self.raw_read(HIF_REMAP_L1) & !0xffff) | (addr >> 16));
++            let _ = self.raw_read(HIF_REMAP_L1);
++            return HIF_REMAP_BASE_L1 + (addr & 0xffff);
++        }
++        ostd::warn!("{}: no window for chip address {:#x}", self.name, addr);
++        0
++    }
++
++    fn raw_read(&self, offset: u32) -> u32 {
++        self.mmio.read_once::<u32>(offset as usize).unwrap_or(u32::MAX)
++    }
++
++    fn raw_write(&self, offset: u32, value: u32) {
++        let _ = self.mmio.write_once::<u32>(offset as usize, value);
++    }
++
++    pub(crate) fn rr(&self, addr: u32) -> u32 {
++        self.raw_read(self.map(addr))
++    }
++
++    pub(crate) fn wr(&self, addr: u32, value: u32) {
++        self.raw_write(self.map(addr), value);
++    }
++
++    fn set(&self, addr: u32, bits: u32) {
++        self.wr(addr, self.rr(addr) | bits);
++    }
++
++    fn clear(&self, addr: u32, bits: u32) {
++        self.wr(addr, self.rr(addr) & !bits);
++    }
++
++    fn poll(&self, addr: u32, mask: u32, value: u32, timeout_ms: u64) -> bool {
++        let deadline = crate::now_ms() + timeout_ms;
++        loop {
++            if self.rr(addr) & mask == value {
++                return true;
++            }
++            if crate::now_ms() >= deadline {
++                return false;
++            }
++            crate::delay_ms(1);
++        }
++    }
++
++    // ---- The chip's start. ----
++
++    /// Ownership to the firmware and back to the driver (Linux's
++    /// `mt792xe_mcu_fw_pmctrl`, `__mt792xe_mcu_drv_pmctrl`), the chip's
++    /// identity, and the Wi-Fi system's reset.
++    pub(crate) fn start(&mut self) -> Result<(), String> {
++        for _ in 0..10 {
++            self.wr(CONN_ON_LPCTL, 1);
++            if self.poll(CONN_ON_LPCTL, 4, 4, 50) {
++                break;
++            }
++        }
++        let mut owned = false;
++        for _ in 0..10 {
++            self.wr(CONN_ON_LPCTL, 2);
++            if self.poll(CONN_ON_LPCTL, 4, 0, 50) {
++                owned = true;
++                break;
++            }
++        }
++        if !owned {
++            return Err(String::from("the chip did not give the driver its ownership"));
++        }
++        self.chip_id = self.rr(HW_CHIPID) & 0xffff;
++        self.rev = self.rr(HW_REV) & 0xff;
++        if self.chip_id == 0x7961 && self.rr(0x7001_0020) & (1 << 7) != 0 {
++            self.chip_id = 0x7920;
++        }
++        // The Wi-Fi system's reset.
++        self.clear(WFSYS_RESET, 1);
++        crate::delay_ms(50);
++        self.set(WFSYS_RESET, 1);
++        if !self.poll(WFSYS_RESET, 0x10, 0x10, 500) {
++            return Err(String::from("the Wi-Fi system did not come out of reset"));
++        }
++        self.wr(HOST_INT_ENA, 0);
++        self.wr(PCIE_MAC_INT_ENABLE, 0xff);
++        self.dma_init()
++    }
++
++    fn new_ring(&self, regs: u32, size: usize, rx: bool) -> Result<Ring, String> {
++        let descs = dma32(size * 16).ok_or_else(|| String::from("no DMA memory below 4 GiB"))?;
++        let buffers = dma32(size * BUFFER).ok_or_else(|| String::from("no DMA memory below 4 GiB"))?;
++        let mut ring = Ring { regs, descs, buffers, size, head: 0, tail: 0 };
++        for slot in 0..size {
++            let ctrl = if rx { (BUFFER as u32) << DMA_CTL_SD_LEN0_SHIFT } else { DMA_CTL_DMA_DONE };
++            let address = if rx { ring.buffer_address(slot) } else { 0 };
++            let desc: [u32; 4] = [address, ctrl, 0, 0];
++            for (index, word) in desc.iter().enumerate() {
++                let _ = ring.descs.write_val(slot * 16 + index * 4, word);
++            }
++        }
++        self.wr(regs, ring.descs.daddr() as u32);
++        self.wr(regs + 4, size as u32);
++        if rx {
++            // Every slot but one is the chip's to fill.
++            ring.head = 0;
++            self.wr(regs + 8, (size - 1) as u32);
++        } else {
++            self.wr(regs + 8, 0);
++            let index = self.rr(regs + 12) as usize % size;
++            ring.head = index;
++            ring.tail = index;
++            self.wr(regs + 8, index as u32);
++        }
++        Ok(ring)
++    }
++
++    /// Linux's `mt7921_dma_init`: the WFDMA stopped, its rings, then
++    /// started again (`mt792x_dma_enable`).
++    fn dma_init(&mut self) -> Result<(), String> {
++        self.clear(
++            GLO_CFG,
++            GLO_TX_DMA_EN | GLO_RX_DMA_EN | GLO_CSR_DISP_BASE_PTR_CHAIN_EN | GLO_OMIT_TX_INFO | GLO_OMIT_RX_INFO | GLO_OMIT_RX_INFO_PFET2,
++        );
++        if !self.poll(GLO_CFG, GLO_TX_DMA_BUSY | GLO_RX_DMA_BUSY, 0, 100) {
++            return Err(String::from("the DMA did not stop"));
++        }
++        self.clear(GLO_CFG_EXT0, 1 << 6);
++        self.set(DMASHDL_SW_CONTROL, 1 << 28);
++        self.clear(WFDMA0_RST, 0x30);
++        self.set(WFDMA0_RST, 0x30);
++        self.tx_data = Some(self.new_ring(TX_RING_BASE + TXQ_DATA * 16, 256, false)?);
++        self.wr(TX_EXT_CTRL, 0x4);
++        self.tx_mcu = Some(self.new_ring(TX_RING_BASE + TXQ_MCU * 16, 64, false)?);
++        self.tx_fwdl = Some(self.new_ring(TX_RING_BASE + TXQ_FWDL * 16, 64, false)?);
++        self.rx_mcu = Some(self.new_ring(RX_RING_BASE + RXQ_MCU * 16, 32, true)?);
++        self.rx_mcu_wa = Some(self.new_ring(RX_RING_BASE + RXQ_MCU_WA * 16, 32, true)?);
++        self.rx_data = Some(self.new_ring(RX_RING_BASE + RXQ_DATA * 16, 256, true)?);
++        // Prefetch: each ring's place and depth in the WFDMA's SRAM.
++        let prefetch = |base: u32, depth: u32| (base << 16) | depth;
++        for (ring, base) in [(0u32, 0x0), (2, 0x40), (3, 0x80), (4, 0xc0), (5, 0x100)] {
++            self.wr(RX_EXT_CTRL + ring * 4, prefetch(base, 4));
++        }
++        for (ring, base) in [(0u32, 0x140), (1, 0x180), (2, 0x1c0), (3, 0x200), (4, 0x240), (5, 0x280), (6, 0x2c0), (16, 0x340), (17, 0x380)] {
++            self.wr(TX_EXT_CTRL + ring * 4, prefetch(base, 4));
++        }
++        self.wr(RST_DTX_PTR, !0);
++        self.wr(PRI_DLY_INT_CFG0, 0);
++        self.set(
++            GLO_CFG,
++            GLO_TX_WB_DDONE | GLO_FIFO_LITTLE_ENDIAN | GLO_CLK_GAT_DIS | GLO_OMIT_TX_INFO | GLO_DMA_SIZE_3 | GLO_FIFO_DIS_CHECK | GLO_RX_WB_DDONE | GLO_CSR_DISP_BASE_PTR_CHAIN_EN | GLO_OMIT_RX_INFO_PFET2,
++        );
++        self.set(GLO_CFG, GLO_TX_DMA_EN | GLO_RX_DMA_EN);
++        self.set(WFDMA_DUMMY_CR, 1 << 1);
++        self.wr(HOST_INT_ENA, INT_TX_DONE_ALL | INT_RX_DONE_DATA | INT_RX_DONE_WM | INT_RX_DONE_WM2 | INT_MCU_CMD);
++        self.set(MCU2HOST_SW_INT_ENA, 1);
++        Ok(())
++    }
++
++    /// Before the firmware's download (`__mt7921_init_hardware`,
++    /// `mt7921e_mcu_init`): its normal mode, and no L0s on the link.
++    pub(crate) fn before_firmware(&self) {
++        self.wr(SWDEF_MODE, SWDEF_NORMAL_MODE);
++        self.set(PCIE_MAC_PM, PCIE_MAC_PM_L0S_DIS);
++    }
++
++    /// Linux's `mt7921_mac_init` and `mt792x_mac_init_band`: frames up to
++    /// 1536 bytes, A-MSDUs split by the chip, the RXD's group 5 off, the
++    /// signal of each frame. Header translation stays off (frames come as
++    /// 802.11).
++    pub(crate) fn mac_init(&self) {
++        let field = |addr: u32, mask: u32, value: u32| self.wr(addr, (self.rr(addr) & !mask) | ((value << mask.trailing_zeros()) & mask));
++        field(MDP_DCR1, MDP_DCR1_MAX_RX_LEN, 1536);
++        self.set(MDP_DCR0, MDP_DCR0_DAMSDU_EN);
++        for band in 0..2 {
++            let ctcr0 = TMAC_CTCR0[band];
++            field(ctcr0, TMAC_CTCR0_INS_DDLMT_REFTIME, 0x3f);
++            self.set(ctcr0, TMAC_CTCR0_INS_DDLMT_VHT_SMPDU_EN | TMAC_CTCR0_INS_DDLMT_EN);
++            field(DMA_DCR0[band], DMA_DCR0_MAX_RX_LEN, 1536);
++            self.clear(DMA_DCR0[band], DMA_DCR0_RXD_G5_EN);
++            field(WTBLOFF_TOP_RSCR[band], WTBLOFF_TOP_RSCR_RCPI_MODE, 0);
++            field(WTBLOFF_TOP_RSCR[band], WTBLOFF_TOP_RSCR_RCPI_PARAM, 3);
++        }
++    }
++
++    // ---- Rings. ----
++
++    /// Queues one buffer of `bytes` on a TX ring. Err: full.
++    fn ring_send(&mut self, which: u32, bytes: &[u8]) -> Result<(), ()> {
++        if bytes.len() > BUFFER {
++            return Err(());
++        }
++        // What the DMA finished (the rings' registers are in the low
++        // megabyte: no window).
++        let regs = match which {
++            TXQ_MCU => self.tx_mcu.as_ref(),
++            TXQ_FWDL => self.tx_fwdl.as_ref(),
++            _ => self.tx_data.as_ref(),
++        }
++        .ok_or(())?
++        .regs;
++        let dma_index = self.raw_read(regs + 12) as usize;
++        let ring = match which {
++            TXQ_MCU => self.tx_mcu.as_mut(),
++            TXQ_FWDL => self.tx_fwdl.as_mut(),
++            _ => self.tx_data.as_mut(),
++        }
++        .ok_or(())?;
++        ring.tail = dma_index % ring.size;
++        if (ring.head + 1) % ring.size == ring.tail {
++            return Err(());
++        }
++        let slot = ring.head;
++        ring.buffers.write_bytes(slot * BUFFER, bytes).map_err(|_| ())?;
++        let desc: [u32; 4] = [ring.buffer_address(slot), ((bytes.len() as u32) << DMA_CTL_SD_LEN0_SHIFT) | DMA_CTL_LAST_SEC0, 0, 0];
++        for (index, word) in desc.iter().enumerate() {
++            ring.descs.write_val(slot * 16 + index * 4, word).map_err(|_| ())?;
++        }
++        ring.head = (ring.head + 1) % ring.size;
++        let (regs, head) = (ring.regs, ring.head);
++        self.wr(regs + 8, head as u32);
++        Ok(())
++    }
++
++    /// Waits until a TX ring has room.
++    fn ring_wait(&mut self, which: u32) -> bool {
++        let deadline = crate::now_ms() + MCU_TIMEOUT_MS;
++        loop {
++            let full = {
++                let ring = match which {
++                    TXQ_MCU => self.tx_mcu.as_ref(),
++                    TXQ_FWDL => self.tx_fwdl.as_ref(),
++                    _ => self.tx_data.as_ref(),
++                };
++                let Some(ring) = ring else { return false };
++                let tail = self.rr(ring.regs + 12) as usize % ring.size;
++                (ring.head + 1) % ring.size == tail
++            };
++            if !full {
++                return true;
++            }
++            if crate::now_ms() >= deadline {
++                return false;
++            }
++            crate::delay_ms(1);
++        }
++    }
++
++    /// Sends a frame (TXD, TXP and frame in one buffer) on the data ring:
++    /// only the TXD and TXP go in the descriptor; the chip fetches the
++    /// frame through the TXP. `slot`: where the caller put the bytes.
++    pub(crate) fn data_send(&mut self, txwi: &[u8]) -> Result<(), ()> {
++        self.ring_send(TXQ_DATA, txwi)
++    }
++
++    /// The packets the chip wrote to an RX ring since the last call.
++    pub(crate) fn ring_receive(&mut self, which: u32) -> Vec<Vec<u8>> {
++        let mut out = Vec::new();
++        let ring = match which {
++            RXQ_MCU => self.rx_mcu.as_mut(),
++            RXQ_MCU_WA => self.rx_mcu_wa.as_mut(),
++            _ => self.rx_data.as_mut(),
++        };
++        let Some(ring) = ring else { return out };
++        let mut last = None;
++        for _ in 0..ring.size {
++            let slot = ring.head;
++            let ctrl: u32 = ring.descs.read_val(slot * 16 + 4).unwrap_or(0);
++            if ctrl & DMA_CTL_DMA_DONE == 0 {
++                break;
++            }
++            let length = ((ctrl >> DMA_CTL_SD_LEN0_SHIFT) & 0x3fff) as usize;
++            if ctrl & DMA_CTL_LAST_SEC0 != 0 && length > 0 && length <= BUFFER {
++                let mut bytes = vec![0u8; length];
++                let _ = ring.buffers.read_bytes(slot * BUFFER, &mut bytes);
++                out.push(bytes);
++            }
++            let fresh = (BUFFER as u32) << DMA_CTL_SD_LEN0_SHIFT;
++            let _ = ring.descs.write_val(slot * 16 + 4, &fresh);
++            last = Some(slot);
++            ring.head = (ring.head + 1) % ring.size;
++        }
++        if let Some(slot) = last {
++            let regs = ring.regs;
++            self.wr(regs + 8, slot as u32);
++        }
++        out
++    }
++
++    // ---- The MCU. ----
++
++    /// Sends an MCU command; with `wait`, its answer's payload (after the
++    /// event header; for the patch semaphore, the status byte first).
++    pub(crate) fn mcu(&mut self, cmd: Cmd, payload: &[u8], wait: bool) -> Result<Vec<u8>, String> {
++        self.seq = (self.seq % 15) + 1;
++        let seq = self.seq;
++        let mut out = Vec::with_capacity(64 + payload.len());
++        let uni = matches!(cmd, Cmd::Uni(_));
++        let header = if uni { 48 } else { 64 };
++        let total = header + payload.len();
++        let txd0 = (total as u32 & 0xffff) | (MT_TX_TYPE_CMD << 23) | (MT_TX_MCU_PORT_RX_Q0 << 25);
++        let txd1 = TXD1_LONG_FORMAT | (MT_HDR_FORMAT_CMD << 16);
++        out.extend_from_slice(&txd0.to_le_bytes());
++        out.extend_from_slice(&txd1.to_le_bytes());
++        out.resize(32, 0);
++        let length = (total - 32) as u16;
++        match cmd {
++            Cmd::Uni(id) => {
++                out.extend_from_slice(&length.to_le_bytes());
++                out.extend_from_slice(&id.to_le_bytes());
++                out.extend_from_slice(&[0, MCU_PKT_ID, 0, seq]);
++                out.extend_from_slice(&[0, 0, 0, MCU_CMD_UNI_EXT_ACK]);
++                out.extend_from_slice(&[0; 4]);
++            }
++            _ => {
++                let (cid, ext, query, ack) = match cmd {
++                    Cmd::Legacy(id) => (id, 0, MCU_Q_NA, 0),
++                    Cmd::Ce(id) => (id, 0, MCU_Q_SET, 0),
++                    Cmd::CeQuery(id) => (id, 0, MCU_Q_QUERY, 0),
++                    Cmd::Ext(id) => (MCU_CMD_EXT_CID, id, MCU_Q_SET, 1),
++                    Cmd::Uni(_) => unreachable!(),
++                };
++                out.extend_from_slice(&length.to_le_bytes());
++                out.extend_from_slice(&MCU_PQ_ID.to_le_bytes());
++                out.extend_from_slice(&[cid, MCU_PKT_ID, query, seq, 0, ext, 0, ack]);
++                out.extend_from_slice(&[0; 20]);
++            }
++        }
++        out.extend_from_slice(payload);
++        if !self.ring_wait(TXQ_MCU) {
++            return Err(format!("the MCU's command ring is full ({cmd:?})"));
++        }
++        self.ring_send(TXQ_MCU, &out).map_err(|()| format!("command {cmd:?} not queued"))?;
++        if !wait {
++            return Ok(Vec::new());
++        }
++        let deadline = crate::now_ms() + MCU_TIMEOUT_MS;
++        crate::WAITING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
++        let result = loop {
++            let mut found = None;
++            for which in [RXQ_MCU, RXQ_MCU_WA, RXQ_DATA] {
++                for packet in self.ring_receive(which) {
++                    // An event (type 7) that is not a frame through the MCU
++                    // (flag 1), answering this command.
++                    let rxd0 = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
++                    let is_event = packet.len() >= MCU_RXD && rxd0 >> 27 == 7 && (rxd0 >> 16) & 0xf != 1;
++                    if found.is_none() && is_event && packet[29] == seq {
++                        found = Some(packet);
++                    } else {
++                        self.pending.push(packet);
++                    }
++                }
++            }
++            if let Some(packet) = found {
++                break Ok(packet);
++            }
++            if crate::now_ms() >= deadline {
++                break Err(format!("no answer to MCU command {cmd:?}"));
++            }
++            crate::sleep();
++        };
++        crate::WAITING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
++        let packet = result?;
++        let skip = if matches!(cmd, Cmd::Legacy(MCU_CMD_PATCH_SEM_CONTROL) | Cmd::Legacy(MCU_CMD_PATCH_FINISH_REQ)) { MCU_RXD - 4 } else { MCU_RXD };
++        Ok(packet.get(skip..).unwrap_or(&[]).to_vec())
++    }
++
++    /// Sends firmware bytes raw on the download ring, in pieces.
++    fn scatter(&mut self, data: &[u8]) -> Result<(), String> {
++        for piece in data.chunks(SCATTER) {
++            if !self.ring_wait(TXQ_FWDL) {
++                return Err(String::from("the firmware's download ring did not drain"));
++            }
++            self.ring_send(TXQ_FWDL, piece).map_err(|()| String::from("a firmware piece did not fit"))?;
++        }
++        Ok(())
++    }
++
++    fn init_download(&mut self, addr: u32, len: u32, mode: u32) -> Result<(), String> {
++        let id = if matches!(addr, 0x0020_0000 | 0x0090_0000 | 0xe000_2800) { MCU_CMD_PATCH_START_REQ } else { MCU_CMD_TARGET_ADDRESS_LEN_REQ };
++        let mut payload = Vec::with_capacity(12);
++        for value in [addr, len, mode] {
++            payload.extend_from_slice(&value.to_le_bytes());
++        }
++        self.mcu(Cmd::Legacy(id), &payload, true).map(|_| ())
++    }
++
++    /// The ROM patch (Linux's `mt76_connac2_load_patch`).
++    pub(crate) fn load_patch(&mut self, file: &[u8]) -> Result<(), String> {
++        let status = self.mcu(Cmd::Legacy(MCU_CMD_PATCH_SEM_CONTROL), &PATCH_SEM_GET.to_le_bytes(), true)?;
++        match status.first().copied() {
++            Some(PATCH_IS_DL) => return Ok(()),
++            Some(PATCH_NOT_DL_SEM_SUCCESS) => {}
++            other => return Err(format!("the patch semaphore said {other:?}")),
++        }
++        let be = |at: usize| file.get(at..at + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
++        let regions = be(44) as usize;
++        let mut result = Ok(());
++        for index in 0..regions.min(16) {
++            let at = 96 + index * 64;
++            if be(at) & 0xffff != PATCH_SEC_TYPE_INFO {
++                result = Err(String::from("a patch section of an unknown kind"));
++                break;
++            }
++            let (offset, addr, len, info) = (be(at + 4) as usize, be(at + 12), be(at + 16), be(at + 20));
++            let mut mode = DL_MODE_NEED_RSP;
++            if info != PATCH_SEC_NOT_SUPPORT {
++                match info >> 24 {
++                    1 => mode |= DL_MODE_ENCRYPT | (((info & 0xff) << 1) & 0x6) | DL_MODE_RESET_SEC_IV,
++                    2 => mode |= DL_MODE_ENCRYPT | DL_CONFIG_ENCRY_MODE_SEL | DL_MODE_RESET_SEC_IV,
++                    _ => {}
++                }
++            }
++            let Some(data) = file.get(offset..offset + len as usize) else {
++                result = Err(String::from("a patch section beyond the file"));
++                break;
++            };
++            if let Err(error) = self.init_download(addr, len, mode).and_then(|()| self.scatter(data)) {
++                result = Err(error);
++                break;
++            }
++        }
++        if result.is_ok() {
++            result = self.mcu(Cmd::Legacy(MCU_CMD_PATCH_FINISH_REQ), &[0, 0, 0, 0], true).map(|_| ());
++        }
++        let _ = self.mcu(Cmd::Legacy(MCU_CMD_PATCH_SEM_CONTROL), &PATCH_SEM_RELEASE.to_le_bytes(), true);
++        result
++    }
++
++    /// The RAM code (Linux's `mt76_connac_mcu_send_ram_firmware`): its
++    /// regions are described before the trailer at the file's end.
++    pub(crate) fn load_ram(&mut self, file: &[u8]) -> Result<(), String> {
++        const TRAILER: usize = 36;
++        const REGION: usize = 40;
++        if file.len() < TRAILER {
++            return Err(String::from("the RAM code is too short"));
++        }
++        let trailer = file.len() - TRAILER;
++        let regions = file[trailer + 2] as usize;
++        let le = |at: usize| file.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
++        let (mut offset, mut override_addr) = (0usize, 0u32);
++        for index in 0..regions {
++            let at = trailer.checked_sub((regions - index) * REGION).ok_or_else(|| String::from("RAM regions beyond the file"))?;
++            let (addr, len, features) = (le(at + 16), le(at + 20) as usize, file[at + 24]);
++            if features & FW_FEATURE_NON_DL == 0 {
++                if features & FW_FEATURE_OVERRIDE_ADDR != 0 {
++                    override_addr = addr;
++                }
++                let mut mode = DL_MODE_NEED_RSP;
++                if features & FW_FEATURE_SET_ENCRYPT != 0 {
++                    mode |= DL_MODE_ENCRYPT | DL_MODE_RESET_SEC_IV;
++                }
++                if features & FW_FEATURE_ENCRY_MODE != 0 {
++                    mode |= DL_CONFIG_ENCRY_MODE_SEL;
++                }
++                mode |= (((features & 0x6) >> 1) as u32) << 1;
++                let data = file.get(offset..offset + len).ok_or_else(|| String::from("a RAM region beyond the file"))?;
++                self.init_download(addr, len as u32, mode)?;
++                self.scatter(data)?;
++            }
++            offset += len;
++        }
++        let option = if override_addr != 0 { FW_START_OVERRIDE } else { 0 };
++        let mut payload = Vec::with_capacity(8);
++        payload.extend_from_slice(&option.to_le_bytes());
++        payload.extend_from_slice(&override_addr.to_le_bytes());
++        self.mcu(Cmd::Legacy(MCU_CMD_FW_START_REQ), &payload, true)?;
++        if !self.poll(CONN_ON_MISC, 0x3, 0x3, 1500) {
++            return Err(String::from("the firmware did not say it runs"));
++        }
++        Ok(())
++    }
++}
+diff --git a/kernel/comps/mt7921/src/lib.rs b/kernel/comps/mt7921/src/lib.rs
+new file mode 100644
+index 0000000..4a2114f
+--- /dev/null
++++ b/kernel/comps/mt7921/src/lib.rs
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! MediaTek Wi-Fi: the MT7921 (AMD RZ608), MT7922 (AMD RZ616) and MT7920
++//! cards, as Linux's mt76 (`mt7921e`) runs them.
++//!
++//! The chip ([`hw`]) runs MediaTek's firmware (a ROM patch and the RAM
++//! code, in linux-firmware's `mediatek/`), which this driver downloads and
++//! then commands over the MCU's rings; the station on it is [`mac`].
++//!
++//! Not yet: the MT7925 (its firmware speaks the newer connac3 commands),
++//! 40 MHz and wider, VHT and HE, block-ack agreements, power save, 6 GHz,
++//! management frame protection. The kernel's log says how far a card gets
++//! (`dmesg | grep mt7921`); `mt7921.off` leaves the cards alone.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++macro_rules! __log_prefix {
++    () => {
++        "mt7921: "
++    };
++}
++
++mod hw;
++mod mac;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    common_device::PciCommonDevice,
++};
++use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    irq::IrqLine,
++    sync::{Mutex, SpinLock, WaitQueue},
++    timer::Jiffies,
++};
++
++use crate::{
++    hw::{BUFFER, Chip},
++    mac::{Mt7921, TOKENS},
++};
++
++/// Wakes the cards' tasks: an interrupt, or the timer.
++static WAKE: WaitQueue = WaitQueue::new();
++static WOKEN: AtomicBool = AtomicBool::new(false);
++static TICKS: AtomicUsize = AtomicUsize::new(0);
++/// Tasks that wait on a time-out: the timer wakes them each tick.
++pub(crate) static WAITING: AtomicUsize = AtomicUsize::new(0);
++
++pub(crate) fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++fn wake() {
++    WOKEN.store(true, Ordering::Release);
++    WAKE.wake_all();
++}
++
++pub(crate) fn sleep() {
++    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
++}
++
++/// A short busy wait, for the chip's register handshakes.
++pub(crate) fn delay_ms(ms: u64) {
++    let deadline = now_ms() + ms + 1;
++    while now_ms() < deadline {
++        core::hint::spin_loop();
++    }
++}
++
++/// The timer: every tick while a task waits on a time-out, else every 20
++/// (cards whose interrupt does not arrive still get looked at).
++fn tick() {
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
++    let period = if WAITING.load(Ordering::Relaxed) > 0 { 1 } else { 20 };
++    if ticks % period == 0 {
++        wake();
++    }
++}
++
++const VENDOR_MEDIATEK: u16 = 0x14c3;
++const VENDOR_ITTIM: u16 = 0x1d2f;
++
++/// Linux's `mt7921_pci_device_table`.
++fn claims(vendor: u16, device: u16) -> bool {
++    matches!((vendor, device), (VENDOR_MEDIATEK, 0x7961 | 0x7922 | 0x0608 | 0x0616 | 0x7920) | (VENDOR_ITTIM, 0x7922))
++}
++
++/// The firmware of a chip (`mt792x_patch_name`, `mt792x_ram_name`): ROM
++/// patch, RAM code.
++fn firmware_of(chip_id: u32) -> (&'static str, &'static str) {
++    match chip_id {
++        0x7922 => ("mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin", "mediatek/WIFI_RAM_CODE_MT7922_1.bin"),
++        0x7920 => ("mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin", "mediatek/WIFI_RAM_CODE_MT7961_1a.bin"),
++        _ => ("mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin", "mediatek/WIFI_RAM_CODE_MT7961_1.bin"),
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++#[derive(Debug)]
++struct Driver {
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if !claims(id.vendor_id, id.device_id) {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.found.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
++static DISABLED: AtomicBool = AtomicBool::new(false);
++aster_cmdline::define_flag_param!("mt7921.off", DISABLED);
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    if DISABLED.load(Ordering::Relaxed) {
++        return Ok(());
++    }
++    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
++    PCI_BUS.lock().register_driver(driver.clone());
++    let cards = core::mem::take(&mut *driver.found.lock());
++    if cards.is_empty() {
++        return Ok(());
++    }
++    ostd::timer::register_callback_on_cpu(tick);
++    *PENDING.lock() = cards;
++    Ok(())
++}
++
++#[init_component(kthread)]
++fn start() -> Result<(), ComponentInitError> {
++    for (index, device) in core::mem::take(&mut *PENDING.lock()).into_iter().enumerate() {
++        aster_core::spawn_kernel_thread(move || run(index, device));
++    }
++    Ok(())
++}
++
++struct Card {
++    state: Mutex<Mt7921>,
++}
++
++struct MediaTekRadio {
++    card: Arc<Card>,
++}
++
++impl Radio for MediaTekRadio {
++    fn start(&self) -> radio::Result<()> {
++        if self.card.state.lock().dead { Err(radio::Error::Down) } else { Ok(()) }
++    }
++
++    fn stop(&self) {
++        let mut state = self.card.state.lock();
++        state.abort_scan();
++        state.leave();
++    }
++
++    fn scan(&self, request: &ScanRequest) -> radio::Result<()> {
++        self.card.state.lock().scan(request)
++    }
++
++    fn abort_scan(&self) {
++        self.card.state.lock().abort_scan();
++    }
++
++    fn join(&self, network: &Join) -> radio::Result<()> {
++        self.card.state.lock().join(network)
++    }
++
++    fn associated(&self, association: &Association) -> radio::Result<()> {
++        self.card.state.lock().associated(association)
++    }
++
++    fn leave(&self) {
++        self.card.state.lock().leave();
++    }
++
++    fn set_key(&self, key: &Key) -> radio::Result<()> {
++        self.card.state.lock().set_key(key, false)
++    }
++
++    fn remove_key(&self, index: u8, pairwise: bool) {
++        let key = Key { index, cipher: radio::CIPHER_CCMP, pairwise, key: Vec::new(), seq: Vec::new() };
++        let _ = self.card.state.lock().set_key(&key, true);
++    }
++
++    fn authorize(&self, _authorized: bool) {}
++
++    fn send_management(&self, frame: &[u8]) -> radio::Result<()> {
++        self.card.state.lock().transmit(frame.to_vec())
++    }
++
++    fn send(&self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        self.card.state.lock().send(ethernet, plain)
++    }
++
++    fn link_stats(&self) -> LinkStats {
++        LinkStats { signal: self.card.state.lock().signal, tx_rate: None }
++    }
++}
++
++/// A card's task: the chip started, its firmware, the station registered,
++/// then what the chip says, as it says it.
++fn run(index: usize, mut device: PciCommonDevice) {
++    let id = *device.device_id();
++    let location = *device.location();
++    let name: String = format!("mt7921 {} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
++    // Memory decoding and bus mastering.
++    location.write16(0x04, location.read16(0x04) | 0x06);
++    // One interrupt: MSI-X vector 0, or MSI, or none (the timer looks).
++    let msix = match device.acquire_msix_capability() {
++        Ok(Some(mut msix)) => match IrqLine::alloc() {
++            Ok(irq) => {
++                msix.set_interrupt_vector(irq, 0);
++                if let Some(irq) = msix.irq_mut(0) {
++                    irq.on_active(|_| wake());
++                }
++                Some(msix)
++            }
++            Err(_) => None,
++        },
++        _ => None,
++    };
++    let msi = if msix.is_some() {
++        None
++    } else {
++        match (device.acquire_msi_capability(), IrqLine::alloc()) {
++            (Some(mut msi), Ok(mut irq)) => {
++                irq.on_active(|_| wake());
++                msi.set_interrupt_vector(irq);
++                Some(msi)
++            }
++            _ => None,
++        }
++    };
++    let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
++        ostd::warn!("{}: no registers", name);
++        return;
++    };
++    let mut chip = Chip::new(mmio, name.clone());
++    if let Err(error) = chip.start() {
++        ostd::warn!("{}: {:04x}:{:04x} did not start: {}", name, id.vendor_id, id.device_id, error);
++        return;
++    }
++    ostd::notice!("{}: MediaTek {:04x} (chip {:04x}, revision {:#x})", name, id.device_id, chip.chip_id, chip.rev);
++    let Some(tokens) = hw::dma32(TOKENS * BUFFER) else {
++        ostd::warn!("{}: no DMA memory below 4 GiB", name);
++        return;
++    };
++    let (patch, ram) = firmware_of(chip.chip_id);
++    let mut state = Mt7921::new(chip, name.clone(), tokens);
++    if let Err(error) = state.bring_up(patch, ram) {
++        ostd::warn!("{}: {}", name, error);
++        return;
++    }
++    let info = state.info();
++    ostd::notice!("{}: ready, MAC {:02x?}", name, state.address);
++    let card = Arc::new(Card { state: Mutex::new(state) });
++    let wlan = aster_wlan::register(info, Arc::new(MediaTekRadio { card: card.clone() }));
++    card.state.lock().device = Some(wlan);
++    loop {
++        sleep();
++        let mut state = card.state.lock();
++        state.poll();
++        if state.dead {
++            break;
++        }
++    }
++    // The interrupt's capability and the device stay until the task ends.
++    drop((msix, msi, device));
++}
+diff --git a/kernel/comps/mt7921/src/mac.rs b/kernel/comps/mt7921/src/mac.rs
+new file mode 100644
+index 0000000..813a58a
+--- /dev/null
++++ b/kernel/comps/mt7921/src/mac.rs
+@@ -0,0 +1,1077 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The station on the MediaTek firmware, as Linux's mt7921 and
++//! mt76_connac drive it: the interface (`DEV_INFO_UPDATE`,
++//! `BSS_INFO_UPDATE`), scans (`START_HW_SCAN`), the access point's station
++//! record and its WTBL entry (`STA_REC_UPDATE`), the channel for joining
++//! (`ROC`), keys (`STA_REC_KEY_V2`); frames out as a TXD and TXP the chip
++//! reads, frames in after their RXD.
++
++use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
++
++use aster_wlan::{
++    Device,
++    ieee80211::{self as wifi, Address},
++    radio::{self, Association, Band, BandId, Channel, HtCap, Info, Join, Key, RxInfo, ScanRequest},
++};
++use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
++
++use crate::hw::{self, BUFFER, Chip, Cmd};
++
++// MCU commands and events (`mt76_connac_mcu.h`, `mt7921/mcu.h`).
++const CE_START_HW_SCAN: u8 = 0x03;
++const CE_SET_RX_FILTER: u8 = 0x0a;
++const CE_SET_CHAN_DOMAIN: u8 = 0x0f;
++const CE_CANCEL_HW_SCAN: u8 = 0x1b;
++const CE_SET_EDCA_PARMS: u8 = 0x1d;
++const CE_GET_NIC_CAPAB: u8 = 0x8a;
++const EXT_EFUSE_BUFFER_MODE: u8 = 0x21;
++const EXT_PROTECT_CTRL: u8 = 0x3e;
++const EXT_MAC_INIT_CTRL: u8 = 0x46;
++const EXT_SET_RX_PATH: u8 = 0x4e;
++const UNI_DEV_INFO_UPDATE: u16 = 0x01;
++const UNI_BSS_INFO_UPDATE: u16 = 0x02;
++const UNI_STA_REC_UPDATE: u16 = 0x03;
++const UNI_ROC: u16 = 0x27;
++const EVENT_SCAN_DONE: u8 = 0x0d;
++const EVENT_BSS_BEACON_LOSS: u8 = 0x13;
++const EVENT_SCHED_SCAN_DONE: u8 = 0x23;
++const UNI_EVENT_ROC: u8 = 0x27;
++/// An event's option: unsolicited, of the UNI set.
++const UNI_UNSOLICITED: u8 = 1 << 2;
++// RXD packet types (`MT_RXD0_PKT_TYPE`) and the flag of frames that came
++// through the MCU.
++const PKT_TYPE_NORMAL: u32 = 2;
++const PKT_TYPE_TXRX_NOTIFY: u32 = 6;
++const PKT_TYPE_RX_EVENT: u32 = 7;
++const NIC_CAP_MAC_ADDR: u32 = 7;
++const NIC_CAP_PHY: u32 = 8;
++// STA_REC and WTBL TLVs.
++const STA_REC_BASIC: u16 = 0x00;
++const STA_REC_RA: u16 = 0x01;
++const STA_REC_STATE: u16 = 0x07;
++const STA_REC_HT: u16 = 0x09;
++const STA_REC_WTBL: u16 = 0x0d;
++const STA_REC_KEY_V2: u16 = 0x11;
++const STA_REC_PHY: u16 = 0x15;
++const WTBL_GENERIC: u16 = 0x00;
++const WTBL_RX: u16 = 0x01;
++const WTBL_HT: u16 = 0x02;
++const WTBL_HDR_TRANS: u16 = 0x06;
++const WTBL_SMPS: u16 = 0x0d;
++const WTBL_RESET_AND_SET: u8 = 1;
++const UNI_BSS_INFO_BASIC: u16 = 0x00;
++const UNI_BSS_INFO_RLM: u16 = 0x02;
++const UNI_BSS_INFO_QBSS: u16 = 0x0f;
++const DEV_INFO_ACTIVE: u16 = 0;
++const ROC_ACQUIRE: u16 = 0;
++const ROC_ABORT: u16 = 1;
++const ROC_REQ_JOIN: u8 = 0;
++const CONNECTION_INFRA_STA: u32 = 0x0001_0001;
++const CONNECTION_INFRA_AP: u32 = 0x0001_0002;
++const CONN_STATE_DISCONNECT: u8 = 0;
++const CONN_STATE_PORT_SECURE: u8 = 2;
++const STATE_NONE: u8 = 0;
++const STATE_ASSOC: u8 = 2;
++const EXTRA_INFO_VER: u16 = 1 << 0;
++const EXTRA_INFO_NEW: u16 = 1 << 1;
++const PHY_MODE_A: u8 = 1 << 0;
++const PHY_MODE_B: u8 = 1 << 1;
++const PHY_MODE_G: u8 = 1 << 2;
++const PHY_MODE_GN: u8 = 1 << 3;
++const PHY_MODE_AN: u8 = 1 << 4;
++const PHY_TYPE_BIT_HR_DSSS: u8 = 1 << 0;
++const PHY_TYPE_BIT_ERP: u8 = 1 << 1;
++const PHY_TYPE_BIT_OFDM: u8 = 1 << 3;
++const PHY_TYPE_BIT_HT: u8 = 1 << 4;
++const MCU_CIPHER_AES_CCMP: u8 = 5;
++const MCU_CIPHER_CCMP_256: u8 = 6;
++const MCU_CIPHER_GCMP: u8 = 7;
++const MCU_CIPHER_GCMP_256: u8 = 8;
++/// `struct sec_key`'s size.
++const SEC_KEY: usize = 36;
++/// The receive filter: on, and nothing more (Linux's `MT7921_FILTER_ENABLE`
++/// with mac80211's flags of a station).
++const FILTER_ENABLE: u32 = 1 << 31;
++/// The MCU's "the firmware asked the DMA to stop" (it wants a recovery,
++/// which this driver does not do).
++const MCU_CMD_STOP_DMA: u32 = 1 << 2;
++/// The WTBL's entries: the access point's station, and the interface's
++/// own (`MT792x_WTBL_RESERVED` less the interface's index), for group keys.
++pub(crate) const WCID_AP: u8 = 1;
++pub(crate) const WCID_OWN: u8 = 19;
++/// The interface's own MAC in the WTBL when an entry has no station.
++const MUAR_NONE: u8 = 0x0e;
++// TXD (`mt76_connac2_mac.h`) and TXP (`struct mt76_connac_hw_txp`).
++const TXD_SIZE: usize = 32;
++const TXP_SIZE: usize = 32;
++const LMAC_ALTX0: u32 = 0x10;
++const HDR_FORMAT_802_11: u32 = 2;
++const TXD2_FIX_RATE: u32 = 1 << 31;
++const TXD2_HTC_VLD: u32 = 1 << 13;
++const TXD2_MULTICAST: u32 = 1 << 10;
++const TXD3_PROTECT_FRAME: u32 = 1 << 1;
++const TXD3_BA_DISABLE: u32 = 1 << 28;
++const TXD6_FIXED_BW: u32 = 1 << 2;
++const MSDU_ID_VALID: u16 = 1 << 15;
++const TXD_LEN_LAST: u16 = 1 << 15;
++const TX_FREE_PAIR: u32 = 1 << 31;
++/// Frame buffers the chip reads through a TXP until a TX-free event gives
++/// them back.
++pub(crate) const TOKENS: usize = 128;
++/// A token the chip never gave back is taken again after this long.
++const TOKEN_STALE_MS: u64 = 2_000;
++/// How long a join keeps the channel (ROC) and how long its grant may take.
++const ROC_MS: u32 = 3_000;
++const ROC_GRANT_MS: u64 = 1_000;
++/// A scan the firmware never ends is ended after this long.
++const SCAN_LIMIT_MS: u64 = 30_000;
++
++/// The rates of each band, in the order of the chip's bitmaps (mt76's
++/// `mt76_rates`: CCK then OFDM; 5 GHz has the OFDM ones), 500 kbit/s each.
++const RATES_2GHZ: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
++const RATES_5GHZ: [u8; 8] = [12, 18, 24, 36, 48, 72, 96, 108];
++
++/// The 5 GHz channels offered, and the ones that need radar detection
++/// (passive here).
++const CHANNELS_5GHZ: [u16; 25] = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165];
++const IEEE80211_CHAN_NO_IR: u32 = 1 << 1;
++const IEEE80211_CHAN_RADAR: u32 = 1 << 3;
++
++/// The HT capabilities this driver offers: 20 MHz with its short guard
++/// interval, LDPC, one stream of STBC received, no SM power save.
++const HT_INFO: u16 = 0x0001 | 0x000c | 0x0020 | 0x0100;
++
++/// A TLV: tag, length (with its four bytes), value.
++fn tlv(tag: u16, value: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(4 + value.len());
++    out.extend_from_slice(&tag.to_le_bytes());
++    out.extend_from_slice(&((4 + value.len()) as u16).to_le_bytes());
++    out.extend_from_slice(value);
++    out
++}
++
++pub(crate) fn le32(data: &[u8], at: usize) -> u32 {
++    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++fn le16(data: &[u8], at: usize) -> u16 {
++    data.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
++}
++
++fn is_2ghz(freq: u16) -> bool {
++    BandId::of(freq) == BandId::Ghz2
++}
++
++/// A channel's number and its band as the firmware's scan and ROC name
++/// them (1: 2.4 GHz, 2: 5 GHz).
++fn channel_band(freq: u16) -> (u8, u8) {
++    (wifi::channel_of(freq).unwrap_or(0), if is_2ghz(freq) { 1 } else { 2 })
++}
++
++/// The network being joined: what the station records need.
++#[derive(Clone)]
++struct Network {
++    join: Join,
++    /// The access point's HT capabilities (the element's value).
++    ht: Option<[u8; 26]>,
++    /// The access point's rates, as the band's bitmap, and its basic ones.
++    rates: u16,
++    basic: u16,
++    dtim: u8,
++}
++
++impl Network {
++    fn new(join: &Join) -> Self {
++        let elements = wifi::Elements(&join.elements);
++        let ht = elements.get(wifi::IE_HT_CAP).filter(|value| value.len() >= 26).map(|value| {
++            let mut cap = [0u8; 26];
++            cap.copy_from_slice(&value[..26]);
++            cap
++        });
++        let table: &[u8] = if is_2ghz(join.freq) { &RATES_2GHZ } else { &RATES_5GHZ };
++        let (mut rates, mut basic) = (0u16, 0u16);
++        for id in [wifi::IE_RATES, wifi::IE_EXT_RATES] {
++            for &rate in elements.get(id).unwrap_or(&[]) {
++                if let Some(index) = table.iter().position(|&known| known == rate & 0x7f) {
++                    rates |= 1 << index;
++                    if rate & 0x80 != 0 {
++                        basic |= 1 << index;
++                    }
++                }
++            }
++        }
++        if rates == 0 {
++            rates = (1 << table.len()) - 1;
++        }
++        if basic == 0 {
++            basic = if is_2ghz(join.freq) { 0x000f } else { 0x0015 };
++        }
++        // The DTIM period, from the beacon's TIM (a probe response has none).
++        let dtim = elements.get(5).and_then(|value| value.get(1).copied()).filter(|&period| period > 0).unwrap_or(1);
++        Self { join: join.clone(), ht, rates, basic, dtim }
++    }
++
++    fn ghz2(&self) -> bool {
++        is_2ghz(self.join.freq)
++    }
++}
++
++/// The card's state for its task and the Wi-Fi component.
++pub(crate) struct Mt7921 {
++    pub(crate) chip: Chip,
++    pub(crate) name: String,
++    pub(crate) address: Address,
++    /// Spatial streams (the firmware's PHY capability).
++    nss: u8,
++    pub(crate) device: Option<Arc<Device>>,
++    tokens: DmaCoherent,
++    /// When each token was handed to the chip (0: free).
++    token_busy: Vec<u64>,
++    next_token: usize,
++    network: Option<Network>,
++    associated: bool,
++    aid: u16,
++    qos: bool,
++    /// The pairwise key's index and the PN of the robust management frames
++    /// this driver puts the cipher's header on.
++    pairwise: Option<(u8, u64)>,
++    scanning: bool,
++    scan_started: u64,
++    scan_seq: u8,
++    roc_token: u8,
++    roc_active: bool,
++    roc_granted: bool,
++    sequence: u16,
++    pub(crate) signal: Option<i8>,
++    pub(crate) dead: bool,
++}
++
++impl Mt7921 {
++    pub(crate) fn new(chip: Chip, name: String, tokens: DmaCoherent) -> Self {
++        Self {
++            chip,
++            name,
++            address: [0; 6],
++            nss: 2,
++            device: None,
++            tokens,
++            token_busy: vec![0; TOKENS],
++            next_token: 0,
++            network: None,
++            associated: false,
++            aid: 0,
++            qos: false,
++            pairwise: None,
++            scanning: false,
++            scan_started: 0,
++            scan_seq: 0,
++            roc_token: 0,
++            roc_active: false,
++            roc_granted: false,
++            sequence: 0,
++            signal: None,
++            dead: false,
++        }
++    }
++
++    /// Linux's `mt7921_init_hardware` and `__mt7921_start`: the firmware,
++    /// the chip's facts, its calibration, the MAC, and the interface.
++    pub(crate) fn bring_up(&mut self, patch: &str, ram: &str) -> Result<(), String> {
++        let (_, patch_file) = aster_firmware::load_first([patch]).ok_or_else(|| format!("{patch} is not in /lib/firmware"))?;
++        let (_, ram_file) = aster_firmware::load_first([ram]).ok_or_else(|| format!("{ram} is not in /lib/firmware"))?;
++        self.chip.before_firmware();
++        self.chip.load_patch(&patch_file).map_err(|error| format!("ROM patch: {error}"))?;
++        ostd::info!("{}: ROM patch loaded", self.name);
++        self.chip.load_ram(&ram_file).map_err(|error| format!("RAM code: {error}"))?;
++        ostd::notice!("{}: the firmware runs", self.name);
++        self.capabilities()?;
++        self.chip.mcu(Cmd::Ext(EXT_EFUSE_BUFFER_MODE), &[0, 1, 0, 0], true)?;
++        self.chip.mac_init();
++        // The RTS threshold (`mt76_connac_mcu_set_rts_thresh`).
++        let mut rts = vec![1u8, 0, 0, 0];
++        rts.extend_from_slice(&0x92bu32.to_le_bytes());
++        rts.extend_from_slice(&2u32.to_le_bytes());
++        self.chip.mcu(Cmd::Ext(EXT_PROTECT_CTRL), &rts, true)?;
++        // The MAC on, the channels allowed, the receive path.
++        self.chip.mcu(Cmd::Ext(EXT_MAC_INIT_CTRL), &[1, 0, 0, 0], true)?;
++        self.channel_domain()?;
++        self.rx_path()?;
++        let mut filter = vec![0u8; 68];
++        filter[4] = 1;
++        filter[8..12].copy_from_slice(&FILTER_ENABLE.to_le_bytes());
++        self.chip.mcu(Cmd::Ce(CE_SET_RX_FILTER), &filter, false)?;
++        self.add_interface()
++    }
++
++    /// The MAC address and the streams (`mt7921_mcu_get_nic_capability`).
++    fn capabilities(&mut self) -> Result<(), String> {
++        let answer = self.chip.mcu(Cmd::CeQuery(CE_GET_NIC_CAPAB), &[], true)?;
++        let elements = le16(&answer, 0);
++        let mut at = 4;
++        for _ in 0..elements {
++            let (kind, length) = (le32(&answer, at), le32(&answer, at + 4) as usize);
++            let Some(data) = answer.get(at + 8..at + 8 + length) else { break };
++            match kind {
++                NIC_CAP_MAC_ADDR if data.len() >= 6 => self.address.copy_from_slice(&data[..6]),
++                // `struct mt7921_phy_cap`: ht, vht, 5g, max_bw, nss, ...
++                NIC_CAP_PHY if data.len() >= 5 => self.nss = data[4].clamp(1, 2),
++                _ => {}
++            }
++            at += 8 + length;
++        }
++        if self.address == [0; 6] || self.address[0] & 1 != 0 {
++            return Err(String::from("the card gave no MAC address"));
++        }
++        Ok(())
++    }
++
++    /// The channels the firmware may use (`mt76_connac_mcu_set_channel_domain`),
++    /// worldwide ("00").
++    fn channel_domain(&mut self) -> Result<(), String> {
++        let channels: Vec<(u16, u32)> = (1..=13u16)
++            .map(|channel| (channel, 0))
++            .chain(CHANNELS_5GHZ.iter().map(|&channel| (channel, if (52..=144).contains(&channel) { IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR } else { 0 })))
++            .collect();
++        let mut out = vec![b'0', b'0', 0, 0, 0, 3, 3, 0, 13, CHANNELS_5GHZ.len() as u8, 0, 0];
++        for (channel, flags) in channels {
++            out.extend_from_slice(&channel.to_le_bytes());
++            out.extend_from_slice(&[0, 0]);
++            out.extend_from_slice(&flags.to_le_bytes());
++        }
++        self.chip.mcu(Cmd::Ce(CE_SET_CHAN_DOMAIN), &out, false).map(|_| ())
++    }
++
++    /// The receive path on the first channel (`mt7921_mcu_set_chan_info`
++    /// with `SET_RX_PATH`).
++    fn rx_path(&mut self) -> Result<(), String> {
++        let mut out = vec![0u8; 76];
++        let mask = (1u8 << self.nss) - 1;
++        out[0] = 1;
++        out[1] = 1;
++        out[3] = self.nss;
++        out[4] = mask;
++        self.chip.mcu(Cmd::Ext(EXT_SET_RX_PATH), &out, true).map(|_| ())
++    }
++
++    /// Linux's `mt76_connac_mcu_uni_add_dev`: the interface's MAC
++    /// (DEV_INFO), then its BSS, a station not connected.
++    fn add_interface(&mut self) -> Result<(), String> {
++        let mut active = vec![1u8, 0];
++        active.extend_from_slice(&self.address);
++        let mut dev = vec![0u8, 0, 0, 0];
++        dev.extend(tlv(DEV_INFO_ACTIVE, &active));
++        self.uni(UNI_DEV_INFO_UPDATE, &dev)?;
++        let basic = self.bss_basic(1, None);
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(UNI_BSS_INFO_BASIC, &basic));
++        self.uni(UNI_BSS_INFO_UPDATE, &out)
++    }
++
++    fn uni(&mut self, id: u16, payload: &[u8]) -> Result<(), String> {
++        let answer = self.chip.mcu(Cmd::Uni(id), payload, true)?;
++        let status = le32(&answer, 4);
++        if status != 0 {
++            return Err(format!("UNI command {id:#x} refused (status {status:#x})"));
++        }
++        Ok(())
++    }
++
++    /// `struct mt76_connac_bss_basic_tlv`'s value: the interface's BSS,
++    /// `conn_state` 1 when not connected, the network when there is one.
++    fn bss_basic(&self, conn_state: u8, network: Option<&Network>) -> Vec<u8> {
++        let ghz2 = network.is_none_or(Network::ghz2);
++        let phymode = if ghz2 { PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN } else { PHY_MODE_A | PHY_MODE_AN };
++        let basic_phy = if ghz2 { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP | PHY_TYPE_BIT_HT } else { PHY_TYPE_BIT_OFDM | PHY_TYPE_BIT_HT };
++        let (bssid, interval, dtim) = network.map_or(([0; 6], 0, 0), |network| (network.join.bssid, network.join.beacon_interval, network.dtim));
++        let mut value = Vec::with_capacity(28);
++        value.extend_from_slice(&[1, 0, 0, 0]);
++        value.extend_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
++        value.extend_from_slice(&[conn_state, 0]);
++        value.extend_from_slice(&bssid);
++        value.extend_from_slice(&(WCID_OWN as u16).to_le_bytes());
++        value.extend_from_slice(&interval.to_le_bytes());
++        value.extend_from_slice(&[dtim, if network.is_some() { phymode } else { 0 }]);
++        value.extend_from_slice(&(WCID_OWN as u16).to_le_bytes());
++        value.extend_from_slice(&(if network.is_some() { basic_phy as u16 } else { 0 }).to_le_bytes());
++        value.extend_from_slice(&[0, 0]);
++        value
++    }
++
++    /// Linux's `mt76_connac_mcu_uni_add_bss` and `_set_chctx`: the BSS with
++    /// its network (connected or not), its QoS, its channel at 20 MHz.
++    fn add_bss(&mut self, connected: bool) -> Result<(), String> {
++        let Some(network) = self.network.clone() else { return Ok(()) };
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(UNI_BSS_INFO_BASIC, &self.bss_basic(!connected as u8, Some(&network))));
++        out.extend(tlv(UNI_BSS_INFO_QBSS, &[self.qos as u8, 0, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &out)?;
++        let channel = wifi::channel_of(network.join.freq).unwrap_or(0);
++        let mut rlm = vec![0u8; 4];
++        let band = if network.ghz2() { 0 } else { 1 };
++        rlm.extend(tlv(UNI_BSS_INFO_RLM, &[channel, channel, 0, 0, self.nss, (1 << self.nss) - 1, 1, 0, 0, band, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &rlm)
++    }
++
++    /// `struct sta_req_hdr` and its TLVs.
++    fn sta_rec(&mut self, wcid: u8, muar: u8, tlvs: &[Vec<u8>]) -> Result<(), String> {
++        let mut out = vec![0u8, wcid];
++        out.extend_from_slice(&(tlvs.len() as u16).to_le_bytes());
++        out.extend_from_slice(&[1, muar, 0, 0]);
++        for value in tlvs {
++            out.extend_from_slice(value);
++        }
++        self.uni(UNI_STA_REC_UPDATE, &out)
++    }
++
++    /// A WTBL request in its STA_REC TLV.
++    fn wtbl(wcid: u8, tlvs: &[Vec<u8>]) -> Vec<u8> {
++        let mut value = vec![wcid, WTBL_RESET_AND_SET];
++        value.extend_from_slice(&(tlvs.len() as u16).to_le_bytes());
++        value.extend_from_slice(&[0, 0, 0, 0]);
++        for inner in tlvs {
++            value.extend_from_slice(inner);
++        }
++        tlv(STA_REC_WTBL, &value)
++    }
++
++    /// The WTBL's generic, RX and header translation entries.
++    fn wtbl_common(peer: &Address, muar: u8, qos: bool, aid: u16, rca1: bool) -> Vec<Vec<u8>> {
++        let mut generic = peer.to_vec();
++        generic.extend_from_slice(&[muar, 0, 0, qos as u8, 0, 0]);
++        generic.extend_from_slice(&aid.to_le_bytes());
++        generic.extend_from_slice(&[0, 0]);
++        vec![
++            tlv(WTBL_GENERIC, &generic),
++            tlv(WTBL_RX, &[0, rca1 as u8, 1, 1, 0, 0, 0, 0]),
++            // To the distribution system; frames come in as 802.11.
++            tlv(WTBL_HDR_TRANS, &[1, 0, 1, 0]),
++        ]
++    }
++
++    /// The access point's station record (`mt7921_mcu_sta_update` for the
++    /// station of the AP), enabled in `state` or disabled.
++    fn station_record(&mut self, enable: bool, state: u8) -> Result<(), String> {
++        let Some(network) = self.network.clone() else { return Ok(()) };
++        let rcpi = self.signal.map_or(0, |signal| (2 * signal as i16 + 220).clamp(0, 220) as u8);
++        let mut tlvs = Vec::new();
++        let conn_state = if enable { CONN_STATE_PORT_SECURE } else { CONN_STATE_DISCONNECT };
++        let newly = state != STATE_ASSOC && enable;
++        let mut basic = CONNECTION_INFRA_AP.to_le_bytes().to_vec();
++        basic.extend_from_slice(&[conn_state, self.qos as u8]);
++        basic.extend_from_slice(&self.aid.to_le_bytes());
++        basic.extend_from_slice(&network.join.bssid);
++        basic.extend_from_slice(&(EXTRA_INFO_VER | if newly { EXTRA_INFO_NEW } else { 0 }).to_le_bytes());
++        tlvs.push(tlv(STA_REC_BASIC, &basic));
++        // The AP's HT is known once it accepted the station.
++        let ht = network.ht.filter(|_| state == STATE_ASSOC);
++        if !enable {
++            tlvs.push(Self::wtbl(WCID_AP, &[]));
++            return self.sta_rec(WCID_AP, 0, &tlvs);
++        }
++        if let Some(cap) = ht {
++            // 20 MHz: the AP's 40 MHz abilities do not apply.
++            let info = u16::from_le_bytes([cap[0], cap[1]]) & !(0x0002 | 0x0040);
++            let mut value = info.to_le_bytes().to_vec();
++            value.extend_from_slice(&[0, 0]);
++            tlvs.push(tlv(STA_REC_HT, &value));
++        }
++        let mut phy_type = if network.ghz2() { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP } else { PHY_TYPE_BIT_OFDM };
++        let mut ampdu = 0u8;
++        if let Some(cap) = ht {
++            phy_type |= PHY_TYPE_BIT_HT;
++            ampdu = cap[2] & 0x1f;
++        }
++        let mut phy = network.basic.to_le_bytes().to_vec();
++        phy.extend_from_slice(&[phy_type, ampdu, 0, rcpi, 0, 0]);
++        tlvs.push(tlv(STA_REC_PHY, &phy));
++        let legacy = if network.ghz2() { ((network.rates >> 4) & 0xff) << 6 | (network.rates & 0xf) } else { (network.rates & 0xff) << 6 };
++        let mut ra = legacy.to_le_bytes().to_vec();
++        let mut mcs = [0u8; 10];
++        if let Some(cap) = ht {
++            mcs.copy_from_slice(&cap[3..13]);
++            for (stream, byte) in mcs.iter_mut().enumerate().take(4) {
++                if stream >= self.nss as usize {
++                    *byte = 0;
++                }
++            }
++            mcs[4..].fill(0);
++        }
++        ra.extend_from_slice(&mcs);
++        tlvs.push(tlv(STA_REC_RA, &ra));
++        tlvs.push(tlv(STA_REC_STATE, &[0, 0, 0, 0, state, 0, 0, 0]));
++        let mut wtbl = Self::wtbl_common(&network.join.bssid, 0, self.qos, self.aid, true);
++        if let Some(cap) = ht {
++            let ldpc = u16::from_le_bytes([cap[0], cap[1]]) & 0x0001 != 0;
++            wtbl.push(tlv(WTBL_HT, &[1, ldpc as u8, cap[2] & 3, (cap[2] >> 2) & 7, 0, 0, 0, 0]));
++            wtbl.push(tlv(WTBL_SMPS, &[0, 0, 0, 0]));
++        }
++        tlvs.push(Self::wtbl(WCID_AP, &wtbl));
++        self.sta_rec(WCID_AP, 0, &tlvs)
++    }
++
++    /// The interface's own WTBL entry, for group frames of the network
++    /// (`mt7921_mcu_sta_update` without a station).
++    fn own_record(&mut self) -> Result<(), String> {
++        let Some(network) = self.network.clone() else { return Ok(()) };
++        let wtbl = Self::wtbl_common(&network.join.bssid, MUAR_NONE, false, 0, true);
++        self.sta_rec(WCID_OWN, MUAR_NONE, &[Self::wtbl(WCID_OWN, &wtbl)])
++    }
++
++    /// The EDCA parameters of the network's WMM element, or the standard
++    /// ones (`mt7921_mcu_set_tx`).
++    fn set_tx(&mut self, elements: &[u8]) {
++        // mac80211's queues (VO, VI, BE, BK) to the firmware's order.
++        const TO_ACI: [usize; 4] = [1, 0, 2, 3];
++        // (cw_min, cw_max, aifs, txop) per mac80211 queue.
++        let mut params: [(u16, u16, u16, u16); 4] = [(3, 7, 2, 47), (7, 15, 2, 94), (15, 1023, 3, 0), (15, 1023, 7, 0)];
++        let wmm = wifi::Elements(elements).iter().find(|(id, value)| *id == wifi::IE_VENDOR && value.len() >= 24 && value[..4] == wifi::WMM_OUI_TYPE && value[4] == 1);
++        if let Some((_, value)) = wmm {
++            for record in value[8..24].chunks(4) {
++                // The ACI (BE, BK, VI, VO) to mac80211's queue.
++                let queue = [2usize, 3, 1, 0][((record[0] >> 5) & 3) as usize];
++                let (ecw_min, ecw_max) = (record[1] & 0xf, record[1] >> 4);
++                params[queue] = ((1 << ecw_min) - 1, (1 << ecw_max) - 1, (record[0] & 0xf) as u16, u16::from_le_bytes([record[2], record[3]]));
++            }
++        }
++        let mut edca = [[0u8; 10]; 4];
++        for (queue, (cw_min, cw_max, aifs, txop)) in params.iter().enumerate() {
++            let entry = &mut edca[TO_ACI[queue]];
++            entry[0..2].copy_from_slice(&cw_min.to_le_bytes());
++            entry[2..4].copy_from_slice(&cw_max.to_le_bytes());
++            entry[4..6].copy_from_slice(&txop.to_le_bytes());
++            entry[6..8].copy_from_slice(&aifs.to_le_bytes());
++        }
++        let mut out: Vec<u8> = edca.concat();
++        out.extend_from_slice(&[0, self.qos as u8, 0, 0]);
++        let _ = self.chip.mcu(Cmd::Ce(CE_SET_EDCA_PARMS), &out, false);
++    }
++
++    /// The channel for joining (`mt7921_mcu_set_roc`), waited for.
++    fn roc_acquire(&mut self) {
++        let Some(network) = &self.network else { return };
++        let (channel, band) = channel_band(network.join.freq);
++        self.roc_token = self.roc_token.wrapping_add(1);
++        self.roc_granted = false;
++        let mut value = vec![0u8, self.roc_token, channel, 0, band, 0, channel, 0, 0, channel, 0, ROC_REQ_JOIN];
++        value.extend_from_slice(&ROC_MS.to_le_bytes());
++        value.extend_from_slice(&[0xff, 0, 0, 0]);
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(ROC_ACQUIRE, &value));
++        if let Err(error) = self.chip.mcu(Cmd::Uni(UNI_ROC), &out, false) {
++            ostd::warn!("{}: the channel for joining: {}", self.name, error);
++            return;
++        }
++        self.roc_active = true;
++        let deadline = crate::now_ms() + ROC_GRANT_MS;
++        crate::WAITING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
++        while !self.roc_granted && !self.dead && crate::now_ms() < deadline {
++            self.poll();
++            if !self.roc_granted {
++                crate::sleep();
++            }
++        }
++        crate::WAITING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
++        if !self.roc_granted {
++            ostd::warn!("{}: the firmware did not grant the channel; joining anyway", self.name);
++        }
++    }
++
++    fn roc_abort(&mut self) {
++        if !self.roc_active {
++            return;
++        }
++        self.roc_active = false;
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(ROC_ABORT, &[0, self.roc_token, 0xff, 0, 0, 0, 0, 0]));
++        let _ = self.chip.mcu(Cmd::Uni(UNI_ROC), &out, false);
++    }
++
++    // ---- The radio's operations. ----
++
++    pub(crate) fn scan(&mut self, request: &ScanRequest) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.scanning {
++            return Err(radio::Error::Busy);
++        }
++        self.scan_seq = (self.scan_seq + 1) & 0x7f;
++        let active = !request.ssids.is_empty();
++        let ssids: Vec<&Vec<u8>> = request.ssids.iter().filter(|ssid| !ssid.is_empty()).take(4).collect();
++        let freqs: Vec<u16> = request.freqs.iter().copied().filter(|&freq| wifi::channel_of(freq).is_some() && BandId::of(freq) != BandId::Ghz6).collect();
++        let listed = !freqs.is_empty() && freqs.len() <= 64;
++        let mut out = Vec::with_capacity(1186);
++        let ssid_type = if ssids.is_empty() { 1 << 0 } else { 1 << 2 };
++        out.extend_from_slice(&[self.scan_seq, 0, active as u8, ssid_type, ssids.len() as u8, if active { 2 } else { 0 }, 0x20, 1]);
++        for index in 0..4 {
++            let mut entry = [0u8; 36];
++            if let Some(ssid) = ssids.get(index) {
++                let length = ssid.len().min(32);
++                entry[0..4].copy_from_slice(&(length as u32).to_le_bytes());
++                entry[4..4 + length].copy_from_slice(&ssid[..length]);
++            }
++            out.extend_from_slice(&entry);
++        }
++        // Probe delay, dwell time and time-out: the firmware's own.
++        out.extend_from_slice(&[0; 6]);
++        let (first, rest) = if listed { freqs.split_at(freqs.len().min(32)) } else { (&[][..], &[][..]) };
++        out.extend_from_slice(&[if listed { 4 } else { 0 }, first.len() as u8]);
++        let entry = |freq: Option<&u16>| freq.map_or([0, 0], |&freq| {
++            let (channel, band) = channel_band(freq);
++            [band, channel]
++        });
++        for index in 0..32 {
++            out.extend_from_slice(&entry(first.get(index)));
++        }
++        let elements = &request.elements[..request.elements.len().min(600)];
++        out.extend_from_slice(&(elements.len() as u16).to_le_bytes());
++        let mut ies = [0u8; 600];
++        ies[..elements.len()].copy_from_slice(elements);
++        out.extend_from_slice(&ies);
++        out.extend_from_slice(&[rest.len() as u8, 0, 0, 0]);
++        for index in 0..32 {
++            out.extend_from_slice(&entry(rest.get(index)));
++        }
++        out.extend_from_slice(&[0; 6 * 36]);
++        out.extend_from_slice(&wifi::BROADCAST);
++        out.extend_from_slice(&[0; 6]);
++        out.extend_from_slice(&[0; 63]);
++        out.push(if ssids.is_empty() { 0 } else { 1 });
++        debug_assert_eq!(out.len(), 1186);
++        if let Err(error) = self.chip.mcu(Cmd::Ce(CE_START_HW_SCAN), &out, false) {
++            ostd::warn!("{}: scan: {}", self.name, error);
++            return Err(radio::Error::Failed);
++        }
++        self.scanning = true;
++        self.scan_started = crate::now_ms();
++        Ok(())
++    }
++
++    /// Linux's `mt76_connac_mcu_cancel_hw_scan`: the scan ends now.
++    pub(crate) fn abort_scan(&mut self) {
++        if !self.scanning {
++            return;
++        }
++        self.scanning = false;
++        let _ = self.chip.mcu(Cmd::Ce(CE_CANCEL_HW_SCAN), &[self.scan_seq, 0, 0, 0], false);
++        if let Some(device) = &self.device {
++            device.scan_done(true);
++        }
++    }
++
++    /// Linux's `mt7921_mac_sta_add` and `mgd_prepare_tx`: the access
++    /// point's station, then the channel.
++    pub(crate) fn join(&mut self, join: &Join) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.leave();
++        self.network = Some(Network::new(join));
++        self.aid = 0;
++        self.qos = false;
++        if let Err(error) = self.station_record(true, STATE_NONE) {
++            ostd::warn!("{}: joining: {}", self.name, error);
++            self.network = None;
++            return Err(radio::Error::Failed);
++        }
++        self.roc_acquire();
++        Ok(())
++    }
++
++    /// Linux's `mt7921_mac_sta_event` (ASSOC), `bss_info_changed` (ASSOC,
++    /// QOS) and `mgd_complete_tx`.
++    pub(crate) fn associated(&mut self, association: &Association) -> radio::Result<()> {
++        if self.network.is_none() {
++            return Err(radio::Error::Invalid);
++        }
++        self.aid = association.aid & 0x3fff;
++        self.qos = association.qos;
++        let result = self.add_bss(true).and_then(|()| self.station_record(true, STATE_ASSOC)).and_then(|()| self.own_record());
++        if let Err(error) = result {
++            ostd::warn!("{}: association: {}", self.name, error);
++            self.roc_abort();
++            return Err(radio::Error::Failed);
++        }
++        self.set_tx(&association.elements);
++        self.roc_abort();
++        self.associated = true;
++        Ok(())
++    }
++
++    /// Linux's `mt7921_mac_sta_remove`: the station's record disabled, the
++    /// BSS not connected any more.
++    pub(crate) fn leave(&mut self) {
++        if self.network.is_none() {
++            return;
++        }
++        if !self.dead {
++            self.roc_abort();
++            let _ = self.station_record(false, STATE_NONE);
++            let _ = self.add_bss(false);
++        }
++        self.network = None;
++        self.associated = false;
++        self.aid = 0;
++        self.pairwise = None;
++        self.signal = None;
++    }
++
++    /// `mt76_connac_mcu_add_key`: pairwise keys on the AP's entry, group
++    /// keys on the interface's.
++    pub(crate) fn set_key(&mut self, key: &Key, remove: bool) -> radio::Result<()> {
++        let cipher = match key.cipher {
++            radio::CIPHER_CCMP => MCU_CIPHER_AES_CCMP,
++            radio::CIPHER_CCMP_256 => MCU_CIPHER_CCMP_256,
++            radio::CIPHER_GCMP => MCU_CIPHER_GCMP,
++            radio::CIPHER_GCMP_256 => MCU_CIPHER_GCMP_256,
++            _ if remove => MCU_CIPHER_AES_CCMP,
++            _ => return Err(radio::Error::Unsupported),
++        };
++        if key.key.len() > 32 {
++            return Err(radio::Error::Invalid);
++        }
++        let (wcid, muar) = if key.pairwise { (WCID_AP, 0) } else { (WCID_OWN, MUAR_NONE) };
++        // `struct sta_rec_sec`: add (0: set, 1: remove), the count, then
++        // two `sec_key`s; the length says how many count.
++        let mut value = vec![remove as u8, !remove as u8, 0, 0];
++        let mut first = [0u8; SEC_KEY];
++        if !remove {
++            first[0] = cipher;
++            first[1] = SEC_KEY as u8;
++            first[2] = key.index;
++            first[3] = key.key.len() as u8;
++            first[4..4 + key.key.len()].copy_from_slice(&key.key);
++        }
++        value.extend_from_slice(&first);
++        value.extend_from_slice(&[0; SEC_KEY]);
++        let length = if remove { 8 } else { 8 + SEC_KEY } as u16;
++        let mut entry = tlv(STA_REC_KEY_V2, &value);
++        entry[2..4].copy_from_slice(&length.to_le_bytes());
++        if let Err(error) = self.sta_rec(wcid, muar, &[entry]) {
++            ostd::warn!("{}: key: {}", self.name, error);
++            return Err(radio::Error::Failed);
++        }
++        if key.pairwise {
++            self.pairwise = if remove { None } else { Some((key.index, 1)) };
++        }
++        Ok(())
++    }
++
++    // ---- Frames. ----
++
++    fn token(&mut self) -> Option<usize> {
++        let now = crate::now_ms().max(1);
++        for step in 0..TOKENS {
++            let token = (self.next_token + step) % TOKENS;
++            let busy = self.token_busy[token];
++            if busy == 0 || now >= busy + TOKEN_STALE_MS {
++                self.next_token = (token + 1) % TOKENS;
++                self.token_busy[token] = now;
++                return Some(token);
++            }
++        }
++        None
++    }
++
++    /// Sends an 802.11 frame: TXD and TXP on the data ring, the frame in a
++    /// token's buffer (Linux's `mt76_connac2_mac_write_txwi` and
++    /// `mt76_connac_write_hw_txp`). Data frames go without the cipher's
++    /// header (the chip makes it); robust management frames get it here.
++    pub(crate) fn transmit(&mut self, mut frame: Vec<u8>) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if frame.len() < wifi::HEADER {
++            return Err(radio::Error::Invalid);
++        }
++        let data = wifi::is_data(&frame);
++        if frame[1] & wifi::PROTECTED != 0 {
++            match self.pairwise.as_mut() {
++                Some((index, pn)) if !data => {
++                    let value = *pn;
++                    *pn += 1;
++                    let header = [value as u8, (value >> 8) as u8, 0, 0x20 | (*index << 6), (value >> 16) as u8, (value >> 24) as u8, (value >> 32) as u8, (value >> 40) as u8];
++                    drop(frame.splice(wifi::HEADER..wifi::HEADER, header));
++                }
++                Some(_) => {}
++                None => frame[1] &= !wifi::PROTECTED,
++            }
++        }
++        let protected = frame[1] & wifi::PROTECTED != 0;
++        let sequence = self.sequence;
++        self.sequence = (sequence + 1) & 0x0fff;
++        frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
++        let qos_data = data && frame[0] & 0x80 != 0;
++        let header = if qos_data { 26 } else { 24 };
++        let tid = if qos_data { (frame[24] & 7) as u32 } else { 0 };
++        let multicast = frame[4] & 1 != 0;
++        let (kind, subtype) = (((frame[0] >> 2) & 3) as u32, ((frame[0] >> 4) & 0xf) as u32);
++        let wcid = if self.network.is_some() { WCID_AP } else { WCID_OWN } as u32;
++        if frame.len() > BUFFER {
++            return Err(radio::Error::Invalid);
++        }
++        let Some(token) = self.token() else { return Err(radio::Error::Busy) };
++        if self.tokens.write_bytes(token * BUFFER, &frame).is_err() {
++            self.token_busy[token] = 0;
++            return Err(radio::Error::Memory);
++        }
++        // The LMAC queue: the access category of the TID (BK 0, BE 1, VI 2,
++        // VO 3), management on ALTX0.
++        let queue = if data { [1u32, 0, 0, 1, 2, 2, 3, 3][tid as usize] } else { LMAC_ALTX0 };
++        let mut txd = [0u32; 8];
++        txd[0] = ((frame.len() + TXD_SIZE) as u32 & 0xffff) | (queue << 25);
++        txd[1] = (1 << 31) | (wcid & 0x3ff) | (HDR_FORMAT_802_11 << 16) | (((header / 2) as u32) << 11) | (tid << 20);
++        txd[2] = (kind << 4) | subtype | if multicast { TXD2_MULTICAST } else { 0 };
++        txd[3] = (15 << 11) | if protected { TXD3_PROTECT_FRAME } else { 0 };
++        if !data || multicast {
++            // The band's lowest rate: CCK 1 Mbit/s, or OFDM 6 Mbit/s.
++            let ghz2 = self.network.as_ref().is_none_or(Network::ghz2);
++            let rate: u32 = if ghz2 { 0 } else { (1 << 6) | 11 };
++            txd[2] |= TXD2_FIX_RATE | TXD2_HTC_VLD;
++            txd[3] |= TXD3_BA_DISABLE;
++            txd[6] = TXD6_FIXED_BW | (rate << 16);
++        }
++        txd[7] = (kind << 20) | (subtype << 16);
++        let mut txwi = Vec::with_capacity(TXD_SIZE + TXP_SIZE);
++        for word in txd {
++            txwi.extend_from_slice(&word.to_le_bytes());
++        }
++        let mut txp = [0u8; TXP_SIZE];
++        txp[0..2].copy_from_slice(&(token as u16 | MSDU_ID_VALID).to_le_bytes());
++        let address = (self.tokens.daddr() + token * BUFFER) as u32;
++        txp[8..12].copy_from_slice(&address.to_le_bytes());
++        txp[12..14].copy_from_slice(&((frame.len() as u16 & 0x0fff) | TXD_LEN_LAST).to_le_bytes());
++        txwi.extend_from_slice(&txp);
++        self.chip.data_send(&txwi).map_err(|()| {
++            self.token_busy[token] = 0;
++            radio::Error::Busy
++        })
++    }
++
++    pub(crate) fn send(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        let Some(network) = &self.network else { return Err(radio::Error::Down) };
++        let tid = self.qos.then(|| wifi::tid_of(ethernet));
++        let protected = !plain && self.pairwise.is_some();
++        let frame = wifi::data_from_ethernet(ethernet, &network.join.bssid, tid, protected).ok_or(radio::Error::Invalid)?;
++        self.transmit(frame)
++    }
++
++    // ---- What the chip says. ----
++
++    pub(crate) fn poll(&mut self) {
++        if self.dead {
++            return;
++        }
++        let status = self.chip.rr(hw::HOST_INT_STA);
++        if status == u32::MAX {
++            ostd::warn!("{}: the card is gone", self.name);
++            self.died();
++            return;
++        }
++        if status != 0 {
++            self.chip.wr(hw::HOST_INT_STA, status);
++        }
++        if status & hw::INT_MCU_CMD != 0 {
++            let command = self.chip.rr(hw::MCU_CMD);
++            self.chip.wr(hw::MCU_CMD, command);
++            if command & MCU_CMD_STOP_DMA != 0 {
++                ostd::warn!("{}: the firmware stopped ({:#x}); the card stays off until the next boot", self.name, command);
++                self.died();
++                return;
++            }
++        }
++        let mut packets = core::mem::take(&mut self.chip.pending);
++        for which in [hw::RXQ_MCU, hw::RXQ_MCU_WA, hw::RXQ_DATA] {
++            packets.extend(self.chip.ring_receive(which));
++        }
++        for packet in packets {
++            self.handle(&packet);
++        }
++        if self.scanning && crate::now_ms() >= self.scan_started + SCAN_LIMIT_MS {
++            ostd::warn!("{}: the scan did not end; ended here", self.name);
++            self.scanning = false;
++            if let Some(device) = &self.device {
++                device.scan_done(true);
++            }
++        }
++    }
++
++    fn died(&mut self) {
++        self.dead = true;
++        if let Some(device) = &self.device {
++            if self.scanning {
++                device.scan_done(true);
++            }
++            device.connection_lost();
++        }
++        self.scanning = false;
++    }
++
++    fn handle(&mut self, packet: &[u8]) {
++        let rxd0 = le32(packet, 0);
++        let (kind, flag) = (rxd0 >> 27, (rxd0 >> 16) & 0xf);
++        match kind {
++            PKT_TYPE_NORMAL => self.rx_frame(packet),
++            PKT_TYPE_RX_EVENT if flag == 1 => self.rx_frame(packet),
++            PKT_TYPE_TXRX_NOTIFY => self.tx_free(packet),
++            PKT_TYPE_RX_EVENT if packet.len() >= hw::MCU_RXD => self.event(packet),
++            _ => {}
++        }
++    }
++
++    /// `struct mt76_connac_tx_free`, then one word per frame or per
++    /// station ("pair") the frames after it belong to.
++    fn tx_free(&mut self, packet: &[u8]) {
++        let count = (le16(packet, 2) & 0x3ff) as usize;
++        let mut freed = 0;
++        let mut at = 8;
++        while freed < count && at + 4 <= packet.len() {
++            let info = le32(packet, at);
++            at += 4;
++            if info & TX_FREE_PAIR != 0 {
++                continue;
++            }
++            freed += 1;
++            let token = ((info >> 16) & 0x7fff) as usize;
++            if let Some(busy) = self.token_busy.get_mut(token) {
++                *busy = 0;
++            }
++        }
++        if let Some(device) = &self.device {
++            device.ready_to_send();
++        }
++    }
++
++    fn event(&mut self, packet: &[u8]) {
++        let (eid, option) = (packet[28], packet[30]);
++        if option & UNI_UNSOLICITED != 0 {
++            if eid == UNI_EVENT_ROC && le16(packet, hw::MCU_RXD + 4) == 0 {
++                self.roc_granted = true;
++            }
++            return;
++        }
++        match eid {
++            EVENT_SCAN_DONE | EVENT_SCHED_SCAN_DONE => {
++                if self.scanning {
++                    self.scanning = false;
++                    if let Some(device) = &self.device {
++                        device.scan_done(false);
++                    }
++                }
++            }
++            EVENT_BSS_BEACON_LOSS => {
++                if self.associated
++                    && let Some(device) = &self.device
++                {
++                    ostd::info!("{}: the firmware lost the access point's beacons", self.name);
++                    device.connection_lost();
++                }
++            }
++            _ => {}
++        }
++    }
++
++    /// A frame after its RXD (Linux's `mt7921_mac_fill_rx`): six words,
++    /// the groups the RXD says are there, the padding; A-MSDU subframes
++    /// (the chip splits them) carry two bytes more after the header.
++    fn rx_frame(&mut self, packet: &[u8]) {
++        let (rxd0, rxd1, rxd2, rxd3, rxd4) = (le32(packet, 0), le32(packet, 4), le32(packet, 8), le32(packet, 12), le32(packet, 16));
++        let length = (rxd0 & 0xffff) as usize;
++        // Band 1, ICV and MIC errors, a bad FCS, a broken A-MSDU, too long.
++        if rxd1 & ((1 << 28) | (1 << 27) | (1 << 26) | (1 << 25)) != 0 || rxd2 & ((1 << 23) | (1 << 24)) != 0 {
++            return;
++        }
++        // Header translation is off in every WTBL entry: 802.11 only.
++        if rxd2 & (1 << 13) != 0 {
++            return;
++        }
++        let mut at = 24;
++        let mut signal: Option<i16> = None;
++        if rxd1 & (1 << 14) != 0 {
++            at += 16;
++        }
++        if rxd1 & (1 << 11) != 0 {
++            at += 16;
++        }
++        if rxd1 & (1 << 12) != 0 {
++            at += 8;
++        }
++        if rxd1 & (1 << 13) != 0 {
++            let mut v1 = le32(packet, at + 4);
++            at += 8;
++            if rxd1 & (1 << 15) != 0 {
++                v1 = le32(packet, at + 24);
++                at += 72;
++            }
++            for chain in 0..self.nss as u32 {
++                let rssi = (((v1 >> (8 * chain)) & 0xff) as i16 - 220) / 2;
++                if rssi < 0 {
++                    signal = Some(signal.map_or(rssi, |best| best.max(rssi)));
++                }
++            }
++        }
++        at += 2 * ((rxd2 >> 14) & 3) as usize;
++        let Some(frame) = packet.get(at..length.min(packet.len())) else { return };
++        if frame.len() < wifi::HEADER {
++            return;
++        }
++        let mut frame = frame.to_vec();
++        if rxd4 & 3 != 0 {
++            let header = if wifi::is_data(&frame) && frame[0] & 0x80 != 0 { 26 } else { 24 };
++            if frame.len() < header + 2 {
++                return;
++            }
++            drop(frame.drain(header..header + 2));
++        }
++        let channel = ((rxd3 >> 8) & 0xff) as u16;
++        let freq = match channel {
++            1..=13 => 2407 + 5 * channel,
++            14 => 2484,
++            15..=180 => 5000 + 5 * channel,
++            _ => return,
++        };
++        let decrypted = (rxd1 >> 16) & 0x1f != 0 && rxd1 & ((1 << 23) | (1 << 24)) == 0;
++        let signal = signal.unwrap_or(-100).clamp(-127, -1) as i8;
++        if let Some(network) = &self.network
++            && wifi::addresses(&frame).is_some_and(|(_, transmitter, _)| transmitter == network.join.bssid)
++        {
++            self.signal = Some(signal);
++        }
++        if let Some(device) = &self.device {
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0 });
++        }
++    }
++
++    pub(crate) fn info(&self) -> Info {
++        let mut mcs = [0u8; 16];
++        for stream in 0..self.nss as usize {
++            mcs[stream] = 0xff;
++        }
++        mcs[12] = 1;
++        let ht = HtCap { info: HT_INFO, ampdu_factor: 3, ampdu_density: 5, mcs };
++        let band = |id: BandId| {
++            let channels: Vec<Channel> = match id {
++                BandId::Ghz2 => (1..=13u16).map(|channel| Channel::new(2407 + 5 * channel)).collect(),
++                _ => CHANNELS_5GHZ
++                    .iter()
++                    .map(|&channel| {
++                        let mut entry = Channel::new(5000 + 5 * channel);
++                        entry.radar = (52..=144).contains(&channel);
++                        entry.passive = entry.radar;
++                        entry
++                    })
++                    .collect(),
++            };
++            Band { id, channels, ht: Some(ht.clone()), vht: None, he: None }
++        };
++        Info {
++            driver: String::from("mt7921"),
++            address: self.address,
++            bands: vec![band(BandId::Ghz2), band(BandId::Ghz5)],
++            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
++            max_scan_ssids: 4,
++            max_scan_ie_len: 600,
++        }
++    }
++}
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 783a9fc..f62bdd9 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -25,6 +25,7 @@ extern crate aster_wlan as _;
+ extern crate aster_bluetooth as _;
+ extern crate aster_firmware as _;
+ extern crate aster_iwlwifi as _;
++extern crate aster_mt7921 as _;
+ extern crate aster_ethernet as _;
+ 
+ #[ostd::main]

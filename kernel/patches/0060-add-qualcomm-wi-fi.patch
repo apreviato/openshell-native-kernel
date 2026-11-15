@@ -1,0 +1,3649 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 96f521e..8928bc0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -88,6 +88,19 @@ dependencies = [
+  "ostd",
+ ]
+ 
++[[package]]
++name = "aster-ath10k"
++version = "0.1.0"
++dependencies = [
++ "aster-cmdline",
++ "aster-core",
++ "aster-firmware",
++ "aster-pci",
++ "aster-wlan",
++ "component",
++ "ostd",
++]
++
+ [[package]]
+ name = "aster-backlight"
+ version = "0.1.0"
+@@ -642,6 +655,7 @@ name = "asterinas"
+ version = "0.1.0"
+ dependencies = [
+  "aster-ahci",
++ "aster-ath10k",
+  "aster-backlight",
+  "aster-bluetooth",
+  "aster-core",
+diff --git a/Cargo.toml b/Cargo.toml
+index 9569117..34665c7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -42,6 +42,7 @@ members = [
+     "kernel/comps/iwlwifi",
+     "kernel/comps/mt7921",
+     "kernel/comps/rtw88",
++    "kernel/comps/ath10k",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -109,6 +110,7 @@ default-members = [
+     "kernel/comps/iwlwifi",
+     "kernel/comps/mt7921",
+     "kernel/comps/rtw88",
++    "kernel/comps/ath10k",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -203,6 +205,7 @@ aster-firmware = { path = "kernel/comps/firmware" }
+ aster-iwlwifi = { path = "kernel/comps/iwlwifi" }
+ aster-mt7921 = { path = "kernel/comps/mt7921" }
+ aster-rtw88 = { path = "kernel/comps/rtw88" }
++aster-ath10k = { path = "kernel/comps/ath10k" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+diff --git a/Components.toml b/Components.toml
+index 261df42..9f7762a 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -29,6 +29,7 @@ firmware = { name = "aster-firmware" }
+ iwlwifi = { name = "aster-iwlwifi" }
+ mt7921 = { name = "aster-mt7921" }
+ rtw88 = { name = "aster-rtw88" }
++ath10k = { name = "aster-ath10k" }
+ ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+ 
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 6e9cb44..1243db4 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -21,6 +21,7 @@ aster-firmware.workspace = true
+ aster-iwlwifi.workspace = true
+ aster-mt7921.workspace = true
+ aster-rtw88.workspace = true
++aster-ath10k.workspace = true
+ aster-ethernet.workspace = true
+ 
+ [target.x86_64-unknown-none.dependencies]
+diff --git a/kernel/comps/ath10k/Cargo.toml b/kernel/comps/ath10k/Cargo.toml
+new file mode 100644
+index 0000000..432115b
+--- /dev/null
++++ b/kernel/comps/ath10k/Cargo.toml
+@@ -0,0 +1,16 @@
++[package]
++name = "aster-ath10k"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-cmdline.workspace = true
++aster-core.workspace = true
++aster-firmware.workspace = true
++aster-pci.workspace = true
++aster-wlan.workspace = true
++component.workspace = true
++ostd.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/ath10k/src/boot.rs b/kernel/comps/ath10k/src/boot.rs
+new file mode 100644
+index 0000000..06e6020
+--- /dev/null
++++ b/kernel/comps/ath10k/src/boot.rs
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The target's boot as Linux's ath10k `core.c` and `bmi.c` run it: the
++//! firmware file's elements, the board data (`board-2.bin` by the card's
++//! PCI IDs, else `board.bin`), the host interest area, the OTP program,
++//! the code swap segment and the firmware's download through BMI.
++
++use alloc::{format, string::String, vec::Vec};
++
++use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
++
++use crate::pci::{Pci, dma32};
++
++/// The host interest area (`QCA988X_HOST_INTEREST_ADDRESS`) and the
++/// offsets of its items (`struct host_interest`).
++const HOST_INTEREST: u32 = 0x0040_0800;
++const HI_APP_HOST_INTEREST: u32 = 0x00;
++const HI_OPTION_FLAG: u32 = 0x10;
++const HI_SERIAL_ENABLE: u32 = 0x14;
++const HI_BE: u32 = 0x44;
++const HI_BOARD_DATA: u32 = 0x54;
++const HI_BOARD_DATA_INITIALIZED: u32 = 0x58;
++const HI_BOARD_EXT_DATA: u32 = 0xac;
++const HI_HCI_UART_PWR_MGMT_PARAMS_EXT: u32 = 0xbc;
++pub(crate) const HI_OPTION_FLAG2: u32 = 0xcc;
++pub(crate) const HI_INTERCONNECT_STATE: u32 = 0xf8;
++pub(crate) const HI_EARLY_ALLOC: u32 = 0x100;
++const HI_FW_SWAP: u32 = 0x104;
++const HTC_PROTOCOL_VERSION: u32 = 0x0002;
++const HI_OPTION_NUM_DEV_SHIFT: u32 = 9;
++const HI_OPTION_FW_MODE_AP: u32 = 0x2;
++const HI_OPTION_FW_MODE_SHIFT: u32 = 12;
++const HI_OPTION_MAC_ADDR_METHOD_SHIFT: u32 = 3;
++/// `patch_load_addr` of every QCA6174 and QCA9377.
++const PATCH_LOAD_ADDR: u32 = 0x1234;
++const BOARD_DATA_SZ: usize = 8192;
++// BMI (`bmi.h`).
++const BMI_DONE: u32 = 1;
++const BMI_READ_MEMORY: u32 = 2;
++const BMI_WRITE_MEMORY: u32 = 3;
++const BMI_EXECUTE: u32 = 4;
++const BMI_GET_TARGET_INFO: u32 = 8;
++const BMI_LZ_STREAM_START: u32 = 13;
++const BMI_LZ_DATA: u32 = 14;
++const BMI_MAX_DATA_SIZE: usize = 256;
++// Firmware elements (`enum ath10k_fw_ie_type`).
++const FW_IE_FW_VERSION: u32 = 0;
++const FW_IE_FEATURES: u32 = 2;
++const FW_IE_FW_IMAGE: u32 = 3;
++const FW_IE_OTP_IMAGE: u32 = 4;
++const FW_IE_WMI_OP_VERSION: u32 = 5;
++const FW_IE_HTT_OP_VERSION: u32 = 6;
++const FW_IE_FW_CODE_SWAP_IMAGE: u32 = 7;
++const BD_IE_BOARD: u32 = 0;
++const BD_IE_BOARD_NAME: u32 = 0;
++const BD_IE_BOARD_DATA: u32 = 1;
++/// `ATH10K_FW_FEATURE_IGNORE_OTP_RESULT`.
++const FEATURE_IGNORE_OTP_RESULT: usize = 7;
++
++pub(crate) fn host_interest(item: u32) -> u32 {
++    HOST_INTEREST + item
++}
++
++fn le32(data: &[u8], at: usize) -> u32 {
++    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++/// Elements `{id, len, data aligned to 4}` after a magic.
++fn elements<'a>(data: &'a [u8], magic: &[u8]) -> Option<Vec<(u32, &'a [u8])>> {
++    if data.len() < magic.len() + 1 || &data[..magic.len()] != magic || data[magic.len()] != 0 {
++        return None;
++    }
++    let mut at = (magic.len() + 1).next_multiple_of(4);
++    let mut out = Vec::new();
++    while at + 8 <= data.len() {
++        let (id, len) = (le32(data, at), le32(data, at + 4) as usize);
++        at += 8;
++        let value = data.get(at..at + len)?;
++        out.push((id, value));
++        at += len.next_multiple_of(4);
++    }
++    Some(out)
++}
++
++/// What the firmware file holds (`struct ath10k_fw_file`).
++pub(crate) struct FirmwareFile {
++    pub(crate) version: String,
++    pub(crate) features: Vec<u8>,
++    pub(crate) image: Vec<u8>,
++    pub(crate) otp: Vec<u8>,
++    pub(crate) codeswap: Vec<u8>,
++    pub(crate) wmi_op_version: u32,
++    pub(crate) htt_op_version: u32,
++}
++
++impl FirmwareFile {
++    /// `ath10k_core_fetch_firmware_api_n`.
++    pub(crate) fn parse(data: &[u8]) -> Option<Self> {
++        let mut file = Self { version: String::new(), features: Vec::new(), image: Vec::new(), otp: Vec::new(), codeswap: Vec::new(), wmi_op_version: 0, htt_op_version: 0 };
++        for (id, value) in elements(data, b"QCA-ATH10K")? {
++            match id {
++                FW_IE_FW_VERSION => file.version = String::from_utf8_lossy(value).into_owned(),
++                FW_IE_FEATURES => file.features = value.to_vec(),
++                FW_IE_FW_IMAGE => file.image = value.to_vec(),
++                FW_IE_OTP_IMAGE => file.otp = value.to_vec(),
++                FW_IE_WMI_OP_VERSION if value.len() == 4 => file.wmi_op_version = le32(value, 0),
++                FW_IE_HTT_OP_VERSION if value.len() == 4 => file.htt_op_version = le32(value, 0),
++                FW_IE_FW_CODE_SWAP_IMAGE => file.codeswap = value.to_vec(),
++                _ => {}
++            }
++        }
++        if file.image.is_empty() { None } else { Some(file) }
++    }
++
++    pub(crate) fn has_feature(&self, bit: usize) -> bool {
++        self.features.get(bit / 8).is_some_and(|byte| byte & (1 << (bit % 8)) != 0)
++    }
++}
++
++/// The board data for a board name in `board-2.bin`
++/// (`ath10k_core_fetch_board_data_api_n`).
++pub(crate) fn board_data(file: &[u8], name: &str) -> Option<Vec<u8>> {
++    for (id, container) in elements(file, b"QCA-ATH10K-BOARD")? {
++        if id != BD_IE_BOARD {
++            continue;
++        }
++        let mut matched = false;
++        let mut at = 0;
++        while at + 8 <= container.len() {
++            let (sub, len) = (le32(container, at), le32(container, at + 4) as usize);
++            at += 8;
++            let value = container.get(at..at + len)?;
++            match sub {
++                BD_IE_BOARD_NAME => matched = value == name.as_bytes(),
++                BD_IE_BOARD_DATA if matched => return Some(value.to_vec()),
++                _ => {}
++            }
++            at += len.next_multiple_of(4);
++        }
++    }
++    None
++}
++
++/// BMI over the PCI pipes.
++pub(crate) struct Bmi<'a> {
++    pub(crate) pci: &'a mut Pci,
++}
++
++impl Bmi<'_> {
++    fn command(&mut self, words: &[u32], payload: &[u8], response: Option<usize>) -> Result<Vec<u8>, String> {
++        let mut request = Vec::with_capacity(words.len() * 4 + payload.len());
++        for word in words {
++            request.extend_from_slice(&word.to_le_bytes());
++        }
++        request.extend_from_slice(payload);
++        self.pci.bmi(&request, response)
++    }
++
++    pub(crate) fn target_info(&mut self) -> Result<(u32, u32), String> {
++        let answer = self.command(&[BMI_GET_TARGET_INFO], &[], Some(8))?;
++        // `resp.get_target_info`: version, type.
++        Ok((le32(&answer, 0), le32(&answer, 4)))
++    }
++
++    pub(crate) fn read32(&mut self, address: u32) -> Result<u32, String> {
++        let answer = self.command(&[BMI_READ_MEMORY, address, 4], &[], Some(4))?;
++        Ok(le32(&answer, 0))
++    }
++
++    pub(crate) fn write_memory(&mut self, mut address: u32, data: &[u8]) -> Result<(), String> {
++        let header = 12;
++        let mut at = 0;
++        while at < data.len() {
++            let n = (data.len() - at).min(BMI_MAX_DATA_SIZE - header);
++            let mut chunk = data[at..at + n].to_vec();
++            chunk.resize(n.next_multiple_of(4), 0);
++            self.command(&[BMI_WRITE_MEMORY, address, chunk.len() as u32], &chunk, None)?;
++            address += n as u32;
++            at += n;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn write32(&mut self, address: u32, value: u32) -> Result<(), String> {
++        self.write_memory(address, &value.to_le_bytes())
++    }
++
++    fn execute(&mut self, address: u32, param: u32) -> Result<u32, String> {
++        let answer = self.command(&[BMI_EXECUTE, address, param], &[], Some(4))?;
++        Ok(le32(&answer, 0))
++    }
++
++    /// `ath10k_bmi_fast_download`.
++    fn fast_download(&mut self, address: u32, data: &[u8]) -> Result<(), String> {
++        self.command(&[BMI_LZ_STREAM_START, address], &[], None)?;
++        let head = data.len() / 4 * 4;
++        let mut at = 0;
++        while at < head {
++            let n = (head - at).min(BMI_MAX_DATA_SIZE - 8);
++            self.command(&[BMI_LZ_DATA, n as u32], &data[at..at + n], None)?;
++            at += n;
++        }
++        if head < data.len() {
++            let mut trailer = [0u8; 4];
++            trailer[..data.len() - head].copy_from_slice(&data[head..]);
++            self.command(&[BMI_LZ_DATA, 4], &trailer, None)?;
++        }
++        self.command(&[BMI_LZ_STREAM_START, 0], &[], None).map(|_| ())
++    }
++
++    pub(crate) fn done(&mut self) -> Result<(), String> {
++        self.command(&[BMI_DONE], &[], None).map(|_| ())
++    }
++}
++
++/// `struct ath10k_swap_code_seg_hw_info` with `ATH10K_SWAP_CODE_SEG_NUM_MAX`
++/// (16) segments.
++const HW_INFO: usize = 16 + 16 * 4 + 16 * 8;
++
++/// The code swap segment in host memory (`ath10k_swap_code_seg_*`): the
++/// target fetches code from it.
++pub(crate) struct CodeSwap {
++    _memory: DmaCoherent,
++    target_addr: u32,
++    hw_info: [u8; HW_INFO],
++}
++
++impl CodeSwap {
++    pub(crate) fn new(data: &[u8]) -> Result<Option<Self>, String> {
++        if data.is_empty() {
++            return Ok(None);
++        }
++        let length = data.len().next_multiple_of(2);
++        let memory = dma32(length).ok_or_else(|| String::from("no DMA memory for the code swap"))?;
++        let (mut at, mut filled) = (0usize, 0usize);
++        let mut target_addr = None;
++        // Items {address, length, data}; the tail (16 bytes, length 0) is a
++        // zero magic of 12 bytes and the BMI write address.
++        while data.len() - at >= 16 {
++            let payload = le32(data, at + 4) as usize;
++            if payload == 0 {
++                if data.len() - at != 16 || data[at..at + 12].iter().any(|&byte| byte != 0) {
++                    return Err(String::from("the code swap's tail is wrong"));
++                }
++                target_addr = Some(le32(data, at + 12));
++                break;
++            }
++            let start = at + 8;
++            let chunk = data.get(start..start + payload).ok_or_else(|| String::from("the code swap is broken"))?;
++            let _ = memory.write_bytes(filled, chunk);
++            filled += payload;
++            at = start + payload;
++        }
++        let target_addr = target_addr.ok_or_else(|| String::from("the code swap has no tail"))?;
++        // `struct ath10k_swap_code_seg_hw_info`: swap_size, num_segs, size,
++        // size_log2, bus_addr[SEG_NUM_MAX], reserved[SEG_NUM_MAX] (64-bit).
++        let mut hw_info = [0u8; HW_INFO];
++        hw_info[0..4].copy_from_slice(&(filled as u32).to_le_bytes());
++        hw_info[4..8].copy_from_slice(&1u32.to_le_bytes());
++        hw_info[8..12].copy_from_slice(&(length as u32).to_le_bytes());
++        hw_info[12..16].copy_from_slice(&(usize::BITS - 1 - length.leading_zeros()).to_le_bytes());
++        hw_info[16..20].copy_from_slice(&(memory.daddr() as u32).to_le_bytes());
++        Ok(Some(Self { _memory: memory, target_addr, hw_info }))
++    }
++}
++
++/// Linux's `ath10k_core_start` up to HTC for a BMI target: the host
++/// interest settings, the board data and OTP, the code swap, the
++/// firmware, the UART off.
++pub(crate) fn boot(bmi: &mut Bmi<'_>, dev_id: u16, firmware: &FirmwareFile, board: &[u8], swap: Option<&CodeSwap>) -> Result<(), String> {
++    // `ath10k_init_configure_target`.
++    bmi.write32(host_interest(HI_APP_HOST_INTEREST), HTC_PROTOCOL_VERSION)?;
++    let mut option = bmi.read32(host_interest(HI_OPTION_FLAG))?;
++    option |= (1 << HI_OPTION_NUM_DEV_SHIFT) | (HI_OPTION_FW_MODE_AP << HI_OPTION_FW_MODE_SHIFT) | (1 << HI_OPTION_MAC_ADDR_METHOD_SHIFT);
++    bmi.write32(host_interest(HI_OPTION_FLAG), option)?;
++    bmi.write32(host_interest(HI_BE), 0)?;
++    bmi.write32(host_interest(HI_FW_SWAP), 0)?;
++    bmi.write32(host_interest(HI_HCI_UART_PWR_MGMT_PARAMS_EXT), dev_id as u32)?;
++    // `ath10k_download_and_run_otp` (board data first).
++    let ext = bmi.read32(host_interest(HI_BOARD_EXT_DATA))?;
++    if ext != 0 && board.len() > BOARD_DATA_SZ {
++        return Err(String::from("the board data has an extension this driver does not write"));
++    }
++    let board_address = bmi.read32(host_interest(HI_BOARD_DATA))?;
++    bmi.write_memory(board_address, &board[..board.len().min(BOARD_DATA_SZ)])?;
++    bmi.write32(host_interest(HI_BOARD_DATA_INITIALIZED), 1)?;
++    if !firmware.otp.is_empty() {
++        bmi.fast_download(PATCH_LOAD_ADDR, &firmware.otp)?;
++        let result = bmi.execute(PATCH_LOAD_ADDR, 0)?;
++        if result != 0 && !firmware.has_feature(FEATURE_IGNORE_OTP_RESULT) {
++            return Err(format!("the OTP program failed ({result:#x})"));
++        }
++    }
++    // `ath10k_download_fw`.
++    if let Some(swap) = swap {
++        bmi.write_memory(swap.target_addr, &swap.hw_info)?;
++    }
++    bmi.fast_download(PATCH_LOAD_ADDR, &firmware.image)?;
++    // `ath10k_init_uart`.
++    bmi.write32(host_interest(HI_SERIAL_ENABLE), 0)?;
++    Ok(())
++}
+diff --git a/kernel/comps/ath10k/src/htc.rs b/kernel/comps/ath10k/src/htc.rs
+new file mode 100644
+index 0000000..412941c
+--- /dev/null
++++ b/kernel/comps/ath10k/src/htc.rs
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! HTC, the host-target message layer of Linux's ath10k `htc.c`: an 8-byte
++//! header with the endpoint, the target's READY with its credits, services
++//! connected to endpoints, credit reports in the trailers.
++
++use alloc::{string::String, vec::Vec};
++
++use crate::pci::{Pci, SERVICE_MAP};
++
++pub(crate) const SVC_RSVD_CTRL: u16 = 0x0001;
++pub(crate) const SVC_WMI_CONTROL: u16 = 0x0100;
++pub(crate) const SVC_HTT_DATA_MSG: u16 = 0x0300;
++const MSG_READY: u16 = 1;
++const MSG_CONNECT_SERVICE: u16 = 2;
++const MSG_CONNECT_SERVICE_RESP: u16 = 3;
++const MSG_SETUP_COMPLETE_EX: u16 = 5;
++const FLAG_NEED_CREDIT_UPDATE: u8 = 0x01;
++const FLAG_TRAILER_PRESENT: u8 = 0x02;
++const CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL: u16 = 1 << 3;
++const RECORD_CREDITS: u8 = 1;
++const HEADER: usize = 8;
++const ENDPOINTS: usize = 8;
++const WAIT_MS: u64 = 3000;
++
++#[derive(Clone, Copy, Default)]
++struct Endpoint {
++    ul_pipe: usize,
++    dl_pipe: usize,
++    credits: u32,
++    credit_flow: bool,
++    seq: u8,
++}
++
++pub(crate) struct Htc {
++    endpoints: [Endpoint; ENDPOINTS],
++    credit_size: u32,
++    total_credits: u32,
++}
++
++/// A message HTC delivered: its endpoint and payload.
++pub(crate) struct Message {
++    pub(crate) endpoint: usize,
++    pub(crate) payload: Vec<u8>,
++}
++
++/// The pipes (host to target, target to host) carrying a service.
++pub(crate) fn pipes_of(service: u16) -> (usize, usize) {
++    let (mut ul, mut dl) = (0, 0);
++    for [svc, dir, pipe] in SERVICE_MAP {
++        if svc == service as u32 {
++            match dir {
++                1 => ul = pipe as usize,
++                2 => dl = pipe as usize,
++                _ => {}
++            }
++        }
++    }
++    (ul, dl)
++}
++
++impl Htc {
++    /// `ath10k_htc_init`: endpoint 0 is the control service.
++    pub(crate) fn new() -> Self {
++        let mut endpoints = [Endpoint::default(); ENDPOINTS];
++        let (ul, dl) = pipes_of(SVC_RSVD_CTRL);
++        endpoints[0] = Endpoint { ul_pipe: ul, dl_pipe: dl, credits: 0, credit_flow: false, seq: 0 };
++        Self { endpoints, credit_size: 0, total_credits: 0 }
++    }
++
++    /// `ath10k_htc_send`: the header, a credit when the endpoint counts
++    /// them, the payload on the endpoint's pipe. Err: no credit or full.
++    pub(crate) fn send(&mut self, pci: &mut Pci, endpoint: usize, payload: &[u8]) -> Result<(), ()> {
++        let ep = &mut self.endpoints[endpoint];
++        let len = HEADER + payload.len();
++        if ep.credit_flow {
++            let needed = (len as u32).div_ceil(self.credit_size.max(1));
++            if ep.credits < needed {
++                return Err(());
++            }
++            ep.credits -= needed;
++        }
++        let mut message = Vec::with_capacity(len);
++        message.push(endpoint as u8);
++        message.push(if ep.credit_flow { FLAG_NEED_CREDIT_UPDATE } else { 0 });
++        message.extend_from_slice(&(payload.len() as u16).to_le_bytes());
++        message.push(0);
++        message.push(ep.seq);
++        message.extend_from_slice(&[0, 0]);
++        message.extend_from_slice(payload);
++        ep.seq = ep.seq.wrapping_add(1);
++        let pipe = ep.ul_pipe;
++        pci.send(pipe, &message, endpoint as u16)
++    }
++
++    /// The header gone, the trailer's credit reports taken
++    /// (`ath10k_htc_rx_completion_handler`).
++    pub(crate) fn receive(&mut self, raw: &[u8]) -> Option<Message> {
++        if raw.len() < HEADER {
++            return None;
++        }
++        let endpoint = raw[0] as usize;
++        let flags = raw[1];
++        let len = u16::from_le_bytes([raw[2], raw[3]]) as usize;
++        if endpoint >= ENDPOINTS || HEADER + len > raw.len() {
++            return None;
++        }
++        let mut payload = &raw[HEADER..HEADER + len];
++        if flags & FLAG_TRAILER_PRESENT != 0 {
++            let trailer_len = raw[4] as usize;
++            if trailer_len < 2 || trailer_len > len {
++                return None;
++            }
++            let (body, trailer) = payload.split_at(len - trailer_len);
++            self.trailer(trailer);
++            payload = body;
++        }
++        if payload.is_empty() {
++            return None;
++        }
++        Some(Message { endpoint, payload: payload.to_vec() })
++    }
++
++    fn trailer(&mut self, mut trailer: &[u8]) {
++        while trailer.len() >= 2 {
++            let (id, len) = (trailer[0], trailer[1] as usize);
++            let Some(record) = trailer.get(2..2 + len) else { return };
++            if id == RECORD_CREDITS {
++                for report in record.chunks_exact(4) {
++                    if let Some(ep) = self.endpoints.get_mut(report[0] as usize) {
++                        ep.credits += report[1] as u32;
++                    }
++                }
++            }
++            trailer = &trailer[2 + len..];
++        }
++    }
++
++    /// Waits for a control message on endpoint 0 (CE 1), handing other
++    /// messages to `other`.
++    fn control(&mut self, pci: &mut Pci, other: &mut impl FnMut(Message)) -> Result<Vec<u8>, String> {
++        let deadline = crate::now_ms() + WAIT_MS;
++        loop {
++            let pipe = self.endpoints[0].dl_pipe;
++            for raw in pci.receive(pipe) {
++                if let Some(message) = self.receive(&raw) {
++                    if message.endpoint == 0 {
++                        return Ok(message.payload);
++                    }
++                    other(message);
++                }
++            }
++            if crate::now_ms() >= deadline {
++                return Err(String::from("the target did not answer HTC"));
++            }
++            crate::delay_us(200);
++        }
++    }
++
++    /// `ath10k_htc_wait_target`: the READY message and its credits.
++    pub(crate) fn wait_target(&mut self, pci: &mut Pci) -> Result<(), String> {
++        let message = self.control(pci, &mut |_| {})?;
++        if message.len() < 8 || u16::from_le_bytes([message[0], message[1]]) != MSG_READY {
++            return Err(String::from("the target's first HTC message is not READY"));
++        }
++        self.total_credits = u16::from_le_bytes([message[2], message[3]]) as u32;
++        self.credit_size = u16::from_le_bytes([message[4], message[5]]) as u32;
++        if self.total_credits == 0 || self.credit_size == 0 {
++            return Err(String::from("the target gave no HTC credits"));
++        }
++        Ok(())
++    }
++
++    /// `ath10k_htc_connect_service`: WMI gets every credit, the others
++    /// none (no credit flow).
++    pub(crate) fn connect(&mut self, pci: &mut Pci, service: u16, other: &mut impl FnMut(Message)) -> Result<usize, String> {
++        let allocation = if service == SVC_WMI_CONTROL { self.total_credits.min(0xff) } else { 0 };
++        let mut flags = (allocation as u16) << 8;
++        if service != SVC_WMI_CONTROL {
++            flags |= CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL;
++        }
++        let mut request = Vec::with_capacity(8);
++        request.extend_from_slice(&MSG_CONNECT_SERVICE.to_le_bytes());
++        request.extend_from_slice(&service.to_le_bytes());
++        request.extend_from_slice(&flags.to_le_bytes());
++        request.extend_from_slice(&[0, 0]);
++        self.send(pci, 0, &request).map_err(|()| String::from("HTC's control pipe is full"))?;
++        let answer = self.control(pci, other)?;
++        if answer.len() < 8 || u16::from_le_bytes([answer[0], answer[1]]) != MSG_CONNECT_SERVICE_RESP {
++            return Err(String::from("no answer to an HTC service's connection"));
++        }
++        let (status, endpoint) = (answer[4], answer[5] as usize);
++        if status != 0 || endpoint >= ENDPOINTS {
++            return Err(alloc::format!("HTC refused service {service:#x} (status {status})"));
++        }
++        let (ul, dl) = pipes_of(service);
++        self.endpoints[endpoint] = Endpoint { ul_pipe: ul, dl_pipe: dl, credits: allocation, credit_flow: service == SVC_WMI_CONTROL, seq: 0 };
++        Ok(endpoint)
++    }
++
++    /// `ath10k_htc_start`: setup complete.
++    pub(crate) fn start(&mut self, pci: &mut Pci) -> Result<(), String> {
++        // `struct ath10k_htc_setup_complete_extended`: pads, flags, bundles.
++        let mut message = Vec::with_capacity(12);
++        message.extend_from_slice(&MSG_SETUP_COMPLETE_EX.to_le_bytes());
++        message.extend_from_slice(&[0u8; 10]);
++        self.send(pci, 0, &message).map_err(|()| String::from("HTC's control pipe is full"))
++    }
++}
+diff --git a/kernel/comps/ath10k/src/htt.rs b/kernel/comps/ath10k/src/htt.rs
+new file mode 100644
+index 0000000..69e0fb4
+--- /dev/null
++++ b/kernel/comps/ath10k/src/htt.rs
+@@ -0,0 +1,617 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! HTT, the data path of Linux's ath10k (`htt_tx.c`, `htt_rx.c`): frames
++//! out through a TX descriptor naming the frame's buffer, frames in through
++//! a ring of buffers the host fills and the target writes, each with an
++//! RX descriptor before the payload. The target says which buffers it
++//! filled either in ring order (RX_IND) or by address (RX_IN_ORD_PADDR_IND,
++//! when its firmware reorders, `WMI_SERVICE_RX_FULL_REORDER`).
++
++use alloc::{vec, vec::Vec};
++
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++
++use crate::pci::dma32;
++
++// Messages (`enum htt_h2t_msg_type`, `htt_tlv_t2h_msg_types`).
++const H2T_VERSION_REQ: u8 = 0;
++const H2T_TX_FRM: u8 = 1;
++const H2T_RX_RING_CFG: u8 = 2;
++const H2T_AGGR_CFG: u8 = 5;
++const T2H_VERSION_CONF: u8 = 0;
++const T2H_RX_IND: u8 = 1;
++const T2H_PEER_MAP: u8 = 3;
++const T2H_PEER_UNMAP: u8 = 4;
++const T2H_TX_COMPL_IND: u8 = 7;
++const T2H_RX_IN_ORD_PADDR_IND: u8 = 0x12;
++// The RX ring (`HTT_RX_RING_SIZE`, `HTT_RX_RING_FILL_LEVEL`).
++const RX_BUF: usize = 2048;
++const RX_RING: usize = 2048;
++const RX_FILL: usize = RX_RING / 2 - 1;
++/// The buffers: the fill level and some being read.
++const RX_BUFFERS: usize = RX_FILL + 64;
++/// Buffers per DMA block.
++const BLOCK: usize = PAGE_SIZE * 16;
++const PER_BLOCK: usize = BLOCK / RX_BUF;
++/// `struct htt_rx_desc_v1` and its parts' offsets.
++const RX_DESC: usize = 300;
++const ATTENTION: usize = 4;
++const FRAG_INFO: usize = 8;
++const MPDU_START: usize = 12;
++const MSDU_START: usize = 24;
++const MSDU_END: usize = 40;
++const PPDU_START: usize = 84;
++const HDR_STATUS: usize = 236;
++const RX_MSDU_SIZE: usize = RX_BUF - RX_DESC;
++const ATTENTION_MSDU_DONE: u32 = 1 << 31;
++const ATTENTION_FCS_ERR: u32 = 1 << 30;
++const ATTENTION_DECRYPT_ERR: u32 = 1 << 29;
++const ATTENTION_TKIP_MIC_ERR: u32 = 1 << 28;
++const ATTENTION_LENGTH_ERRS: u32 = (1 << 27) | (1 << 17);
++const MSDU_END_LAST: u32 = 1 << 15;
++const MPDU_START_ENCRYPTED: u32 = 1 << 13;
++const ENCRYPT_NONE: u32 = 7;
++const DECAP_RAW: u32 = 0;
++const DECAP_NATIVE_WIFI: u32 = 1;
++const DECAP_ETHERNET: u32 = 2;
++/// Every part of the descriptor and every kind of frame.
++const RX_RING_FLAGS: u16 = 0xffff;
++/// An invalid combined RSSI.
++const RSSI_INVALID: u8 = 0x80;
++/// Where an RX indication's prefix is: the HTT header, the indication's
++/// own (7 bytes), the PPDU's (36).
++const RX_IND_PREFIX: usize = 1 + 7 + 36;
++/// The range statuses of bad frames: FCS, duplicate, replay, TKIP MIC,
++/// decryption, length (`enum htt_rx_mpdu_status`).
++const RX_STATUS_DROP: [u8; 6] = [2, 3, 4, 9, 10, 11];
++/// The in-order indication's header and its MSDU descriptors.
++const IN_ORD_HEADER: usize = 8;
++const IN_ORD_DESC: usize = 8;
++const IN_ORD_OFFLOAD: u8 = 1 << 5;
++const IN_ORD_FRAG: u8 = 1 << 6;
++/// `struct htt_rx_offload_msdu`'s header.
++const OFFLOAD_HEADER: usize = 7;
++/// `ATH10K_DEFAULT_NOISE_FLOOR`.
++const NOISE_FLOOR: i32 = -95;
++// TX.
++const TX_SLOTS: usize = 128;
++const TX_BUF: usize = 2048;
++/// `struct ath10k_htt_txbuf_32`: frags[2] (16), the HTC header (8), the
++/// HTT command (1), the TX descriptor (15); padded to 64.
++const TXBUF: usize = 64;
++const TXBUF_HTC: usize = 16;
++const TXBUF_SENT: usize = 8 + 1 + 15;
++/// `htt->prefetch_len`: the headers the target classifies by.
++const PREFETCH: usize = 36 + 4 + 8 + 2;
++pub(crate) const TX_MODE_NATIVE_WIFI: u8 = 1;
++pub(crate) const TX_MODE_MGMT: u8 = 3;
++pub(crate) const TID_NON_QOS: u8 = 0x10;
++pub(crate) const TID_MGMT: u8 = 0x11;
++const FLAGS0_MAC_HDR_PRESENT: u8 = 1 << 0;
++const FLAGS0_NO_ENCRYPT: u8 = 1 << 2;
++const FLAGS1_POSTPONED: u16 = 1 << 11;
++const INVALID_PEER: u32 = 0xffff;
++/// The aggregates' sizes Linux asks for (`ATH10K_HTT_MAX_NUM_AMPDU_DEFAULT`,
++/// `..._AMSDU_DEFAULT`).
++const MAX_AMPDU: u8 = 64;
++const MAX_AMSDU: u8 = 3;
++
++/// A frame the target gave: an 802.11 frame with its signal, whether the
++/// chip decrypted it and the length of the cipher's header left in it; or
++/// an Ethernet frame and whether it came protected.
++pub(crate) enum Received {
++    Frame { frame: Vec<u8>, signal: i8, decrypted: bool, security_header: u8 },
++    Ethernet(Vec<u8>, bool),
++}
++
++/// What a T2H message changed besides frames.
++#[derive(Default)]
++pub(crate) struct Changes {
++    pub(crate) tx_done: bool,
++    pub(crate) peer_mapped: bool,
++    pub(crate) peer_unmapped: bool,
++}
++
++pub(crate) struct Htt {
++    pub(crate) endpoint: usize,
++    // RX.
++    ring: DmaCoherent,
++    alloc_index: DmaCoherent,
++    blocks: Vec<DmaCoherent>,
++    free: Vec<usize>,
++    /// The buffer in each ring slot (in ring order).
++    slots: Vec<Option<usize>>,
++    read: usize,
++    write: usize,
++    filled: usize,
++    pub(crate) in_order: bool,
++    signal: i8,
++    // TX.
++    txbufs: DmaCoherent,
++    frames: DmaCoherent,
++    busy: Vec<bool>,
++    next: usize,
++    pub(crate) peers: Vec<(u16, [u8; 6])>,
++    pub(crate) version: Option<(u8, u8)>,
++}
++
++fn le32(data: &[u8], at: usize) -> u32 {
++    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++fn le16(data: &[u8], at: usize) -> u16 {
++    data.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
++}
++
++impl Htt {
++    pub(crate) fn new() -> Option<Self> {
++        let mut blocks = Vec::new();
++        for _ in 0..RX_BUFFERS.div_ceil(PER_BLOCK) {
++            blocks.push(dma32(BLOCK)?);
++        }
++        Some(Self {
++            endpoint: 0,
++            ring: dma32(RX_RING * 4)?,
++            alloc_index: dma32(4)?,
++            blocks,
++            free: (0..RX_BUFFERS).rev().collect(),
++            slots: vec![None; RX_RING],
++            read: 0,
++            write: 0,
++            filled: 0,
++            in_order: false,
++            signal: -100,
++            txbufs: dma32(TX_SLOTS * TXBUF)?,
++            frames: dma32(TX_SLOTS * TX_BUF)?,
++            busy: vec![false; TX_SLOTS],
++            next: 0,
++            peers: Vec::new(),
++            version: None,
++        })
++    }
++
++    // ---- H2T messages (their HTC payloads). ----
++
++    /// `ath10k_htt_h2t_ver_req_msg`.
++    pub(crate) fn version_request() -> Vec<u8> {
++        vec![H2T_VERSION_REQ, 0, 0, 0]
++    }
++
++    /// `ath10k_htt_h2t_aggr_cfg_msg_32` (`struct htt_aggr_conf`).
++    pub(crate) fn aggregation_config() -> Vec<u8> {
++        vec![H2T_AGGR_CFG, MAX_AMPDU, MAX_AMSDU]
++    }
++
++    /// `ath10k_htt_send_rx_ring_cfg_32`.
++    pub(crate) fn ring_config(&self) -> Vec<u8> {
++        let mut out = vec![H2T_RX_RING_CFG, 1, 0, 0];
++        out.extend_from_slice(&(self.alloc_index.daddr() as u32).to_le_bytes());
++        out.extend_from_slice(&(self.ring.daddr() as u32).to_le_bytes());
++        out.extend_from_slice(&(RX_RING as u16).to_le_bytes());
++        out.extend_from_slice(&(RX_BUF as u16).to_le_bytes());
++        out.extend_from_slice(&RX_RING_FLAGS.to_le_bytes());
++        out.extend_from_slice(&(self.write as u16).to_le_bytes());
++        // Offsets in words: 802.11 header, payload, PPDU start/end, MPDU
++        // start/end, MSDU start/end, attention, fragments.
++        for offset in [HDR_STATUS / 4, RX_DESC / 4, PPDU_START / 4, 31, MPDU_START / 4, 20, MSDU_START / 4, MSDU_END / 4, ATTENTION / 4, FRAG_INFO / 4] {
++            out.extend_from_slice(&(offset as u16).to_le_bytes());
++        }
++        out
++    }
++
++    // ---- RX buffers. ----
++
++    fn buffer_address(&self, buffer: usize) -> u32 {
++        (self.blocks[buffer / PER_BLOCK].daddr() + (buffer % PER_BLOCK) * RX_BUF) as u32
++    }
++
++    fn buffer_of(&self, address: u32) -> Option<usize> {
++        self.blocks.iter().enumerate().find_map(|(index, block)| {
++            let start = block.daddr() as u32;
++            let offset = address.checked_sub(start)? as usize;
++            (offset < BLOCK && offset % RX_BUF == 0).then_some(index * PER_BLOCK + offset / RX_BUF)
++        })
++    }
++
++    fn buffer_read(&self, buffer: usize, at: usize, out: &mut [u8]) {
++        let _ = self.blocks[buffer / PER_BLOCK].read_bytes((buffer % PER_BLOCK) * RX_BUF + at, out);
++    }
++
++    fn buffer_clear_attention(&self, buffer: usize) {
++        let _ = self.blocks[buffer / PER_BLOCK].write_bytes((buffer % PER_BLOCK) * RX_BUF + ATTENTION, &[0u8; 4]);
++    }
++
++    /// `__ath10k_htt_rx_ring_fill_n`: free buffers into the ring up to the
++    /// fill level, the new index where the target reads it.
++    pub(crate) fn fill(&mut self) {
++        let mut moved = false;
++        while self.filled < RX_FILL {
++            let Some(buffer) = self.free.pop() else { break };
++            self.buffer_clear_attention(buffer);
++            let _ = self.ring.write_bytes(self.write * 4, &self.buffer_address(buffer).to_le_bytes());
++            self.slots[self.write] = Some(buffer);
++            self.write = (self.write + 1) % RX_RING;
++            self.filled += 1;
++            moved = true;
++        }
++        if moved {
++            let _ = self.alloc_index.write_bytes(0, &(self.write as u32).to_le_bytes());
++        }
++    }
++
++    /// The next buffer in ring order (`ath10k_htt_rx_netbuf_pop`).
++    fn pop(&mut self) -> Option<usize> {
++        if self.filled == 0 {
++            return None;
++        }
++        let buffer = self.slots[self.read].take();
++        self.read = (self.read + 1) % RX_RING;
++        self.filled -= 1;
++        buffer
++    }
++
++    /// The buffer at an address (`ath10k_htt_rx_pop_paddr`). The target
++    /// may keep buffers past the slot it took them from (it reorders), so
++    /// the slot may hold a newer one already.
++    fn pop_address(&mut self, address: u32) -> Option<usize> {
++        let buffer = self.buffer_of(address)?;
++        if self.free.contains(&buffer) {
++            return None;
++        }
++        if let Some(slot) = self.slots.iter().position(|slot| *slot == Some(buffer)) {
++            self.slots[slot] = None;
++        }
++        self.filled = self.filled.saturating_sub(1);
++        Some(buffer)
++    }
++
++    fn release_buffers(&mut self, buffers: &[usize]) {
++        self.free.extend_from_slice(buffers);
++    }
++
++    // ---- T2H messages. ----
++
++    /// A T2H message: frames into `out`, the peers and TX slots kept.
++    pub(crate) fn handle(&mut self, message: &[u8], out: &mut Vec<Received>) -> Changes {
++        let mut changes = Changes::default();
++        let Some(&kind) = message.first() else { return changes };
++        match kind {
++            T2H_VERSION_CONF if message.len() >= 4 => self.version = Some((message[2], message[1])),
++            T2H_PEER_MAP if message.len() >= 10 => {
++                let id = le16(message, 2);
++                let mut address = [0u8; 6];
++                address.copy_from_slice(&message[4..10]);
++                self.peers.retain(|&(peer, _)| peer != id);
++                self.peers.push((id, address));
++                changes.peer_mapped = true;
++            }
++            T2H_PEER_UNMAP if message.len() >= 4 => {
++                let id = le16(message, 2);
++                self.peers.retain(|&(peer, _)| peer != id);
++                changes.peer_unmapped = true;
++            }
++            T2H_TX_COMPL_IND if message.len() >= 4 => {
++                for index in 0..message[2] as usize {
++                    let id = le16(message, 4 + index * 2) as usize;
++                    if let Some(slot) = self.busy.get_mut(id) {
++                        *slot = false;
++                    }
++                }
++                changes.tx_done = true;
++            }
++            T2H_RX_IND => {
++                self.rx_indication(message, out);
++                self.fill();
++            }
++            T2H_RX_IN_ORD_PADDR_IND => {
++                self.in_order_indication(message, out);
++                self.fill();
++            }
++            _ => {}
++        }
++        changes
++    }
++
++    /// `ath10k_htt_rx_proc_rx_ind_ll`: each MPDU of each range from the
++    /// ring.
++    fn rx_indication(&mut self, message: &[u8], out: &mut Vec<Received>) {
++        if message.len() < RX_IND_PREFIX + 4 {
++            return;
++        }
++        let ranges = (le32(message, 4) >> 24) as usize;
++        let fw_bytes = le16(message, RX_IND_PREFIX) as usize;
++        let ranges_at = RX_IND_PREFIX + 4 + fw_bytes.next_multiple_of(4);
++        for range in 0..ranges {
++            let at = ranges_at + range * 4;
++            let Some(entry) = message.get(at..at + 2) else { break };
++            let (count, status) = (entry[0] as usize, entry[1]);
++            for _ in 0..count {
++                let Some(msdus) = self.pop_mpdu() else { return };
++                if !RX_STATUS_DROP.contains(&status) {
++                    self.mpdu(&msdus, None, out);
++                }
++                self.release_buffers(&msdus);
++            }
++        }
++    }
++
++    /// `ath10k_htt_rx_amsdu_pop`: the MSDUs of one MPDU. Chained buffers
++    /// (an MSDU longer than a buffer) are dropped.
++    fn pop_mpdu(&mut self) -> Option<Vec<usize>> {
++        let mut msdus = Vec::new();
++        loop {
++            let Some(buffer) = self.pop() else {
++                self.release_buffers(&msdus);
++                return None;
++            };
++            msdus.push(buffer);
++            let mut desc = [0u8; MSDU_END + 20];
++            self.buffer_read(buffer, 0, &mut desc);
++            if le32(&desc, ATTENTION) & ATTENTION_MSDU_DONE == 0 {
++                // A stale descriptor: Linux gives up on the indication too.
++                self.release_buffers(&msdus);
++                return None;
++            }
++            for _ in 0..desc[FRAG_INFO + 2] {
++                if let Some(chained) = self.pop() {
++                    self.release_buffers(&[chained]);
++                }
++            }
++            if le32(&desc, MSDU_END + 16) & MSDU_END_LAST != 0 {
++                return Some(msdus);
++            }
++        }
++    }
++
++    /// `ath10k_htt_rx_in_ord_ind`: the MSDUs by address, cut into MPDUs at
++    /// their last MSDU; offloaded frames are 802.11 frames already.
++    fn in_order_indication(&mut self, message: &[u8], out: &mut Vec<Received>) {
++        if message.len() < IN_ORD_HEADER {
++            return;
++        }
++        let info = message[1];
++        let count = le16(message, 6) as usize;
++        let mut msdus: Vec<(usize, usize)> = Vec::with_capacity(count);
++        for index in 0..count {
++            let at = IN_ORD_HEADER + index * IN_ORD_DESC;
++            if message.len() < at + IN_ORD_DESC {
++                break;
++            }
++            let (address, length) = (le32(message, at), le16(message, at + 4) as usize);
++            match self.pop_address(address) {
++                Some(buffer) => msdus.push((buffer, length)),
++                None => ostd::warn!("the target filled an unknown RX buffer {:#x}", address),
++            }
++        }
++        let buffers: Vec<usize> = msdus.iter().map(|&(buffer, _)| buffer).collect();
++        if info & IN_ORD_FRAG != 0 {
++            // Fragments: not reassembled here.
++        } else if info & IN_ORD_OFFLOAD != 0 {
++            for &(buffer, _) in &msdus {
++                let mut header = [0u8; OFFLOAD_HEADER];
++                self.buffer_read(buffer, 0, &mut header);
++                let length = (le16(&header, 0) as usize).min(RX_BUF - OFFLOAD_HEADER);
++                let mut frame = vec![0u8; length];
++                self.buffer_read(buffer, OFFLOAD_HEADER, &mut frame);
++                if frame.len() >= 24 {
++                    // Decrypted by the firmware, which leaves the Protected
++                    // bit (`ath10k_htt_rx_h_rx_offload_prep`).
++                    let decrypted = frame[1] & 0x40 != 0;
++                    out.push(Received::Frame { frame, signal: self.signal, decrypted, security_header: 0 });
++                }
++            }
++        } else {
++            let mut mpdu = Vec::new();
++            for &(buffer, _) in &msdus {
++                mpdu.push(buffer);
++                let mut desc = [0u8; MSDU_END + 20];
++                self.buffer_read(buffer, 0, &mut desc);
++                if le32(&desc, ATTENTION) & ATTENTION_MSDU_DONE == 0 {
++                    mpdu.clear();
++                    continue;
++                }
++                if le32(&desc, MSDU_END + 16) & MSDU_END_LAST != 0 {
++                    self.mpdu(&mpdu, Some(&msdus), out);
++                    mpdu.clear();
++                }
++            }
++        }
++        self.release_buffers(&buffers);
++    }
++
++    /// The MSDUs of an MPDU as frames (`ath10k_htt_rx_h_mpdu` and the
++    /// undecaps). `lengths`: the in-order indication's payload lengths.
++    fn mpdu(&mut self, msdus: &[usize], lengths: Option<&[(usize, usize)]>, out: &mut Vec<Received>) {
++        let Some(&first_buffer) = msdus.first() else { return };
++        let mut first = [0u8; RX_DESC];
++        self.buffer_read(first_buffer, 0, &mut first);
++        // The error flags are valid in the last MSDU's descriptor.
++        let mut last = [0u8; 8];
++        self.buffer_read(*msdus.last().unwrap_or(&first_buffer), 0, &mut last);
++        let attention = le32(&last, ATTENTION);
++        if attention & (ATTENTION_FCS_ERR | ATTENTION_DECRYPT_ERR | ATTENTION_TKIP_MIC_ERR) != 0 {
++            return;
++        }
++        let mpdu_info = le32(&first, MPDU_START);
++        let encrypt = if mpdu_info & MPDU_START_ENCRYPTED != 0 { mpdu_info >> 28 } else { ENCRYPT_NONE };
++        let original: [u8; 64] = first[HDR_STATUS..HDR_STATUS + 64].try_into().unwrap();
++        let rssi = first[PPDU_START + 16];
++        if rssi != RSSI_INVALID {
++            self.signal = (NOISE_FLOOR + rssi as i32).clamp(-127, -1) as i8;
++        }
++        let signal = self.signal;
++        let decrypted = encrypt != ENCRYPT_NONE;
++        for &buffer in msdus {
++            let mut desc = [0u8; MSDU_END + 20];
++            self.buffer_read(buffer, 0, &mut desc);
++            if le32(&desc, ATTENTION) & ATTENTION_LENGTH_ERRS != 0 {
++                continue;
++            }
++            let length = lengths
++                .and_then(|lengths| lengths.iter().find(|&&(entry, _)| entry == buffer).map(|&(_, length)| length))
++                .unwrap_or((le32(&desc, MSDU_START) & 0x3fff) as usize);
++            let decap = (le32(&desc, MSDU_START + 8) >> 8) & 3;
++            let mut payload = vec![0u8; length.min(RX_MSDU_SIZE)];
++            self.buffer_read(buffer, RX_DESC, &mut payload);
++            match decap {
++                DECAP_NATIVE_WIFI => {
++                    if let Some((frame, security_header)) = undecap_nwifi(&payload, &original, encrypt) {
++                        out.push(Received::Frame { frame, signal, decrypted, security_header });
++                    }
++                }
++                DECAP_ETHERNET => out.push(Received::Ethernet(payload, decrypted)),
++                DECAP_RAW if payload.len() > 4 && !decrypted => {
++                    // With its FCS (`ath10k_htt_rx_h_undecap_raw`).
++                    payload.truncate(payload.len() - 4);
++                    out.push(Received::Frame { frame: payload, signal, decrypted: false, security_header: 0 });
++                }
++                _ => {}
++            }
++        }
++    }
++
++    // ---- TX. ----
++
++    fn slot(&mut self) -> Option<usize> {
++        for step in 0..TX_SLOTS {
++            let slot = (self.next + step) % TX_SLOTS;
++            if !self.busy[slot] {
++                self.busy[slot] = true;
++                self.next = (slot + 1) % TX_SLOTS;
++                return Some(slot);
++            }
++        }
++        None
++    }
++
++    /// `ath10k_htt_tx_32`: the frame in its slot, the TX descriptor with
++    /// the HTC header before it; the two pieces for the CE (the HTC header
++    /// and descriptor, the frame's first bytes for the target to classify).
++    /// Management frames are named by their own address, data frames by
++    /// the fragment list.
++    pub(crate) fn tx(&mut self, frame: &[u8], mode: u8, vdev: u8, tid: u8, no_encrypt: bool) -> Option<(usize, [(u32, usize); 2])> {
++        if frame.len() > TX_BUF || frame.is_empty() {
++            return None;
++        }
++        let slot = self.slot()?;
++        let frame_address = (self.frames.daddr() + slot * TX_BUF) as u32;
++        let _ = self.frames.write_bytes(slot * TX_BUF, frame);
++        let txbuf_address = (self.txbufs.daddr() + slot * TXBUF) as u32;
++        let prefetch = PREFETCH.min(frame.len()).next_multiple_of(4);
++        let mut flags0 = (mode << 5) | FLAGS0_MAC_HDR_PRESENT;
++        if no_encrypt {
++            flags0 |= FLAGS0_NO_ENCRYPT;
++        }
++        let flags1 = (vdev as u16 & 0x3f) | ((tid as u16 & 0x1f) << 6) | FLAGS1_POSTPONED;
++        let frags_address = if mode == TX_MODE_MGMT { frame_address } else { txbuf_address };
++        let mut txbuf = [0u8; TXBUF_HTC + TXBUF_SENT];
++        txbuf[0..4].copy_from_slice(&frame_address.to_le_bytes());
++        txbuf[4..8].copy_from_slice(&(frame.len() as u32).to_le_bytes());
++        // The HTC header: endpoint, no flags, the length after it.
++        txbuf[TXBUF_HTC] = self.endpoint as u8;
++        txbuf[TXBUF_HTC + 2..TXBUF_HTC + 4].copy_from_slice(&((1 + 15 + prefetch) as u16).to_le_bytes());
++        // The HTT command and descriptor.
++        let at = TXBUF_HTC + 8;
++        txbuf[at] = H2T_TX_FRM;
++        txbuf[at + 1] = flags0;
++        txbuf[at + 2..at + 4].copy_from_slice(&flags1.to_le_bytes());
++        txbuf[at + 4..at + 6].copy_from_slice(&(frame.len() as u16).to_le_bytes());
++        txbuf[at + 6..at + 8].copy_from_slice(&(slot as u16).to_le_bytes());
++        txbuf[at + 8..at + 12].copy_from_slice(&frags_address.to_le_bytes());
++        txbuf[at + 12..at + 16].copy_from_slice(&INVALID_PEER.to_le_bytes());
++        let _ = self.txbufs.write_bytes(slot * TXBUF, &txbuf);
++        Some((slot, [(txbuf_address + TXBUF_HTC as u32, TXBUF_SENT), (frame_address, prefetch)]))
++    }
++
++    /// A slot whose frame did not go out.
++    pub(crate) fn release(&mut self, slot: usize) {
++        if let Some(busy) = self.busy.get_mut(slot) {
++            *busy = false;
++        }
++    }
++
++    pub(crate) fn reset_tx(&mut self) {
++        self.busy.iter_mut().for_each(|busy| *busy = false);
++    }
++}
++
++/// Linux's `ath10k_htt_rx_h_undecap_nwifi`: the original 802.11 header
++/// (and the cipher's header) in place of the native Wi-Fi one, its DA and
++/// SA kept, the A-MSDU bit cleared (the chip split the A-MSDU). The frame
++/// and the length of the cipher's header in it.
++fn undecap_nwifi(payload: &[u8], original: &[u8; 64], encrypt: u32) -> Option<(Vec<u8>, u8)> {
++    if payload.len() < 24 {
++        return None;
++    }
++    let (da, sa) = (address_da(payload)?, address_sa(payload)?);
++    // The native Wi-Fi header is padded to 4 bytes.
++    let body = payload.get(header_length(payload).next_multiple_of(4)..)?;
++    let header_len = header_length(original);
++    // The cipher's header (`ath10k_htt_rx_crypto_param_len`).
++    let crypto = match encrypt {
++        ENCRYPT_NONE => 0,
++        0 | 1 | 3 => 4,
++        _ => 8,
++    };
++    let crypto_at = header_len.next_multiple_of(4);
++    let mut frame = Vec::with_capacity(header_len + crypto + body.len());
++    frame.extend_from_slice(original.get(..header_len)?);
++    if crypto > 0 {
++        frame.extend_from_slice(original.get(crypto_at..crypto_at + crypto)?);
++    }
++    frame.extend_from_slice(body);
++    set_da_sa(&mut frame, &da, &sa);
++    if frame[0] & 0xfc == 0x88 {
++        let qos = if frame[1] & 0x03 == 0x03 { 30 } else { 24 };
++        if let Some(byte) = frame.get_mut(qos) {
++            *byte &= !0x80;
++        }
++    }
++    Some((frame, crypto as u8))
++}
++
++/// `ieee80211_hdrlen` of a data or management frame.
++fn header_length(header: &[u8]) -> usize {
++    let (fc0, fc1) = (header[0], header[1]);
++    let mut length = if fc0 & 0x0c == 0x08 && fc1 & 0x03 == 0x03 { 30 } else { 24 };
++    if fc0 & 0x0c == 0x08 && fc0 & 0x80 != 0 {
++        length += 2;
++        if fc1 & 0x80 != 0 {
++            length += 4;
++        }
++    }
++    length
++}
++
++fn da_offset(frame: &[u8]) -> usize {
++    if frame[1] & 0x01 != 0 { 16 } else { 4 }
++}
++
++fn sa_offset(frame: &[u8]) -> usize {
++    match frame[1] & 0x03 {
++        0x02 => 16,
++        0x03 => 24,
++        _ => 10,
++    }
++}
++
++/// `ieee80211_get_DA`/`_SA` of a frame by its DS bits.
++fn address_da(frame: &[u8]) -> Option<[u8; 6]> {
++    let at = da_offset(frame);
++    frame.get(at..at + 6)?.try_into().ok()
++}
++
++fn address_sa(frame: &[u8]) -> Option<[u8; 6]> {
++    let at = sa_offset(frame);
++    frame.get(at..at + 6)?.try_into().ok()
++}
++
++fn set_da_sa(frame: &mut [u8], da: &[u8; 6], sa: &[u8; 6]) {
++    let (da_at, sa_at) = (da_offset(frame), sa_offset(frame));
++    if frame.len() >= da_at + 6 {
++        frame[da_at..da_at + 6].copy_from_slice(da);
++    }
++    if frame.len() >= sa_at + 6 {
++        frame[sa_at..sa_at + 6].copy_from_slice(sa);
++    }
++}
+diff --git a/kernel/comps/ath10k/src/lib.rs b/kernel/comps/ath10k/src/lib.rs
+new file mode 100644
+index 0000000..898a772
+--- /dev/null
++++ b/kernel/comps/ath10k/src/lib.rs
+@@ -0,0 +1,392 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Qualcomm Atheros Wi-Fi of Linux's ath10k family on PCIe: the QCA6174
++//! (168c:003e, hw2.1 and hw3.x), the QCA6164 (168c:0041) and the QCA9377
++//! (168c:0042), with linux-firmware's `ath10k/<chip>/<hw>/firmware-N.bin`
++//! and `board-2.bin` (or `board.bin`).
++//!
++//! The chip ([`pci`]: copy engines, resets, the diagnostic window) boots
++//! its firmware through BMI ([`boot`]); HTC ([`htc`]) carries WMI
++//! ([`wmi`], the TLV commands and events) and HTT ([`htt`], the frames).
++//! The station on it is [`sta`]: scans by the firmware, one STA vdev, the
++//! access point's peer, keys in the firmware, native Wi-Fi frames.
++//!
++//! Not yet: the older QCA988x/QCA99x0 firmware interfaces, 40/80 MHz,
++//! VHT, power save, 802.11w. `dmesg | grep ath10k` says how far a card
++//! gets; `ath10k.off` leaves the cards alone.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++macro_rules! __log_prefix {
++    () => {
++        "ath10k: "
++    };
++}
++
++mod boot;
++mod htc;
++mod htt;
++mod pci;
++mod sta;
++mod wmi;
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId,
++    bus::{PciDevice, PciDriver},
++    common_device::PciCommonDevice,
++};
++use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
++use component::{ComponentInitError, init_component};
++use ostd::{
++    bus::BusProbeError,
++    irq::IrqLine,
++    sync::{Mutex, SpinLock, WaitQueue},
++    timer::Jiffies,
++};
++
++use crate::{
++    boot::{Bmi, CodeSwap, FirmwareFile},
++    pci::Pci,
++    sta::Ath10k,
++};
++
++static WAKE: WaitQueue = WaitQueue::new();
++static WOKEN: AtomicBool = AtomicBool::new(false);
++static TICKS: AtomicUsize = AtomicUsize::new(0);
++
++pub(crate) fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++fn wake() {
++    WOKEN.store(true, Ordering::Release);
++    WAKE.wake_all();
++}
++
++fn sleep() {
++    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
++}
++
++/// A busy wait for the chip's handshakes (the timer is too coarse).
++pub(crate) fn delay_us(us: u64) {
++    let start = ostd::arch::read_tsc();
++    let cycles = us * (ostd::arch::tsc_freq() / 1_000_000).max(1);
++    while ostd::arch::read_tsc().wrapping_sub(start) < cycles {
++        core::hint::spin_loop();
++    }
++}
++
++pub(crate) fn delay_ms(ms: u64) {
++    delay_us(ms * 1000);
++}
++
++/// The timer wakes the tasks every few ticks: scans time out and
++/// interrupts that do not arrive are made up for.
++fn tick() {
++    if TICKS.fetch_add(1, Ordering::Relaxed) % 5 == 0 {
++        wake();
++    }
++}
++
++const VENDOR_QUALCOMM_ATHEROS: u16 = 0x168c;
++/// The firmware files, newest interface first (`ATH10K_FW_API_MAX` down).
++const FIRMWARE_FILES: [&str; 3] = ["firmware-6.bin", "firmware-5.bin", "firmware-4.bin"];
++/// The firmware interfaces this driver speaks (`ATH10K_FW_WMI_OP_VERSION_TLV`,
++/// `ATH10K_FW_HTT_OP_VERSION_TLV`).
++const WMI_OP_VERSION_TLV: u32 = 4;
++const HTT_OP_VERSION_TLV: u32 = 3;
++/// `SOC_CHIP_ID_REV`.
++const CHIP_ID_REV_SHIFT: u32 = 8;
++const CHIP_ID_REV_MASK: u32 = 0xf;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Model {
++    Qca6174,
++    Qca9377,
++}
++
++impl Model {
++    fn of(vendor: u16, device: u16) -> Option<Self> {
++        match (vendor, device) {
++            (VENDOR_QUALCOMM_ATHEROS, 0x003e | 0x0041) => Some(Model::Qca6174),
++            (VENDOR_QUALCOMM_ATHEROS, 0x0042) => Some(Model::Qca9377),
++            _ => None,
++        }
++    }
++
++    /// `ath10k_bus_pci_get_num_banks` by the chip's revision.
++    fn iram_banks(self, chip_id: u32) -> Option<u32> {
++        match self {
++            Model::Qca9377 => Some(9),
++            Model::Qca6174 => match (chip_id >> CHIP_ID_REV_SHIFT) & CHIP_ID_REV_MASK {
++                0 | 1 | 4 | 5 => Some(3),
++                2 => Some(4),
++                8..=10 => Some(9),
++                _ => None,
++            },
++        }
++    }
++
++    /// The firmware's directory for the target's version
++    /// (`ath10k_hw_params_list`).
++    fn firmware_dir(self, version: u32) -> Option<&'static str> {
++        match (self, version) {
++            (Model::Qca6174, 0x0501_0000) => Some("ath10k/QCA6174/hw2.1"),
++            (Model::Qca6174, 0x0502_0000 | 0x0503_0000) => Some("ath10k/QCA6174/hw3.0"),
++            (Model::Qca9377, 0x0502_0000 | 0x0502_0001) => Some("ath10k/QCA9377/hw1.0"),
++            _ => None,
++        }
++    }
++}
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++#[derive(Debug)]
++struct Driver {
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if Model::of(id.vendor_id, id.device_id).is_none() {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.found.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
++static DISABLED: AtomicBool = AtomicBool::new(false);
++aster_cmdline::define_flag_param!("ath10k.off", DISABLED);
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    if DISABLED.load(Ordering::Relaxed) {
++        return Ok(());
++    }
++    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
++    PCI_BUS.lock().register_driver(driver.clone());
++    let cards = core::mem::take(&mut *driver.found.lock());
++    if cards.is_empty() {
++        return Ok(());
++    }
++    ostd::timer::register_callback_on_cpu(tick);
++    *PENDING.lock() = cards;
++    Ok(())
++}
++
++#[init_component(kthread)]
++fn start() -> Result<(), ComponentInitError> {
++    for (index, device) in core::mem::take(&mut *PENDING.lock()).into_iter().enumerate() {
++        aster_core::spawn_kernel_thread(move || run(index, device));
++    }
++    Ok(())
++}
++
++struct Card {
++    state: Mutex<Ath10k>,
++}
++
++struct AtherosRadio {
++    card: Arc<Card>,
++}
++
++impl Radio for AtherosRadio {
++    fn start(&self) -> radio::Result<()> {
++        if self.card.state.lock().dead { Err(radio::Error::Down) } else { Ok(()) }
++    }
++
++    fn stop(&self) {
++        let mut state = self.card.state.lock();
++        state.abort_scan();
++        state.leave();
++    }
++
++    fn scan(&self, request: &ScanRequest) -> radio::Result<()> {
++        self.card.state.lock().scan(request)
++    }
++
++    fn abort_scan(&self) {
++        self.card.state.lock().abort_scan();
++        wake();
++    }
++
++    fn join(&self, network: &Join) -> radio::Result<()> {
++        self.card.state.lock().join(network)
++    }
++
++    fn associated(&self, association: &Association) -> radio::Result<()> {
++        self.card.state.lock().associated(association)
++    }
++
++    fn leave(&self) {
++        self.card.state.lock().leave();
++    }
++
++    fn set_key(&self, key: &Key) -> radio::Result<()> {
++        self.card.state.lock().set_key(key)
++    }
++
++    fn remove_key(&self, index: u8, pairwise: bool) {
++        self.card.state.lock().remove_key(index, pairwise);
++    }
++
++    fn authorize(&self, authorized: bool) {
++        self.card.state.lock().authorize(authorized);
++    }
++
++    fn send_management(&self, frame: &[u8]) -> radio::Result<()> {
++        self.card.state.lock().send_management(frame)
++    }
++
++    fn send(&self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        self.card.state.lock().send(ethernet, plain)
++    }
++
++    fn link_stats(&self) -> LinkStats {
++        LinkStats { signal: self.card.state.lock().signal, tx_rate: None }
++    }
++}
++
++/// The PCI Express capability's offset in the configuration space.
++fn pcie_capability(location: &aster_pci::PciDeviceLocation) -> Option<u16> {
++    let mut at = location.read8(0x34) & 0xfc;
++    for _ in 0..48 {
++        if at < 0x40 {
++            return None;
++        }
++        if location.read8(at as u16) == 0x10 {
++            return Some(at as u16);
++        }
++        at = location.read8(at as u16 + 1) & 0xfc;
++    }
++    None
++}
++
++/// `ath10k_pci_hif_power_up`: the chip reset, the copy engines, the
++/// target's configuration, its CPU woken (in BMI).
++fn power_up(pci: &mut Pci, model: Model) -> Result<(), String> {
++    pci.wake()?;
++    pci.chip_reset()?;
++    let banks = model.iram_banks(pci.chip_id).ok_or_else(|| format!("chip {:#x} is a revision this driver does not know", pci.chip_id))?;
++    pci.init_pipes();
++    pci.init_config(banks)?;
++    pci.wake_target_cpu();
++    Ok(())
++}
++
++/// The firmware and board files for the target (`ath10k_core_fetch_firmware_files`,
++/// `ath10k_core_fetch_board_file`).
++fn firmware_files(dir: &str, board_name: &str) -> Result<(FirmwareFile, Vec<u8>), String> {
++    let paths: Vec<String> = FIRMWARE_FILES.iter().map(|file| format!("{dir}/{file}")).collect();
++    // Waits for the system's files once; then the first that speaks TLV.
++    if aster_firmware::load_first(paths.iter().map(String::as_str)).is_none() {
++        return Err(format!("no {dir}/firmware-N.bin in /lib/firmware"));
++    }
++    let firmware = paths
++        .iter()
++        .filter_map(|path| aster_firmware::try_load(path))
++        .filter_map(|data| FirmwareFile::parse(&data))
++        .find(|file| file.wmi_op_version == WMI_OP_VERSION_TLV && file.htt_op_version == HTT_OP_VERSION_TLV)
++        .ok_or_else(|| format!("no firmware in {dir} with the TLV interface"))?;
++    let board = aster_firmware::try_load(&format!("{dir}/board-2.bin"))
++        .and_then(|file| boot::board_data(&file, board_name))
++        .or_else(|| aster_firmware::try_load(&format!("{dir}/board.bin")).map(|file| file.to_vec()))
++        .ok_or_else(|| format!("no board data for {board_name} in {dir}"))?;
++    Ok((firmware, board))
++}
++
++/// A card's task: the firmware booted, the station registered, then what
++/// the chip says.
++fn run(index: usize, mut device: PciCommonDevice) {
++    let id = *device.device_id();
++    let Some(model) = Model::of(id.vendor_id, id.device_id) else { return };
++    let location = *device.location();
++    let name: String = format!("ath10k {} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
++    location.write16(0x04, location.read16(0x04) | 0x06);
++    // Linux keeps ASPM off while the firmware boots; it stays off here.
++    if let Some(cap) = pcie_capability(&location) {
++        location.write16(cap + 0x10, location.read16(cap + 0x10) & !0x0003);
++    }
++    // MSI, or none (the timer looks).
++    let msi = match (device.acquire_msi_capability(), IrqLine::alloc()) {
++        (Some(mut msi), Ok(mut irq)) => {
++            irq.on_active(|_| wake());
++            msi.set_interrupt_vector(irq);
++            Some(msi)
++        }
++        _ => None,
++    };
++    let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
++        ostd::warn!("{}: no registers in BAR 0", name);
++        return;
++    };
++    let Some(mut pci) = Pci::new(mmio) else {
++        ostd::warn!("{}: no DMA memory below 4 GiB", name);
++        return;
++    };
++    match bring_up(&mut pci, model, id.device_id, &location, &name) {
++        Ok(()) => {}
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    }
++    let state = match Ath10k::start(pci, name.clone()) {
++        Ok(state) => state,
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    };
++    let info = state.info();
++    ostd::notice!("{}: ready, MAC {:02x?}", name, state.address);
++    let card = Arc::new(Card { state: Mutex::new(state) });
++    let wlan = aster_wlan::register(info, Arc::new(AtherosRadio { card: card.clone() }));
++    card.state.lock().device = Some(wlan);
++    loop {
++        sleep();
++        let mut state = card.state.lock();
++        state.poll();
++        if state.dead {
++            break;
++        }
++    }
++    drop((msi, device));
++}
++
++/// Power up, find the target's files, power up again (as Linux does
++/// between probing and starting) and boot the firmware through BMI.
++fn bring_up(pci: &mut Pci, model: Model, device_id: u16, location: &aster_pci::PciDeviceLocation, name: &str) -> Result<(), String> {
++    power_up(pci, model)?;
++    let (version, target_type) = Bmi { pci }.target_info()?;
++    let dir = model.firmware_dir(version).ok_or_else(|| format!("{model:?} target version {version:#x} (type {target_type}) is not known"))?;
++    let board_name = format!("bus=pci,vendor={:04x},device={:04x},subsystem-vendor={:04x},subsystem-device={:04x}", VENDOR_QUALCOMM_ATHEROS, device_id, location.read16(0x2c), location.read16(0x2e));
++    ostd::notice!("{}: {:?} chip {:#x}, target {:#x}, {}", name, model, pci.chip_id, version, dir);
++    let (firmware, board) = firmware_files(dir, &board_name)?;
++    ostd::notice!("{}: firmware {}", name, firmware.version);
++    let swap = CodeSwap::new(&firmware.codeswap)?;
++    power_up(pci, model)?;
++    let mut bmi = Bmi { pci };
++    let _ = bmi.target_info()?;
++    boot::boot(&mut bmi, device_id, &firmware, &board, swap.as_ref())?;
++    bmi.done()?;
++    // The code swap's memory stays the target's.
++    core::mem::forget(swap);
++    Ok(())
++}
+diff --git a/kernel/comps/ath10k/src/pci.rs b/kernel/comps/ath10k/src/pci.rs
+new file mode 100644
+index 0000000..eb91dca
+--- /dev/null
++++ b/kernel/comps/ath10k/src/pci.rs
+@@ -0,0 +1,667 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The QCA6174/QCA9377 over PCIe as Linux's ath10k `pci.c` and `ce.c` run
++//! it: BAR 0, the SoC kept awake, the cold and warm resets, the Copy
++//! Engines (rings of descriptors the target and the host pass buffers
++//! through), the diagnostic window into the target's memory, and BMI, the
++//! boot loader's messages.
++
++use alloc::{format, string::String, vec, vec::Vec};
++
++use aster_pci::cfg_space::BarAccess;
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++
++// `qca6174_regs` and `hw.h`.
++const RTC_SOC_BASE: u32 = 0x0000_0800;
++const SOC_CORE_BASE: u32 = 0x0003_a000;
++const CE0_BASE: u32 = 0x0003_4400;
++const CE_STRIDE: u32 = 0x400;
++const FW_INDICATOR: u32 = 0x0003_a028;
++const PCIE_LOCAL_BASE: u32 = 0x0008_0000;
++const SOC_CHIP_ID: u32 = 0x0000_00f0;
++const PCIE_INTR_FW_MASK: u32 = 0x0000_0400;
++const PCIE_INTR_CE_MASK_ALL: u32 = 0x0007_f800;
++const PCIE_INTR_ENABLE: u32 = 0x0008;
++const PCIE_INTR_CLR: u32 = 0x0014;
++const RTC_STATE: u32 = 0x0000;
++const RTC_STATE_ON: u32 = 3;
++const PCIE_SOC_WAKE: u32 = 0x0004;
++const SOC_GLOBAL_RESET: u32 = 0x0008;
++const SOC_RESET_CONTROL: u32 = 0x0000;
++const SOC_RESET_CONTROL_CE_RST: u32 = 0x0000_0001;
++const SOC_RESET_CONTROL_CPU_WARM_RST: u32 = 0x0000_0040;
++const SOC_LF_TIMER_CONTROL0: u32 = 0x0000_0050;
++const SOC_LF_TIMER_CONTROL0_ENABLE: u32 = 0x0000_0004;
++const CORE_CTRL: u32 = 0x0000;
++const CORE_CTRL_CPU_INTR: u32 = 0x0000_2000;
++const CORE_CTRL_PCIE_REG_31: u32 = 0x0000_0800;
++pub(crate) const FW_IND_EVENT_PENDING: u32 = 1;
++const FW_IND_INITIALIZED: u32 = 2;
++/// `ATH10K_PCI_TARGET_WAIT`.
++const TARGET_WAIT_MS: u64 = 3000;
++// The Copy Engine's registers (`qcax_ce_regs`).
++const CE_SR_BA: u32 = 0x00;
++const CE_SR_SIZE: u32 = 0x04;
++const CE_DR_BA: u32 = 0x08;
++const CE_DR_SIZE: u32 = 0x0c;
++const CE_CTRL1: u32 = 0x10;
++const CE_HOST_IE: u32 = 0x2c;
++const CE_WM_STATUS: u32 = 0x30;
++const CE_MISC_IE: u32 = 0x34;
++const CE_SR_WR_INDEX: u32 = 0x3c;
++const CE_DST_WR_INDEX: u32 = 0x40;
++const CE_CURRENT_SRRI: u32 = 0x44;
++const CE_CURRENT_DRRI: u32 = 0x48;
++const CE_SRC_WM: u32 = 0x4c;
++const CE_DST_WM: u32 = 0x50;
++const CE_CC_MASK: u32 = 0x01;
++const CE_WM_MASK: u32 = 0x1e;
++const CE_DESC: usize = 8;
++const CE_DESC_GATHER: u16 = 1 << 0;
++/// The CEs of the QCA6174 (`ce_count`).
++pub(crate) const CE_COUNT: usize = 8;
++pub(crate) const CE_DIAG: usize = 7;
++pub(crate) const DIAG_TRANSFER_LIMIT: usize = 2048;
++const BMI_CE_TO_TARGET: usize = 0;
++const BMI_CE_TO_HOST: usize = 1;
++const BMI_TIMEOUT_MS: u64 = 3000;
++
++/// The host's side of each CE (`pci_host_ce_config_wlan`, with smaller
++/// rings than Linux's): source entries and their size, destination
++/// entries, interrupts off.
++pub(crate) const HOST_CE: [(usize, usize, usize, bool); CE_COUNT] = [
++    (16, 256, 0, false),
++    (0, 2048, 128, false),
++    (0, 2048, 128, false),
++    (32, 2048, 0, false),
++    (256, 256, 0, true),
++    (0, 512, 128, false),
++    (0, 0, 0, false),
++    (2, DIAG_TRANSFER_LIMIT, 2, true),
++];
++
++/// The target's side (`pci_target_ce_config_wlan`, the first seven):
++/// pipe, direction (1 out, 2 in, 3 both), entries, bytes, flags.
++const TARGET_CE: [[u32; 6]; 7] = [
++    [0, 1, 32, 256, 0, 0],
++    [1, 2, 32, 2048, 0, 0],
++    [2, 2, 64, 2048, 0, 0],
++    [3, 1, 32, 2048, 0, 0],
++    [4, 1, 256, 256, 0, 0],
++    [5, 2, 32, 512, 0, 0],
++    [6, 3, 32, 4096, 0, 0],
++];
++
++/// Which pipe carries each HTC service (`pci_target_service_to_ce_map_wlan`):
++/// service, direction, pipe.
++pub(crate) const SERVICE_MAP: [[u32; 3]; 17] = [
++    [0x0104, 1, 3],
++    [0x0104, 2, 2],
++    [0x0102, 1, 3],
++    [0x0102, 2, 2],
++    [0x0101, 1, 3],
++    [0x0101, 2, 2],
++    [0x0103, 1, 3],
++    [0x0103, 2, 2],
++    [0x0100, 1, 3],
++    [0x0100, 2, 2],
++    [0x0001, 1, 0],
++    [0x0001, 2, 1],
++    [0xfe00, 1, 0],
++    [0xfe00, 2, 1],
++    [0x0300, 1, 4],
++    [0x0300, 2, 5],
++    [0, 0, 0],
++];
++
++/// DMA memory the 32-bit descriptors can name, asked for again until it
++/// lies below 4 GiB.
++pub(crate) fn dma32(bytes: usize) -> Option<DmaCoherent> {
++    let pages = bytes.div_ceil(PAGE_SIZE).max(1);
++    let mut rejected = Vec::new();
++    for _ in 0..64 {
++        let block = DmaCoherent::alloc(pages, true).ok()?;
++        if (block.daddr() as u64) + (pages * PAGE_SIZE) as u64 <= 1 << 32 {
++            return Some(block);
++        }
++        rejected.push(block);
++    }
++    None
++}
++
++/// A CE ring: its descriptors and a buffer per slot.
++struct Ring {
++    descs: DmaCoherent,
++    buffers: Option<DmaCoherent>,
++    slot: usize,
++    entries: usize,
++    sw: usize,
++    write: usize,
++}
++
++impl Ring {
++    fn new(entries: usize, slot: usize) -> Option<Self> {
++        let entries = entries.next_power_of_two();
++        let buffers = if slot > 0 { Some(dma32(entries * slot)?) } else { None };
++        Some(Self { descs: dma32(entries * CE_DESC)?, buffers, slot, entries, sw: 0, write: 0 })
++    }
++
++    fn mask(&self) -> usize {
++        self.entries - 1
++    }
++
++    fn buffer_address(&self, slot: usize) -> u32 {
++        self.buffers.as_ref().map_or(0, |buffers| (buffers.daddr() + slot * self.slot) as u32)
++    }
++
++    fn desc(&self, slot: usize) -> (u32, u16, u16) {
++        let mut raw = [0u8; CE_DESC];
++        let _ = self.descs.read_bytes(slot * CE_DESC, &mut raw);
++        (u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]), u16::from_le_bytes([raw[4], raw[5]]), u16::from_le_bytes([raw[6], raw[7]]))
++    }
++
++    fn set_desc(&self, slot: usize, addr: u32, nbytes: u16, flags: u16) {
++        let mut raw = [0u8; CE_DESC];
++        raw[0..4].copy_from_slice(&addr.to_le_bytes());
++        raw[4..6].copy_from_slice(&nbytes.to_le_bytes());
++        raw[6..8].copy_from_slice(&flags.to_le_bytes());
++        let _ = self.descs.write_bytes(slot * CE_DESC, &raw);
++    }
++}
++
++pub(crate) struct Pipe {
++    src: Option<Ring>,
++    dst: Option<Ring>,
++    src_max: usize,
++}
++
++pub(crate) struct Pci {
++    mmio: BarAccess,
++    pub(crate) pipes: Vec<Pipe>,
++    pub(crate) chip_id: u32,
++}
++
++impl Pci {
++    pub(crate) fn new(mmio: BarAccess) -> Option<Self> {
++        let mut pipes = Vec::with_capacity(CE_COUNT);
++        for (src, size, dst, _) in HOST_CE {
++            let src_ring = if src > 0 { Some(Ring::new(src, size)?) } else { None };
++            let dst_ring = if dst > 0 { Some(Ring::new(dst, size)?) } else { None };
++            pipes.push(Pipe { src: src_ring, dst: dst_ring, src_max: size });
++        }
++        Some(Self { mmio, pipes, chip_id: 0 })
++    }
++
++    pub(crate) fn read32(&self, offset: u32) -> u32 {
++        self.mmio.read_once::<u32>(offset as usize).unwrap_or(u32::MAX)
++    }
++
++    pub(crate) fn write32(&self, offset: u32, value: u32) {
++        let _ = self.mmio.write_once::<u32>(offset as usize, value);
++    }
++
++    fn reg_read32(&self, addr: u32) -> u32 {
++        self.read32(PCIE_LOCAL_BASE + addr)
++    }
++
++    fn reg_write32(&self, addr: u32, value: u32) {
++        self.write32(PCIE_LOCAL_BASE + addr, value);
++    }
++
++    fn soc_read32(&self, addr: u32) -> u32 {
++        self.read32(RTC_SOC_BASE + addr)
++    }
++
++    fn soc_write32(&self, addr: u32, value: u32) {
++        self.write32(RTC_SOC_BASE + addr, value);
++    }
++
++    /// The SoC awake (`__ath10k_pci_wake`, `ath10k_pci_wake_wait`); the
++    /// driver keeps it so.
++    pub(crate) fn wake(&self) -> Result<(), String> {
++        self.reg_write32(PCIE_SOC_WAKE, 1);
++        let mut waited = 0u64;
++        let mut step = 5u64;
++        while waited < 30_000 {
++            if self.reg_read32(RTC_STATE) & 0x7 == RTC_STATE_ON {
++                return Ok(());
++            }
++            crate::delay_us(step);
++            waited += step;
++            if step < 50 {
++                step += 5;
++            }
++        }
++        Err(String::from("the SoC did not wake up"))
++    }
++
++    // ---- Interrupts. ----
++
++    /// `ath10k_pci_irq_disable` without the CEs (they are polled).
++    pub(crate) fn irq_disable(&self) {
++        for ce in 0..CE_COUNT {
++            let base = CE0_BASE + CE_STRIDE * ce as u32;
++            self.write32(base + CE_HOST_IE, self.read32(base + CE_HOST_IE) & !1);
++            self.write32(base + CE_MISC_IE, 0);
++        }
++        self.write32(SOC_CORE_BASE + PCIE_INTR_ENABLE, 0);
++        self.write32(SOC_CORE_BASE + PCIE_INTR_CLR, PCIE_INTR_FW_MASK | PCIE_INTR_CE_MASK_ALL);
++        let _ = self.read32(SOC_CORE_BASE + PCIE_INTR_ENABLE);
++        let control = self.read32(SOC_CORE_BASE + CORE_CTRL) & !CORE_CTRL_PCIE_REG_31;
++        self.write32(SOC_CORE_BASE + CORE_CTRL, control);
++    }
++
++    /// `ath10k_pci_irq_enable`: the copy-complete interrupts of the CEs
++    /// that take them, the legacy line, the MSI's firmware bit.
++    pub(crate) fn irq_enable(&self) {
++        for (ce, (src, _, dst, no_interrupt)) in HOST_CE.iter().enumerate() {
++            let base = CE0_BASE + CE_STRIDE * ce as u32;
++            let enabled = !no_interrupt && (*src > 0 || *dst > 0);
++            let value = self.read32(base + CE_HOST_IE);
++            self.write32(base + CE_HOST_IE, if enabled { value | 1 } else { value & !1 });
++            self.write32(base + CE_MISC_IE, self.read32(base + CE_MISC_IE) & !0x7e0);
++        }
++        self.write32(SOC_CORE_BASE + PCIE_INTR_ENABLE, PCIE_INTR_FW_MASK | PCIE_INTR_CE_MASK_ALL);
++        let _ = self.read32(SOC_CORE_BASE + PCIE_INTR_ENABLE);
++        let control = self.read32(SOC_CORE_BASE + CORE_CTRL) | CORE_CTRL_PCIE_REG_31;
++        self.write32(SOC_CORE_BASE + CORE_CTRL, control);
++    }
++
++    /// The legacy interrupt's cause cleared, after the CEs were served.
++    pub(crate) fn clear_interrupts(&self) {
++        for ce in 0..CE_COUNT {
++            let base = CE0_BASE + CE_STRIDE * ce as u32;
++            self.write32(base + CE_WM_STATUS, CE_CC_MASK | CE_WM_MASK);
++        }
++        self.write32(SOC_CORE_BASE + PCIE_INTR_CLR, PCIE_INTR_FW_MASK | PCIE_INTR_CE_MASK_ALL);
++    }
++
++    pub(crate) fn firmware_indicator(&self) -> u32 {
++        self.read32(FW_INDICATOR)
++    }
++
++    // ---- Resets. ----
++
++    /// `ath10k_pci_wait_for_target_init`.
++    fn wait_for_target(&self) -> Result<(), String> {
++        let deadline = crate::now_ms() + TARGET_WAIT_MS;
++        let mut value;
++        loop {
++            value = self.read32(FW_INDICATOR);
++            if value != u32::MAX && value & (FW_IND_EVENT_PENDING | FW_IND_INITIALIZED) != 0 {
++                break;
++            }
++            if crate::now_ms() >= deadline {
++                break;
++            }
++            crate::delay_ms(10);
++        }
++        self.irq_disable();
++        if value == u32::MAX {
++            return Err(String::from("the card fell off the bus"));
++        }
++        if value & FW_IND_EVENT_PENDING != 0 {
++            return Err(String::from("the target crashed while starting"));
++        }
++        if value & FW_IND_INITIALIZED == 0 {
++            return Err(String::from("the target did not start"));
++        }
++        Ok(())
++    }
++
++    /// `ath10k_pci_qca6174_chip_reset`: cold reset, then warm.
++    pub(crate) fn chip_reset(&mut self) -> Result<(), String> {
++        let value = self.reg_read32(SOC_GLOBAL_RESET);
++        self.reg_write32(SOC_GLOBAL_RESET, value | 1);
++        crate::delay_ms(20);
++        self.reg_write32(SOC_GLOBAL_RESET, value & !1);
++        crate::delay_ms(20);
++        self.wake()?;
++        self.wait_for_target().map_err(|error| format!("after the cold reset: {error}"))?;
++        self.warm_reset()
++    }
++
++    /// `ath10k_pci_warm_reset`.
++    fn warm_reset(&mut self) -> Result<(), String> {
++        self.irq_disable();
++        // SI0 (the QCA6174's mask is 0: a no-op write, as Linux).
++        let value = self.soc_read32(SOC_RESET_CONTROL);
++        self.soc_write32(SOC_RESET_CONTROL, value);
++        crate::delay_ms(10);
++        let value = self.soc_read32(SOC_RESET_CONTROL);
++        self.soc_write32(SOC_RESET_CONTROL, value);
++        crate::delay_ms(10);
++        self.warm_reset_cpu();
++        self.init_pipes();
++        let _ = self.wait_for_target();
++        let value = self.soc_read32(SOC_LF_TIMER_CONTROL0);
++        self.soc_write32(SOC_LF_TIMER_CONTROL0, value & !SOC_LF_TIMER_CONTROL0_ENABLE);
++        let value = self.soc_read32(SOC_RESET_CONTROL);
++        self.soc_write32(SOC_RESET_CONTROL, value | SOC_RESET_CONTROL_CE_RST);
++        crate::delay_ms(10);
++        self.soc_write32(SOC_RESET_CONTROL, value & !SOC_RESET_CONTROL_CE_RST);
++        self.warm_reset_cpu();
++        self.init_pipes();
++        self.wait_for_target().map_err(|error| format!("after the warm reset: {error}"))?;
++        self.chip_id = self.soc_read32(SOC_CHIP_ID);
++        Ok(())
++    }
++
++    fn warm_reset_cpu(&self) {
++        self.write32(FW_INDICATOR, 0);
++        let value = self.soc_read32(SOC_RESET_CONTROL);
++        self.soc_write32(SOC_RESET_CONTROL, value | SOC_RESET_CONTROL_CPU_WARM_RST);
++    }
++
++    /// `ath10k_pci_wake_target_cpu`.
++    pub(crate) fn wake_target_cpu(&self) {
++        let value = self.read32(SOC_CORE_BASE + CORE_CTRL) | CORE_CTRL_CPU_INTR;
++        self.write32(SOC_CORE_BASE + CORE_CTRL, value);
++    }
++
++    // ---- Copy Engines. ----
++
++    /// `ath10k_ce_init_pipe` for every CE: the rings' indices from the
++    /// hardware, their base, size, maximum transfer and watermarks.
++    pub(crate) fn init_pipes(&mut self) {
++        for (ce, pipe) in self.pipes.iter_mut().enumerate() {
++            let base = CE0_BASE + CE_STRIDE * ce as u32;
++            let read = |offset: u32| self.mmio.read_once::<u32>((base + offset) as usize).unwrap_or(0);
++            let write = |offset: u32, value: u32| {
++                let _ = self.mmio.write_once::<u32>((base + offset) as usize, value);
++            };
++            if let Some(ring) = &mut pipe.src {
++                for slot in 0..ring.entries {
++                    ring.set_desc(slot, 0, 0, 0);
++                }
++                ring.sw = read(CE_CURRENT_SRRI) as usize & ring.mask();
++                ring.write = read(CE_SR_WR_INDEX) as usize & ring.mask();
++                write(CE_SR_BA, ring.descs.daddr() as u32);
++                write(CE_SR_SIZE, ring.entries as u32);
++                let control = (read(CE_CTRL1) & !0xffff & !(1 << 16)) | (pipe.src_max as u32 & 0xffff);
++                write(CE_CTRL1, control);
++                write(CE_SRC_WM, ring.entries as u32 & 0xffff);
++            }
++            if let Some(ring) = &mut pipe.dst {
++                for slot in 0..ring.entries {
++                    ring.set_desc(slot, 0, 0, 0);
++                }
++                ring.sw = read(CE_CURRENT_DRRI) as usize & ring.mask();
++                ring.write = read(CE_DST_WR_INDEX) as usize & ring.mask();
++                write(CE_DR_BA, ring.descs.daddr() as u32);
++                write(CE_DR_SIZE, ring.entries as u32);
++                write(CE_CTRL1, read(CE_CTRL1) & !(1 << 17));
++                write(CE_DST_WM, ring.entries as u32 & 0xffff);
++            }
++        }
++    }
++
++    fn ce_base(ce: usize) -> u32 {
++        CE0_BASE + CE_STRIDE * ce as u32
++    }
++
++    /// `_ath10k_ce_send_nolock` with a raw address: Err when full.
++    fn send_raw(&mut self, ce: usize, addr: u32, nbytes: usize, transfer_id: u16, gather: bool) -> Result<(), ()> {
++        let base = Self::ce_base(ce);
++        let ring = self.pipes[ce].src.as_mut().ok_or(())?;
++        let mask = ring.mask();
++        if (ring.sw.wrapping_sub(1).wrapping_sub(ring.write)) & mask == 0 {
++            return Err(());
++        }
++        let flags = (transfer_id << 2) | if gather { CE_DESC_GATHER } else { 0 };
++        ring.set_desc(ring.write, addr, nbytes as u16, flags);
++        ring.write = (ring.write + 1) & mask;
++        if !gather {
++            let write = ring.write as u32;
++            self.write32(base + CE_SR_WR_INDEX, write);
++        }
++        Ok(())
++    }
++
++    /// Sends bytes through a CE: copied into the slot's buffer.
++    pub(crate) fn send(&mut self, ce: usize, data: &[u8], transfer_id: u16) -> Result<(), ()> {
++        self.reap_sent(ce);
++        let ring = self.pipes[ce].src.as_ref().ok_or(())?;
++        if data.len() > ring.slot {
++            return Err(());
++        }
++        let (slot, address) = (ring.write, ring.buffer_address(ring.write));
++        ring.buffers.as_ref().ok_or(())?.write_bytes(slot * ring.slot, data).map_err(|_| ())?;
++        self.send_raw(ce, address, data.len(), transfer_id, false)
++    }
++
++    /// Sends the gathered pieces of one message (HTT's descriptor and its
++    /// frame): every piece but the last flagged GATHER.
++    pub(crate) fn send_gather(&mut self, ce: usize, pieces: &[(u32, usize)], transfer_id: u16) -> Result<(), ()> {
++        self.reap_sent(ce);
++        let ring = self.pipes[ce].src.as_ref().ok_or(())?;
++        let free = (ring.sw.wrapping_sub(1).wrapping_sub(ring.write)) & ring.mask();
++        if free < pieces.len() {
++            return Err(());
++        }
++        for (index, &(addr, len)) in pieces.iter().enumerate() {
++            self.send_raw(ce, addr, len, transfer_id, index + 1 < pieces.len())?;
++        }
++        Ok(())
++    }
++
++    /// Source slots the hardware finished (`_ath10k_ce_completed_send_next`).
++    pub(crate) fn reap_sent(&mut self, ce: usize) -> usize {
++        let base = Self::ce_base(ce);
++        let hw = self.read32(base + CE_CURRENT_SRRI);
++        let Some(ring) = self.pipes[ce].src.as_mut() else { return 0 };
++        if hw == u32::MAX {
++            return 0;
++        }
++        let hw = hw as usize & ring.mask();
++        let mut count = 0;
++        while ring.sw != hw {
++            ring.sw = (ring.sw + 1) & ring.mask();
++            count += 1;
++        }
++        count
++    }
++
++    /// Whether every source slot of a CE is done.
++    pub(crate) fn send_idle(&mut self, ce: usize) -> bool {
++        self.reap_sent(ce);
++        self.pipes[ce].src.as_ref().is_none_or(|ring| ring.sw == ring.write)
++    }
++
++    /// Posts receive buffers into a CE's destination ring until it is
++    /// full (`ath10k_pci_rx_post_pipe`).
++    pub(crate) fn rx_post(&mut self, ce: usize) {
++        let base = Self::ce_base(ce);
++        let Some(ring) = self.pipes[ce].dst.as_mut() else { return };
++        let mask = ring.mask();
++        let mut posted = false;
++        while (ring.sw.wrapping_sub(1).wrapping_sub(ring.write)) & mask != 0 {
++            let address = ring.buffer_address(ring.write);
++            ring.set_desc(ring.write, address, 0, 0);
++            ring.write = (ring.write + 1) & mask;
++            posted = true;
++        }
++        if posted {
++            let write = ring.write as u32;
++            self.write32(base + CE_DST_WR_INDEX, write);
++        }
++    }
++
++    /// The messages a CE received since the last call, its buffers posted
++    /// again (`_ath10k_ce_completed_recv_next`).
++    pub(crate) fn receive(&mut self, ce: usize) -> Vec<Vec<u8>> {
++        let mut out = Vec::new();
++        let Some(ring) = self.pipes[ce].dst.as_mut() else { return out };
++        let mask = ring.mask();
++        while ring.sw != ring.write {
++            let (_, nbytes, _) = ring.desc(ring.sw);
++            if nbytes == 0 {
++                break;
++            }
++            let mut data = vec![0u8; (nbytes as usize).min(ring.slot)];
++            if let Some(buffers) = &ring.buffers {
++                let _ = buffers.read_bytes(ring.sw * ring.slot, &mut data);
++            }
++            let address = ring.buffer_address(ring.sw);
++            ring.set_desc(ring.sw, address, 0, 0);
++            ring.sw = (ring.sw + 1) & mask;
++            out.push(data);
++        }
++        if !out.is_empty() {
++            self.rx_post(ce);
++        }
++        out
++    }
++
++    // ---- The diagnostic window (CE 7). ----
++
++    /// `ath10k_pci_qca6174_targ_cpu_to_ce_addr`.
++    fn ce_address(&self, addr: u32) -> u32 {
++        let high = (self.read32(SOC_CORE_BASE + CORE_CTRL) & 0x7ff) << 21;
++        high | if addr >= 0x10_0000 { 0x10_0000 } else { 0 } | (addr & 0xf_ffff)
++    }
++
++    fn diag_wait(&mut self) -> Result<usize, String> {
++        let deadline = crate::now_ms() + 50;
++        loop {
++            let done = self.send_idle(CE_DIAG);
++            let ring = self.pipes[CE_DIAG].dst.as_ref().ok_or_else(|| String::from("no diagnostic window"))?;
++            let (_, nbytes, _) = ring.desc(ring.sw);
++            if done && nbytes != 0 {
++                let ring = self.pipes[CE_DIAG].dst.as_mut().unwrap();
++                ring.set_desc(ring.sw, 0, 0, 0);
++                ring.sw = (ring.sw + 1) & ring.mask();
++                return Ok(nbytes as usize);
++            }
++            if crate::now_ms() >= deadline {
++                return Err(String::from("the diagnostic window did not answer"));
++            }
++            crate::delay_us(10);
++        }
++    }
++
++    fn diag_post(&mut self, address: u32) {
++        let base = Self::ce_base(CE_DIAG);
++        let ring = self.pipes[CE_DIAG].dst.as_mut().unwrap();
++        ring.set_desc(ring.write, address, 0, 0);
++        ring.write = (ring.write + 1) & ring.mask();
++        let write = ring.write as u32;
++        self.write32(base + CE_DST_WR_INDEX, write);
++    }
++
++    /// `ath10k_pci_diag_read_mem`.
++    pub(crate) fn diag_read(&mut self, address: u32, out: &mut [u8]) -> Result<(), String> {
++        let mut address = self.ce_address(address);
++        let staging = self.pipes[CE_DIAG].src.as_ref().map(|ring| ring.buffer_address(0)).unwrap_or(0);
++        let mut done = 0;
++        while done < out.len() {
++            let n = (out.len() - done).min(DIAG_TRANSFER_LIMIT);
++            self.diag_post(staging);
++            self.send_raw(CE_DIAG, address, n, 0, false).map_err(|()| String::from("the diagnostic window is busy"))?;
++            let got = self.diag_wait()?;
++            if got != n {
++                return Err(String::from("the diagnostic window read short"));
++            }
++            let ring = self.pipes[CE_DIAG].src.as_ref().unwrap();
++            let _ = ring.buffers.as_ref().unwrap().read_bytes(0, &mut out[done..done + n]);
++            address += n as u32;
++            done += n;
++        }
++        Ok(())
++    }
++
++    /// `ath10k_pci_diag_write_mem`.
++    pub(crate) fn diag_write(&mut self, address: u32, data: &[u8]) -> Result<(), String> {
++        let mut address = self.ce_address(address);
++        let mut done = 0;
++        while done < data.len() {
++            let n = (data.len() - done).min(DIAG_TRANSFER_LIMIT);
++            let ring = self.pipes[CE_DIAG].src.as_ref().unwrap();
++            let staging = ring.buffer_address(0);
++            let _ = ring.buffers.as_ref().unwrap().write_bytes(0, &data[done..done + n]);
++            self.diag_post(address);
++            self.send_raw(CE_DIAG, staging, n, 0, false).map_err(|()| String::from("the diagnostic window is busy"))?;
++            let got = self.diag_wait()?;
++            if got != n {
++                return Err(String::from("the diagnostic window wrote short"));
++            }
++            address += n as u32;
++            done += n;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn diag_read32(&mut self, address: u32) -> Result<u32, String> {
++        let mut bytes = [0u8; 4];
++        self.diag_read(address, &mut bytes)?;
++        Ok(u32::from_le_bytes(bytes))
++    }
++
++    pub(crate) fn diag_write32(&mut self, address: u32, value: u32) -> Result<(), String> {
++        self.diag_write(address, &value.to_le_bytes())
++    }
++
++    /// `ath10k_pci_init_config`: the target's CE configuration and service
++    /// map, L1 off, the early allocation, early configuration done.
++    pub(crate) fn init_config(&mut self, iram_banks: u32) -> Result<(), String> {
++        let pcie_state = self.diag_read32(crate::boot::host_interest(crate::boot::HI_INTERCONNECT_STATE))?;
++        if pcie_state == 0 {
++            return Err(String::from("the target has no PCIe state"));
++        }
++        let pipe_cfg = self.diag_read32(pcie_state)?;
++        if pipe_cfg == 0 {
++            return Err(String::from("the target has no CE configuration"));
++        }
++        let mut config = Vec::with_capacity(TARGET_CE.len() * 24);
++        for entry in TARGET_CE {
++            for value in entry {
++                config.extend_from_slice(&value.to_le_bytes());
++            }
++        }
++        self.diag_write(pipe_cfg, &config)?;
++        let service_map = self.diag_read32(pcie_state + 4)?;
++        if service_map == 0 {
++            return Err(String::from("the target has no service map"));
++        }
++        let mut map = Vec::with_capacity(SERVICE_MAP.len() * 12);
++        for entry in SERVICE_MAP {
++            for value in entry {
++                map.extend_from_slice(&value.to_le_bytes());
++            }
++        }
++        self.diag_write(service_map, &map)?;
++        let flags = self.diag_read32(pcie_state + 32)?;
++        self.diag_write32(pcie_state + 32, flags & !1)?;
++        let early = crate::boot::host_interest(crate::boot::HI_EARLY_ALLOC);
++        let value = self.diag_read32(early)?;
++        self.diag_write32(early, value | (0x6d8a << 16) | (iram_banks & 0xf))?;
++        let flag2 = crate::boot::host_interest(crate::boot::HI_OPTION_FLAG2);
++        let value = self.diag_read32(flag2)?;
++        self.diag_write32(flag2, value | 0x10)
++    }
++
++    // ---- BMI (`ath10k_pci_hif_exchange_bmi_msg`). ----
++
++    pub(crate) fn bmi(&mut self, request: &[u8], response: Option<usize>) -> Result<Vec<u8>, String> {
++        if response.is_some() {
++            self.rx_post(BMI_CE_TO_HOST);
++        }
++        self.send(BMI_CE_TO_TARGET, request, 0).map_err(|()| String::from("the BMI pipe is full"))?;
++        let deadline = crate::now_ms() + BMI_TIMEOUT_MS;
++        let mut answer = None;
++        loop {
++            let sent = self.send_idle(BMI_CE_TO_TARGET);
++            if response.is_some() && answer.is_none() {
++                answer = self.receive(BMI_CE_TO_HOST).into_iter().next();
++            }
++            if sent && (response.is_none() || answer.is_some()) {
++                break;
++            }
++            if crate::now_ms() >= deadline {
++                return Err(String::from("the boot loader did not answer"));
++            }
++            crate::delay_us(50);
++        }
++        Ok(answer.unwrap_or_default())
++    }
++}
+diff --git a/kernel/comps/ath10k/src/sta.rs b/kernel/comps/ath10k/src/sta.rs
+new file mode 100644
+index 0000000..b0d2c9e
+--- /dev/null
++++ b/kernel/comps/ath10k/src/sta.rs
+@@ -0,0 +1,876 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The station as Linux's ath10k `mac.c` runs it on the TLV firmware: HTC
++//! up, WMI's service ready and init, HTT's RX ring, one STA vdev; scans by
++//! the firmware, a vdev started on the network's channel and a peer for the
++//! access point, the peer's rates at association, keys in the firmware,
++//! management frames received through WMI and sent through HTT, data
++//! through HTT as native Wi-Fi frames (the chip encrypts).
++
++use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
++
++use aster_wlan::{
++    Device,
++    ieee80211::{self as wifi, Address},
++    radio::{self, Association, Band, BandId, Channel, HtCap, Info, Join, Key, RxInfo, ScanRequest},
++};
++use ostd::mm::{HasDaddr, dma::DmaCoherent};
++
++use crate::{
++    htc::{self, Htc, Message},
++    htt::{self, Htt, Received},
++    pci::{self, Pci, dma32},
++    wmi::{self, Cmd},
++};
++
++const VDEV: u32 = 0;
++/// How long the firmware gets for an answer.
++const WAIT_MS: u64 = 3000;
++/// How long a scan may run before it is taken for ended.
++const SCAN_TIMEOUT_MS: u64 = 30_000;
++const RATES_2GHZ: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
++const RATES_5GHZ: [u8; 8] = [12, 18, 24, 36, 48, 72, 96, 108];
++const CCK_RATES: [u8; 4] = [2, 4, 11, 22];
++const CHANNELS_5GHZ: [u16; 25] = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165];
++/// 802.11 HT capabilities: RX STBC of one stream, SM power save off; the
++/// short guard interval when the firmware has it.
++const HT_INFO: u16 = 0x0100 | 0x000c;
++const HT_SGI_20: u16 = 0x0020;
++/// The most power a channel is given, in dBm.
++const MAX_POWER: u8 = 20;
++/// The WPA element's OUI and type.
++const WPA_OUI_TYPE: [u8; 4] = [0x00, 0x50, 0xf2, 0x01];
++
++fn channel_freq(channel: u16) -> u16 {
++    match channel {
++        1..=13 => 2407 + 5 * channel,
++        14 => 2484,
++        _ => 5000 + 5 * channel,
++    }
++}
++
++fn radar(channel: u16) -> bool {
++    (52..=144).contains(&channel)
++}
++
++fn le32(data: &[u8], at: usize) -> u32 {
++    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++/// Linux's `ath10k_parse_mpdudensity`: the 802.11 code in microseconds.
++fn mpdu_density(code: u8) -> u32 {
++    match code & 7 {
++        0 => 0,
++        1..=3 => 1,
++        4 => 2,
++        5 => 4,
++        6 => 8,
++        _ => 16,
++    }
++}
++
++/// The network being joined.
++struct Network {
++    join: Join,
++    freq: u16,
++    ht: bool,
++}
++
++/// A scan: one band at a time (mac80211 splits them for ath10k), each
++/// with its probe requests' rates.
++struct Scan {
++    parts: Vec<(Vec<u16>, Vec<u8>)>,
++    ssids: Vec<Vec<u8>>,
++    running: bool,
++    aborted: bool,
++    deadline: u64,
++}
++
++pub(crate) struct Ath10k {
++    pub(crate) pci: Pci,
++    htc: Htc,
++    htt: Htt,
++    wmi: usize,
++    pub(crate) name: String,
++    pub(crate) address: Address,
++    pub(crate) device: Option<Arc<Device>>,
++    services: Vec<u32>,
++    rf_chains: u32,
++    ht_cap_info: u32,
++    mem_reqs: Option<Vec<(u32, u32, u32, u32)>>,
++    _chunks: Vec<DmaCoherent>,
++    ready: bool,
++    vdev_start: Option<u32>,
++    vdev_started: bool,
++    vdev_stopped: bool,
++    network: Option<Network>,
++    peer: bool,
++    associated: bool,
++    qos: bool,
++    pairwise: bool,
++    scan: Option<Scan>,
++    scan_freq: u16,
++    sequence: u16,
++    pub(crate) signal: Option<i8>,
++    pub(crate) dead: bool,
++}
++
++impl Ath10k {
++    /// `ath10k_core_start` after BMI: HTC, WMI and HTT up, the radio's
++    /// settings, the station's vdev (`ath10k_add_interface`).
++    pub(crate) fn start(pci: Pci, name: String) -> Result<Self, String> {
++        let htt = Htt::new().ok_or_else(|| String::from("no DMA memory below 4 GiB for HTT"))?;
++        let mut card = Self {
++            pci,
++            htc: Htc::new(),
++            htt,
++            wmi: usize::MAX,
++            name,
++            address: [0; 6],
++            device: None,
++            services: Vec::new(),
++            rf_chains: 1,
++            ht_cap_info: 0,
++            mem_reqs: None,
++            _chunks: Vec::new(),
++            ready: false,
++            vdev_start: None,
++            vdev_started: false,
++            vdev_stopped: false,
++            network: None,
++            peer: false,
++            associated: false,
++            qos: false,
++            pairwise: false,
++            scan: None,
++            scan_freq: 0,
++            sequence: 0,
++            signal: None,
++            dead: false,
++        };
++        // `ath10k_hif_start`: interrupts and the receive buffers.
++        card.pci.irq_enable();
++        for (ce, (_, _, dst, _)) in pci::HOST_CE.iter().enumerate() {
++            if *dst > 0 && ce != pci::CE_DIAG {
++                card.pci.rx_post(ce);
++            }
++        }
++        card.htc.wait_target(&mut card.pci)?;
++        let mut early = Vec::new();
++        card.htt.endpoint = card.htc.connect(&mut card.pci, htc::SVC_HTT_DATA_MSG, &mut |message| early.push(message))?;
++        card.wmi = card.htc.connect(&mut card.pci, htc::SVC_WMI_CONTROL, &mut |message| early.push(message))?;
++        card.htc.start(&mut card.pci)?;
++        for message in early {
++            card.dispatch(message);
++        }
++        // WMI: the firmware's services and memory, init, ready.
++        card.wait(|card| card.mem_reqs.is_some(), WAIT_MS).map_err(|()| String::from("no WMI service ready event"))?;
++        let reorder = card.service(wmi::SERVICE_RX_FULL_REORDER);
++        card.htt.in_order = reorder;
++        if card.service(wmi::SERVICE_MGMT_TX_WMI) {
++            ostd::info!("{}: the firmware also takes management frames through WMI; they go through HTT", card.name);
++        }
++        let chunks = card.allocate_chunks()?;
++        card.wmi_send(wmi::init(&chunks, htt::TX_MODE_NATIVE_WIFI as u32, reorder)).map_err(|()| String::from("WMI init did not go out"))?;
++        card.wait(|card| card.ready, WAIT_MS).map_err(|()| String::from("no WMI ready event"))?;
++        // HTT (`ath10k_htt_setup`).
++        card.htt_send(&Htt::version_request())?;
++        card.wait(|card| card.htt.version.is_some(), WAIT_MS).map_err(|()| String::from("no HTT version"))?;
++        let (major, minor) = card.htt.version.unwrap_or_default();
++        if major < 3 {
++            return Err(format!("HTT {major}.{minor} is older than this driver's 3.x"));
++        }
++        card.htt.fill();
++        let ring = card.htt.ring_config();
++        card.htt_send(&ring)?;
++        card.htt_send(&Htt::aggregation_config())?;
++        // The radio (`ath10k_start`, `ath10k_set_antenna`) and the channels
++        // (`ath10k_update_channel_list`).
++        let chains = (1u32 << card.rf_chains.clamp(1, 3)) - 1;
++        for (param, value) in [
++            (wmi::PDEV_PARAM_PMF_QOS, 1),
++            (wmi::PDEV_PARAM_DYNAMIC_BW, 1),
++            (wmi::PDEV_PARAM_ANI_ENABLE, 1),
++            (wmi::PDEV_PARAM_TX_CHAIN_MASK, chains),
++            (wmi::PDEV_PARAM_RX_CHAIN_MASK, chains),
++        ] {
++            card.wmi_command(wmi::pdev_set_param(param, value))?;
++        }
++        let channels: Vec<(u16, u8, u32, u8)> = card.channels().iter().map(|&(freq, flags)| (freq, if freq < 3000 { wmi::MODE_11NG_HT20 } else { wmi::MODE_11NA_HT20 }, flags, MAX_POWER * 2)).collect();
++        card.wmi_command(wmi::scan_chan_list(&channels))?;
++        // The station's vdev.
++        let address = card.address;
++        card.wmi_command(wmi::vdev_create(VDEV, &address))?;
++        card.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_DEF_KEYID, 0))?;
++        card.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_TX_ENCAP_TYPE, htt::TX_MODE_NATIVE_WIFI as u32))?;
++        card.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_RTS_THRESHOLD, 2347))?;
++        card.wmi_command(wmi::sta_ps_off(VDEV))?;
++        ostd::notice!("{}: HTT {}.{}, {} RF chain(s){}", card.name, major, minor, card.rf_chains, if reorder { ", RX reordered by the firmware" } else { "" });
++        Ok(card)
++    }
++
++    /// Whether the firmware has a service (four to a word, as Linux reads
++    /// the TLV bitmap).
++    fn service(&self, id: usize) -> bool {
++        self.services.get(id / 4).is_some_and(|word| word & (1 << (id % 4)) != 0)
++    }
++
++    /// The memory the firmware asked for (`ath10k_wmi_alloc_host_mem`):
++    /// (request, address, size) for the init command.
++    fn allocate_chunks(&mut self) -> Result<Vec<(u32, u32, u32)>, String> {
++        let mut chunks = Vec::new();
++        for &(req_id, unit_size, unit_info, units) in self.mem_reqs.as_deref().unwrap_or(&[]) {
++            let units = if unit_info & wmi::NUM_UNITS_IS_NUM_PEERS != 0 {
++                wmi::NUM_PEERS + 1
++            } else if unit_info & wmi::NUM_UNITS_IS_NUM_VDEVS != 0 {
++                wmi::NUM_VDEVS + 1
++            } else {
++                units
++            };
++            let size = (units * unit_size.next_multiple_of(4)) as usize;
++            if size == 0 {
++                continue;
++            }
++            let memory = dma32(size).ok_or_else(|| format!("no DMA memory for the firmware's {size} bytes"))?;
++            chunks.push((req_id, memory.daddr() as u32, size as u32));
++            self._chunks.push(memory);
++        }
++        Ok(chunks)
++    }
++
++    fn channels(&self) -> Vec<(u16, u32)> {
++        let mut out: Vec<(u16, u32)> = (1..=13).map(|channel| (channel_freq(channel), wmi::CHAN_FLAG_ALLOW_HT)).collect();
++        for &channel in &CHANNELS_5GHZ {
++            let mut flags = wmi::CHAN_FLAG_ALLOW_HT;
++            if radar(channel) {
++                flags |= wmi::CHAN_FLAG_PASSIVE | wmi::CHAN_FLAG_DFS;
++            }
++            out.push((channel_freq(channel), flags));
++        }
++        out
++    }
++
++    // ---- Messages. ----
++
++    /// The receiving pipes served, every message dispatched.
++    fn service_pipes(&mut self) {
++        self.pci.clear_interrupts();
++        let mut messages = Vec::new();
++        for (ce, (_, _, dst, _)) in pci::HOST_CE.iter().enumerate() {
++            if *dst == 0 || ce == pci::CE_DIAG {
++                continue;
++            }
++            for raw in self.pci.receive(ce) {
++                if let Some(message) = self.htc.receive(&raw) {
++                    messages.push(message);
++                }
++            }
++        }
++        for message in messages {
++            self.dispatch(message);
++        }
++    }
++
++    fn dispatch(&mut self, message: Message) {
++        if message.endpoint == self.wmi {
++            self.wmi_event(&message.payload);
++        } else if message.endpoint == self.htt.endpoint && message.endpoint != 0 {
++            let mut frames = Vec::new();
++            let changes = self.htt.handle(&message.payload, &mut frames);
++            for frame in frames {
++                self.deliver(frame);
++            }
++            if changes.tx_done
++                && let Some(device) = &self.device
++            {
++                device.ready_to_send();
++            }
++        }
++    }
++
++    /// Serves the pipes until `done` or the time is up.
++    fn wait(&mut self, done: impl Fn(&Self) -> bool, ms: u64) -> Result<(), ()> {
++        let deadline = crate::now_ms() + ms;
++        loop {
++            self.service_pipes();
++            if done(self) {
++                return Ok(());
++            }
++            if crate::now_ms() >= deadline || self.dead {
++                return Err(());
++            }
++            crate::delay_us(200);
++        }
++    }
++
++    /// A WMI command, waiting for credits when they ran out.
++    fn wmi_send(&mut self, cmd: Cmd) -> Result<(), ()> {
++        let message = cmd.message();
++        let deadline = crate::now_ms() + WAIT_MS;
++        loop {
++            if self.htc.send(&mut self.pci, self.wmi, &message).is_ok() {
++                return Ok(());
++            }
++            if crate::now_ms() >= deadline || self.dead {
++                return Err(());
++            }
++            self.service_pipes();
++            crate::delay_us(100);
++        }
++    }
++
++    fn wmi_command(&mut self, cmd: Cmd) -> Result<(), String> {
++        let id = cmd.id;
++        self.wmi_send(cmd).map_err(|()| format!("WMI command {id:#x} did not go out"))
++    }
++
++    fn htt_send(&mut self, message: &[u8]) -> Result<(), String> {
++        let deadline = crate::now_ms() + WAIT_MS;
++        loop {
++            if self.htc.send(&mut self.pci, self.htt.endpoint, message).is_ok() {
++                return Ok(());
++            }
++            if crate::now_ms() >= deadline {
++                return Err(String::from("an HTT message did not go out"));
++            }
++            crate::delay_us(100);
++        }
++    }
++
++    /// A WMI event (`ath10k_wmi_tlv_op_rx`).
++    fn wmi_event(&mut self, payload: &[u8]) {
++        if payload.len() < 4 {
++            return;
++        }
++        let id = le32(payload, 0) & 0x00ff_ffff;
++        let tlvs = wmi::tlvs(&payload[4..]);
++        let find = |tag: u16| tlvs.iter().find(|(entry, _)| *entry == tag).map(|(_, value)| *value);
++        match id {
++            wmi::EV_SERVICE_READY => {
++                let Some(event) = find(wmi::TAG_SERVICE_READY_EVENT) else { return };
++                self.rf_chains = le32(event, 36).max(1);
++                self.ht_cap_info = le32(event, 40);
++                if let Some(bitmap) = find(wmi::TAG_ARRAY_UINT32) {
++                    self.services = bitmap.chunks_exact(4).map(|word| le32(word, 0)).collect();
++                }
++                let mut reqs = Vec::new();
++                if let Some(array) = find(wmi::TAG_ARRAY_STRUCT) {
++                    for (tag, value) in wmi::nested(array) {
++                        if tag == wmi::TAG_WLAN_HOST_MEM_REQ && value.len() >= 16 {
++                            reqs.push((le32(value, 0), le32(value, 4), le32(value, 8), le32(value, 12)));
++                        }
++                    }
++                }
++                self.mem_reqs = Some(reqs);
++            }
++            wmi::EV_READY => {
++                if let Some(event) = find(wmi::TAG_READY_EVENT)
++                    && let Some(mac) = event.get(24..30)
++                {
++                    if mac.iter().any(|&byte| byte != 0) {
++                        self.address.copy_from_slice(mac);
++                    }
++                    self.ready = true;
++                }
++            }
++            wmi::EV_SCAN => {
++                let Some(event) = find(wmi::TAG_SCAN_EVENT) else { return };
++                let (kind, freq) = (le32(event, 0), le32(event, 8));
++                if kind & (wmi::SCAN_EVENT_COMPLETED | wmi::SCAN_EVENT_START_FAILED | wmi::SCAN_EVENT_DEQUEUED) != 0 {
++                    if let Some(scan) = &mut self.scan {
++                        scan.running = false;
++                    }
++                    self.scan_step();
++                } else if freq != 0 {
++                    self.scan_freq = freq as u16;
++                }
++            }
++            wmi::EV_VDEV_START_RESP => {
++                if let Some(event) = find(wmi::TAG_VDEV_START_RESPONSE_EVENT) {
++                    self.vdev_start = Some(le32(event, 12));
++                }
++            }
++            wmi::EV_VDEV_STOPPED => self.vdev_stopped = true,
++            wmi::EV_PEER_STA_KICKOUT => self.lost("the firmware kicked the access point out"),
++            wmi::EV_ROAM => {
++                if let Some(event) = find(wmi::TAG_ROAM_EVENT)
++                    && le32(event, 4) == wmi::ROAM_REASON_BEACON_MISS
++                {
++                    self.lost("beacons from the access point stopped");
++                }
++            }
++            wmi::EV_MGMT_RX => {
++                let (Some(header), Some(frame)) = (find(wmi::TAG_MGMT_RX_HDR), find(wmi::TAG_ARRAY_BYTE)) else { return };
++                self.management_rx(header, frame);
++            }
++            _ => {}
++        }
++    }
++
++    fn lost(&mut self, why: &str) {
++        if self.associated {
++            ostd::info!("{}: {}", self.name, why);
++            if let Some(device) = &self.device {
++                device.connection_lost();
++            }
++        }
++    }
++
++    /// `ath10k_wmi_event_mgmt_rx`: the frame, its channel and signal.
++    fn management_rx(&mut self, header: &[u8], frame: &[u8]) {
++        let (channel, snr, length, status) = (le32(header, 0), le32(header, 4), le32(header, 16) as usize, le32(header, 20));
++        if status & wmi::RX_STATUS_ERRORS != 0 || length < wifi::HEADER || length > frame.len() {
++            return;
++        }
++        let mut frame = frame[..length].to_vec();
++        let freq = match channel {
++            1..=14 | 36..=177 => channel_freq(channel as u16),
++            _ => self.current_freq(),
++        };
++        let signal = (-95 + snr as i32).clamp(-127, -1) as i8;
++        // Protected management frames (802.11w) arrive decrypted: the
++        // header and MIC left only on robust action, deauthentication and
++        // disassociation frames.
++        let (mut decrypted, mut security_header) = (false, 0);
++        let subtype = frame[0] & 0xfc;
++        if frame[1] & wifi::PROTECTED != 0 && subtype != wifi::AUTH {
++            decrypted = true;
++            if matches!(subtype, wifi::ACTION | wifi::DEAUTH | wifi::DISASSOC) {
++                security_header = 8;
++                frame.truncate(frame.len().saturating_sub(8));
++            } else {
++                frame[1] &= !wifi::PROTECTED;
++            }
++        }
++        self.note_signal(&frame, signal);
++        if let Some(device) = &self.device {
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header });
++        }
++    }
++
++    fn current_freq(&self) -> u16 {
++        if self.scan.is_some() && self.scan_freq != 0 {
++            self.scan_freq
++        } else {
++            self.network.as_ref().map_or(self.scan_freq, |network| network.freq)
++        }
++    }
++
++    fn note_signal(&mut self, frame: &[u8], signal: i8) {
++        if let Some(network) = &self.network
++            && wifi::addresses(frame).is_some_and(|(_, transmitter, _)| transmitter == network.join.bssid)
++        {
++            self.signal = Some(signal);
++        }
++    }
++
++    fn deliver(&mut self, received: Received) {
++        match received {
++            Received::Frame { frame, signal, decrypted, security_header } => {
++                self.note_signal(&frame, signal);
++                let freq = self.current_freq();
++                if let Some(device) = &self.device {
++                    device.received(&frame, RxInfo { freq, signal, decrypted, security_header });
++                }
++            }
++            Received::Ethernet(ethernet, protected) => {
++                if let Some(device) = &self.device {
++                    device.received_ethernet(ethernet, protected);
++                }
++            }
++        }
++    }
++
++    // ---- Scans (`ath10k_hw_scan`). ----
++
++    pub(crate) fn scan(&mut self, request: &ScanRequest) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.scan.is_some() {
++            return Err(radio::Error::Busy);
++        }
++        let known = self.channels();
++        let mut freqs: Vec<u16> = request.freqs.iter().copied().filter(|freq| known.iter().any(|&(entry, _)| entry == *freq)).collect();
++        if freqs.is_empty() {
++            freqs = known.iter().map(|&(freq, _)| freq).collect();
++        }
++        let mut parts = Vec::new();
++        for (band, rates) in [(BandId::Ghz2, &RATES_2GHZ[..]), (BandId::Ghz5, &RATES_5GHZ[..])] {
++            let band_freqs: Vec<u16> = freqs.iter().copied().filter(|&freq| BandId::of(freq) == band).collect();
++            if band_freqs.is_empty() {
++                continue;
++            }
++            let mut ies = Vec::new();
++            wifi::put_rates(&mut ies, rates);
++            ies.extend_from_slice(&request.elements);
++            parts.push((band_freqs, ies));
++        }
++        self.scan = Some(Scan { parts, ssids: request.ssids.clone(), running: false, aborted: false, deadline: 0 });
++        self.scan_step();
++        Ok(())
++    }
++
++    pub(crate) fn abort_scan(&mut self) {
++        let Some(scan) = &mut self.scan else { return };
++        scan.aborted = true;
++        scan.parts.clear();
++        if scan.running {
++            let _ = self.wmi_send(wmi::stop_scan(VDEV));
++        } else {
++            self.scan_step();
++        }
++    }
++
++    /// The scan's next band, or its end.
++    fn scan_step(&mut self) {
++        loop {
++            let Some(scan) = &mut self.scan else { return };
++            if scan.running {
++                if crate::now_ms() < scan.deadline {
++                    return;
++                }
++                ostd::warn!("{}: the scan did not end; taking it for done", self.name);
++                scan.running = false;
++            }
++            if scan.parts.is_empty() {
++                let aborted = scan.aborted;
++                self.scan = None;
++                if let Some(device) = &self.device {
++                    device.scan_done(aborted);
++                }
++                return;
++            }
++            let (freqs, ies) = scan.parts.remove(0);
++            let cmd = wmi::start_scan(VDEV, &freqs, &scan.ssids, &ies);
++            if self.wmi_send(cmd).is_ok() {
++                if let Some(scan) = &mut self.scan {
++                    scan.running = true;
++                    scan.deadline = crate::now_ms() + SCAN_TIMEOUT_MS;
++                }
++                return;
++            }
++        }
++    }
++
++    fn end_scan(&mut self) {
++        if self.scan.is_some() {
++            self.abort_scan();
++            let _ = self.wait(|card| card.scan.is_none(), 1000);
++            if self.scan.is_some() {
++                self.scan = None;
++                if let Some(device) = &self.device {
++                    device.scan_done(true);
++                }
++            }
++        }
++    }
++
++    // ---- Joining. ----
++
++    /// The vdev on the network's channel (`ath10k_vdev_start`) and the
++    /// access point's peer (`ath10k_peer_create`, waiting for its map).
++    pub(crate) fn join(&mut self, join: &Join) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.leave();
++        self.end_scan();
++        let Some(&(_, flags)) = self.channels().iter().find(|&&(freq, _)| freq == join.freq) else { return Err(radio::Error::Invalid) };
++        let ht = wifi::Elements(&join.elements).get(wifi::IE_HT_CAP).is_some_and(|value| value.len() >= 26);
++        let ghz2 = join.freq < 3000;
++        let mode = match (ghz2, ht) {
++            (true, true) => wmi::MODE_11NG_HT20,
++            (true, false) => wmi::MODE_11G,
++            (false, true) => wmi::MODE_11NA_HT20,
++            (false, false) => wmi::MODE_11A,
++        };
++        let flags = if ht { flags } else { flags & !wmi::CHAN_FLAG_ALLOW_HT };
++        self.vdev_start = None;
++        self.vdev_stopped = false;
++        let words = wmi::channel_words(join.freq, mode, flags, MAX_POWER * 2);
++        self.wmi_send(wmi::vdev_start(VDEV, join.beacon_interval.max(1), 1, words)).map_err(|()| radio::Error::Failed)?;
++        if self.wait(|card| card.vdev_start.is_some(), WAIT_MS).is_err() || self.vdev_start != Some(0) {
++            ostd::warn!("{}: the firmware did not start the vdev on {} MHz ({:?})", self.name, join.freq, self.vdev_start);
++            return Err(radio::Error::Failed);
++        }
++        self.vdev_started = true;
++        self.network = Some(Network { join: join.clone(), freq: join.freq, ht });
++        let bssid = join.bssid;
++        self.wmi_send(wmi::peer_create(VDEV, &bssid)).map_err(|()| radio::Error::Failed)?;
++        self.peer = true;
++        if self.wait(|card| card.htt.peers.iter().any(|&(_, address)| address == bssid), WAIT_MS).is_err() {
++            ostd::warn!("{}: the firmware did not map the access point's peer", self.name);
++            self.leave();
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    /// `ath10k_bss_assoc`: the access point's rates and capabilities
++    /// (`ath10k_peer_assoc_prepare`), then the vdev up with the AID.
++    pub(crate) fn associated(&mut self, association: &Association) -> radio::Result<()> {
++        let Some(network) = &self.network else { return Err(radio::Error::Invalid) };
++        let bssid = network.join.bssid;
++        let ghz2 = network.freq < 3000;
++        let beacon = wifi::Elements(&network.join.elements);
++        let response = wifi::Elements(&association.elements);
++        let mut legacy = Vec::new();
++        for elements in [&response, &beacon] {
++            for id in [wifi::IE_RATES, wifi::IE_EXT_RATES] {
++                for &rate in elements.get(id).unwrap_or(&[]) {
++                    let rate = rate & 0x7f;
++                    if (ghz2 || !CCK_RATES.contains(&rate)) && !legacy.iter().any(|&known: &u8| known & 0x7f == rate) {
++                        legacy.push(if CCK_RATES.contains(&rate) { rate | 0x80 } else { rate });
++                    }
++                }
++            }
++            if !legacy.is_empty() {
++                break;
++            }
++        }
++        let ht_cap = response.get(wifi::IE_HT_CAP).or_else(|| beacon.get(wifi::IE_HT_CAP)).filter(|value| value.len() >= 26 && network.ht);
++        let mut flags = wmi::PEER_AUTH;
++        if association.qos {
++            flags |= wmi::PEER_QOS;
++        }
++        if beacon.get(wifi::IE_RSN).is_some() {
++            flags |= wmi::PEER_NEED_PTK_4_WAY;
++        }
++        if beacon.vendor(WPA_OUI_TYPE).is_some() {
++            flags |= wmi::PEER_NEED_PTK_4_WAY | wmi::PEER_NEED_GTK_2_WAY;
++        }
++        let mut peer = wmi::PeerAssoc {
++            address: bssid,
++            vdev: VDEV,
++            aid: association.aid & 0x3fff,
++            flags,
++            caps: association.capability,
++            ht_caps: 0,
++            max_mpdu: 0,
++            mpdu_density: 0,
++            rate_caps: 0,
++            nss: 1,
++            phy_mode: 0,
++            legacy,
++            ht: Vec::new(),
++        };
++        if let Some(cap) = ht_cap {
++            let info = u16::from_le_bytes([cap[0], cap[1]]);
++            peer.flags |= wmi::PEER_HT;
++            peer.ht_caps = info;
++            peer.max_mpdu = (1 << (13 + (cap[2] & 3) as u32)) - 1;
++            peer.mpdu_density = mpdu_density(cap[2] >> 2);
++            peer.rate_caps = wmi::RC_HT_FLAG;
++            if info & HT_SGI_20 != 0 && self.ht_cap_info & wmi::HT_CAP_HT20_SGI != 0 {
++                peer.rate_caps |= wmi::RC_SGI_FLAG;
++            }
++            let streams = self.rf_chains.clamp(1, 4) as usize;
++            let mut nss = 0;
++            for stream in 0..streams {
++                let mask = cap[3 + stream];
++                if mask != 0 {
++                    nss = stream + 1;
++                }
++                for bit in 0..8 {
++                    if mask & (1 << bit) != 0 {
++                        peer.ht.push((stream * 8 + bit) as u8);
++                    }
++                }
++            }
++            peer.nss = nss.max(1) as u32;
++        }
++        let cck_only = peer.legacy.iter().all(|&rate| rate & 0x80 != 0);
++        peer.phy_mode = match (ghz2, ht_cap.is_some()) {
++            (true, true) => wmi::MODE_11NG_HT20,
++            (true, false) if cck_only => wmi::MODE_11B,
++            (true, false) => wmi::MODE_11G,
++            (false, true) => wmi::MODE_11NA_HT20,
++            (false, false) => wmi::MODE_11A,
++        };
++        self.wmi_send(wmi::peer_assoc(&peer)).map_err(|()| radio::Error::Failed)?;
++        // The ERP settings (`ath10k_bss_info_changed`).
++        let short_slot = !ghz2 || association.capability & wifi::CAP_SHORT_SLOT != 0;
++        let short_preamble = association.capability & wifi::CAP_SHORT_PREAMBLE != 0;
++        for (param, short) in [(wmi::VDEV_PARAM_SLOT_TIME, short_slot), (wmi::VDEV_PARAM_PREAMBLE, short_preamble)] {
++            let _ = self.wmi_send(wmi::vdev_set_param(VDEV, param, if short { wmi::SHORT } else { wmi::LONG }));
++        }
++        self.wmi_send(wmi::vdev_up(VDEV, association.aid & 0x3fff, &bssid)).map_err(|()| radio::Error::Failed)?;
++        self.associated = true;
++        self.qos = association.qos;
++        Ok(())
++    }
++
++    /// The vdev down, the peer gone, the vdev stopped (`ath10k_bss_disassoc`,
++    /// `ath10k_peer_delete`, `ath10k_vdev_stop`).
++    pub(crate) fn leave(&mut self) {
++        if self.network.is_none() && !self.vdev_started {
++            return;
++        }
++        let bssid = self.network.as_ref().map(|network| network.join.bssid);
++        if !self.dead {
++            if self.associated {
++                let _ = self.wmi_send(wmi::vdev_down(VDEV));
++            }
++            if self.peer
++                && let Some(bssid) = bssid
++            {
++                if self.wmi_send(wmi::peer_delete(VDEV, &bssid)).is_ok() {
++                    let _ = self.wait(|card| !card.htt.peers.iter().any(|&(_, address)| address == bssid), 1000);
++                }
++                self.htt.peers.retain(|&(_, address)| address != bssid);
++            }
++            if self.vdev_started {
++                self.vdev_stopped = false;
++                if self.wmi_send(wmi::vdev_stop(VDEV)).is_ok() {
++                    let _ = self.wait(|card| card.vdev_stopped, 1000);
++                }
++            }
++        }
++        self.network = None;
++        self.vdev_started = false;
++        self.peer = false;
++        self.associated = false;
++        self.qos = false;
++        self.pairwise = false;
++        self.signal = None;
++    }
++
++    /// `ath10k_set_key`: CCMP, the pairwise key for the access point's peer,
++    /// the group key under its address too.
++    pub(crate) fn set_key(&mut self, key: &Key) -> radio::Result<()> {
++        if key.cipher != radio::CIPHER_CCMP || key.key.len() != 16 {
++            return Err(radio::Error::Unsupported);
++        }
++        let Some(network) = &self.network else { return Err(radio::Error::Invalid) };
++        let bssid = network.join.bssid;
++        let flags = if key.pairwise { wmi::KEY_PAIRWISE } else { wmi::KEY_GROUP };
++        self.wmi_send(wmi::install_key(VDEV, &bssid, key.index, flags, wmi::CIPHER_AES_CCM, &key.key)).map_err(|()| radio::Error::Failed)?;
++        if key.pairwise {
++            self.pairwise = true;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn remove_key(&mut self, index: u8, pairwise: bool) {
++        let Some(network) = &self.network else { return };
++        let bssid = network.join.bssid;
++        let flags = if pairwise { wmi::KEY_PAIRWISE } else { wmi::KEY_GROUP };
++        let _ = self.wmi_send(wmi::install_key(VDEV, &bssid, index, flags, wmi::CIPHER_NONE, &[]));
++        if pairwise {
++            self.pairwise = false;
++        }
++    }
++
++    /// The access point's peer may pass data (`WMI_PEER_AUTHORIZE`).
++    pub(crate) fn authorize(&mut self, authorized: bool) {
++        let Some(network) = &self.network else { return };
++        let bssid = network.join.bssid;
++        let _ = self.wmi_send(wmi::peer_set_param(VDEV, &bssid, wmi::PEER_PARAM_AUTHORIZE, authorized as u32));
++    }
++
++    // ---- Frames. ----
++
++    fn transmit(&mut self, frame: &[u8], mode: u8, tid: u8, no_encrypt: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        let (slot, pieces) = self.htt.tx(frame, mode, VDEV as u8, tid, no_encrypt).ok_or(radio::Error::Busy)?;
++        let (pipe, _) = htc::pipes_of(htc::SVC_HTT_DATA_MSG);
++        if self.pci.send_gather(pipe, &pieces, 0).is_err() {
++            self.htt.release(slot);
++            return Err(radio::Error::Busy);
++        }
++        Ok(())
++    }
++
++    /// A management frame through HTT (HTT 3.x, `ATH10K_MAC_TX_HTT`),
++    /// unprotected (no 802.11w here), its sequence number set.
++    pub(crate) fn send_management(&mut self, frame: &[u8]) -> radio::Result<()> {
++        if frame.len() < wifi::HEADER {
++            return Err(radio::Error::Invalid);
++        }
++        let mut frame = frame.to_vec();
++        frame[1] &= !wifi::PROTECTED;
++        let sequence = self.sequence;
++        self.sequence = (sequence + 1) & 0x0fff;
++        frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
++        self.transmit(&frame, htt::TX_MODE_MGMT, htt::TID_MGMT, true)
++    }
++
++    /// A data frame as native Wi-Fi (no QoS control; its TID in the
++    /// descriptor), encrypted by the chip with the pairwise key unless
++    /// plain.
++    pub(crate) fn send(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        let Some(network) = &self.network else { return Err(radio::Error::Down) };
++        let protected = !plain && self.pairwise;
++        let frame = wifi::data_from_ethernet(ethernet, &network.join.bssid, None, protected).ok_or(radio::Error::Invalid)?;
++        let tid = if self.qos { wifi::tid_of(ethernet) } else { htt::TID_NON_QOS };
++        self.transmit(&frame, htt::TX_MODE_NATIVE_WIFI, tid, !protected)
++    }
++
++    // ---- What the chip says. ----
++
++    pub(crate) fn poll(&mut self) {
++        if self.dead {
++            return;
++        }
++        let indicator = self.pci.firmware_indicator();
++        if indicator == u32::MAX {
++            self.died("the card is gone");
++            return;
++        }
++        if indicator & pci::FW_IND_EVENT_PENDING != 0 {
++            self.died("the firmware crashed; the card stays off until the next boot");
++            return;
++        }
++        self.service_pipes();
++        if self.scan.as_ref().is_some_and(|scan| scan.running) {
++            self.scan_step();
++        }
++    }
++
++    fn died(&mut self, why: &str) {
++        ostd::warn!("{}: {}", self.name, why);
++        self.dead = true;
++        self.htt.reset_tx();
++        if let Some(device) = &self.device {
++            if self.scan.take().is_some() {
++                device.scan_done(true);
++            }
++            device.connection_lost();
++        }
++    }
++
++    pub(crate) fn info(&self) -> Info {
++        let streams = self.rf_chains.clamp(1, 2) as usize;
++        let mut mcs = [0u8; 16];
++        for byte in mcs.iter_mut().take(streams) {
++            *byte = 0xff;
++        }
++        mcs[12] = 1;
++        let mut info = HT_INFO;
++        if self.ht_cap_info & wmi::HT_CAP_HT20_SGI != 0 {
++            info |= HT_SGI_20;
++        }
++        // A-MPDUs up to 64 KiB, 8 µs apart (Linux's `ath10k_get_ht_cap`).
++        let ht = HtCap { info, ampdu_factor: 3, ampdu_density: 6, mcs };
++        let mut bands = vec![Band { id: BandId::Ghz2, channels: Vec::new(), ht: Some(ht), vht: None, he: None }, Band { id: BandId::Ghz5, channels: Vec::new(), ht: Some(ht), vht: None, he: None }];
++        for (freq, flags) in self.channels() {
++            let mut channel = Channel::new(freq);
++            channel.radar = flags & wmi::CHAN_FLAG_DFS != 0;
++            channel.passive = flags & wmi::CHAN_FLAG_PASSIVE != 0;
++            channel.max_power = MAX_POWER;
++            let band = if BandId::of(freq) == BandId::Ghz2 { 0 } else { 1 };
++            bands[band].channels.push(channel);
++        }
++        Info {
++            driver: String::from("ath10k"),
++            address: self.address,
++            bands,
++            ciphers: vec![radio::CIPHER_CCMP],
++            max_scan_ssids: 16,
++            max_scan_ie_len: 200,
++        }
++    }
++}
+diff --git a/kernel/comps/ath10k/src/wmi.rs b/kernel/comps/ath10k/src/wmi.rs
+new file mode 100644
+index 0000000..3c7dd82
+--- /dev/null
++++ b/kernel/comps/ath10k/src/wmi.rs
+@@ -0,0 +1,426 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! WMI over TLVs, the QCA6174/QCA9377 firmware's control interface as
++//! Linux's ath10k `wmi-tlv.c` builds it: a command ID, then tagged values.
++
++use alloc::vec::Vec;
++
++// Commands (`enum wmi_tlv_cmd_id`: group << 12 | index).
++pub(crate) const INIT: u32 = 0x1;
++pub(crate) const START_SCAN: u32 = 0x3001;
++pub(crate) const STOP_SCAN: u32 = 0x3002;
++pub(crate) const SCAN_CHAN_LIST: u32 = 0x3003;
++pub(crate) const PDEV_SET_PARAM: u32 = 0x4003;
++pub(crate) const VDEV_CREATE: u32 = 0x5001;
++pub(crate) const VDEV_START_REQUEST: u32 = 0x5003;
++pub(crate) const VDEV_UP: u32 = 0x5005;
++pub(crate) const VDEV_STOP: u32 = 0x5006;
++pub(crate) const VDEV_DOWN: u32 = 0x5007;
++pub(crate) const VDEV_SET_PARAM: u32 = 0x5008;
++pub(crate) const VDEV_INSTALL_KEY: u32 = 0x5009;
++pub(crate) const PEER_CREATE: u32 = 0x6001;
++pub(crate) const PEER_DELETE: u32 = 0x6002;
++pub(crate) const PEER_SET_PARAM: u32 = 0x6004;
++pub(crate) const PEER_ASSOC: u32 = 0x6005;
++pub(crate) const STA_POWERSAVE_MODE: u32 = 0x9001;
++// Events.
++pub(crate) const EV_SERVICE_READY: u32 = 0x1;
++pub(crate) const EV_READY: u32 = 0x2;
++pub(crate) const EV_SCAN: u32 = 0x3001;
++pub(crate) const EV_VDEV_START_RESP: u32 = 0x5001;
++pub(crate) const EV_VDEV_STOPPED: u32 = 0x5002;
++pub(crate) const EV_PEER_STA_KICKOUT: u32 = 0x6001;
++pub(crate) const EV_MGMT_RX: u32 = 0x7001;
++pub(crate) const EV_ROAM: u32 = 0xb001;
++// Tags.
++pub(crate) const TAG_ARRAY_UINT32: u16 = 0x10;
++pub(crate) const TAG_ARRAY_BYTE: u16 = 0x11;
++pub(crate) const TAG_ARRAY_STRUCT: u16 = 0x12;
++const TAG_ARRAY_FIXED_STRUCT: u16 = 0x13;
++pub(crate) const TAG_SERVICE_READY_EVENT: u16 = 0x20;
++pub(crate) const TAG_WLAN_HOST_MEM_REQ: u16 = 0x22;
++pub(crate) const TAG_READY_EVENT: u16 = 0x23;
++pub(crate) const TAG_SCAN_EVENT: u16 = 0x24;
++pub(crate) const TAG_VDEV_START_RESPONSE_EVENT: u16 = 0x28;
++pub(crate) const TAG_MGMT_RX_HDR: u16 = 0x2c;
++pub(crate) const TAG_ROAM_EVENT: u16 = 0x30;
++const TAG_INIT_CMD: u16 = 0x4a;
++const TAG_RESOURCE_CONFIG: u16 = 0x4b;
++const TAG_HOST_MEMORY_CHUNK: u16 = 0x4c;
++const TAG_START_SCAN_CMD: u16 = 0x4d;
++const TAG_STOP_SCAN_CMD: u16 = 0x4e;
++const TAG_SCAN_CHAN_LIST_CMD: u16 = 0x4f;
++const TAG_CHANNEL: u16 = 0x50;
++const TAG_PDEV_SET_PARAM: u16 = 0x52;
++const TAG_VDEV_CREATE: u16 = 0x56;
++const TAG_VDEV_START_REQUEST: u16 = 0x58;
++const TAG_VDEV_UP: u16 = 0x5c;
++const TAG_VDEV_STOP: u16 = 0x5d;
++const TAG_VDEV_DOWN: u16 = 0x5e;
++const TAG_VDEV_SET_PARAM: u16 = 0x5f;
++const TAG_VDEV_INSTALL_KEY: u16 = 0x60;
++const TAG_PEER_CREATE: u16 = 0x61;
++const TAG_PEER_DELETE: u16 = 0x62;
++const TAG_PEER_SET_PARAM: u16 = 0x64;
++const TAG_PEER_ASSOC: u16 = 0x65;
++const TAG_VHT_RATE_SET: u16 = 0x66;
++const TAG_STA_POWERSAVE_MODE: u16 = 0x6c;
++// ABI (`wmi-tlv.c`).
++const ABI: [u32; 6] = [0x0100_0000, 53, 0x5f41_4351, 0x0000_4c4d, 0, 0];
++const SCAN_ID_PREFIX: u32 = 0xa000;
++// Scans (`wmi.h`).
++pub(crate) const SCAN_EVENT_STARTED: u32 = 1 << 0;
++pub(crate) const SCAN_EVENT_COMPLETED: u32 = 1 << 1;
++const SCAN_EVENT_BSS_CHANNEL: u32 = 1 << 2;
++const SCAN_EVENT_FOREIGN_CHANNEL: u32 = 1 << 3;
++pub(crate) const SCAN_EVENT_DEQUEUED: u32 = 1 << 4;
++pub(crate) const SCAN_EVENT_START_FAILED: u32 = 1 << 6;
++const SCAN_EVENT_FOREIGN_CHANNEL_EXIT: u32 = 1 << 8;
++const SCAN_FLAG_PASSIVE: u32 = 0x1;
++const SCAN_CHAN_STAT_EVENT: u32 = 0x10;
++const SCAN_FILTER_PROBE_REQ: u32 = 0x20;
++pub(crate) const CHAN_FLAG_PASSIVE: u32 = 0x80;
++pub(crate) const CHAN_FLAG_DFS: u32 = 0x400;
++pub(crate) const CHAN_FLAG_ALLOW_HT: u32 = 0x800;
++pub(crate) const MODE_11A: u8 = 0;
++pub(crate) const MODE_11G: u8 = 1;
++pub(crate) const MODE_11B: u8 = 2;
++pub(crate) const MODE_11NA_HT20: u8 = 4;
++pub(crate) const MODE_11NG_HT20: u8 = 5;
++// The resources Linux asks the TLV firmware for (`TARGET_TLV_NUM_*`).
++pub(crate) const NUM_VDEVS: u32 = 4;
++pub(crate) const NUM_PEERS: u32 = 33;
++// `struct wlan_host_mem_req`'s `num_unit_info`.
++pub(crate) const NUM_UNITS_IS_NUM_VDEVS: u32 = 1 << 0;
++pub(crate) const NUM_UNITS_IS_NUM_PEERS: u32 = 1 << 1;
++// Services (`enum wmi_tlv_service`), four to a word of the bitmap.
++pub(crate) const SERVICE_RX_FULL_REORDER: usize = 0x41;
++pub(crate) const SERVICE_MGMT_TX_WMI: usize = 0x4c;
++// Parameters (`enum wmi_tlv_pdev_param`, `_vdev_param`, `_peer_param`).
++pub(crate) const PDEV_PARAM_TX_CHAIN_MASK: u32 = 0x1;
++pub(crate) const PDEV_PARAM_RX_CHAIN_MASK: u32 = 0x2;
++pub(crate) const PDEV_PARAM_DYNAMIC_BW: u32 = 0xa;
++pub(crate) const PDEV_PARAM_PMF_QOS: u32 = 0x22;
++pub(crate) const PDEV_PARAM_ANI_ENABLE: u32 = 0x25;
++pub(crate) const VDEV_PARAM_RTS_THRESHOLD: u32 = 0x1;
++pub(crate) const VDEV_PARAM_SLOT_TIME: u32 = 0x7;
++pub(crate) const VDEV_PARAM_PREAMBLE: u32 = 0x8;
++// `WMI_VDEV_SLOT_TIME_*`, `WMI_VDEV_PREAMBLE_*`.
++pub(crate) const LONG: u32 = 1;
++pub(crate) const SHORT: u32 = 2;
++pub(crate) const VDEV_PARAM_DEF_KEYID: u32 = 0x21;
++pub(crate) const VDEV_PARAM_TX_ENCAP_TYPE: u32 = 0x30;
++pub(crate) const PEER_PARAM_AUTHORIZE: u32 = 0x3;
++// Peers (`enum wmi_tlv_peer_flags`).
++pub(crate) const PEER_AUTH: u32 = 0x1;
++pub(crate) const PEER_QOS: u32 = 0x2;
++pub(crate) const PEER_NEED_PTK_4_WAY: u32 = 0x4;
++pub(crate) const PEER_NEED_GTK_2_WAY: u32 = 0x10;
++pub(crate) const PEER_HT: u32 = 0x1000;
++pub(crate) const RC_HT_FLAG: u32 = 0x8;
++pub(crate) const RC_SGI_FLAG: u32 = 0x4;
++// Keys.
++pub(crate) const KEY_PAIRWISE: u32 = 0x0;
++pub(crate) const KEY_GROUP: u32 = 0x1;
++pub(crate) const CIPHER_NONE: u32 = 0x0;
++pub(crate) const CIPHER_AES_CCM: u32 = 0x4;
++// Received management frames' errors (`WMI_RX_STATUS_ERR_*`).
++pub(crate) const RX_STATUS_ERRORS: u32 = 0x01 | 0x08 | 0x10;
++pub(crate) const ROAM_REASON_BEACON_MISS: u32 = 2;
++// `WMI_HT_CAP_*` of the service ready event.
++pub(crate) const HT_CAP_HT20_SGI: u32 = 0x0002;
++
++/// A command being built: the header, then TLVs.
++pub(crate) struct Cmd {
++    pub(crate) id: u32,
++    pub(crate) body: Vec<u8>,
++}
++
++impl Cmd {
++    pub(crate) fn new(id: u32) -> Self {
++        Self { id, body: Vec::new() }
++    }
++
++    /// A TLV with 32-bit words.
++    pub(crate) fn tlv(mut self, tag: u16, words: &[u32]) -> Self {
++        self.body.extend_from_slice(&((words.len() * 4) as u16).to_le_bytes());
++        self.body.extend_from_slice(&tag.to_le_bytes());
++        for word in words {
++            self.body.extend_from_slice(&word.to_le_bytes());
++        }
++        self
++    }
++
++    /// A TLV with raw bytes, padded to 4.
++    pub(crate) fn bytes(mut self, tag: u16, bytes: &[u8]) -> Self {
++        let padded = bytes.len().next_multiple_of(4);
++        self.body.extend_from_slice(&(padded as u16).to_le_bytes());
++        self.body.extend_from_slice(&tag.to_le_bytes());
++        self.body.extend_from_slice(bytes);
++        self.body.resize(self.body.len() + padded - bytes.len(), 0);
++        self
++    }
++
++    /// The message for HTC: the command ID, then the TLVs.
++    pub(crate) fn message(&self) -> Vec<u8> {
++        let mut out = Vec::with_capacity(4 + self.body.len());
++        out.extend_from_slice(&(self.id & 0x00ff_ffff).to_le_bytes());
++        out.extend_from_slice(&self.body);
++        out
++    }
++}
++
++/// A MAC address as WMI carries it (`struct wmi_mac_addr`, 8 bytes).
++pub(crate) fn mac(address: &[u8; 6]) -> [u32; 2] {
++    [u32::from_le_bytes([address[0], address[1], address[2], address[3]]), u16::from_le_bytes([address[4], address[5]]) as u32]
++}
++
++/// Linux's `ath10k_wmi_tlv_op_gen_init` for the QCA6174's resources;
++/// `reorder`: the firmware reorders received frames itself.
++pub(crate) fn init(chunks: &[(u32, u32, u32)], decap_mode: u32, reorder: bool) -> Cmd {
++    let mut cmd = Cmd::new(INIT);
++    let mut head = ABI.to_vec();
++    head.push(chunks.len() as u32);
++    cmd = cmd.tlv(TAG_INIT_CMD, &head);
++    let offload = if reorder { NUM_VDEVS } else { 0 };
++    let config: [u32; 44] = [
++        NUM_VDEVS,          // num_vdevs
++        NUM_PEERS,          // num_peers
++        offload,            // num_offload_peers
++        offload,            // num_offload_reorder_bufs
++        2,                  // num_peer_keys
++        66,                 // num_tids
++        0x10,               // ast_skid_limit
++        0x7,                // tx_chain_mask
++        0x7,                // rx_chain_mask
++        0x64, 0x64, 0x64, 0x28, // rx_timeout_pri
++        decap_mode,         // rx_decap_mode
++        4,                  // scan_max_pending_reqs
++        4,                  // bmiss_offload_max_vdev
++        4,                  // roam_offload_max_vdev
++        8,                  // roam_offload_max_ap_profiles
++        0,                  // num_mcast_groups
++        0,                  // num_mcast_table_elems
++        0,                  // mcast2ucast_mode
++        0x400,              // tx_dbg_log_size
++        0x20,               // num_wds_entries
++        0,                  // dma_burst_size
++        0,                  // mac_aggr_delim
++        0,                  // rx_skip_defrag_timeout_dup_detection_check
++        0,                  // vow_config
++        2,                  // gtk_offload_max_vdev
++        1056,               // num_msdu_desc
++        2,                  // max_frag_entries
++        1,                  // num_tdls_vdevs
++        0x20,               // num_tdls_conn_table_entries
++        2,                  // beacon_tx_offload_max_vdev
++        5,                  // num_multicast_filter_entries
++        0,                  // num_wow_filters
++        6,                  // num_keep_alive_pattern
++        0,                  // keep_alive_pattern_size
++        1,                  // max_tdls_concurrent_sleep_sta
++        1,                  // max_tdls_concurrent_buffer_sta
++        0,                  // wmi_send_separate
++        0,                  // num_ocb_vdevs
++        0,                  // num_ocb_channels
++        0,                  // num_ocb_schedules
++        0x200,              // host_capab: MGMT_BUNDLE_TX_COMPL
++    ];
++    cmd = cmd.tlv(TAG_RESOURCE_CONFIG, &config);
++    let mut array = Vec::new();
++    for &(req_id, address, size) in chunks {
++        let inner = Cmd::new(0).tlv(TAG_HOST_MEMORY_CHUNK, &[req_id, address, size, 0]);
++        array.extend_from_slice(&inner.body);
++    }
++    cmd.raw(TAG_ARRAY_STRUCT, &array)
++}
++
++impl Cmd {
++    /// A TLV whose value is already built (nested TLVs).
++    pub(crate) fn raw(mut self, tag: u16, value: &[u8]) -> Self {
++        self.body.extend_from_slice(&(value.len() as u16).to_le_bytes());
++        self.body.extend_from_slice(&tag.to_le_bytes());
++        self.body.extend_from_slice(value);
++        self
++    }
++}
++
++/// A channel (`ath10k_wmi_put_wmi_channel`): frequency, mode, flags,
++/// powers in half dBm.
++pub(crate) fn channel_words(freq: u16, mode: u8, flags: u32, max_power: u8) -> [u32; 6] {
++    [freq as u32, freq as u32, 0, (mode as u32) | flags, (max_power as u32) << 8 | (max_power as u32) << 16, (max_power as u32) << 8]
++}
++
++/// Linux's `gen_scan_chan_list`.
++pub(crate) fn scan_chan_list(channels: &[(u16, u8, u32, u8)]) -> Cmd {
++    let mut array = Vec::new();
++    for &(freq, mode, flags, power) in channels {
++        let inner = Cmd::new(0).tlv(TAG_CHANNEL, &channel_words(freq, mode, flags, power));
++        array.extend_from_slice(&inner.body);
++    }
++    Cmd::new(SCAN_CHAN_LIST).tlv(TAG_SCAN_CHAN_LIST_CMD, &[channels.len() as u32]).raw(TAG_ARRAY_STRUCT, &array)
++}
++
++/// Linux's `ath10k_hw_scan` with `ath10k_wmi_start_scan_init`'s defaults.
++pub(crate) fn start_scan(vdev: u32, freqs: &[u16], ssids: &[Vec<u8>], ies: &[u8]) -> Cmd {
++    let mut flags = SCAN_CHAN_STAT_EVENT;
++    if ssids.is_empty() {
++        flags |= SCAN_FLAG_PASSIVE;
++    }
++    flags ^= SCAN_FILTER_PROBE_REQ;
++    let notify = SCAN_EVENT_STARTED | SCAN_EVENT_COMPLETED | SCAN_EVENT_BSS_CHANNEL | SCAN_EVENT_FOREIGN_CHANNEL | SCAN_EVENT_FOREIGN_CHANNEL_EXIT | SCAN_EVENT_DEQUEUED;
++    let mut head = Vec::with_capacity(27);
++    head.extend_from_slice(&[SCAN_ID_PREFIX, SCAN_ID_PREFIX | 1, vdev, 1, notify, 50, 150, 50, 500, 0, 0, 0, 20000, 5, flags]);
++    head.extend_from_slice(&[0, freqs.len() as u32, 1, ssids.len() as u32, ies.len() as u32, 3]);
++    head.extend_from_slice(&[0, 0, 0, 0]);
++    let channel_words: Vec<u32> = freqs.iter().map(|&freq| freq as u32).collect();
++    let mut ssid_bytes = Vec::with_capacity(ssids.len() * 36);
++    for ssid in ssids {
++        let length = ssid.len().min(32);
++        ssid_bytes.extend_from_slice(&(length as u32).to_le_bytes());
++        let mut value = [0u8; 32];
++        value[..length].copy_from_slice(&ssid[..length]);
++        ssid_bytes.extend_from_slice(&value);
++    }
++    let broadcast = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0];
++    Cmd::new(START_SCAN)
++        .tlv(TAG_START_SCAN_CMD, &head)
++        .tlv(TAG_ARRAY_UINT32, &channel_words)
++        .raw(TAG_ARRAY_FIXED_STRUCT, &ssid_bytes)
++        .raw(TAG_ARRAY_FIXED_STRUCT, &broadcast)
++        .bytes(TAG_ARRAY_BYTE, ies)
++}
++
++/// Stops the scan (`gen_stop_scan`: requestor, scan, type 0 = this one).
++pub(crate) fn stop_scan(vdev: u32) -> Cmd {
++    Cmd::new(STOP_SCAN).tlv(TAG_STOP_SCAN_CMD, &[SCAN_ID_PREFIX | 1, SCAN_ID_PREFIX, 0, vdev])
++}
++
++pub(crate) fn pdev_set_param(param: u32, value: u32) -> Cmd {
++    Cmd::new(PDEV_SET_PARAM).tlv(TAG_PDEV_SET_PARAM, &[0, param, value])
++}
++
++pub(crate) fn vdev_create(vdev: u32, address: &[u8; 6]) -> Cmd {
++    let [lo, hi] = mac(address);
++    // Type STA (2), subtype none.
++    Cmd::new(VDEV_CREATE).tlv(TAG_VDEV_CREATE, &[vdev, 2, 0, lo, hi])
++}
++
++pub(crate) fn vdev_set_param(vdev: u32, param: u32, value: u32) -> Cmd {
++    Cmd::new(VDEV_SET_PARAM).tlv(TAG_VDEV_SET_PARAM, &[vdev, param, value])
++}
++
++/// Linux's `gen_vdev_start`: the vdev's channel, its beacon interval and
++/// DTIM, no SSID (a station), no NoA.
++pub(crate) fn vdev_start(vdev: u32, beacon_interval: u16, dtim: u8, channel: [u32; 6]) -> Cmd {
++    let mut head = Vec::with_capacity(18);
++    head.extend_from_slice(&[vdev, 0, beacon_interval as u32, dtim as u32, 0]);
++    head.extend_from_slice(&[0u32; 9]);
++    head.extend_from_slice(&[0, 0, 0, 0]);
++    Cmd::new(VDEV_START_REQUEST).tlv(TAG_VDEV_START_REQUEST, &head).tlv(TAG_CHANNEL, &channel).raw(TAG_ARRAY_STRUCT, &[])
++}
++
++pub(crate) fn vdev_up(vdev: u32, aid: u16, bssid: &[u8; 6]) -> Cmd {
++    let [lo, hi] = mac(bssid);
++    Cmd::new(VDEV_UP).tlv(TAG_VDEV_UP, &[vdev, aid as u32, lo, hi])
++}
++
++pub(crate) fn vdev_down(vdev: u32) -> Cmd {
++    Cmd::new(VDEV_DOWN).tlv(TAG_VDEV_DOWN, &[vdev])
++}
++
++pub(crate) fn vdev_stop(vdev: u32) -> Cmd {
++    Cmd::new(VDEV_STOP).tlv(TAG_VDEV_STOP, &[vdev])
++}
++
++/// Power save off (`WMI_STA_PS_MODE_DISABLED`).
++pub(crate) fn sta_ps_off(vdev: u32) -> Cmd {
++    Cmd::new(STA_POWERSAVE_MODE).tlv(TAG_STA_POWERSAVE_MODE, &[vdev, 0])
++}
++
++pub(crate) fn peer_create(vdev: u32, address: &[u8; 6]) -> Cmd {
++    let [lo, hi] = mac(address);
++    Cmd::new(PEER_CREATE).tlv(TAG_PEER_CREATE, &[vdev, lo, hi, 0])
++}
++
++pub(crate) fn peer_delete(vdev: u32, address: &[u8; 6]) -> Cmd {
++    let [lo, hi] = mac(address);
++    Cmd::new(PEER_DELETE).tlv(TAG_PEER_DELETE, &[vdev, lo, hi])
++}
++
++pub(crate) fn peer_set_param(vdev: u32, address: &[u8; 6], param: u32, value: u32) -> Cmd {
++    let [lo, hi] = mac(address);
++    Cmd::new(PEER_SET_PARAM).tlv(TAG_PEER_SET_PARAM, &[vdev, lo, hi, param, value])
++}
++
++/// The access point's capabilities and rates (`gen_peer_assoc`).
++pub(crate) struct PeerAssoc {
++    pub(crate) address: [u8; 6],
++    pub(crate) vdev: u32,
++    pub(crate) aid: u16,
++    pub(crate) flags: u32,
++    pub(crate) caps: u16,
++    pub(crate) ht_caps: u16,
++    pub(crate) max_mpdu: u32,
++    pub(crate) mpdu_density: u32,
++    pub(crate) rate_caps: u32,
++    pub(crate) nss: u32,
++    pub(crate) phy_mode: u8,
++    pub(crate) legacy: Vec<u8>,
++    pub(crate) ht: Vec<u8>,
++}
++
++pub(crate) fn peer_assoc(peer: &PeerAssoc) -> Cmd {
++    let [lo, hi] = mac(&peer.address);
++    let head = [
++        lo,
++        hi,
++        peer.vdev,
++        1,
++        peer.aid as u32,
++        peer.flags,
++        peer.caps as u32,
++        1,
++        peer.ht_caps as u32,
++        peer.max_mpdu,
++        peer.mpdu_density,
++        peer.rate_caps,
++        peer.nss,
++        0,
++        peer.phy_mode as u32,
++        0,
++        0,
++        peer.legacy.len() as u32,
++        peer.ht.len() as u32,
++    ];
++    Cmd::new(PEER_ASSOC).tlv(TAG_PEER_ASSOC, &head).bytes(TAG_ARRAY_BYTE, &peer.legacy).bytes(TAG_ARRAY_BYTE, &peer.ht).tlv(TAG_VHT_RATE_SET, &[0, 0, 0, 0])
++}
++
++/// A key (`gen_vdev_install_key`, `struct wmi_vdev_install_key_cmd`).
++pub(crate) fn install_key(vdev: u32, peer: &[u8; 6], index: u8, flags: u32, cipher: u32, key: &[u8]) -> Cmd {
++    let [lo, hi] = mac(peer);
++    let mut head = Vec::with_capacity(23);
++    head.extend_from_slice(&[vdev, lo, hi, index as u32, flags, cipher]);
++    head.extend_from_slice(&[0u32; 6]);
++    head.extend_from_slice(&[0u32; 8]);
++    head.extend_from_slice(&[key.len() as u32, 0, 0]);
++    Cmd::new(VDEV_INSTALL_KEY).tlv(TAG_VDEV_INSTALL_KEY, &head).bytes(TAG_ARRAY_BYTE, key)
++}
++
++/// The TLVs of an event: (tag, value).
++pub(crate) fn tlvs(mut data: &[u8]) -> Vec<(u16, &[u8])> {
++    let mut out = Vec::new();
++    while data.len() >= 4 {
++        let len = u16::from_le_bytes([data[0], data[1]]) as usize;
++        let tag = u16::from_le_bytes([data[2], data[3]]);
++        let Some(value) = data.get(4..4 + len) else { break };
++        out.push((tag, value));
++        data = &data[4 + len..];
++    }
++    out
++}
++
++/// Nested TLVs of an array.
++pub(crate) fn nested(value: &[u8]) -> Vec<(u16, &[u8])> {
++    tlvs(value)
++}
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 76e2b86..f5f0007 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -27,6 +27,7 @@ extern crate aster_firmware as _;
+ extern crate aster_iwlwifi as _;
+ extern crate aster_mt7921 as _;
+ extern crate aster_rtw88 as _;
++extern crate aster_ath10k as _;
+ extern crate aster_ethernet as _;
+ 
+ #[ostd::main]

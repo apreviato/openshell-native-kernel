@@ -1,0 +1,607 @@
+diff --git a/kernel/comps/bluetooth/src/device.rs b/kernel/comps/bluetooth/src/device.rs
+old mode 100755
+new mode 100644
+index 815a4b3..df1c4b4
+--- a/kernel/comps/bluetooth/src/device.rs
++++ b/kernel/comps/bluetooth/src/device.rs
+@@ -238,6 +238,11 @@ impl Device {
+         self.driver.usb_ids()
+     }
+ 
++    /// Tells the driver which voice links the controller carries.
++    pub(crate) fn set_voice(&self, voice: crate::Voice) {
++        self.driver.voice(voice);
++    }
++
+     /// Tells the driver the controller is in its boot loader (Intel's), or
+     /// out of it.
+     pub(crate) fn set_bootloader(&self, on: bool) {
+diff --git a/kernel/comps/bluetooth/src/lib.rs b/kernel/comps/bluetooth/src/lib.rs
+old mode 100755
+new mode 100644
+index de6b7fb..bf30cda
+--- a/kernel/comps/bluetooth/src/lib.rs
++++ b/kernel/comps/bluetooth/src/lib.rs
+@@ -73,6 +73,21 @@ pub trait Driver: Send + Sync {
+     /// The controller entered (or left) its boot loader: Intel's then
+     /// sends events on the data endpoint too, and takes firmware there.
+     fn set_bootloader(&self, _on: bool) {}
++    /// The voice links the controller carries changed (Linux's
++    /// `hci_notify` with `HCI_NOTIFY_ENABLE_SCO_*`): a USB transport
++    /// chooses its isochronous setting by them.
++    fn voice(&self, _voice: Voice) {}
++}
++
++/// The synchronous (voice) links a controller carries, and how their data
++/// goes over HCI.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Voice {
++    None,
++    /// CVSD on the air, linear samples over HCI (8 or 16 bits).
++    Cvsd { links: u8, sixteen_bit: bool },
++    /// Transparent data (mSBC, encoded by the program).
++    Transparent { links: u8 },
+ }
+ 
+ /// A registered controller, which its driver reports to.
+diff --git a/kernel/comps/bluetooth/src/sco.rs b/kernel/comps/bluetooth/src/sco.rs
+old mode 100755
+new mode 100644
+index 3c040fc..dd630d8
+--- a/kernel/comps/bluetooth/src/sco.rs
++++ b/kernel/comps/bluetooth/src/sco.rs
+@@ -18,6 +18,7 @@ use alloc::{
+ use ostd::sync::{LocalIrqDisabled, SpinLock};
+ 
+ use crate::{
++    Voice,
+     device::Device,
+     device_at, hci, l2cap,
+     link::{self, Action},
+@@ -177,8 +178,32 @@ fn find(device: u16, test: impl Fn(&Sco) -> bool) -> Option<Arc<ProtoSocket>> {
+     sockets_on(device).into_iter().find(|socket| socket.state.lock().sco.as_ref().is_some_and(&test))
+ }
+ 
++/// Tells the controller's driver which voice links are up (a USB
++/// transport chooses its isochronous setting by their number and coding,
++/// as Linux's `btusb` does on `HCI_NOTIFY_*`).
++fn notify_voice(device: u16) {
++    let Some(controller) = device_at(device) else { return };
++    let mut links = 0u8;
++    let mut voice_setting = None;
++    for socket in sockets_on(device) {
++        let state = socket.state.lock();
++        if state.sco.as_ref().is_some_and(|sco| sco.stage == Stage::Open) {
++            links = links.saturating_add(1);
++            voice_setting.get_or_insert(state.voice);
++        }
++    }
++    let voice = match voice_setting {
++        None => Voice::None,
++        Some(setting) if setting & AIRMODE_MASK == AIRMODE_TRANSPARENT => Voice::Transparent { links },
++        // The input sample size, bit 5 of the voice setting: 16-bit samples.
++        Some(setting) => Voice::Cvsd { links, sixteen_bit: setting & 0x0020 != 0 },
++    };
++    controller.set_voice(voice);
++}
++
+ /// Ends a socket's link.
+ fn finish(socket: &Arc<ProtoSocket>, error: Option<i32>) {
++    let device = socket.state.lock().sco.as_ref().map(|sco| (sco.device, sco.stage == Stage::Open));
+     {
+         let mut state = socket.state.lock();
+         state.sco = None;
+@@ -190,6 +215,9 @@ fn finish(socket: &Arc<ProtoSocket>, error: Option<i32>) {
+     }
+     PENDING.lock().retain(|(child, _)| !Arc::ptr_eq(child, socket));
+     socket.wake();
++    if let Some((device, true)) = device {
++        notify_voice(device);
++    }
+ }
+ 
+ /// A socket connects to a device (its peer set).
+@@ -440,6 +468,7 @@ pub(crate) fn connection_complete(device: &Device, status: u8, handle: u16, addr
+         state.phase = Phase::Connected;
+     }
+     socket.wake();
++    notify_voice(device.index);
+     // The device's link goes to its listener.
+     let listener = {
+         let mut pending = PENDING.lock();
+@@ -518,11 +547,15 @@ pub(crate) fn close(socket: &ProtoSocket) {
+     }
+ }
+ 
+-/// A link whose socket is gone: it goes (a deferred one is refused).
++/// A link whose socket is gone (shut, closed or freed): it goes (a
++/// deferred one is refused), and the voice links that stay are told.
+ pub(crate) fn dropped(sco: Sco) {
+     let Some(device) = device_at(sco.device) else { return };
+     match sco.stage {
+-        Stage::Open => device.queue_action(Action::Disconnect(sco.handle, 0x13)),
++        Stage::Open => {
++            device.queue_action(Action::Disconnect(sco.handle, 0x13));
++            notify_voice(sco.device);
++        }
+         Stage::Deferred => {
+             let mut params = sco.address.to_vec();
+             params.push(0x0d);
+diff --git a/kernel/comps/usb/src/bt.rs b/kernel/comps/usb/src/bt.rs
+old mode 100755
+new mode 100644
+index 788dabf..eda82de
+--- a/kernel/comps/usb/src/bt.rs
++++ b/kernel/comps/usb/src/bt.rs
+@@ -2,14 +2,16 @@
+ 
+ //! Bluetooth controllers on USB (Linux's `btusb`): commands go out as
+ //! control transfers, events come on the interrupt endpoint, ACL data on
+-//! the bulk endpoints, each packet in as many transfers as it takes. The
+-//! controller task (`xhci`) moves them; this side keeps what goes out and
+-//! puts packets back together.
++//! the bulk endpoints, voice (SCO) on the isochronous endpoints of the next
++//! interface, in the setting the voice links need, each packet in as many
++//! transfers as it takes. The controller task (`xhci`, `xhci::btsco`)
++//! moves them; this side keeps what goes out and puts packets back
++//! together.
+ 
+ use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+ use core::sync::atomic::{AtomicBool, Ordering};
+ 
+-use aster_bluetooth::{Driver, bus, hci};
++use aster_bluetooth::{Driver, Voice, bus, hci};
+ use ostd::sync::{LocalIrqDisabled, SpinLock};
+ 
+ /// Makers whose Bluetooth interfaces carry their own class (0xff) but
+@@ -33,12 +35,20 @@ pub(crate) struct Shared {
+     pub tx: SpinLock<VecDeque<(u8, Vec<u8>)>, LocalIrqDisabled>,
+     /// Intel's boot loader: events on the bulk endpoint, firmware out on it.
+     pub bootloader: AtomicBool,
++    /// The voice links the stack last said the controller carries, until
++    /// the controller task puts the isochronous interface in their setting.
++    pub voice: SpinLock<Option<Voice>, LocalIrqDisabled>,
+     ids: (u16, u16),
+ }
+ 
+ impl Shared {
+     pub(crate) fn new(ids: (u16, u16)) -> Arc<Self> {
+-        Arc::new(Self { tx: SpinLock::new(VecDeque::new()), bootloader: AtomicBool::new(false), ids })
++        Arc::new(Self {
++            tx: SpinLock::new(VecDeque::new()),
++            bootloader: AtomicBool::new(false),
++            voice: SpinLock::new(None),
++            ids,
++        })
+     }
+ }
+ 
+@@ -47,7 +57,7 @@ pub(crate) struct UsbBluetooth(pub Arc<Shared>);
+ 
+ impl Driver for UsbBluetooth {
+     fn send(&self, packet_type: u8, packet: &[u8]) -> bool {
+-        if !matches!(packet_type, hci::COMMAND_PKT | hci::ACL_PKT) {
++        if !matches!(packet_type, hci::COMMAND_PKT | hci::ACL_PKT | hci::SCO_PKT) {
+             return false;
+         }
+         self.0.tx.lock().push_back((packet_type, packet.to_vec()));
+@@ -66,6 +76,11 @@ impl Driver for UsbBluetooth {
+     fn set_bootloader(&self, on: bool) {
+         self.0.bootloader.store(on, Ordering::Release);
+     }
++
++    fn voice(&self, voice: Voice) {
++        *self.0.voice.lock() = Some(voice);
++        crate::wake();
++    }
+ }
+ 
+ /// Whether a command goes on the bulk endpoint: Intel's secure send in its
+@@ -75,8 +90,9 @@ pub(crate) fn command_on_bulk(shared: &Shared, packet: &[u8]) -> bool {
+ }
+ 
+ /// Puts packets back together from the pieces transfers bring: events
+-/// (a 2-byte header, the length in its second byte) or ACL data (4 bytes,
+-/// the length in the last two).
++/// (a 2-byte header, the length in its second byte), ACL data (4 bytes,
++/// the length in the last two) or SCO data (3 bytes, the length in the
++/// last).
+ pub(crate) struct Reassembly {
+     header: usize,
+     buffer: Vec<u8>,
+@@ -91,16 +107,20 @@ impl Reassembly {
+         Self { header: 4, buffer: Vec::new() }
+     }
+ 
++    pub(crate) const fn sco() -> Self {
++        Self { header: 3, buffer: Vec::new() }
++    }
++
+     fn expected(&self) -> Option<usize> {
+         if self.buffer.len() < self.header {
+             return None;
+         }
+         Some(
+             self.header
+-                + if self.header == 2 {
+-                    self.buffer[1] as usize
+-                } else {
+-                    u16::from_le_bytes([self.buffer[2], self.buffer[3]]) as usize
++                + match self.header {
++                    2 => self.buffer[1] as usize,
++                    3 => self.buffer[2] as usize,
++                    _ => u16::from_le_bytes([self.buffer[2], self.buffer[3]]) as usize,
+                 },
+         )
+     }
+diff --git a/kernel/comps/usb/src/xhci.rs b/kernel/comps/usb/src/xhci.rs
+index 18d0b8d..a081e72 100644
+--- a/kernel/comps/usb/src/xhci.rs
++++ b/kernel/comps/usb/src/xhci.rs
+@@ -33,6 +33,7 @@ use crate::{
+ };
+ 
+ mod audio;
++mod btsco;
+ mod programs;
+ 
+ /// Completion codes.
+@@ -222,6 +223,8 @@ struct BtEndpoints {
+     tx_buffers: DmaCoherent,
+     tx_free: Vec<usize>,
+     tx_in_flight: Vec<(u64, usize)>,
++    /// Its voice interface (isochronous), when it has one.
++    sco: Option<btsco::ScoEndpoints>,
+ }
+ 
+ /// A hub's ports and what is on them.
+@@ -930,7 +933,7 @@ impl Controller {
+                 && interface.endpoints.iter().any(|endpoint| endpoint.is_in() && endpoint.transfer_type() == TRANSFER_INTERRUPT);
+             let before = claimed.len();
+             let (started, driver) = match interface.class {
+-                _ if bluetooth => (self.start_bluetooth(slot_id, interface).map(|()| claimed.push(interface.number + 1)), "btusb"),
++                _ if bluetooth => (self.start_bluetooth(slot_id, configuration, interface).map(|()| claimed.push(interface.number + 1)), "btusb"),
+                 3 => (self.start_hid(slot_id, interface), "usbhid"),
+                 uac::CLASS if interface.subclass == uac::SUBCLASS_CONTROL => (
+                     self.start_audio(slot_id, configuration, interface).map(|taken| claimed.extend(taken)),
+@@ -1232,6 +1235,10 @@ impl Controller {
+             self.audio_done(slot_id, dci, event);
+             return;
+         }
++        if self.is_sco_endpoint(slot_id, dci) {
++            self.sco_done(slot_id, dci, event);
++            return;
++        }
+         if self.slots.get(&slot_id).is_some_and(|slot| slot.net.iter().any(|net| net.rx_dci == dci || net.tx_dci == dci)) {
+             self.net_transfer_done(slot_id, dci, event);
+             return;
+@@ -1506,7 +1513,7 @@ impl Controller {
+ 
+     /// A Bluetooth controller: its event endpoint and its ACL endpoints,
+     /// handed to the Bluetooth stack, which sets it up.
+-    fn start_bluetooth(&mut self, slot_id: u8, interface: &Interface) -> Result<()> {
++    fn start_bluetooth(&mut self, slot_id: u8, configuration: &Configuration, interface: &Interface) -> Result<()> {
+         let find = |kind: u8, inward: bool| {
+             interface.endpoints.iter().find(|e| e.transfer_type() == kind && e.is_in() == inward).copied()
+         };
+@@ -1542,6 +1549,7 @@ impl Controller {
+             tx_buffers: DmaCoherent::alloc(BT_TX_BUFFERS * BT_BUFFER / 4096, true).map_err(|_| Error::NoMemory)?,
+             tx_free: (0..BT_TX_BUFFERS).collect(),
+             tx_in_flight: Vec::new(),
++            sco: btsco::ScoEndpoints::of(configuration, interface),
+         };
+         for index in 0..BT_EVENT_BUFFERS {
+             Self::queue_bt_event(&mut bluetooth, index);
+@@ -1636,6 +1644,8 @@ impl Controller {
+         let slot_ids: Vec<u8> = self.slots.iter().filter(|(_, slot)| !slot.bt.is_empty()).map(|(id, _)| *id).collect();
+         for slot_id in slot_ids {
+             for which in 0..self.slots.get(&slot_id).map_or(0, |slot| slot.bt.len()) {
++                // The voice links' setting first: their packets go out in it.
++                self.serve_bt_voice(slot_id, which);
+                 loop {
+                     let Some(bluetooth) = self.slots.get_mut(&slot_id).and_then(|slot| slot.bt.get_mut(which)) else { break };
+                     let next = {
+@@ -1653,6 +1663,10 @@ impl Controller {
+                         }
+                     };
+                     let Some((kind, packet)) = next else { break };
++                    if kind == aster_bluetooth::hci::SCO_PKT {
++                        self.send_sco(slot_id, which, &packet);
++                        continue;
++                    }
+                     if kind == aster_bluetooth::hci::COMMAND_PKT && !bt::command_on_bulk(&bluetooth.shared, &packet) {
+                         if let Err(error) = self.control(slot_id, 0x20, 0x00, 0, 0, Data::Out(&packet)) {
+                             ostd::notice!("{}: slot {}: a Bluetooth command did not go out: {:?}", self.name, slot_id, error);
+diff --git a/kernel/comps/usb/src/xhci/audio.rs b/kernel/comps/usb/src/xhci/audio.rs
+index 5354e95..c4ea46e 100644
+--- a/kernel/comps/usb/src/xhci/audio.rs
++++ b/kernel/comps/usb/src/xhci/audio.rs
+@@ -56,9 +56,9 @@ pub(super) const EP_ISOCH_OUT: u32 = 1;
+ pub(super) const EP_ISOCH_IN: u32 = 5;
+ /// The isochronous TRB, and its flags: Block Event Interrupt, Start
+ /// Isochronous ASAP.
+-const TRB_ISOCH: u32 = 5;
++pub(super) const TRB_ISOCH: u32 = 5;
+ const BEI: u32 = 1 << 9;
+-const SIA: u32 = 1 << 31;
++pub(super) const SIA: u32 = 1 << 31;
+ /// Completion codes of isochronous transfers.
+ const RING_UNDERRUN: u8 = 14;
+ const RING_OVERRUN: u8 = 15;
+diff --git a/kernel/comps/usb/src/xhci/btsco.rs b/kernel/comps/usb/src/xhci/btsco.rs
+new file mode 100644
+index 0000000..90b46c9
+--- /dev/null
++++ b/kernel/comps/usb/src/xhci/btsco.rs
+@@ -0,0 +1,271 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Bluetooth voice over USB (Linux's `btusb` with `CONFIG_BT_HCIBTUSB` SCO):
++//! a USB controller carries its SCO links' data on the isochronous
++//! endpoints of its second interface, whose alternate settings grow with
++//! the links (Bluetooth Core 5.4, Vol 4, Part B, 2.1.1): none in setting 0,
++//! and for CVSD the setting by the number of links and the samples' size
++//! (8-bit: 1, 2, 3; 16-bit: 2, 4, 5), for transparent data (mSBC) setting
++//! 6 where there is one, else 1 (Linux's `btusb_work`). The stack says
++//! which links are up (`aster_bluetooth::Voice`); the controller task puts
++//! the interface in their setting, keeps transfers in on the IN endpoint
++//! (each packet's piece of a SCO packet, put back together by its 3-byte
++//! header) and sends each SCO packet out in packets of the setting's size,
++//! one a (micro)frame.
++
++use alloc::vec::Vec;
++
++use aster_bluetooth::{Voice, hci};
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++
++use super::{
++    Controller, Data, SET_INTERFACE, SHORT_PACKET, SUCCESS,
++    audio::{EP_ISOCH_IN, EP_ISOCH_OUT, SIA, TRB_ISOCH},
++};
++use crate::{
++    bt,
++    desc::{Configuration, Endpoint, Interface, TRANSFER_ISOCHRONOUS},
++    ring::{IOC, ProducerRing, Trb},
++};
++
++/// Transfers kept on the IN endpoint (16 ms at full speed), and buffers
++/// for what goes out.
++const IN_TDS: usize = 16;
++const OUT_SLOTS: usize = 48;
++
++/// One alternate setting: its endpoints.
++#[derive(Clone, Copy, Debug)]
++struct ScoAlt {
++    alternate: u8,
++    inward: Endpoint,
++    outward: Endpoint,
++}
++
++/// The setting in use, with its transfers.
++struct ScoActive {
++    in_dci: u8,
++    out_dci: u8,
++    in_ring: ProducerRing,
++    out_ring: ProducerRing,
++    /// IN slots first, then OUT slots, `slot` bytes each.
++    buffers: DmaCoherent,
++    slot: usize,
++    in_size: usize,
++    out_size: usize,
++    in_flight: Vec<(u64, usize)>,
++    out_flight: Vec<(u64, usize)>,
++    out_free: Vec<usize>,
++}
++
++/// A controller's voice interface.
++pub(super) struct ScoEndpoints {
++    interface: u8,
++    alts: Vec<ScoAlt>,
++    current: u8,
++    active: Option<ScoActive>,
++    reassembly: bt::Reassembly,
++}
++
++impl ScoEndpoints {
++    /// The interface after the controller's (`control`): its settings with
++    /// an isochronous endpoint each way.
++    pub(super) fn of(configuration: &Configuration, control: &Interface) -> Option<Self> {
++        let number = control.number + 1;
++        let alts: Vec<ScoAlt> = configuration
++            .interfaces
++            .iter()
++            .filter(|interface| interface.number == number && interface.alternate > 0)
++            .filter_map(|interface| {
++                let find = |inward: bool| {
++                    interface.endpoints.iter().find(|e| e.transfer_type() == TRANSFER_ISOCHRONOUS && e.is_in() == inward).copied()
++                };
++                Some(ScoAlt { alternate: interface.alternate, inward: find(true)?, outward: find(false)? })
++            })
++            .collect();
++        (!alts.is_empty()).then(|| Self { interface: number, alts, current: 0, active: None, reassembly: bt::Reassembly::sco() })
++    }
++
++    fn has(&self, alternate: u8) -> bool {
++        self.alts.iter().any(|alt| alt.alternate == alternate)
++    }
++
++    /// The setting the links need (Linux's `btusb_work`), or the largest
++    /// below it the controller has.
++    fn wanted(&self, voice: Voice) -> u8 {
++        let wanted = match voice {
++            Voice::None => return 0,
++            Voice::Cvsd { links, sixteen_bit: true } => [2, 4, 5][usize::from(links.clamp(1, 3)) - 1],
++            Voice::Cvsd { links, sixteen_bit: false } => links.clamp(1, 3),
++            Voice::Transparent { .. } => {
++                if self.has(6) {
++                    6
++                } else {
++                    1
++                }
++            }
++        };
++        self.alts.iter().map(|alt| alt.alternate).filter(|alternate| *alternate <= wanted).max().unwrap_or(0)
++    }
++}
++
++impl Controller {
++    /// Puts a controller's voice interface in the setting the stack's
++    /// latest voice links need.
++    pub(super) fn serve_bt_voice(&mut self, slot_id: u8, which: usize) {
++        let Some(bluetooth) = self.slots.get(&slot_id).and_then(|slot| slot.bt.get(which)) else { return };
++        let Some(voice) = bluetooth.shared.voice.lock().take() else { return };
++        let Some(sco) = bluetooth.sco.as_ref() else { return };
++        let wanted = sco.wanted(voice);
++        if wanted == sco.current {
++            return;
++        }
++        let (interface, index) = (sco.interface, bluetooth.controller.index());
++        let alt = sco.alts.iter().find(|alt| alt.alternate == wanted).copied();
++        // The setting in use goes first: its endpoints, then the interface.
++        if let Some(active) = self.slots.get_mut(&slot_id).and_then(|slot| slot.bt.get_mut(which)).and_then(|bt| bt.sco.as_mut()).and_then(|sco| sco.active.take()) {
++            self.drop_endpoints(slot_id, &[active.in_dci, active.out_dci]);
++        }
++        let switched = self.control(slot_id, 0x01, SET_INTERFACE, u16::from(wanted), u16::from(interface), Data::None).is_ok();
++        let active = match (switched, alt) {
++            (true, Some(alt)) => self.start_sco(slot_id, &alt),
++            _ => None,
++        };
++        let Some(sco) = self.slots.get_mut(&slot_id).and_then(|slot| slot.bt.get_mut(which)).and_then(|bt| bt.sco.as_mut()) else { return };
++        sco.current = if switched { wanted } else { 0 };
++        sco.reassembly.clear();
++        ostd::notice!("{}: hci{}: voice {:?}: setting {} of interface {}", self.name, index, voice, sco.current, interface);
++        if let Some(active) = active {
++            let in_dci = active.in_dci;
++            sco.active = Some(active);
++            self.ring(slot_id, in_dci);
++        }
++    }
++
++    /// A setting's endpoints configured, with its IN transfers queued.
++    fn start_sco(&mut self, slot_id: u8, alt: &ScoAlt) -> Option<ScoActive> {
++        let in_ring = ProducerRing::new()?;
++        let out_ring = ProducerRing::new()?;
++        self.configure_endpoint(slot_id, &alt.inward, EP_ISOCH_IN, &in_ring).ok()?;
++        self.configure_endpoint(slot_id, &alt.outward, EP_ISOCH_OUT, &out_ring).ok()?;
++        let in_size = usize::from(alt.inward.max_packet & 0x7ff).max(1);
++        let out_size = usize::from(alt.outward.max_packet & 0x7ff).max(1);
++        let slot = in_size.max(out_size).next_power_of_two().max(64);
++        let pages = ((IN_TDS + OUT_SLOTS) * slot).div_ceil(PAGE_SIZE);
++        let mut active = ScoActive {
++            in_dci: alt.inward.dci(),
++            out_dci: alt.outward.dci(),
++            in_ring,
++            out_ring,
++            buffers: DmaCoherent::alloc(pages, true).ok()?,
++            slot,
++            in_size,
++            out_size,
++            in_flight: Vec::new(),
++            out_flight: Vec::new(),
++            out_free: (IN_TDS..IN_TDS + OUT_SLOTS).rev().collect(),
++        };
++        for index in 0..IN_TDS {
++            Self::queue_sco_in(&mut active, index);
++        }
++        Some(active)
++    }
++
++    fn queue_sco_in(active: &mut ScoActive, index: usize) {
++        let trb = active.in_ring.push(Trb {
++            parameter: active.buffers.daddr() as u64 + (index * active.slot) as u64,
++            status: active.in_size as u32,
++            control: Trb::with_type(TRB_ISOCH) | IOC | SIA,
++        });
++        active.in_flight.push((trb, index));
++    }
++
++    /// A SCO packet from the stack: out in packets of the setting's size,
++    /// one each (micro)frame. Without a setting for voice, or room, it goes.
++    pub(super) fn send_sco(&mut self, slot_id: u8, which: usize, packet: &[u8]) {
++        let Some(active) = self
++            .slots
++            .get_mut(&slot_id)
++            .and_then(|slot| slot.bt.get_mut(which))
++            .and_then(|bt| bt.sco.as_mut())
++            .and_then(|sco| sco.active.as_mut())
++        else {
++            return;
++        };
++        let pieces = packet.chunks(active.out_size);
++        if pieces.len() > active.out_free.len() {
++            return;
++        }
++        for piece in packet.chunks(active.out_size) {
++            let index = active.out_free.pop().unwrap();
++            let at = index * active.slot;
++            if active.buffers.write_bytes(at, piece).is_err() {
++                active.out_free.push(index);
++                return;
++            }
++            let trb = active.out_ring.push(Trb {
++                parameter: active.buffers.daddr() as u64 + at as u64,
++                status: piece.len() as u32,
++                control: Trb::with_type(TRB_ISOCH) | IOC | SIA,
++            });
++            active.out_flight.push((trb, index));
++        }
++        let dci = active.out_dci;
++        self.ring(slot_id, dci);
++    }
++
++    /// Whether an endpoint is a controller's voice endpoint.
++    pub(super) fn is_sco_endpoint(&self, slot_id: u8, dci: u8) -> bool {
++        self.slots.get(&slot_id).is_some_and(|slot| {
++            slot.bt.iter().any(|bt| {
++                bt.sco.as_ref().and_then(|sco| sco.active.as_ref()).is_some_and(|active| active.in_dci == dci || active.out_dci == dci)
++            })
++        })
++    }
++
++    /// A voice packet's end: what came in goes to the stack, a piece that
++    /// went out frees its buffer.
++    pub(super) fn sco_done(&mut self, slot_id: u8, dci: u8, event: &Trb) {
++        let code = event.completion_code();
++        let Some(bluetooth) = self.slots.get_mut(&slot_id).and_then(|slot| {
++            slot.bt.iter_mut().find(|bt| {
++                bt.sco.as_ref().and_then(|sco| sco.active.as_ref()).is_some_and(|active| active.in_dci == dci || active.out_dci == dci)
++            })
++        }) else {
++            return;
++        };
++        let controller = bluetooth.controller.clone();
++        let Some(sco) = bluetooth.sco.as_mut() else { return };
++        let Some(active) = sco.active.as_mut() else { return };
++        if dci == active.out_dci {
++            // This piece and those before it (a missed one reports nothing).
++            if let Some(position) = active.out_flight.iter().position(|(trb, _)| *trb == event.parameter) {
++                for (_, index) in active.out_flight.drain(..=position) {
++                    active.out_free.push(index);
++                }
++            }
++            return;
++        }
++        let Some(position) = active.in_flight.iter().position(|(trb, _)| *trb == event.parameter) else { return };
++        let mut done: Vec<(u64, usize)> = active.in_flight.drain(..=position).collect();
++        let (_, index) = done.pop().unwrap();
++        let mut packets = Vec::new();
++        if code == SUCCESS || code == SHORT_PACKET {
++            let length = active.in_size.saturating_sub((event.status & 0xff_ffff) as usize);
++            if length > 0 {
++                let mut data = alloc::vec![0u8; length];
++                if active.buffers.read_bytes(index * active.slot, &mut data).is_ok() {
++                    packets = sco.reassembly.push(&data);
++                }
++            }
++        }
++        // Those missed before it, and it, go in again.
++        for (_, missed) in done {
++            Self::queue_sco_in(active, missed);
++        }
++        Self::queue_sco_in(active, index);
++        for packet in packets {
++            controller.receive(hci::SCO_PKT, &packet);
++        }
++        self.ring(slot_id, dci);
++    }
++}

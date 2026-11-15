@@ -16,8 +16,9 @@
 # install it, update an installed one (keep files), and more options. With
 # OPENSHELL_MEDIA_PAYLOAD (the payload tools/qemu/run.sh puts in the
 # initramfs) and RELEASE_AB, the medium's release gets its signed manifest
-# for the updater; OPENSHELL_GRUB_FONT (GRUB's unicode.pf2) gives the menu
-# its look (menu-theme.txt, menu.png).
+# for the updater. The menu has its look (menu-theme.txt, menu.png) in the
+# signed GRUB's own font; OPENSHELL_GRUB_FONT (GRUB's unicode.pf2) is a copy
+# on the ESP for a GRUB without one.
 set -euo pipefail
 
 action=$1 version=$2 kernel=$3 desktop=$4 recovery=$5 output=$6
@@ -67,12 +68,14 @@ case "$action" in
         esp="$work/esp"
         sb_esp_files "$esp" "$SB_KEYS" disc
         # The menu's look, as OpenShell Live's: its background (menu.png,
-        # make-menu.py) and theme with the release, in GRUB's Unifont
-        # (OPENSHELL_GRUB_FONT, run.sh); without the font, GRUB's plain menu.
+        # make-menu.py) and theme with the release, in GRUB's Unifont: the
+        # signed GRUB's own (its memdisk, the only one Secure Boot allows),
+        # else this copy (OPENSHELL_GRUB_FONT, run.sh).
+        mkdir -p "$esp/EFI/BOOT/theme"
+        cp "$here/menu.png" "$esp/EFI/BOOT/theme/"
+        tr -d '\r' < "$here/menu-theme.txt" | sed "s|@VERSION@|amd64 · $version · $(date -u +%Y-%m-%d)|" > "$esp/EFI/BOOT/theme/theme.txt"
         if [[ -f "${OPENSHELL_GRUB_FONT:-}" ]]; then
-            mkdir -p "$esp/EFI/BOOT/theme"
-            cp "$here/menu.png" "$OPENSHELL_GRUB_FONT" "$esp/EFI/BOOT/theme/"
-            tr -d '\r' < "$here/menu-theme.txt" | sed "s|@VERSION@|amd64 · $version · $(date -u +%Y-%m-%d)|" > "$esp/EFI/BOOT/theme/theme.txt"
+            cp "$OPENSHELL_GRUB_FONT" "$esp/EFI/BOOT/theme/unicode.pf2"
         fi
         update_entry=
         if [[ -n "$manifest_args" ]]; then
@@ -102,7 +105,17 @@ terminal_output console $openshell_serial
 search --no-floppy --file --set=openshell_esp /EFI/BOOT/mmx64.efi
 export openshell_esp
 source ($openshell_esp)/EFI/BOOT/splash.cfg
-if loadfont ($openshell_esp)/EFI/BOOT/theme/unicode.pf2; then
+# The menu's font: Unifont from the signed GRUB's own memdisk. Debian puts it
+# there because, with Secure Boot on, GRUB refuses font files from disk
+# ("prohibited by secure boot policy") and would show its plain text menu.
+# A GRUB without it reads the copy on the ESP.
+set openshell_font=
+if loadfont unicode; then
+    set openshell_font=memdisk
+elif loadfont ($openshell_esp)/EFI/BOOT/theme/unicode.pf2; then
+    set openshell_font=esp
+fi
+if [ -n "$openshell_font" ]; then
     set gfxmode=auto
     if terminal_output gfxterm $openshell_serial; then
         set theme=($openshell_esp)/EFI/BOOT/theme/theme.txt

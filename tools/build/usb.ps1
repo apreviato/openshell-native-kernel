@@ -1,5 +1,6 @@
 # USB selection follows OpenShellLive's usb-target.ps1. The writer keeps the
-# verified source and the same raw device handle open through readback.
+# verified source and the same raw device handle open through readback, and
+# writes the partition table last (Copy-OpenShellNativeUsbImage).
 function Get-OpenShellNativeUsb {
     param([int]$DiskNumber, [uint64]$MinimumSize)
     $disk = Get-Disk -Number $DiskNumber -ErrorAction Stop
@@ -45,46 +46,71 @@ function Assert-OpenShellNativeUsb {
     return $disk
 }
 
-function Copy-OpenShellNativeUsbImage {
-    param([IO.FileStream]$Source, [IO.FileStream]$Device, [string]$ExpectedHash, [int]$DiskNumber)
-    $length = $Source.Length
+# Copies bytes From to To of the image to the same place on the stick, or
+# with -Verify reads them back from both: returns their SHA-256 values.
+function Invoke-OpenShellNativeUsbRange {
+    param([IO.Stream]$Source, [IO.Stream]$Device, [long]$From, [long]$To, [string]$Activity, [switch]$Verify)
     $buffer = New-Object byte[] 4MB
-    $hash = [Security.Cryptography.SHA256]::Create()
+    $sourceHash = [Security.Cryptography.SHA256]::Create()
+    $deviceHash = [Security.Cryptography.SHA256]::Create()
     try {
-        foreach ($phase in @('Writing', 'Verifying')) {
-            [void]$Device.Seek(0, [IO.SeekOrigin]::Begin)
-            $processed = 0L
-            $activity = "$phase OpenShell Native on disk $DiskNumber"
-            try {
-                while ($processed -lt $length) {
-                    $count = [int][Math]::Min($buffer.Length, $length - $processed)
-                    if ($phase -eq 'Writing') {
-                        $received = 0
-                        while ($received -lt $count) {
-                            $read = $Source.Read($buffer, $received, $count - $received)
-                            if ($read -le 0) { throw "Short image read at $processed bytes." }
-                            $received += $read
-                        }
-                        $Device.Write($buffer, 0, $count)
-                    } else {
-                        $count = $Device.Read($buffer, 0, $count)
-                        if ($count -le 0) { throw "Short USB read at $processed bytes." }
-                        [void]$hash.TransformBlock($buffer, 0, $count, $buffer, 0)
-                    }
-                    $processed += $count
-                    Write-Progress -Activity $activity -PercentComplete ([int](100 * $processed / $length))
-                }
-                if ($phase -eq 'Writing') { $Device.Flush($true) }
-            } finally {
-                Write-Progress -Activity $activity -Completed
+        $Source.Position = $From
+        [void]$Device.Seek($From, [IO.SeekOrigin]::Begin)
+        $processed = $From
+        while ($processed -lt $To) {
+            $count = [int][Math]::Min($buffer.Length, $To - $processed)
+            $received = 0
+            while ($received -lt $count) {
+                $read = $Source.Read($buffer, $received, $count - $received)
+                if ($read -le 0) { throw "Short image read at $processed bytes." }
+                $received += $read
             }
+            if ($Verify) {
+                [void]$sourceHash.TransformBlock($buffer, 0, $count, $buffer, 0)
+                $received = 0
+                while ($received -lt $count) {
+                    $read = $Device.Read($buffer, $received, $count - $received)
+                    if ($read -le 0) { throw "Short USB read at $processed bytes." }
+                    $received += $read
+                }
+                [void]$deviceHash.TransformBlock($buffer, 0, $count, $buffer, 0)
+            } else {
+                $Device.Write($buffer, 0, $count)
+            }
+            $processed += $count
+            Write-Progress -Activity $Activity -PercentComplete ([int](100 * ($processed - $From) / [Math]::Max(1, $To - $From)))
         }
-        [void]$hash.TransformFinalBlock([byte[]]@(), 0, 0)
-        if ([BitConverter]::ToString($hash.Hash).Replace('-', '') -ne $ExpectedHash) {
-            throw "USB verification failed on disk $DiskNumber."
-        }
+        if (-not $Verify) { $Device.Flush($true) }
+        [void]$sourceHash.TransformFinalBlock([byte[]]@(), 0, 0)
+        [void]$deviceHash.TransformFinalBlock([byte[]]@(), 0, 0)
+        return @([BitConverter]::ToString($sourceHash.Hash), [BitConverter]::ToString($deviceHash.Hash))
     } finally {
-        $hash.Dispose()
+        Write-Progress -Activity $Activity -Completed
+        $sourceHash.Dispose()
+        $deviceHash.Dispose()
+    }
+}
+
+# The image's first 4 MiB hold its partition table and go last: until then
+# the stick has none, so Windows mounts nothing on it while the rest is
+# written and read back. Once Windows sees the EFI partition it mounts it and
+# writes there ("System Volume Information"), which a read-back after it
+# would take for a bad write. Each part is checked against the image (whose
+# SHA-256 was checked whole before) before the next is written.
+function Copy-OpenShellNativeUsbImage {
+    param([IO.Stream]$Source, [IO.Stream]$Device, [string]$ExpectedHash, [int]$DiskNumber)
+    $length = $Source.Length
+    $head = [long][Math]::Min(4MB, $length)
+    foreach ($part in @(@($head, $length), @(0L, $head))) {
+        $from, $to = $part
+        if ($from -ge $to) { continue }
+        [void](Invoke-OpenShellNativeUsbRange -Source $Source -Device $Device -From $from -To $to `
+            -Activity "Writing OpenShell Native on disk $DiskNumber")
+        $sums = Invoke-OpenShellNativeUsbRange -Source $Source -Device $Device -From $from -To $to `
+            -Activity "Verifying OpenShell Native on disk $DiskNumber" -Verify
+        if ($sums[0] -ne $sums[1]) {
+            throw "USB verification failed on disk $DiskNumber (bytes $from to $to)."
+        }
     }
 }
 

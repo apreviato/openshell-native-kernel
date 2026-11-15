@@ -1,0 +1,639 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 56a3a79..c66d788 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -462,6 +462,7 @@ dependencies = [
+  "aster-framebuffer",
+  "component",
+  "ostd",
++ "spin",
+ ]
+ 
+ [[package]]
+diff --git a/kernel/comps/simpledrm/Cargo.toml b/kernel/comps/simpledrm/Cargo.toml
+index d1e815f..b06678c 100644
+--- a/kernel/comps/simpledrm/Cargo.toml
++++ b/kernel/comps/simpledrm/Cargo.toml
+@@ -9,6 +9,7 @@ aster-drm.workspace = true
+ aster-framebuffer.workspace = true
+ component.workspace = true
+ ostd.workspace = true
++spin.workspace = true
+ 
+ [lints]
+ workspace = true
+diff --git a/kernel/comps/simpledrm/src/lib.rs b/kernel/comps/simpledrm/src/lib.rs
+index 7f0ccbd..d276a14 100644
+--- a/kernel/comps/simpledrm/src/lib.rs
++++ b/kernel/comps/simpledrm/src/lib.rs
+@@ -18,7 +18,10 @@ macro_rules! __log_prefix {
+ }
+ 
+ use alloc::{sync::Arc, vec};
+-use core::fmt::Debug;
++use core::{
++    fmt::Debug,
++    sync::atomic::{AtomicBool, Ordering},
++};
+ 
+ use aster_core::prelude::*;
+ use aster_drm::{
+@@ -45,12 +48,21 @@ use aster_drm::{
+ use aster_framebuffer::{
+     framebuffer::{self, FrameBuffer},
+     pixel::PixelFormat,
++    splash,
+ };
+ use component::{ComponentInitError, init_component};
++use ostd::timer::Jiffies;
++use spin::Once;
+ 
+ const SIMPLEDRM_NAME: &str = "simpledrm";
+ const SIMPLEDRM_DESC: &str = "DRM driver for simple-framebuffer platform devices";
+ 
++/// How long the display server's frames may stay off the screen while the
++/// boot splash moves, in seconds, should none of them get anything drawn.
++const SPLASH_HOLD_LIMIT: u64 = 180;
++/// The points of a frame looked at for something drawn: a 4x4 grid.
++const SPLASH_PROBES: usize = 4;
++
+ #[init_component(process)]
+ fn init() -> Result<(), ComponentInitError> {
+     let Some(boot_framebuffer) = framebuffer::FRAMEBUFFER.get() else {
+@@ -79,6 +91,22 @@ struct SimpleDrmDevice {
+     features: DrmFeatures,
+     pixel_format: DrmPixelFormat,
+     mode_config: DrmModeConfig,
++    /// When the display server's first frame was kept off the screen for the
++    /// boot splash.
++    splash_held_since: Once<Jiffies>,
++    /// Frames were kept off the screen: the next one goes there whole.
++    splash_owes_frame: AtomicBool,
++}
++
++/// What a frame does while the boot splash may be on the screen.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum SplashHold {
++    /// No splash moves: the frame goes to the screen as usual.
++    None,
++    /// The splash stays; the frame does not go to the screen.
++    Kept,
++    /// The splash just stopped: the whole frame goes to the screen.
++    Released,
+ }
+ 
+ impl SimpleDrmDevice {
+@@ -126,9 +154,73 @@ impl SimpleDrmDevice {
+             features: DrmFeatures::empty(),
+             pixel_format,
+             mode_config,
++            splash_held_since: Once::new(),
++            splash_owes_frame: AtomicBool::new(false),
+         })
+     }
+ 
++    /// The boot splash's bar moves on the screen (aster_framebuffer::splash)
++    /// until the session shows. A display server's first frames are empty
++    /// (Xorg without acceleration starts black, its root window undrawn with
++    /// `-background none`): they stay off the screen, as Plymouth keeps its
++    /// splash until the desktop draws, and the first frame with something on
++    /// it (the desktop's boot screen, the setup screen) ends the splash. So
++    /// does a frame after SPLASH_HOLD_LIMIT seconds of holding.
++    fn hold_splash(&self, framebuffer: &DrmFramebuffer, source_rect: DrmRect) -> SplashHold {
++        if splash::is_moving() {
++            let since = *self.splash_held_since.call_once(Jiffies::elapsed);
++            let held = Jiffies::elapsed()
++                .as_duration()
++                .saturating_sub(since.as_duration());
++            if !self.has_drawing(framebuffer, source_rect) && held.as_secs() < SPLASH_HOLD_LIMIT
++            {
++                self.splash_owes_frame.store(true, Ordering::Release);
++                return SplashHold::Kept;
++            }
++            if splash::release() {
++                ostd::info!("the session shows; the boot splash ends");
++            }
++        }
++        // Kept frames, or the splash ended otherwise (a console, /dev/fb0):
++        // what the screen has is not the frame's.
++        if self.splash_owes_frame.swap(false, Ordering::AcqRel) {
++            SplashHold::Released
++        } else {
++            SplashHold::None
++        }
++    }
++
++    /// Whether the frame has something drawn on it: two or more points of a
++    /// grid over it that are not black. One could be the pointer.
++    fn has_drawing(&self, framebuffer: &DrmFramebuffer, source_rect: DrmRect) -> bool {
++        let bytes_per_pixel = framebuffer.pixel_format().bytes_per_pixel();
++        let pitch = framebuffer.pitch() as usize;
++        let base = framebuffer.offset() as usize;
++        let mut drawn = 0;
++        for row in 0..SPLASH_PROBES {
++            for column in 0..SPLASH_PROBES {
++                let x = source_rect.x() as usize
++                    + (2 * column + 1) * source_rect.width() as usize / (2 * SPLASH_PROBES);
++                let y = source_rect.y() as usize
++                    + (2 * row + 1) * source_rect.height() as usize / (2 * SPLASH_PROBES);
++                let mut pixel = [0u8; 4];
++                let pixel = &mut pixel[..bytes_per_pixel.min(4)];
++                if framebuffer
++                    .gem_object()
++                    .read_bytes(base + y * pitch + x * bytes_per_pixel, pixel)
++                    .is_err()
++                {
++                    return true;
++                }
++                // XRGB8888: blue, green, red, then the unused byte.
++                if pixel.iter().take(3).any(|&value| value != 0) {
++                    drawn += 1;
++                }
++            }
++        }
++        drawn >= 2
++    }
++
+     fn flush_framebuffer(&self, framebuffer: &DrmFramebuffer, source_rect: DrmRect) -> Result<()> {
+         self.flush_region(framebuffer, source_rect, source_rect)
+     }
+@@ -281,6 +373,9 @@ impl DrmKmsOps for SimpleDrmDevice {
+         // simpledrm cannot turn off the firmware display, so the last image remains visible
+         // while the DRM core clears its state.
+         if let Some(framebuffer) = framebuffer {
++            if self.hold_splash(framebuffer, source_rect) == SplashHold::Kept {
++                return Ok(());
++            }
+             self.flush_framebuffer(framebuffer, source_rect)?;
+         }
+         Ok(())
+@@ -292,8 +387,18 @@ impl DrmKmsOps for SimpleDrmDevice {
+         source_rects: &[DrmRect],
+         damage: &[DrmRect],
+     ) -> Result<()> {
++        // While the boot splash holds, nothing of the frame went to the screen:
++        // once it ends, all of it does.
++        let whole = match source_rects.first() {
++            Some(first) => match self.hold_splash(framebuffer, *first) {
++                SplashHold::Kept => return Ok(()),
++                SplashHold::Released => true,
++                SplashHold::None => false,
++            },
++            None => false,
++        };
+         for source_rect in source_rects {
+-            if damage.is_empty() {
++            if damage.is_empty() || whole {
+                 self.flush_framebuffer(framebuffer, *source_rect)?;
+                 continue;
+             }
+diff --git a/kernel/core/comps/framebuffer/src/console.rs b/kernel/core/comps/framebuffer/src/console.rs
+index 0b272c1..dfd2b1a 100644
+--- a/kernel/core/comps/framebuffer/src/console.rs
++++ b/kernel/core/comps/framebuffer/src/console.rs
+@@ -178,7 +178,7 @@ impl ConsoleState {
+         self.bytes.copy_within(offset.., 0);
+         self.bytes[self.backend.io_mem().size() - offset..].fill(0);
+ 
+-        if self.is_output_enabled() {
++        if self.draws() {
+             self.backend.write_bytes_at(0, &self.bytes).unwrap();
+         }
+ 
+@@ -208,7 +208,7 @@ impl ConsoleState {
+         let bg_pixel = self.backend.render_pixel(self.bg_color);
+ 
+         let pixel_size = fg_pixel.nbytes();
+-        let is_output_enabled = self.is_output_enabled();
++        let is_output_enabled = self.draws();
+ 
+         let mut offset = self.backend.calc_offset(self.x_pos, self.y_pos);
+ 
+@@ -261,7 +261,7 @@ impl ConsoleState {
+         let rendered_pixel = self.backend.render_pixel(color);
+         let rendered_pixel_size = rendered_pixel.nbytes();
+         let row_bytes = (x1 - x0) * rendered_pixel_size;
+-        let is_output_enabled = self.is_output_enabled();
++        let is_output_enabled = self.draws();
+ 
+         for y in y0..y1 {
+             let off = self.backend.calc_offset(x0, y).as_usize();
+@@ -299,6 +299,16 @@ impl ConsoleState {
+     fn is_output_enabled(&self) -> bool {
+         self.is_active && self.mode == ConsoleMode::Text
+     }
++
++    /// Whether text is drawn in the framebuffer now; if so, the boot
++    /// splash's bar stops moving (splash.rs), as the console draws over it.
++    fn draws(&self) -> bool {
++        let enabled = self.is_output_enabled();
++        if enabled {
++            crate::splash::release();
++        }
++        enabled
++    }
+ }
+ 
+ impl EscapeOp for ConsoleState {
+diff --git a/kernel/core/comps/framebuffer/src/framebuffer.rs b/kernel/core/comps/framebuffer/src/framebuffer.rs
+index e217a9d..bf22521 100644
+--- a/kernel/core/comps/framebuffer/src/framebuffer.rs
++++ b/kernel/core/comps/framebuffer/src/framebuffer.rs
+@@ -111,11 +111,23 @@ pub(crate) fn init() {
+         // Use write-combining for framebuffer to enable faster write operations.
+         // Write-combining allows the CPU to combine multiple writes into fewer bus transactions,
+         // which is ideal for framebuffer access patterns (sequential writes).
+-        let io_mem = IoMem::acquire_with_cache_policy(
++        // A firmware whose framebuffer lies in ordinary memory (QEMU's ramfb,
++        // some virtual machines) gets no framebuffer rather than a panic.
++        let io_mem = match IoMem::acquire_with_cache_policy(
+             fb_base..fb_base.checked_add(fb_size).unwrap(),
+             CachePolicy::WriteCombining,
+-        )
+-        .unwrap();
++        ) {
++            Ok(io_mem) => io_mem,
++            Err(error) => {
++                ostd::error!(
++                    "The framebuffer at {:#x} ({} bytes) is not device memory: {:?}",
++                    fb_base,
++                    fb_size,
++                    error
++                );
++                return;
++            }
++        };
+ 
+         let default_cmap = FbCmap {
+             entries: Vec::new(),
+@@ -132,8 +144,10 @@ pub(crate) fn init() {
+     };
+ 
+     // What the boot loader drew stays on the screen (a splash) until a
+-    // console or a display server draws over it.
+-    FRAMEBUFFER.call_once(|| Arc::new(framebuffer));
++    // console or a display server draws over it; the splash's bar moves
++    // meanwhile (splash.rs).
++    let framebuffer = FRAMEBUFFER.call_once(|| Arc::new(framebuffer));
++    crate::splash::start(framebuffer);
+ }
+ 
+ impl FrameBuffer {
+diff --git a/kernel/core/comps/framebuffer/src/lib.rs b/kernel/core/comps/framebuffer/src/lib.rs
+index b3132b3..ad3c78d 100644
+--- a/kernel/core/comps/framebuffer/src/lib.rs
++++ b/kernel/core/comps/framebuffer/src/lib.rs
+@@ -19,6 +19,7 @@ pub mod font;
+ pub mod framebuffer;
+ pub mod mode;
+ pub mod pixel;
++pub mod splash;
+ 
+ use component::{ComponentInitError, init_component};
+ 
+diff --git a/kernel/core/comps/framebuffer/src/splash.rs b/kernel/core/comps/framebuffer/src/splash.rs
+new file mode 100644
+index 0000000..7382759
+--- /dev/null
++++ b/kernel/core/comps/framebuffer/src/splash.rs
+@@ -0,0 +1,319 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The boot splash's bar, kept moving.
++//!
++//! The boot loader may leave a splash on the screen (OpenShell's GRUB draws
++//! one: the OPENSHELL wordmark over a 200x3 bar with a 60px segment in its
++//! middle, as Plymouth's first frame on OpenShell Live). On Live, Plymouth
++//! then moves the segment back and forth along the bar until the desktop's
++//! boot screen, which has the same bar, takes over. Here the kernel does it,
++//! from its start through unpacking the initramfs and the session's start,
++//! until a display server shows a frame with something on it (see
++//! `aster-simpledrm`), a console draws text, or a program draws on `/dev/fb0`
++//! ([`release`]).
++//!
++//! The splash is recognised on the screen, where the boot loader's stretch
++//! put it (the near-black around the bar, the bar, the brighter segment at
++//! its middle), so a screen without it is left as it is. The bar and the
++//! segment are taken from the screen as they were drawn, then the segment
++//! moves as Plymouth's script moves it: `(sin(frame / 12) + 1) / 2` of the
++//! way along the bar, 50 frames a second.
++
++use alloc::{sync::Arc, vec, vec::Vec};
++use core::{
++    ops::Range,
++    sync::atomic::{AtomicU8, AtomicU64, Ordering},
++};
++
++use ostd::{sync::SpinLock, timer::TIMER_FREQ};
++use spin::Once;
++
++use crate::{framebuffer::FrameBuffer, pixel::PixelFormat};
++
++// The splash's geometry on a 1920x1080 screen (OpenShell Live's Plymouth
++// theme; openshell-native distro/image/make-splash.py).
++const REFERENCE_WIDTH: usize = 1920;
++const REFERENCE_HEIGHT: usize = 1080;
++/// The bar's columns, its rounded ends included, and its rows.
++const BAR_X: Range<usize> = 860..1060;
++const BAR_Y: Range<usize> = 579..582;
++/// The segment's columns where the splash has it, in the bar's middle.
++const SEGMENT_X: Range<usize> = 930..990;
++/// Where the bar alone is, between its left end and the segment.
++const TRACK_X: usize = 900;
++/// Near-black around the bar: left and right of it, above it (under the
++/// wordmark) and under it (over the status line).
++const AROUND: [(usize, usize); 4] = [(820, 580), (1100, 580), (960, 569), (960, 589)];
++/// The splash's background, #050607.
++const BACKGROUND: [u8; 3] = [0x05, 0x06, 0x07];
++
++/// Plymouth's script moves the segment 50 times a second.
++const FRAMES_PER_SECOND: u64 = 50;
++/// `frame / 12` radians, in 1/65536 turns per frame: 65536 / (2 * pi * 12).
++const TURN_PER_FRAME: u64 = 869;
++
++const OFF: u8 = 0;
++const MOVING: u8 = 1;
++const RELEASED: u8 = 2;
++
++static STATE: AtomicU8 = AtomicU8::new(OFF);
++static TICKS: AtomicU64 = AtomicU64::new(0);
++static SPLASH: Once<SpinLock<Splash>> = Once::new();
++
++/// Looks for the boot splash on the screen and, where it is, keeps its bar
++/// moving.
++pub(crate) fn start(framebuffer: &Arc<FrameBuffer>) {
++    let Some(splash) = Splash::find(framebuffer) else {
++        return;
++    };
++    SPLASH.call_once(|| SpinLock::new(splash));
++    STATE.store(MOVING, Ordering::Release);
++    ostd::timer::register_callback_on_cpu(tick);
++    ostd::info!("the boot splash's bar moves until the session shows");
++}
++
++/// Whether the splash's bar is moving on the screen.
++pub fn is_moving() -> bool {
++    STATE.load(Ordering::Acquire) == MOVING
++}
++
++/// Stops moving the splash's bar: something else draws on the screen now.
++/// Returns whether it was moving. The screen keeps the last frame.
++pub fn release() -> bool {
++    if STATE
++        .compare_exchange(MOVING, RELEASED, Ordering::AcqRel, Ordering::Acquire)
++        .is_err()
++    {
++        return false;
++    }
++    // A frame being drawn right now ends first.
++    if let Some(splash) = SPLASH.get() {
++        drop(splash.disable_irq().lock());
++    }
++    true
++}
++
++fn tick() {
++    if STATE.load(Ordering::Relaxed) != MOVING {
++        return;
++    }
++    let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
++    if ticks % (TIMER_FREQ / FRAMES_PER_SECOND).max(1) != 0 {
++        return;
++    }
++    let Some(splash) = SPLASH.get() else {
++        return;
++    };
++    // In the timer interrupt: a frame is skipped rather than waited for.
++    let Some(mut splash) = splash.try_lock() else {
++        return;
++    };
++    if STATE.load(Ordering::Acquire) == MOVING {
++        splash.next_frame();
++    }
++}
++
++struct Splash {
++    framebuffer: Arc<FrameBuffer>,
++    /// Bytes per pixel (4: the splash is only looked for at 32 bits).
++    bytes: usize,
++    /// The screen's rows the bar covers, with a row of its edge each side.
++    rows: Range<usize>,
++    /// The columns redrawn: the bar without its rounded ends.
++    span: Range<usize>,
++    /// One column of the bar alone, top to bottom over `rows`.
++    track: Vec<u8>,
++    /// The segment as drawn, row by row over `rows`, `segment_width` wide.
++    segment: Vec<u8>,
++    segment_width: usize,
++    /// The segment's left column at the bar's left end, and how far it goes.
++    first_column: usize,
++    travel: usize,
++    /// One row of `span`, composed before it is written.
++    line: Vec<u8>,
++    frame: u64,
++    drawn_at: Option<usize>,
++}
++
++impl core::fmt::Debug for Splash {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("Splash")
++            .field("rows", &self.rows)
++            .field("span", &self.span)
++            .field("segment_width", &self.segment_width)
++            .finish_non_exhaustive()
++    }
++}
++
++impl Splash {
++    /// The splash's bar as the boot loader drew it, if the screen has it.
++    fn find(framebuffer: &Arc<FrameBuffer>) -> Option<Self> {
++        if framebuffer.pixel_format() != PixelFormat::BgrReserved {
++            return None;
++        }
++        let bytes = 4;
++        let (width, height) = (framebuffer.width(), framebuffer.height());
++        // The boot loader stretches the 1920x1080 splash over the screen.
++        let x = |reference: usize| reference * width / REFERENCE_WIDTH;
++        let y = |reference: usize| reference * height / REFERENCE_HEIGHT;
++        if width < REFERENCE_WIDTH / 4 || height < REFERENCE_HEIGHT / 4 {
++            return None;
++        }
++        let pixel = |column: usize, row: usize| -> Option<[u8; 4]> {
++            let mut value = [0u8; 4];
++            framebuffer
++                .read_bytes_at(row * framebuffer.line_size() + column * bytes, &mut value)
++                .ok()?;
++            Some(value)
++        };
++        let brightest = |value: [u8; 4]| value[0].max(value[1]).max(value[2]);
++
++        let middle = y((BAR_Y.start + BAR_Y.end) / 2);
++        let background = pixel(x(AROUND[0].0), y(AROUND[0].1))?;
++        for (column, row) in AROUND {
++            if pixel(x(column), y(row))? != background {
++                return None;
++            }
++        }
++        // #050607, in either byte order.
++        let near = |a: u8, b: u8| a.abs_diff(b) <= 4;
++        if !(near(background[1], BACKGROUND[1])
++            && near(background[0].min(background[2]), BACKGROUND[0])
++            && near(background[0].max(background[2]), BACKGROUND[2]))
++        {
++            return None;
++        }
++        let track = pixel(x(TRACK_X), middle)?;
++        let segment = pixel(x((SEGMENT_X.start + SEGMENT_X.end) / 2), middle)?;
++        if brightest(track) < brightest(background) + 8
++            || brightest(segment) < brightest(track) + 64
++        {
++            return None;
++        }
++
++        // The rows with the bar, its blended edges included.
++        let top = y(BAR_Y.start).saturating_sub(1);
++        let bottom = ((BAR_Y.end * height).div_ceil(REFERENCE_HEIGHT) + 1).min(height);
++        let rows = top..bottom;
++        let span = (x(BAR_X.start) + 2)..x(BAR_X.end - 1).saturating_sub(1);
++        let first_segment_column = x(SEGMENT_X.start).saturating_sub(1);
++        let segment_end = ((SEGMENT_X.end * width).div_ceil(REFERENCE_WIDTH) + 1).min(width);
++        let segment_width = segment_end.checked_sub(first_segment_column)?;
++        if span.is_empty() || rows.is_empty() || segment_width > span.len() {
++            return None;
++        }
++
++        let mut track_column = vec![0u8; rows.len() * bytes];
++        for (index, row) in rows.clone().enumerate() {
++            let value = pixel(x(TRACK_X), row)?;
++            track_column[index * bytes..(index + 1) * bytes].copy_from_slice(&value);
++        }
++        let mut segment_pixels = vec![0u8; rows.len() * segment_width * bytes];
++        for (index, row) in rows.clone().enumerate() {
++            let start = index * segment_width * bytes;
++            framebuffer
++                .read_bytes_at(
++                    row * framebuffer.line_size() + first_segment_column * bytes,
++                    &mut segment_pixels[start..start + segment_width * bytes],
++                )
++                .ok()?;
++        }
++
++        // Plymouth's segment goes from the bar's left end to its right end.
++        let first_column = x(BAR_X.start).saturating_sub(1);
++        let last_column = x(BAR_X.end) + 1;
++        let travel = last_column.checked_sub(first_column + segment_width)?;
++
++        Some(Self {
++            framebuffer: framebuffer.clone(),
++            bytes,
++            rows,
++            line: vec![0u8; span.len() * bytes],
++            span,
++            track: track_column,
++            segment: segment_pixels,
++            segment_width,
++            first_column,
++            travel,
++            frame: 0,
++            drawn_at: None,
++        })
++    }
++
++    fn next_frame(&mut self) {
++        self.frame += 1;
++        let along = position((self.frame * TURN_PER_FRAME) as u32);
++        let left = self.first_column + (self.travel * along as usize >> 16);
++        if self.drawn_at == Some(left) {
++            return;
++        }
++        self.drawn_at = Some(left);
++
++        let bytes = self.bytes;
++        let line_size = self.framebuffer.line_size();
++        for (index, row) in self.rows.clone().enumerate() {
++            let track = &self.track[index * bytes..(index + 1) * bytes];
++            let segment_row = &self.segment
++                [index * self.segment_width * bytes..(index + 1) * self.segment_width * bytes];
++            for (offset, column) in self.span.clone().enumerate() {
++                let source = if column >= left && column < left + self.segment_width {
++                    let at = (column - left) * bytes;
++                    &segment_row[at..at + bytes]
++                } else {
++                    track
++                };
++                self.line[offset * bytes..(offset + 1) * bytes].copy_from_slice(source);
++            }
++            let _ = self
++                .framebuffer
++                .write_bytes_at(row * line_size + self.span.start * bytes, &self.line);
++        }
++    }
++}
++
++/// `(sin(turn) + 1) / 2` in 1/65536ths (0 to 65536), `turn` in 1/65536 turns.
++fn position(turn: u32) -> u32 {
++    // sin(k * pi / 128) for k in 0..=64, in 1/65536ths.
++    const QUARTER: [i32; 65] = [
++        0, 1608, 3216, 4821, 6424, 8022, 9616, 11204, 12785, 14359, 15924, 17479, 19024, 20557,
++        22078, 23586, 25080, 26558, 28020, 29466, 30893, 32303, 33692, 35062, 36410, 37736, 39040,
++        40320, 41576, 42806, 44011, 45190, 46341, 47464, 48559, 49624, 50660, 51665, 52639, 53581,
++        54491, 55368, 56212, 57022, 57798, 58538, 59244, 59914, 60547, 61145, 61705, 62228, 62714,
++        63162, 63572, 63944, 64277, 64571, 64827, 65043, 65220, 65358, 65457, 65516, 65536,
++    ];
++    let turn = turn & 0xFFFF;
++    let quadrant = turn >> 14;
++    let within = turn & 0x3FFF;
++    let angle = if quadrant & 1 == 0 {
++        within
++    } else {
++        0x4000 - within
++    };
++    let index = (angle >> 8) as usize;
++    let fraction = (angle & 0xFF) as i32;
++    let sine = if index >= 64 {
++        QUARTER[64]
++    } else {
++        QUARTER[index] + ((QUARTER[index + 1] - QUARTER[index]) * fraction >> 8)
++    };
++    let sine = if quadrant >= 2 { -sine } else { sine };
++    ((sine + 65536) / 2) as u32
++}
++
++#[cfg(ktest)]
++mod test {
++    use ostd::prelude::*;
++
++    use super::position;
++
++    #[ktest]
++    fn position_follows_the_sine() {
++        assert_eq!(position(0), 32768);
++        assert_eq!(position(0x4000), 65536);
++        assert_eq!(position(0x8000), 32768);
++        assert_eq!(position(0xC000), 0);
++        // sin(30 degrees) = 0.5: three quarters of the way.
++        let thirty = position(65536 / 12);
++        assert!(thirty.abs_diff(49152) < 64, "{thirty}");
++    }
++}
+diff --git a/kernel/core/src/device/fb.rs b/kernel/core/src/device/fb.rs
+index 0a5c3b7..2a99a53 100644
+--- a/kernel/core/src/device/fb.rs
++++ b/kernel/core/src/device/fb.rs
+@@ -460,6 +460,8 @@ impl FileOps for FbHandle {
+         if !reader.has_remain() {
+             return Ok(0);
+         }
++        // The program draws on the screen now, not the boot splash.
++        aster_framebuffer::splash::release();
+ 
+         let io_mem = self.framebuffer.io_mem();
+         let size = io_mem.size();
+@@ -505,6 +507,7 @@ impl PerOpenFileOps for FbHandle {
+     }
+ 
+     fn mappable(&self, _request: FileMmapRequest) -> Result<MappableObject<'_>> {
++        aster_framebuffer::splash::release();
+         Ok(MappableObject::Device(self as &dyn Mappable))
+     }
+ 

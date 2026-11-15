@@ -44,6 +44,31 @@ iwlwifi-7265D-29.ucode
 iwlwifi-3160-17.ucode
 iwlwifi-3168-29.ucode
 
+# MediaTek Wi-Fi (kernel/comps/mt7921): the patch and the RAM code of the
+# MT7921 (and its AMD RZ608/RZ616 names), the MT7920 (1a) and the MT7922.
+licence LICENCE.mediatek 018qiwzkha4qr6md3kism2fm88knlxg55igy8ncqi1adf1k3y3d9
+mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin
+mediatek/WIFI_RAM_CODE_MT7961_1.bin
+mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin
+mediatek/WIFI_RAM_CODE_MT7961_1a.bin
+mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin
+mediatek/WIFI_RAM_CODE_MT7922_1.bin
+
+# Realtek Wi-Fi (kernel/comps/rtw88): the RTL8821CE's firmware (its licence
+# is the Realtek one under Bluetooth below).
+rtw88/rtw8821c_fw.bin
+
+# Qualcomm Atheros Wi-Fi (kernel/comps/ath10k): each chip revision's
+# firmware over PCIe (firmware-N.bin, the newest interface the driver tries
+# first), its board data and the firmware's notices.
+licence LICENSE.QualcommAtheros_ath10k 0grvqbl0j8d1na0d6dffzq9h2gk9j5n4qjpf8fhvmmrq4485ayik
+ath10k/QCA6174/hw*/firmware-[0-9].bin
+ath10k/QCA6174/hw*/board*.bin
+ath10k/QCA6174/hw*/notice_ath10k_firmware-[0-9].txt
+ath10k/QCA9377/hw1.0/firmware-[0-9].bin
+ath10k/QCA9377/hw1.0/board*.bin
+ath10k/QCA9377/hw1.0/notice_ath10k_firmware-[0-9].txt
+
 # Intel Bluetooth on USB (kernel/comps/bluetooth, intel.rs): the firmware the
 # boot loader takes and its configuration (.ddc), for every controller from
 # the 8260 on. Legacy names (8260 to AX201) by variant and revisions; TLV
