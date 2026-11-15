@@ -322,6 +322,22 @@ pub fn record_boot(store: &mut impl Store, booted: Boot, env: &bootenv::BootEnv)
     Ok(())
 }
 
+/// Puts the release that ran before the last update (the slot that is not
+/// confirmed, still good) on trial again: the next boot runs it, and its
+/// session confirms it. The USB stick's updater offers it ("Restore the
+/// previous release"); a failed trial falls back as any other.
+pub fn restore_previous(store: &mut impl Store) -> Result<Slot, Error> {
+    let mut selector = load(store).ok_or(Error::NoSelector)?;
+    let previous = selector.confirmed.ok_or(Error::State("no confirmed slot to restore from"))?.other();
+    let record = selector.slot(previous);
+    if record.state != State::Good || !valid_release(&record.release) {
+        return Err(Error::State("no previous release to restore"));
+    }
+    selector.slot_mut(previous).state = State::Trial(TRIAL_BOOTS);
+    save(store, &mut selector)?;
+    Ok(previous)
+}
+
 /// Confirms the running slot after the health checks of the session.
 pub fn confirm(store: &mut impl Store, running: Slot) -> Result<(), Error> {
     let mut selector = load(store).ok_or(Error::NoSelector)?;
@@ -525,6 +541,29 @@ pub(crate) mod tests {
                 Boot::Recovery => panic!("cut {cut}: recovery with {selector:?}"),
             }
         }
+    }
+
+    #[test]
+    fn restores_the_previous_release() {
+        let mut disk = installed();
+        // A fresh installation has nothing before it.
+        assert_eq!(restore_previous(&mut disk), Err(Error::State("no previous release to restore")));
+        update(&mut disk).unwrap();
+        // Slot A still holds the release that ran before.
+        assert_eq!(restore_previous(&mut disk), Ok(Slot::A));
+        assert_eq!(choose_boot(&mut disk), Ok(Boot::Slot(Slot::A)));
+        confirm(&mut disk, Slot::A).unwrap();
+        let selector = load(&disk).unwrap();
+        assert_eq!(selector.confirmed, Some(Slot::A));
+        assert_eq!(selector.slot(Slot::A).release, "2026.11.0");
+        // A restore that never confirms falls back to the release it replaced.
+        restore_previous(&mut disk).unwrap();
+        for _ in 0..TRIAL_BOOTS {
+            assert_eq!(choose_boot(&mut disk), Ok(Boot::Slot(Slot::B)));
+        }
+        assert_eq!(choose_boot(&mut disk), Ok(Boot::Slot(Slot::A)));
+        // A release that failed is no previous release.
+        assert_eq!(restore_previous(&mut disk), Err(Error::State("no previous release to restore")));
     }
 
     #[test]

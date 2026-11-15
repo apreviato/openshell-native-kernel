@@ -79,7 +79,7 @@ if ($expected -notmatch '^[0-9a-fA-F]{64}$') { throw "Invalid SHA-256 in $media.
 $secureBoot = @'
 Secure Boot: the stick starts like OpenShell Live's (Debian's shim and GRUB). The first time on a
 computer with Secure Boot on, enroll OpenShell Native's key once: in the boot menu choose
-"Enroll the OpenShell Native key", then in MokManager Enroll key from disk >
+"More options > Enroll the OpenShell Native key", then in MokManager Enroll key from disk >
 ENROLL_THIS_KEY_IN_MOKMANAGER.cer > Continue > Yes, and reboot.
 '@
 if ($writeUsb) {

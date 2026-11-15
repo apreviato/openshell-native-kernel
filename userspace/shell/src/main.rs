@@ -279,6 +279,11 @@ fn run(args: &[OsString]) -> Result<(), Box<dyn Error>> {
     let sound = start_sound_server(&home, &runtime, &state);
     let pulse_server = sound.as_ref().map(|(_, address)| address.clone());
     let _sound = sound.map(|(server, _)| server);
+    // Cards that come and go (a USB headset plugged in): the server opens
+    // and lets go of them as they do (sound.rs).
+    if let Some(address) = pulse_server.clone() {
+        thread::spawn(move || openshell_shell::sound::follow_cards(OsStr::new("pactl"), &address, &STOP_REQUESTED));
+    }
     let mut cursor_path = home.join(".icons").into_os_string();
     cursor_path.push(":");
     cursor_path.push(home.join(".local/share/icons"));

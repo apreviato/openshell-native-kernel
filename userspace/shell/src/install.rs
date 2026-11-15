@@ -116,6 +116,34 @@ pub fn disks_line(listing: &str) -> String {
     }
 }
 
+/// Runs a job of the medium's (the installer, the updater) and follows it:
+/// its "PROGRESS <percent> <message>" lines and "DONE" make the state; its
+/// last "FAILED <message>" on stderr says why it failed. "started", or why
+/// it did not start.
+pub fn follow(mut command: Command, state: &Arc<Mutex<InstallState>>, what: &str) -> String {
+    let child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+    let Ok(mut child) = child else { return format!("failed {what} did not start") };
+    *state.lock().unwrap() = InstallState::Running { percent: 0, message: "Starting".into() };
+    let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let shared = state.clone();
+    let stopped = format!("{what} stopped");
+    thread::spawn(move || {
+        let errors = thread::spawn(move || BufReader::new(stderr).lines().map_while(Result::ok).last().unwrap_or_default());
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let mut state = shared.lock().unwrap();
+            *state = state.clone().after(&line);
+        }
+        let status = child.wait();
+        let last_error = errors.join().unwrap_or_default();
+        let mut state = shared.lock().unwrap();
+        if !matches!(status, Ok(status) if status.success()) || *state != InstallState::Done {
+            let message = last_error.strip_prefix("FAILED ").unwrap_or(&last_error).to_owned();
+            *state = InstallState::Failed(if message.is_empty() { stopped } else { message });
+        }
+    });
+    "started".into()
+}
+
 /// The installer's answers, until `install` hands them over.
 #[derive(Default)]
 struct Setup {
@@ -200,28 +228,7 @@ impl Installer {
                         }
                     }
                 }
-                let child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-                let Ok(mut child) = child else { return "failed the installer did not start".into() };
-                *self.state.lock().unwrap() = InstallState::Running { percent: 0, message: "Starting".into() };
-                let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-                let shared = self.state.clone();
-                thread::spawn(move || {
-                    let errors = thread::spawn(move || {
-                        BufReader::new(stderr).lines().map_while(Result::ok).last().unwrap_or_default()
-                    });
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                        let mut state = shared.lock().unwrap();
-                        *state = state.clone().after(&line);
-                    }
-                    let status = child.wait();
-                    let last_error = errors.join().unwrap_or_default();
-                    let mut state = shared.lock().unwrap();
-                    if !matches!(status, Ok(status) if status.success()) || *state != InstallState::Done {
-                        let message = last_error.strip_prefix("FAILED ").unwrap_or(&last_error).to_owned();
-                        *state = InstallState::Failed(if message.is_empty() { "the installer stopped".into() } else { message });
-                    }
-                });
-                "started".into()
+                follow(command, &self.state, "the installer")
             }
             _ => "invalid".into(),
         }

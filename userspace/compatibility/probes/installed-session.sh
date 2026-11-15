@@ -1,6 +1,12 @@
 #!/bin/sh
 # Starts the Desktop with persistent state on disk, or temporary state in live mode.
 # The root supervisor invokes this script again only after Desktop health.
+#
+# The live medium's boot menu (distro/image/build-media.sh) starts it as
+# "live" (the Desktop), "install" or "update": those two open the medium's
+# setup screen (userspace/compatibility/setup) on its own session instead of
+# the Desktop, as OpenShell Live's Install and Update entries do; leaving it
+# starts the live Desktop.
 set -eu
 
 root=/opt/openshell-compat
@@ -146,12 +152,28 @@ settings=
 updates=
 # The Desktop's mode, as OpenShell Live tells it from its files (hostd context.ts).
 mode=installed
-if [ "${1:-}" = live ]; then
+# The medium's setup screen, in place of the Desktop: install or update.
+setup_screen=
+case "${1:-}" in
+    install | update)
+        if [ -x "$root/bin/openshell-setup" ]; then
+            setup_screen=$1
+        else
+            set -- live
+        fi
+        ;;
+esac
+if [ "${1:-}" = live ] || [ -n "$setup_screen" ]; then
     mode=live
     data=/tmp/openshell-live
     # The live medium installs itself on a disk (Install OpenShell), as root.
     if [ -x "$root/bin/openshell-native-install" ]; then
         login="installer=$root/bin/openshell-native-install"
+    fi
+    # And updates an installed system (the setup screen's Update).
+    if [ "$setup_screen" = update ] && [ -x "$root/bin/openshell-native-update" ]; then
+        login="$login
+usb_updater=$root/bin/openshell-native-update"
     fi
 else
     case "$slot" in a|b) ;; *) exit 1 ;; esac
@@ -252,6 +274,11 @@ wm=$root/bin/openbox
 if [ -x "$root/bin/openshell-wm" ]; then wm=$root/bin/openshell-wm; fi
 config=$(mktemp /tmp/openshell-installed-session.XXXXXX)
 trap 'rm -f "$config"' EXIT
+# The session's program: the Desktop, or the medium's setup screen.
+shell_command="$root/bin/openshell-shell /opt/openshell /opt/openshell-cef/openshell-cef-host $state $root/bin/node"
+if [ -n "$setup_screen" ]; then
+    shell_command="$root/bin/openshell-setup $setup_screen"
+fi
 cat > "$config" <<EOF
 user=65534:65534
 display=:0
@@ -259,7 +286,7 @@ home=$state/home
 log_dir=$data/openshell/session-logs
 x=$root/bin/openshell-x :0 -screen 0 1280x800x24 -nolisten tcp -ac
 wm=$wm
-shell=$root/bin/openshell-shell /opt/openshell /opt/openshell-cef/openshell-cef-host $state $root/bin/node
+shell=$shell_command
 env=PATH=$root/bin:/bin:/usr/bin
 env=FONTCONFIG_FILE=$root/fonts.conf
 env=XDG_CONFIG_DIRS=$root/xdg
@@ -287,7 +314,8 @@ fi
 # files to read and which plug-ins to load. It starts again if it ends; its
 # log is this boot's.
 wifi=
-if [ -x "$root/bin/wpa_supplicant" ]; then
+# The setup screen needs none of the services the Desktop offers.
+if [ -z "$setup_screen" ] && [ -x "$root/bin/wpa_supplicant" ]; then
     mkdir -p /run/openshell-wifi/interfaces
     chmod 0700 /run/openshell-wifi /run/openshell-wifi/interfaces
     : > "$data/openshell/session-logs/wifi.log"
@@ -444,7 +472,7 @@ fi
 # kernel's route notifications).
 discovery_service=
 name_service=
-if [ -x "$root/bin/dbus-daemon" ] && [ -x "$root/bin/avahi-daemon" ] && [ -f /etc/dbus-1/system.conf ]; then
+if [ -z "$setup_screen" ] && [ -x "$root/bin/dbus-daemon" ] && [ -x "$root/bin/avahi-daemon" ] && [ -f /etc/dbus-1/system.conf ]; then
     grep -q '^messagebus:' /etc/passwd || echo 'messagebus:x:71:71:D-Bus system bus:/run/dbus:/bin/false' >> /etc/passwd
     grep -q '^messagebus:' /etc/group || echo 'messagebus:x:71:' >> /etc/group
     grep -q '^avahi:' /etc/passwd || echo 'avahi:x:70:70:Avahi mDNS/DNS-SD:/run/avahi-daemon:/bin/false' >> /etc/passwd
@@ -501,6 +529,39 @@ if [ -x "$root/bin/dbus-daemon" ] && [ -x "$root/bin/avahi-daemon" ] && [ -f /et
     ) >> "$data/openshell/session-logs/discovery.log" 2>&1 &
     discovery_service=$!
 fi
+# Bluetooth, as on Live: BlueZ's daemon, on the system bus, runs the
+# kernel's controllers (their firmware the kernel loads), and Settings ▸
+# Bluetooth speaks to it through bluetoothctl. Pairings stay on the data
+# partition (a live session's last until it ends). It starts again if it
+# ends.
+bluetooth_service=
+if [ -n "$discovery_service" ] && [ -x "$root/bin/bluetoothd" ]; then
+    if [ -n "${settings:-}" ]; then
+        bluetooth_state=$data/openshell/system/bluetooth
+    else
+        bluetooth_state=/tmp/openshell-bluetooth
+    fi
+    mkdir -p "$bluetooth_state" /var/lib
+    chmod 0700 "$bluetooth_state"
+    # BlueZ keeps its controllers' and devices' keys in /var/lib/bluetooth.
+    if [ ! -L /var/lib/bluetooth ]; then
+        rm -rf /var/lib/bluetooth
+        ln -s "$bluetooth_state" /var/lib/bluetooth
+    fi
+    : > "$data/openshell/session-logs/bluetooth.log"
+    (
+        set +e
+        while :; do
+            for i in $(seq 1 100); do
+                [ -S /run/dbus/system_bus_socket ] && break
+                sleep 0.2
+            done
+            "$root/bin/bluetoothd" --nodetach
+            sleep 5
+        done
+    ) >> "$data/openshell/session-logs/bluetooth.log" 2>&1 &
+    bluetooth_service=$!
+fi
 # Printing: CUPS's scheduler, for this computer's programs only (the
 # loopback address and its socket), with the session's person as its
 # administrator, who adds and removes printers in Settings: nobody else has
@@ -508,7 +569,7 @@ fi
 # (a live session's last until it ends). It starts again if it ends; its log
 # is this boot's.
 cups_service=
-if [ -x "$root/bin/cupsd" ] && [ -d "$root/cups/lib/cups" ]; then
+if [ -z "$setup_screen" ] && [ -x "$root/bin/cupsd" ] && [ -d "$root/cups/lib/cups" ]; then
     if [ -n "${settings:-}" ]; then
         cups_state=$data/openshell/system/cups
     else
@@ -603,6 +664,47 @@ EOF
     ) &
     cups_service=$!
 fi
+# USB printers that speak IPP over USB (most made since 2015), as on Debian:
+# ipp-usb gives each one as an IPP printer on this computer (the loopback
+# address), which Avahi announces, so Settings ▸ Printers lists it with the
+# network's (`lpstat -e`) and CUPS prints to it without a driver. It finds
+# the printers itself (libusb, from the kernel's sysfs and uevents) as they
+# come and go. The kernel's IPv6 is IPv4's (patch 0051): [::1] is the
+# 127.0.0.1 it listens on already. It starts again if it ends.
+ipp_usb_service=
+if [ -n "$discovery_service" ] && [ -x "$root/bin/ipp-usb" ]; then
+    mkdir -p /etc/ipp-usb /var/lib/ipp-usb/dev /var/log/ipp-usb
+    cat > /etc/ipp-usb/ipp-usb.conf <<EOF
+[network]
+  http-min-port = 60000
+  http-max-port = 65535
+  dns-sd = enable
+  interface = loopback
+  ipv6 = disable
+[auth uid]
+  all = *
+[logging]
+  device-log = all
+  main-log = debug
+  console-log = info
+  console-color = disable
+  max-file-size = 256K
+  max-backup-files = 2
+EOF
+    : > "$data/openshell/session-logs/ipp-usb.log"
+    (
+        set +e
+        while :; do
+            for i in $(seq 1 100); do
+                [ -S /run/dbus/system_bus_socket ] && break
+                sleep 0.2
+            done
+            "$root/bin/ipp-usb" standalone
+            sleep 5
+        done
+    ) >> "$data/openshell/session-logs/ipp-usb.log" 2>&1 &
+    ipp_usb_service=$!
+fi
 "$root/bin/openshell-session" "$config" >> "$data/openshell/session-logs/supervisor.log" 2>&1 &
 supervisor=$!
 trap 'kill -TERM "$supervisor" 2>/dev/null || true' HUP INT TERM
@@ -625,6 +727,14 @@ fi
 if [ -n "$cups_service" ]; then
     kill "$cups_service" 2>/dev/null || true
     killall cupsd 2>/dev/null || true
+fi
+if [ -n "$ipp_usb_service" ]; then
+    kill "$ipp_usb_service" 2>/dev/null || true
+    killall ipp-usb 2>/dev/null || true
+fi
+if [ -n "$bluetooth_service" ]; then
+    kill "$bluetooth_service" 2>/dev/null || true
+    killall bluetoothd 2>/dev/null || true
 fi
 if [ -n "$discovery_service" ]; then
     # Its loop ends once the daemon it waits for does.
@@ -680,4 +790,10 @@ case "$status" in
         if [ "$status" = 64 ]; then poweroff -f; else reboot -f; fi
         ;;
 esac
+# The setup screen was left ("Try OpenShell Native"), or could not go on:
+# the live Desktop, as the boot menu's first entry starts it.
+if [ -n "$setup_screen" ]; then
+    rm -f "$config"
+    exec sh -l "$root/installed-session.sh" live
+fi
 exit "$status"

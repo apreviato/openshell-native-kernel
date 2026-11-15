@@ -6,8 +6,10 @@ pub mod install;
 pub mod login;
 pub mod power;
 pub mod settings;
+pub mod sound;
 pub mod ssh;
 pub mod update;
+pub mod usb_update;
 pub mod wifi;
 pub mod session;
 

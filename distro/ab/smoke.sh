@@ -152,6 +152,32 @@ grep -q '^openshell_fallback=a$' "$disk/grubenv"
 expect_grub a
 expect a
 
+# Restoring the previous release (the USB stick's updater): the good
+# release the last update replaced goes on trial, boots and is confirmed.
+main_disk=$disk
+disk="$work/restore"
+"$ab" "$disk" install 2026.11.0
+if "$ab" "$disk" restore 2>/dev/null; then
+    echo 'Restored a release a fresh installation never had' >&2
+    exit 1
+fi
+"$ab" "$disk" stage "$work/2026.12.0" "$work/2026.12.0/MANIFEST" 2 "$keys"
+"$ab" "$disk" trial
+expect b
+"$ab" "$disk" confirm b 2026.12.0
+"$ab" "$disk" restore | grep -Fxq 'restoring 2026.11.0 in slot a'
+expect a
+"$ab" "$disk" confirm a 2026.11.0
+expect a
+"$ab" "$disk" status | grep -q '^b: Good 2026.12.0$'
+# update-offline writes only a mounted system partition of an OpenShell disk.
+mkdir -p "$work/not-a-partition"
+if "$ab" "$disk" update-offline "$work/2026.12.0" "$work/2026.12.0/MANIFEST" 2 "$keys" "$work/not-a-partition" 2>/dev/null; then
+    echo 'update-offline wrote a folder that is no system partition' >&2
+    exit 1
+fi
+disk=$main_disk
+
 # One damaged selector copy is survived; two mean recovery.
 newest=$(ls -t "$disk"/selector.* | head -1)
 printf 'garbage' > "$newest"

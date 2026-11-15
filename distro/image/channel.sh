@@ -13,6 +13,10 @@
 #
 # Sourced by run.sh and build-media.sh:
 #   channel_key <key-folder> <openshell-ab>     openshell-native-release.{key,pem}, made once
+#   channel_manifest <folder> <openshell-ab> <key-folder> <version>
+#                                              MANIFEST and MANIFEST.sig of the release in <folder>
+#                                              (kernel, initramfs.cpio.gz, boot.cfg); the live
+#                                              medium carries them too, for its updater
 #   channel_release <out> <openshell-ab> <key-folder> <version> <built-at> <signed-kernel> <initramfs> <boot.cfg> [<iso>]
 #                                              <out>/latest.json(.sig) and <out>/openshell-native-<version>-amd64.tar
 #
@@ -33,20 +37,25 @@ channel_key() {
     fi
 }
 
+channel_manifest() {
+    local stage=$1 ab=$2 keys=$3 version=$4 file
+    {
+        printf 'release=%s\narch=x86_64\nschema=%s\n' "$version" "$CHANNEL_SCHEMA"
+        for file in kernel initramfs.cpio.gz boot.cfg; do
+            printf 'file=%s %s %s\n' "$file" "$(stat -L -c %s "$stage/$file")" "$(sha256sum "$stage/$file" | cut -d' ' -f1)"
+        done
+    } > "$stage/MANIFEST"
+    "$ab" sign "$keys/$CHANNEL_KEY_NAME.key" "$stage/MANIFEST"
+}
+
 channel_release() {
     local out=$1 ab=$2 keys=$3 version=$4 built=$5 kernel=$6 initramfs=$7 boot=$8 iso=${9:-}
-    local name="openshell-native-$version-amd64.tar" stage file
+    local name="openshell-native-$version-amd64.tar" stage
     stage=$(mktemp -d)
     cp "$kernel" "$stage/kernel"
     cp "$initramfs" "$stage/initramfs.cpio.gz"
     cp "$boot" "$stage/boot.cfg"
-    {
-        printf 'release=%s\narch=x86_64\nschema=%s\n' "$version" "$CHANNEL_SCHEMA"
-        for file in kernel initramfs.cpio.gz boot.cfg; do
-            printf 'file=%s %s %s\n' "$file" "$(stat -c %s "$stage/$file")" "$(sha256sum "$stage/$file" | cut -d' ' -f1)"
-        done
-    } > "$stage/MANIFEST"
-    "$ab" sign "$keys/$CHANNEL_KEY_NAME.key" "$stage/MANIFEST"
+    channel_manifest "$stage" "$ab" "$keys" "$version"
     mkdir -p "$out"
     tar -C "$stage" -cf "$out/$name" MANIFEST MANIFEST.sig kernel initramfs.cpio.gz boot.cfg
     rm -rf "$stage"

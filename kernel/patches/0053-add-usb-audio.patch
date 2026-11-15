@@ -1,0 +1,2897 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 93ae621..56a3a79 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -539,6 +539,7 @@ dependencies = [
+  "aster-network",
+  "aster-pci",
+  "aster-softirq",
++ "aster-sound",
+  "component",
+  "device-id",
+  "ostd",
+diff --git a/kernel/comps/sound/src/card.rs b/kernel/comps/sound/src/card.rs
+old mode 100755
+new mode 100644
+index e11a444..4e412a1
+--- a/kernel/comps/sound/src/card.rs
++++ b/kernel/comps/sound/src/card.rs
+@@ -5,6 +5,9 @@
+ //! mixer controls (the master volume and switch, the capture ones, the
+ //! jacks); and a task that follows the headphone jack, turning the speakers
+ //! off while headphones are in.
++//!
++//! Other drivers make cards of their own (`Card::external`: a USB audio
++//! device's), whose controls their [`Mixer`] puts on the hardware.
+ 
+ use alloc::{
+     boxed::Box,
+@@ -44,6 +47,8 @@ enum Target {
+     CaptureSwitch,
+     /// A jack's presence (read only).
+     Jack,
++    /// An external card's control: its mixer applies it.
++    External,
+ }
+ 
+ pub struct Control {
+@@ -55,6 +60,10 @@ pub struct Control {
+     /// A dB scale: (the lowest step's gain, the step, in hundredths of a
+     /// dB; whether the lowest is a mute).
+     pub db_scale: Option<(i32, u32, bool)>,
++    /// Or the gains of the lowest and the highest value, in hundredths of
++    /// a dB, with whether the lowest is a mute (`TLV_DB_MINMAX`), where
++    /// steps are no whole hundredths (a USB device's 1/256 dB).
++    pub db_range: Option<(i32, i32, bool)>,
+     values: SpinLock<Vec<i64>, LocalIrqDisabled>,
+     target: Target,
+     /// When it last changed (the card's event counter).
+@@ -65,6 +74,54 @@ impl Control {
+     pub fn values(&self) -> Vec<i64> {
+         self.values.lock().clone()
+     }
++
++    /// A control of an external card, which its [`Mixer`] applies.
++    pub fn external(name: String, kind: ControlKind, count: u32, db_range: Option<(i32, i32, bool)>, initial: Vec<i64>) -> Self {
++        Self {
++            name,
++            iface: IFACE_MIXER,
++            kind,
++            count,
++            writable: true,
++            db_scale: None,
++            db_range,
++            values: SpinLock::new(initial),
++            target: Target::External,
++            changed: AtomicU64::new(0),
++        }
++    }
++}
++
++/// The hardware behind an external card's controls.
++pub trait Mixer: Send + Sync {
++    /// Control `index` of the card has these values now (within its range).
++    fn apply(&self, index: usize, values: &[i64]);
++}
++
++/// What a card's identity says (`SNDRV_CTL_IOCTL_CARD_INFO`).
++pub struct CardInfo {
++    pub id: String,
++    pub driver: String,
++    pub name: String,
++    pub longname: String,
++    pub mixer_name: String,
++    pub components: String,
++    pub pcm_name: String,
++}
++
++/// An HDA codec's card: the routes and which outputs play now.
++struct Hda {
++    controller: Arc<Controller>,
++    codec: usize,
++    outputs: Vec<Route>,
++    inputs: Vec<Route>,
++    /// Whether each output plays now (headphones in: not the speakers).
++    enabled: SpinLock<Vec<bool>, LocalIrqDisabled>,
++}
++
++enum Backend {
++    Hda(Hda),
++    External(Arc<dyn Mixer>),
+ }
+ 
+ pub struct Card {
+@@ -82,12 +139,7 @@ pub struct Card {
+     /// Counts control changes; readers of events wait for it to move.
+     pub events: AtomicU64,
+     pub event_wait: WaitQueue,
+-    controller: Arc<Controller>,
+-    codec: usize,
+-    outputs: Vec<Route>,
+-    inputs: Vec<Route>,
+-    /// Whether each output plays now (headphones in: not the speakers).
+-    enabled: SpinLock<Vec<bool>, LocalIrqDisabled>,
++    backend: Backend,
+ }
+ 
+ /// Makers' names for the codecs' vendor IDs (as Linux's `hda_codec.c`).
+@@ -178,6 +230,7 @@ impl Card {
+                     count: 2,
+                     writable: true,
+                     db_scale: Some((amp.caps.centibels(0), step, false)),
++                    db_range: None,
+                     values: SpinLock::new(vec![i64::from(amp.caps.offset); 2]),
+                     target: volume,
+                     changed: AtomicU64::new(0),
+@@ -190,6 +243,7 @@ impl Card {
+                 count: 2,
+                 writable: true,
+                 db_scale: None,
++                db_range: None,
+                 values: SpinLock::new(vec![1; 2]),
+                 target: switch,
+                 changed: AtomicU64::new(0),
+@@ -211,6 +265,7 @@ impl Card {
+                     count: 1,
+                     writable: false,
+                     db_scale: None,
++                    db_range: None,
+                     values: SpinLock::new(vec![0]),
+                     target: Target::Jack,
+                     changed: AtomicU64::new(0),
+@@ -232,18 +287,51 @@ impl Card {
+             controls,
+             events: AtomicU64::new(0),
+             event_wait: WaitQueue::new(),
+-            controller: controller.clone(),
+-            codec: codec_index,
+-            enabled: SpinLock::new(vec![true; outputs.len()]),
+-            outputs,
+-            inputs,
++            backend: Backend::Hda(Hda {
++                controller: controller.clone(),
++                codec: codec_index,
++                enabled: SpinLock::new(vec![true; outputs.len()]),
++                outputs,
++                inputs,
++            }),
+         });
+         card.apply_all();
+         Some(card)
+     }
+ 
+-    fn codec(&self) -> &Codec {
+-        &self.controller.codecs[self.codec]
++    /// A card another driver made: its streams, its controls and the mixer
++    /// that applies them. `index` is the one `crate::add_card` gives.
++    pub fn external(
++        index: u32,
++        info: CardInfo,
++        playback: Option<Arc<Pcm>>,
++        capture: Option<Arc<Pcm>>,
++        controls: Vec<Control>,
++        mixer: Arc<dyn Mixer>,
++    ) -> Arc<Self> {
++        Arc::new(Self {
++            index,
++            id: info.id,
++            driver: info.driver,
++            name: info.name,
++            longname: info.longname,
++            mixer_name: info.mixer_name,
++            components: info.components,
++            pcm_name: info.pcm_name,
++            playback,
++            capture,
++            controls,
++            events: AtomicU64::new(0),
++            event_wait: WaitQueue::new(),
++            backend: Backend::External(mixer),
++        })
++    }
++
++    fn hda(&self) -> Option<&Hda> {
++        match &self.backend {
++            Backend::Hda(hda) => Some(hda),
++            Backend::External(_) => None,
++        }
+     }
+ 
+     /// Sets a control's values; returns whether they changed.
+@@ -266,9 +354,12 @@ impl Card {
+             if *current == clamped {
+                 return false;
+             }
+-            *current = clamped;
++            *current = clamped.clone();
++        }
++        match &self.backend {
++            Backend::Hda(_) => self.apply(control.target),
++            Backend::External(mixer) => mixer.apply(index, &clamped),
+         }
+-        self.apply(control.target);
+         self.note_changed(index);
+         true
+     }
+@@ -295,15 +386,16 @@ impl Card {
+     /// Puts a control's values on the codec: the volume and the mute on the
+     /// routes' amplifiers (or, without one, the pins).
+     fn apply(&self, target: Target) {
++        let Some(hda) = self.hda() else { return };
+         let (routes, output, volume, switch) = match target {
+-            Target::PlaybackVolume | Target::PlaybackSwitch => (&self.outputs[..], true, Target::PlaybackVolume, Target::PlaybackSwitch),
+-            Target::CaptureVolume | Target::CaptureSwitch => (&self.inputs[..self.inputs.len().min(1)], false, Target::CaptureVolume, Target::CaptureSwitch),
+-            Target::Jack => return,
++            Target::PlaybackVolume | Target::PlaybackSwitch => (&hda.outputs[..], true, Target::PlaybackVolume, Target::PlaybackSwitch),
++            Target::CaptureVolume | Target::CaptureSwitch => (&hda.inputs[..hda.inputs.len().min(1)], false, Target::CaptureVolume, Target::CaptureSwitch),
++            Target::Jack | Target::External => return,
+         };
+-        let codec = self.codec();
++        let codec = &hda.controller.codecs[hda.codec];
+         let levels = self.control_values(volume);
+         let on = self.control_values(switch).unwrap_or_else(|| vec![1, 1]);
+-        let enabled = self.enabled.lock().clone();
++        let enabled = hda.enabled.lock().clone();
+         for (index, route) in routes.iter().enumerate() {
+             let playing = !output || enabled.get(index).copied().unwrap_or(true);
+             match codec.volume_amp(route, output) {
+@@ -319,7 +411,7 @@ impl Card {
+                         let mute = on.get(channel).copied().unwrap_or(1) == 0 || !playing;
+                         let side = if channel == 0 { 1 << 13 } else { 1 << 12 };
+                         let payload = (codec::amp_payload(&amp, gain, mute) & !(3 << 12)) | side;
+-                        self.controller.command(codec.address, amp.nid, verb::SET_AMP_GAIN_MUTE, payload);
++                        hda.controller.command(codec.address, amp.nid, verb::SET_AMP_GAIN_MUTE, payload);
+                     }
+                 }
+                 None => {}
+@@ -332,30 +424,32 @@ impl Card {
+                 } else {
+                     0
+                 };
+-                self.controller.command(codec.address, route.pin, verb::SET_PIN_WIDGET_CONTROL, control);
++                hda.controller.command(codec.address, route.pin, verb::SET_PIN_WIDGET_CONTROL, control);
+             }
+         }
+     }
+ 
+     /// Whether something is plugged into a pin's jack.
+-    fn sense(&self, nid: u8) -> bool {
+-        let codec = self.codec();
++    fn sense(hda: &Hda, nid: u8) -> bool {
++        let codec = &hda.controller.codecs[hda.codec];
+         if pin(codec, nid).is_some_and(|w| w.needs_sense_trigger()) {
+-            self.controller.command(codec.address, nid, verb::SET_PIN_SENSE, 0);
++            hda.controller.command(codec.address, nid, verb::SET_PIN_SENSE, 0);
+         }
+-        self.controller.command(codec.address, nid, verb::GET_PIN_SENSE, 0).is_some_and(|sense| sense & (1 << 31) != 0)
++        hda.controller.command(codec.address, nid, verb::GET_PIN_SENSE, 0).is_some_and(|sense| sense & (1 << 31) != 0)
+     }
+ 
+     /// Looks at the jacks: headphones in turn the speakers and line outs
+     /// off; the jack controls follow.
+     pub(crate) fn poll_jacks(&self) {
+-        let headphones = self.outputs.iter().filter(|r| r.device == PinDevice::Headphone && !r.internal).find(|r| pin(self.codec(), r.pin).is_some_and(|w| w.presence_detect()));
+-        let mic = self.inputs.iter().filter(|r| r.device == PinDevice::Mic && !r.internal).find(|r| pin(self.codec(), r.pin).is_some_and(|w| w.presence_detect()));
+-        let headphones_in = headphones.is_some_and(|route| self.sense(route.pin));
+-        let mic_in = mic.is_some_and(|route| self.sense(route.pin));
+-        let enabled = codec::outputs_enabled(&self.outputs, headphones_in);
++        let Some(hda) = self.hda() else { return };
++        let codec = &hda.controller.codecs[hda.codec];
++        let headphones = hda.outputs.iter().filter(|r| r.device == PinDevice::Headphone && !r.internal).find(|r| pin(codec, r.pin).is_some_and(|w| w.presence_detect()));
++        let mic = hda.inputs.iter().filter(|r| r.device == PinDevice::Mic && !r.internal).find(|r| pin(codec, r.pin).is_some_and(|w| w.presence_detect()));
++        let headphones_in = headphones.is_some_and(|route| Self::sense(hda, route.pin));
++        let mic_in = mic.is_some_and(|route| Self::sense(hda, route.pin));
++        let enabled = codec::outputs_enabled(&hda.outputs, headphones_in);
+         let changed = {
+-            let mut current = self.enabled.lock();
++            let mut current = hda.enabled.lock();
+             let changed = *current != enabled;
+             *current = enabled;
+             changed
+diff --git a/kernel/comps/sound/src/hda.rs b/kernel/comps/sound/src/hda.rs
+old mode 100755
+new mode 100644
+index b0c69a3..1b4a088
+--- a/kernel/comps/sound/src/hda.rs
++++ b/kernel/comps/sound/src/hda.rs
+@@ -485,7 +485,8 @@ impl Stream {
+ }
+ 
+ impl StreamHw for Stream {
+-    fn prepare(&self, setup: &Setup, buffer: u64) -> pcm::Result<()> {
++    fn prepare(&self, setup: &Setup, buffer: &Arc<pcm::Buffer>) -> pcm::Result<()> {
++        let buffer = buffer.dma.daddr() as u64;
+         let bits = if setup.sample_bits == 16 { 16 } else { codec_bits(&self.controller, &self.converters) };
+         let format = codec::stream_format(setup.rate, bits, setup.channels).ok_or(PcmError::Invalid)?;
+         if setup.periods > MAX_PERIODS {
+diff --git a/kernel/comps/sound/src/lib.rs b/kernel/comps/sound/src/lib.rs
+old mode 100755
+new mode 100644
+index 74bc566..99d1d6f
+--- a/kernel/comps/sound/src/lib.rs
++++ b/kernel/comps/sound/src/lib.rs
+@@ -4,6 +4,9 @@
+ //! cards (`card`), with their PCM streams (`pcm`, whose parameters `params`
+ //! negotiates). The ALSA device files (`/dev/snd`) are the kernel's
+ //! (`aster-core`'s `device::snd`), on top of this.
++//!
++//! Other drivers add cards and take them away again (`add_card`,
++//! `remove_card`): a USB audio device's, as it comes and goes.
+ 
+ #![no_std]
+ #![deny(unsafe_code)]
+@@ -37,11 +40,14 @@ use ostd::{
+     sync::{SpinLock, WaitQueue},
+ };
+ 
+-pub use card::Card;
+-pub use pcm::{Direction, Pcm};
++pub use card::{Card, CardInfo, Control, ControlKind, Mixer};
++pub use pcm::{Direction, Pcm, StreamHw};
+ 
+ static CARDS: SpinLock<Vec<Arc<Card>>> = SpinLock::new(Vec::new());
+ static CARD_HOOK: spin::Once<fn(&Arc<Card>)> = spin::Once::new();
++static CARD_GONE_HOOK: spin::Once<fn(&Arc<Card>)> = spin::Once::new();
++/// ALSA has 32 cards at most (`SNDRV_CARDS`).
++pub const MAX_CARDS: u32 = 32;
+ /// Streams running: the timer looks at their positions while there are some.
+ static RUNNING: AtomicUsize = AtomicUsize::new(0);
+ static TICKS: AtomicU64 = AtomicU64::new(0);
+@@ -72,6 +78,42 @@ pub fn set_card_hook(hook: fn(&Arc<Card>)) {
+     CARD_HOOK.call_once(|| hook);
+ }
+ 
++/// Sets the hook told of each card that went away (its device files go).
++pub fn set_card_gone_hook(hook: fn(&Arc<Card>)) {
++    CARD_GONE_HOOK.call_once(|| hook);
++}
++
++/// Adds a card with the lowest free number, as Linux numbers them: `build`
++/// makes it with that number. Its device files follow (the card hook).
++pub fn add_card(build: impl FnOnce(u32) -> Option<Arc<Card>>) -> Option<Arc<Card>> {
++    let card = {
++        let mut cards = CARDS.lock();
++        let index = (0..MAX_CARDS).find(|index| cards.iter().all(|card| card.index != *index))?;
++        let card = build(index)?;
++        cards.push(card.clone());
++        card
++    };
++    if let Some(hook) = CARD_HOOK.get() {
++        hook(&card);
++    }
++    note_activity();
++    Some(card)
++}
++
++/// Takes a card away (its device went): its streams are disconnected,
++/// which whoever has them open sees, and its device files go.
++pub fn remove_card(card: &Arc<Card>) {
++    CARDS.lock().retain(|other| !Arc::ptr_eq(other, card));
++    for pcm in card.pcms() {
++        pcm.disconnect();
++    }
++    if let Some(hook) = CARD_GONE_HOOK.get() {
++        hook(card);
++    }
++    card.event_wait.wake_all();
++    note_activity();
++}
++
+ pub(crate) fn note_running(running: bool) {
+     if running {
+         RUNNING.fetch_add(1, Ordering::AcqRel);
+@@ -106,7 +148,7 @@ fn update_streams() {
+ }
+ 
+ /// A controller's interrupt: some stream finished a period.
+-pub(crate) fn streams_moved() {
++pub fn streams_moved() {
+     STREAM_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+     update_streams();
+ }
+@@ -180,7 +222,7 @@ pub fn run() {
+     if devices.is_empty() {
+         return;
+     }
+-    let mut index = 0;
++    let mut found = 0;
+     for device in devices {
+         let id = *device.device_id();
+         let location = *device.location();
+@@ -190,26 +232,23 @@ pub fn run() {
+             continue;
+         };
+         let place = format!("pci {:02x}:{:02x}.{}", location.bus, location.device, location.function);
+-        match Card::new(index, Arc::new(controller), id.vendor_id, place) {
++        let controller = Arc::new(controller);
++        match add_card(|index| Card::new(index, controller, id.vendor_id, place)) {
+             Some(card) => {
+                 ostd::notice!(
+                     "card {}: {} ({}){}{}",
+-                    index,
++                    card.index,
+                     card.name,
+                     card.mixer_name,
+                     if card.playback.is_some() { ", playback" } else { "" },
+                     if card.capture.is_some() { ", capture" } else { "" }
+                 );
+-                CARDS.lock().push(card.clone());
+-                if let Some(hook) = CARD_HOOK.get() {
+-                    hook(&card);
+-                }
+-                index += 1;
++                found += 1;
+             }
+             None => ostd::notice!("{}: no analog outputs or inputs (HDMI only)", name),
+         }
+     }
+-    if index == 0 {
++    if found == 0 {
+         return;
+     }
+     // The jacks, twice a second.
+diff --git a/kernel/comps/sound/src/params.rs b/kernel/comps/sound/src/params.rs
+old mode 100755
+new mode 100644
+index f00c176..24cf870
+--- a/kernel/comps/sound/src/params.rs
++++ b/kernel/comps/sound/src/params.rs
+@@ -38,8 +38,15 @@ pub mod access {
+ 
+ /// Sample formats (`SNDRV_PCM_FORMAT_*`) and their sizes in bits.
+ pub mod format {
++    pub const S8: u32 = 0;
++    pub const U8: u32 = 1;
+     pub const S16_LE: u32 = 2;
++    pub const S16_BE: u32 = 3;
+     pub const S32_LE: u32 = 10;
++    pub const FLOAT_LE: u32 = 14;
++    /// 24 bits in 3 bytes, as USB devices send them.
++    pub const S24_3LE: u32 = 32;
++    pub const S24_3BE: u32 = 33;
+ 
+     /// The bits a sample of `format` takes in memory.
+     pub fn physical_width(format: u32) -> Option<u32> {
+@@ -474,6 +481,28 @@ const RULES: [Rule; 18] = {
+     ]
+ };
+ 
++/// What period and buffer sizes in bytes must be multiples of: the
++/// hardware's step and, once the frame's size is known, whole frames (a
++/// USB device's 6-byte frames, 24 bits in 3 bytes on two channels, would
++/// otherwise leave a period a fraction of a frame and the periods no
++/// whole number).
++fn byte_step(params: &HwParams, limits: &HwLimits) -> u32 {
++    let step = limits.byte_step.max(1);
++    let frame = params.interval(param::FRAME_BITS);
++    if !frame.is_single() {
++        return step;
++    }
++    let bytes = params.get(param::FRAME_BITS) / 8;
++    if bytes == 0 {
++        return step;
++    }
++    let (mut a, mut b) = (step, bytes);
++    while b != 0 {
++        (a, b) = (b, a % b);
++    }
++    step / a * bytes
++}
++
+ /// The parameter space the hardware allows, before any rule.
+ fn constraints(limits: &HwLimits) -> HwParams {
+     use param::*;
+@@ -576,7 +605,7 @@ pub fn refine(params: &mut HwParams, limits: &HwLimits) -> Result<(), ()> {
+         changed |= 1 << param::RATE;
+     }
+     for p in [param::PERIOD_BYTES, param::BUFFER_BYTES] {
+-        let stepped = params.interval(p).step(limits.byte_step);
++        let stepped = params.interval(p).step(byte_step(params, limits));
+         if params.interval_mut(p).refine(&stepped)? {
+             changed |= 1 << p;
+         }
+@@ -598,7 +627,7 @@ pub fn refine(params: &mut HwParams, limits: &HwLimits) -> Result<(), ()> {
+             }
+         }
+         for p in [param::PERIOD_BYTES, param::BUFFER_BYTES] {
+-            let stepped = params.interval(p).step(limits.byte_step);
++            let stepped = params.interval(p).step(byte_step(params, limits));
+             if params.interval_mut(p).refine(&stepped)? {
+                 changed |= 1 << p;
+                 again = true;
+diff --git a/kernel/comps/sound/src/pcm.rs b/kernel/comps/sound/src/pcm.rs
+old mode 100755
+new mode 100644
+index c4f205f..87deb8e
+--- a/kernel/comps/sound/src/pcm.rs
++++ b/kernel/comps/sound/src/pcm.rs
+@@ -16,7 +16,7 @@ use core::{
+ };
+ 
+ use ostd::{
+-    mm::{FrameAllocOptions, HasDaddr, HasSize, PAGE_SIZE, UFrame, USegment, VmIo, dma::DmaStream},
++    mm::{FrameAllocOptions, HasSize, PAGE_SIZE, UFrame, USegment, VmIo, dma::DmaStream},
+     sync::{LocalIrqDisabled, SpinLock, WaitQueue},
+ };
+ 
+@@ -56,6 +56,8 @@ pub enum PcmError {
+     NoMemory,
+     Busy,
+     Io,
++    /// The device went away (ENODEV).
++    Disconnected,
+ }
+ 
+ pub type Result<T> = core::result::Result<T, PcmError>;
+@@ -102,14 +104,21 @@ pub struct SwParams {
+     pub tstamp_type: u32,
+ }
+ 
+-/// The hardware side of a stream.
++/// The hardware side of a stream. `start`, `stop` and `position` are
++/// called with the stream's lock held (they must not wait); `prepare` and
++/// `release` may wait.
+ pub trait StreamHw: Send + Sync {
+-    /// Sets the stream up to run over a buffer at `buffer`, in periods.
+-    fn prepare(&self, setup: &Setup, buffer: u64) -> Result<()>;
++    /// Sets the stream up to run over `buffer`, in periods.
++    fn prepare(&self, setup: &Setup, buffer: &Arc<Buffer>) -> Result<()>;
+     fn start(&self);
+     fn stop(&self);
+     /// Where in the buffer the hardware is, in bytes.
+     fn position(&self) -> usize;
++    /// Frames between the hardware's position and what is heard (or was
++    /// recorded): a USB device's packets in flight.
++    fn delay(&self) -> u64 {
++        0
++    }
+     /// The stream is let go (closed, or set up anew).
+     fn release(&self);
+     /// Its registers, for a stall's report.
+@@ -297,6 +306,30 @@ impl Pcm {
+         self.runtime.lock().state
+     }
+ 
++    /// The device went away: the stream stops for good, and whoever waits
++    /// on it wakes to see that (ENODEV from then on).
++    pub fn disconnect(&self) {
++        {
++            let mut runtime = self.runtime.lock();
++            if matches!(runtime.state, State::Running | State::Draining) {
++                self.hw.stop();
++                crate::note_running(false);
++            }
++            runtime.state = State::Disconnected;
++            runtime.trigger = now();
++            self.publish(&runtime);
++        }
++        self.wait.wake_all();
++        crate::note_activity();
++    }
++
++    fn connected(&self) -> Result<()> {
++        if self.runtime.lock().state == State::Disconnected {
++            return Err(PcmError::Disconnected);
++        }
++        Ok(())
++    }
++
+     pub fn setup(&self) -> Option<Setup> {
+         self.runtime.lock().setup
+     }
+@@ -320,6 +353,7 @@ impl Pcm {
+     }
+ 
+     pub fn hw_params(&self, params: &mut HwParams) -> Result<Setup> {
++        self.connected()?;
+         if matches!(self.state(), State::Running | State::Draining | State::Paused | State::Xrun) {
+             return Err(PcmError::BadState);
+         }
+@@ -377,6 +411,7 @@ impl Pcm {
+     }
+ 
+     pub fn hw_free(&self) -> Result<()> {
++        self.connected()?;
+         let buffer = {
+             let mut runtime = self.runtime.lock();
+             if matches!(runtime.state, State::Running | State::Draining | State::Paused) {
+@@ -432,7 +467,8 @@ impl Pcm {
+         let (setup, buffer) = {
+             let runtime = self.runtime.lock();
+             match runtime.state {
+-                State::Open | State::Disconnected => return Err(PcmError::BadState),
++                State::Disconnected => return Err(PcmError::Disconnected),
++                State::Open => return Err(PcmError::BadState),
+                 State::Running | State::Draining | State::Paused => self.hw.stop(),
+                 _ => {}
+             }
+@@ -445,7 +481,7 @@ impl Pcm {
+             let _ = buffer.frames.write_bytes(offset, &silence);
+             offset += PAGE_SIZE;
+         }
+-        self.hw.prepare(&setup, buffer.dma.daddr() as u64)?;
++        self.hw.prepare(&setup, &buffer)?;
+         let mut runtime = self.runtime.lock();
+         runtime.hw_ptr = 0;
+         runtime.last_position = 0;
+@@ -471,6 +507,7 @@ impl Pcm {
+     }
+ 
+     pub fn start(&self) -> Result<()> {
++        self.connected()?;
+         let mut runtime = self.runtime.lock();
+         // Playback with nothing written would underrun at once.
+         if self.direction == Direction::Playback && self.avail_of(&runtime) >= runtime.setup.map_or(0, |s| s.buffer_size) {
+@@ -492,7 +529,10 @@ impl Pcm {
+     /// Stops at once, dropping what is pending.
+     pub fn drop_(&self) -> Result<()> {
+         let mut runtime = self.runtime.lock();
+-        if matches!(runtime.state, State::Open | State::Disconnected) {
++        if runtime.state == State::Disconnected {
++            return Err(PcmError::Disconnected);
++        }
++        if runtime.state == State::Open {
+             return Err(PcmError::BadState);
+         }
+         if runtime.state == State::Paused {
+@@ -511,7 +551,8 @@ impl Pcm {
+     pub fn drain_begin(&self) -> Result<bool> {
+         let mut runtime = self.runtime.lock();
+         match runtime.state {
+-            State::Open | State::Disconnected => Err(PcmError::BadState),
++            State::Disconnected => Err(PcmError::Disconnected),
++            State::Open => Err(PcmError::BadState),
+             State::Setup | State::Xrun => {
+                 runtime.state = State::Setup;
+                 self.publish(&runtime);
+@@ -676,8 +717,8 @@ impl Pcm {
+         let buffer_size = runtime.setup.map_or(0, |s| s.buffer_size);
+         let delay = match (self.direction, runtime.state) {
+             (_, State::Running | State::Draining | State::Paused) => match self.direction {
+-                Direction::Playback => buffer_size as i64 - avail as i64,
+-                Direction::Capture => avail as i64,
++                Direction::Playback => buffer_size as i64 - avail as i64 + self.hw.delay() as i64,
++                Direction::Capture => avail as i64 + self.hw.delay() as i64,
+             },
+             _ => 0,
+         };
+@@ -721,6 +762,9 @@ impl Pcm {
+     pub fn transfer_window(&self, frames: u64) -> Result<(usize, u64)> {
+         self.update();
+         let runtime = self.runtime.lock();
++        if runtime.state == State::Disconnected {
++            return Err(PcmError::Disconnected);
++        }
+         let setup = runtime.setup.ok_or(PcmError::BadState)?;
+         match runtime.state {
+             State::Xrun => return Err(PcmError::Xrun),
+diff --git a/kernel/comps/usb/Cargo.toml b/kernel/comps/usb/Cargo.toml
+old mode 100755
+new mode 100644
+index 30f7b0f..8092675
+--- a/kernel/comps/usb/Cargo.toml
++++ b/kernel/comps/usb/Cargo.toml
+@@ -14,6 +14,7 @@ aster-network.workspace = true
+ aster-softirq.workspace = true
+ aster-input.workspace = true
+ aster-pci.workspace = true
++aster-sound.workspace = true
+ component.workspace = true
+ device-id.workspace = true
+ ostd.workspace = true
+diff --git a/kernel/comps/usb/src/audio.rs b/kernel/comps/usb/src/audio.rs
+new file mode 100644
+index 0000000..963392b
+--- /dev/null
++++ b/kernel/comps/usb/src/audio.rs
+@@ -0,0 +1,754 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! USB audio devices (headsets, speakers, microphones, sound cards) as the
++//! USB Audio Class describes them, versions 1 and 2: the audio control
++//! interface's terminals, units and clocks, and the streaming interfaces'
++//! alternate settings with their formats, rates and endpoints. The mixer's
++//! controls (the feature units' volumes and mutes) are named as Linux's
++//! `snd-usb-audio` names them, which is what PulseAudio's mixer paths look
++//! for. `xhci::audio` runs the streams and the controls.
++//!
++//! Reference: USB Audio 1.0 (`audio10.pdf`), USB Audio 2.0 (`Audio20 final`);
++//! Linux's `sound/usb/{stream,format,mixer,clock}.c`.
++
++use alloc::{
++    collections::BTreeMap,
++    format,
++    string::{String, ToString},
++    vec,
++    vec::Vec,
++};
++
++use crate::desc::{CS_INTERFACE, Configuration, Endpoint, Interface, TRANSFER_ISOCHRONOUS};
++
++/// The audio class, its subclasses and its versions (the interface protocol).
++pub(crate) const CLASS: u8 = 0x01;
++pub(crate) const SUBCLASS_CONTROL: u8 = 0x01;
++pub(crate) const SUBCLASS_STREAMING: u8 = 0x02;
++const PROTOCOL_V2: u8 = 0x20;
++const PROTOCOL_V3: u8 = 0x30;
++
++/// Audio control descriptors' subtypes (both versions; where they differ,
++/// version 2's are named so).
++mod ac {
++    pub(super) const HEADER: u8 = 0x01;
++    pub(super) const INPUT_TERMINAL: u8 = 0x02;
++    pub(super) const OUTPUT_TERMINAL: u8 = 0x03;
++    pub(super) const MIXER_UNIT: u8 = 0x04;
++    pub(super) const SELECTOR_UNIT: u8 = 0x05;
++    pub(super) const FEATURE_UNIT: u8 = 0x06;
++    /// Version 1's processing unit; version 2's effect unit.
++    pub(super) const PROCESSING_UNIT_V1: u8 = 0x07;
++    pub(super) const EFFECT_UNIT_V2: u8 = 0x07;
++    pub(super) const EXTENSION_UNIT_V1: u8 = 0x08;
++    pub(super) const PROCESSING_UNIT_V2: u8 = 0x08;
++    pub(super) const EXTENSION_UNIT_V2: u8 = 0x09;
++    pub(super) const CLOCK_SOURCE: u8 = 0x0a;
++    pub(super) const CLOCK_SELECTOR: u8 = 0x0b;
++    pub(super) const CLOCK_MULTIPLIER: u8 = 0x0c;
++    pub(super) const SAMPLE_RATE_CONVERTER: u8 = 0x0d;
++}
++
++/// Audio streaming descriptors' subtypes.
++mod as_ {
++    pub(super) const GENERAL: u8 = 0x01;
++    pub(super) const FORMAT_TYPE: u8 = 0x02;
++}
++
++/// Version 1's format tags; version 2's format bits.
++const FORMAT_PCM: u16 = 0x0001;
++const FORMAT_PCM8: u16 = 0x0002;
++const FORMAT_IEEE_FLOAT: u16 = 0x0003;
++const FORMATS_V2_PCM: u32 = 1 << 0;
++const FORMATS_V2_PCM8: u32 = 1 << 1;
++const FORMATS_V2_IEEE_FLOAT: u32 = 1 << 2;
++const FORMAT_TYPE_I: u8 = 0x01;
++
++/// The ALSA sample formats (`SNDRV_PCM_FORMAT_*`) of USB audio's PCM.
++pub(crate) mod alsa {
++    pub(crate) const S8: u32 = 0;
++    pub(crate) const U8: u32 = 1;
++    pub(crate) const S16_LE: u32 = 2;
++    pub(crate) const S32_LE: u32 = 10;
++    pub(crate) const FLOAT_LE: u32 = 14;
++    pub(crate) const S24_3LE: u32 = 32;
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Version {
++    V1,
++    V2,
++}
++
++/// The rates of a format: some, or any in a range (version 1's continuous
++/// rates; version 2 asks its clock).
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Rates {
++    List(Vec<u32>),
++    Range(u32, u32),
++}
++
++/// The rates ALSA knows (`snd_pcm_known_rates`), which a range offers.
++pub(crate) const KNOWN_RATES: [u32; 14] =
++    [8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000, 352800, 384000];
++
++impl Rates {
++    /// Every rate it has: a range's as the known rates within it.
++    pub(crate) fn list(&self) -> Vec<u32> {
++        match self {
++            Rates::List(rates) => rates.clone(),
++            Rates::Range(low, high) => KNOWN_RATES.iter().copied().filter(|rate| (*low..=*high).contains(rate)).collect(),
++        }
++    }
++
++    pub(crate) fn has(&self, rate: u32) -> bool {
++        match self {
++            Rates::List(rates) => rates.contains(&rate),
++            Rates::Range(low, high) => (*low..=*high).contains(&rate),
++        }
++    }
++
++    /// Whether there are several, so the device must be told which.
++    pub(crate) fn several(&self) -> bool {
++        match self {
++            Rates::List(rates) => rates.len() > 1,
++            Rates::Range(low, high) => low != high,
++        }
++    }
++}
++
++/// One alternate setting of a streaming interface that carries audio.
++#[derive(Clone, Debug)]
++pub(crate) struct Alt {
++    pub alternate: u8,
++    /// Its ALSA sample format.
++    pub format: u32,
++    pub channels: u8,
++    /// Bytes a sample takes, and the bits that count.
++    pub bytes: u8,
++    pub bits: u8,
++    pub rates: Rates,
++    /// The endpoint that carries the samples.
++    pub endpoint: Endpoint,
++    /// The endpoint that says the device's rate (asynchronous playback).
++    pub feedback: Option<Endpoint>,
++    /// Version 1: the endpoint takes the rate (Sampling Frequency control).
++    pub rate_control: bool,
++}
++
++impl Alt {
++    pub(crate) fn frame_bytes(&self) -> usize {
++        usize::from(self.bytes) * usize::from(self.channels)
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Direction {
++    /// To the device (an OUT endpoint).
++    Playback,
++    /// From it.
++    Capture,
++}
++
++/// A streaming interface: one direction of a function.
++#[derive(Clone, Debug)]
++pub(crate) struct Stream {
++    pub interface: u8,
++    pub direction: Direction,
++    /// The terminal it is linked to.
++    pub terminal: u8,
++    pub alts: Vec<Alt>,
++}
++
++/// What a unit or terminal of the control interface is.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Entity {
++    InputTerminal { kind: u16, channels: u8, clock: u8, name: u8 },
++    OutputTerminal { kind: u16, source: u8, clock: u8, name: u8 },
++    /// Its controls per channel, the master's first (version 1: a bit per
++    /// control; version 2: two bits per control).
++    Feature { source: u8, controls: Vec<u32>, name: u8 },
++    /// A mixer, selector, processing, extension, effect or rate unit: what
++    /// Linux treats as a virtual terminal when naming controls.
++    Unit { sources: Vec<u8> },
++    ClockSource { attributes: u8, controls: u8 },
++    ClockSelector { sources: Vec<u8> },
++    ClockMultiplier { source: u8 },
++}
++
++/// A USB audio function: its control interface, its units and terminals,
++/// and its streams.
++#[derive(Clone, Debug)]
++pub(crate) struct Function {
++    pub version: Version,
++    pub control: u8,
++    pub entities: BTreeMap<u8, Entity>,
++    pub streams: Vec<Stream>,
++}
++
++fn u16_at(d: &[u8], at: usize) -> u16 {
++    d.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
++}
++
++fn u24_at(d: &[u8], at: usize) -> u32 {
++    d.get(at..at + 3).map_or(0, |b| u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16)
++}
++
++fn u32_at(d: &[u8], at: usize) -> u32 {
++    d.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++/// The function whose control interface is `control`, with the streaming
++/// interfaces it has: version 1's header lists them; version 2's follow
++/// it in the configuration (its interface association groups them).
++/// Version 3 devices offer a version 1 or 2 configuration too.
++pub(crate) fn parse(configuration: &Configuration, control: &Interface) -> Option<Function> {
++    let version = match control.protocol {
++        PROTOCOL_V2 => Version::V2,
++        PROTOCOL_V3 => return None,
++        _ => Version::V1,
++    };
++    let mut entities = BTreeMap::new();
++    let mut listed: Vec<u8> = Vec::new();
++    for d in &control.class_descriptors {
++        if d.len() < 4 || d[1] != CS_INTERFACE {
++            continue;
++        }
++        let id = d[3];
++        let entity = match (d[2], version) {
++            (ac::HEADER, Version::V1) => {
++                let count = usize::from(*d.get(7).unwrap_or(&0));
++                listed = d.iter().skip(8).take(count).copied().collect();
++                continue;
++            }
++            (ac::HEADER, Version::V2) => continue,
++            (ac::INPUT_TERMINAL, Version::V1) if d.len() >= 12 => {
++                Entity::InputTerminal { kind: u16_at(d, 4), channels: d[7], clock: 0, name: d[11] }
++            }
++            (ac::INPUT_TERMINAL, Version::V2) if d.len() >= 17 => {
++                Entity::InputTerminal { kind: u16_at(d, 4), channels: d[8], clock: d[7], name: d[16] }
++            }
++            (ac::OUTPUT_TERMINAL, Version::V1) if d.len() >= 9 => {
++                Entity::OutputTerminal { kind: u16_at(d, 4), source: d[7], clock: 0, name: d[8] }
++            }
++            (ac::OUTPUT_TERMINAL, Version::V2) if d.len() >= 12 => {
++                Entity::OutputTerminal { kind: u16_at(d, 4), source: d[7], clock: d[8], name: d[11] }
++            }
++            (ac::FEATURE_UNIT, Version::V1) if d.len() >= 7 => {
++                let size = usize::from(d[5]);
++                if size == 0 {
++                    continue;
++                }
++                let count = (d.len() - 7) / size;
++                let controls = (0..count)
++                    .map(|channel| {
++                        let at = 6 + channel * size;
++                        d[at..at + size].iter().rev().fold(0u32, |value, byte| value << 8 | u32::from(*byte))
++                    })
++                    .collect();
++                Entity::Feature { source: d[4], controls, name: *d.last().unwrap_or(&0) }
++            }
++            (ac::FEATURE_UNIT, Version::V2) if d.len() >= 6 => {
++                let count = (d.len() - 6) / 4;
++                let controls = (0..count).map(|channel| u32_at(d, 5 + channel * 4)).collect();
++                Entity::Feature { source: d[4], controls, name: *d.last().unwrap_or(&0) }
++            }
++            (ac::MIXER_UNIT | ac::SELECTOR_UNIT, _) if d.len() >= 5 => {
++                let pins = usize::from(d[4]);
++                Entity::Unit { sources: d.iter().skip(5).take(pins).copied().collect() }
++            }
++            (ac::PROCESSING_UNIT_V1 | ac::EXTENSION_UNIT_V1, Version::V1) | (ac::PROCESSING_UNIT_V2 | ac::EXTENSION_UNIT_V2, Version::V2)
++                if d.len() >= 7 =>
++            {
++                let pins = usize::from(d[6]);
++                Entity::Unit { sources: d.iter().skip(7).take(pins).copied().collect() }
++            }
++            (ac::EFFECT_UNIT_V2, Version::V2) if d.len() >= 7 => Entity::Unit { sources: vec![d[6]] },
++            (ac::SAMPLE_RATE_CONVERTER, Version::V2) if d.len() >= 5 => Entity::Unit { sources: vec![d[4]] },
++            (ac::CLOCK_SOURCE, Version::V2) if d.len() >= 8 => Entity::ClockSource { attributes: d[4], controls: d[5] },
++            (ac::CLOCK_SELECTOR, Version::V2) if d.len() >= 5 => {
++                let pins = usize::from(d[4]);
++                Entity::ClockSelector { sources: d.iter().skip(5).take(pins).copied().collect() }
++            }
++            (ac::CLOCK_MULTIPLIER, Version::V2) if d.len() >= 5 => Entity::ClockMultiplier { source: d[4] },
++            _ => continue,
++        };
++        entities.insert(id, entity);
++    }
++    // The streaming interfaces.
++    let numbers: Vec<u8> = match version {
++        Version::V1 => listed,
++        Version::V2 => {
++            let mut numbers = Vec::new();
++            let mut next = control.number + 1;
++            while configuration.interfaces.iter().any(|i| i.number == next && i.class == CLASS && i.subclass == SUBCLASS_STREAMING) {
++                numbers.push(next);
++                next += 1;
++            }
++            numbers
++        }
++    };
++    let mut streams = Vec::new();
++    for number in numbers {
++        let alts: Vec<&Interface> = configuration
++            .interfaces
++            .iter()
++            .filter(|i| i.number == number && i.class == CLASS && i.subclass == SUBCLASS_STREAMING)
++            .collect();
++        let mut stream: Option<Stream> = None;
++        for interface in alts {
++            let Some((terminal, alt)) = parse_alt(version, interface) else { continue };
++            let direction = if alt.endpoint.is_in() { Direction::Capture } else { Direction::Playback };
++            let stream = stream.get_or_insert_with(|| Stream { interface: number, direction, terminal, alts: Vec::new() });
++            if stream.direction == direction {
++                stream.alts.push(alt);
++            }
++        }
++        streams.extend(stream);
++    }
++    if streams.is_empty() {
++        return None;
++    }
++    Some(Function { version, control: control.number, entities, streams })
++}
++
++/// An alternate setting's format and endpoints, with the terminal it is
++/// linked to; none for the zero-bandwidth setting or a format that is not
++/// PCM (compressed audio, MIDI).
++fn parse_alt(version: Version, interface: &Interface) -> Option<(u8, Alt)> {
++    let general = interface.functional(as_::GENERAL)?;
++    let format = interface.functional(as_::FORMAT_TYPE)?;
++    if format.get(3) != Some(&FORMAT_TYPE_I) {
++        return None;
++    }
++    let endpoint = *interface
++        .endpoints
++        .iter()
++        .find(|e| e.transfer_type() == TRANSFER_ISOCHRONOUS && e.usage() != 1)?;
++    let (terminal, kind, channels, bytes, bits, rates) = match version {
++        Version::V1 => {
++            if general.len() < 7 || format.len() < 8 {
++                return None;
++            }
++            let tag = u16_at(general, 5);
++            let (channels, bytes, bits) = (format[4], format[5], format[6]);
++            let count = usize::from(format[7]);
++            let rates = if count == 0 {
++                Rates::Range(u24_at(format, 8), u24_at(format, 11))
++            } else {
++                Rates::List((0..count).map(|i| u24_at(format, 8 + i * 3)).filter(|rate| *rate != 0).collect())
++            };
++            let kind = match tag {
++                FORMAT_PCM => Kind::Pcm,
++                FORMAT_PCM8 => Kind::Pcm8,
++                FORMAT_IEEE_FLOAT => Kind::Float,
++                _ => return None,
++            };
++            (general[3], kind, channels, bytes, bits, rates)
++        }
++        Version::V2 => {
++            if general.len() < 11 || format.len() < 6 {
++                return None;
++            }
++            let formats = u32_at(general, 6);
++            let kind = if formats & FORMATS_V2_PCM != 0 {
++                Kind::Pcm
++            } else if formats & FORMATS_V2_PCM8 != 0 {
++                Kind::Pcm8
++            } else if formats & FORMATS_V2_IEEE_FLOAT != 0 {
++                Kind::Float
++            } else {
++                return None;
++            };
++            // The rates come from the clock (asked once the device runs).
++            (general[3], kind, general[10], format[4], format[5], Rates::List(Vec::new()))
++        }
++    };
++    let format = alsa_format(kind, bytes)?;
++    if channels == 0 {
++        return None;
++    }
++    // Asynchronous playback's feedback: version 1 names its endpoint;
++    // version 2's is the setting's other isochronous endpoint, an IN one.
++    let feedback = interface
++        .endpoints
++        .iter()
++        .find(|e| {
++            e.transfer_type() == TRANSFER_ISOCHRONOUS
++                && e.is_in()
++                && !endpoint.is_in()
++                && (e.usage() == 1 || (endpoint.synch_address != 0 && e.address == endpoint.synch_address))
++        })
++        .copied();
++    let alt = Alt {
++        alternate: interface.alternate,
++        format,
++        channels,
++        bytes,
++        bits: if bits == 0 { bytes * 8 } else { bits },
++        rates,
++        endpoint,
++        feedback,
++        rate_control: endpoint.class_attributes & 1 != 0,
++    };
++    Some((terminal, alt))
++}
++
++#[derive(Clone, Copy)]
++enum Kind {
++    Pcm,
++    Pcm8,
++    Float,
++}
++
++/// The ALSA format of a sample: as Linux's `parse_audio_format_i_type`.
++fn alsa_format(kind: Kind, bytes: u8) -> Option<u32> {
++    Some(match (kind, bytes) {
++        (Kind::Pcm, 1) => alsa::S8,
++        (Kind::Pcm, 2) => alsa::S16_LE,
++        (Kind::Pcm, 3) => alsa::S24_3LE,
++        (Kind::Pcm, 4) => alsa::S32_LE,
++        (Kind::Pcm8, 1) => alsa::U8,
++        (Kind::Float, 4) => alsa::FLOAT_LE,
++        _ => return None,
++    })
++}
++
++impl Function {
++    /// The clock a stream's terminal runs on (version 2): its terminal's
++    /// clock entity, which may be a selector or a multiplier in front of the
++    /// clock source.
++    pub(crate) fn clock_of(&self, stream: &Stream) -> Option<u8> {
++        match self.entities.get(&stream.terminal)? {
++            Entity::InputTerminal { clock, .. } | Entity::OutputTerminal { clock, .. } if *clock != 0 => Some(*clock),
++            _ => None,
++        }
++    }
++
++    /// The terminal at the end of a path upstream from `id` (through
++    /// feature units, which pass audio as it is): Linux's
++    /// `check_input_term`. A mixer or another unit ends it as a virtual
++    /// terminal (none).
++    fn input_terminal(&self, mut id: u8) -> Option<u16> {
++        for _ in 0..32 {
++            match self.entities.get(&id)? {
++                Entity::InputTerminal { kind, .. } => return Some(*kind),
++                Entity::Feature { source, .. } => id = *source,
++                _ => return None,
++            }
++        }
++        None
++    }
++
++    fn terminal_name(&self, id: u8) -> u8 {
++        match self.entities.get(&id) {
++            Some(Entity::InputTerminal { name, .. } | Entity::OutputTerminal { name, .. }) => *name,
++            _ => 0,
++        }
++    }
++
++    /// The feature units' volumes and mutes, as ALSA controls: each output
++    /// terminal's path upstream, every unit once (Linux's
++    /// `snd_usb_mixer_controls`). `string` gives a string descriptor.
++    pub(crate) fn controls(&self, string: &mut dyn FnMut(u8) -> Option<String>, card_name: &str) -> Vec<FeatureControl> {
++        let mut controls = Vec::new();
++        let mut seen: Vec<u8> = Vec::new();
++        for (&terminal, entity) in &self.entities {
++            let Entity::OutputTerminal { kind: output, source, .. } = entity else { continue };
++            let mut pending = vec![*source];
++            while let Some(id) = pending.pop() {
++                if seen.contains(&id) {
++                    continue;
++                }
++                seen.push(id);
++                match self.entities.get(&id) {
++                    Some(Entity::Feature { source, controls: bits, name }) => {
++                        pending.push(*source);
++                        self.feature_controls(id, *source, bits, *name, terminal, *output, string, card_name, &mut controls);
++                    }
++                    Some(Entity::Unit { sources }) => pending.extend(sources.iter().copied()),
++                    _ => {}
++                }
++            }
++        }
++        // Names are unique, as ALSA's are (with an index otherwise): a
++        // second of the same name goes.
++        let mut names: Vec<String> = Vec::new();
++        controls.retain(|control| {
++            let unique = !names.contains(&control.name);
++            names.push(control.name.clone());
++            unique
++        });
++        controls
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn feature_controls(
++        &self,
++        unit: u8,
++        source: u8,
++        bits: &[u32],
++        name: u8,
++        terminal: u8,
++        output: u16,
++        string: &mut dyn FnMut(u8) -> Option<String>,
++        card_name: &str,
++        out: &mut Vec<FeatureControl>,
++    ) {
++        // The control's name: the unit's own, the terminal upstream's, or
++        // the output's (Linux's rule), then whether it plays or records.
++        let base = (name != 0).then(|| string(name)).flatten().filter(|s| !s.is_empty()).or_else(|| {
++            let upstream = self.upstream_terminal(source);
++            upstream
++                .and_then(|(id, kind)| term_name(kind, self.terminal_name(id), string))
++                .or_else(|| term_name(output, self.terminal_name(terminal), string))
++        });
++        let mut base = base.unwrap_or_else(|| format!("Feature {}", unit));
++        // A headset's "Speaker" is its headphones (Linux's
++        // `check_no_speaker_on_headset`), as PulseAudio expects.
++        if base == "Speaker" && card_name.contains("Headset") {
++            base = "Headphone".to_string();
++        }
++        let capture = output >> 8 == 0x01;
++        let direction = if capture { " Capture" } else { " Playback" };
++        let has = |channel: usize, control: Control| -> bool {
++            let value = bits.get(channel).copied().unwrap_or(0);
++            match self.version {
++                Version::V1 => value & (1 << (control as u32 - 1)) != 0,
++                // Two bits per control: 01 readable, 11 settable.
++                Version::V2 => (value >> ((control as u32 - 1) * 2)) & 3 == 3,
++            }
++        };
++        let channels = bits.len().saturating_sub(1);
++        for control in [Control::Mute, Control::Volume] {
++            let per_channel: Vec<u8> = (1..=channels).filter(|channel| has(*channel, control)).map(|channel| channel as u8).collect();
++            // Per channel when the first has it (Linux's rule), else the master.
++            let channels = if per_channel.first() == Some(&1) {
++                per_channel
++            } else if has(0, control) {
++                vec![0]
++            } else {
++                continue;
++            };
++            let suffix = if control == Control::Mute { " Switch" } else { " Volume" };
++            out.push(FeatureControl {
++                unit,
++                control,
++                channels,
++                master_too: has(0, control) && per_channel_first(bits, self.version, control),
++                name: format!("{}{}{}", base, direction, suffix),
++                capture,
++            });
++        }
++    }
++
++    /// The input terminal upstream of `id` through feature units, with its id.
++    fn upstream_terminal(&self, mut id: u8) -> Option<(u8, u16)> {
++        let kind = self.input_terminal(id)?;
++        for _ in 0..32 {
++            match self.entities.get(&id)? {
++                Entity::InputTerminal { .. } => return Some((id, kind)),
++                Entity::Feature { source, .. } => id = *source,
++                _ => return None,
++            }
++        }
++        None
++    }
++}
++
++fn per_channel_first(bits: &[u32], version: Version, control: Control) -> bool {
++    let value = bits.get(1).copied().unwrap_or(0);
++    match version {
++        Version::V1 => value & (1 << (control as u32 - 1)) != 0,
++        Version::V2 => (value >> ((control as u32 - 1) * 2)) & 3 == 3,
++    }
++}
++
++/// A feature unit control (`UAC_FU_*`: 1 mute, 2 volume).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Control {
++    Mute = 1,
++    Volume = 2,
++}
++
++/// One ALSA control over a feature unit's channels.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct FeatureControl {
++    pub unit: u8,
++    pub control: Control,
++    /// The channels it sets (0: the master).
++    pub channels: Vec<u8>,
++    /// The master has it too: set to its neutral value (0 dB, on).
++    pub master_too: bool,
++    pub name: String,
++    pub capture: bool,
++}
++
++/// A terminal's name, as Linux's `get_term_name` gives it: its string, or
++/// what its type is called.
++fn term_name(kind: u16, name: u8, string: &mut dyn FnMut(u8) -> Option<String>) -> Option<String> {
++    if name != 0 {
++        if let Some(text) = string(name).filter(|text| !text.is_empty()) {
++            return Some(text);
++        }
++    }
++    let named = match kind & 0xff00 {
++        0x0100 => Some("PCM"),
++        0x0200 => Some("Mic"),
++        0x0400 => Some("Headset"),
++        0x0500 => Some("Phone"),
++        _ => None,
++    };
++    if let Some(named) = named {
++        return Some(named.to_string());
++    }
++    let named = match kind {
++        0x0300 => "Output",
++        0x0301 => "Speaker",
++        0x0302 => "Headphone",
++        0x0303 => "HMD Audio",
++        0x0304 => "Speaker",
++        0x0305 => "Room Speaker",
++        0x0306 => "Com Speaker",
++        0x0307 => "LFE",
++        0x0600 => "External In",
++        0x0601 => "Analog In",
++        0x0602 => "Digital In",
++        0x0603 => "Line",
++        0x0604 => "Legacy In",
++        0x0605 => "IEC958 In",
++        0x0606 => "1394 DA Stream",
++        0x0607 => "1394 DV Stream",
++        0x0700 => "Embedded",
++        0x0701 => "Noise Source",
++        0x0702 => "Equalization Noise",
++        0x0703 => "CD",
++        0x0704 => "DAT",
++        0x0705 => "DCC",
++        0x0706 => "MiniDisk",
++        0x0707 => "Analog Tape",
++        0x0708 => "Phonograph",
++        0x0709 => "VCR Audio",
++        0x070a => "Video Disk Audio",
++        0x070b => "DVD Audio",
++        0x070c => "TV Tuner Audio",
++        0x070d => "Satellite Rec Audio",
++        0x070e => "Cable Tuner Audio",
++        0x070f => "DSS Audio",
++        0x0710 => "Radio Receiver",
++        0x0711 => "Radio Transmitter",
++        0x0712 => "Multi-Track Recorder",
++        0x0713 => "Synthesizer",
++        _ => return None,
++    };
++    Some(named.to_string())
++}
++
++/// The card's ID as ALSA makes one from its name: the last word's letters
++/// and digits, at most 15 (`snd_card_set_id`), "Default" without any.
++pub(crate) fn card_id(name: &str) -> String {
++    let word = name.split(|c: char| c.is_whitespace() || c == '_' || c == '-').filter(|w| w.chars().any(|c| c.is_ascii_alphanumeric())).last().unwrap_or("");
++    let mut id: String = word.chars().filter(char::is_ascii_alphanumeric).take(15).collect();
++    if id.starts_with(|c: char| c.is_ascii_digit()) {
++        id.insert(0, 'D');
++        id.truncate(15);
++    }
++    if id.is_empty() || id.starts_with("card") {
++        id = "Default".to_string();
++    }
++    id
++}
++
++/// A UAC2 range reply (`wNumSubRanges` and triplets of `size` bytes each):
++/// the rates it allows, as Linux's `parse_uac2_sample_rate_range`.
++pub(crate) fn rates_of_range(reply: &[u8]) -> Vec<u32> {
++    let count = usize::from(u16_at(reply, 0));
++    let mut rates = Vec::new();
++    for index in 0..count {
++        let at = 2 + index * 12;
++        if at + 12 > reply.len() {
++            break;
++        }
++        let (low, high, step) = (u32_at(reply, at), u32_at(reply, at + 4), u32_at(reply, at + 8));
++        if low == 0 {
++            continue;
++        }
++        if step == 0 || low == high {
++            if !rates.contains(&low) {
++                rates.push(low);
++            }
++            continue;
++        }
++        for rate in KNOWN_RATES {
++            if (low..=high).contains(&rate) && (rate - low) % step == 0 && !rates.contains(&rate) {
++                rates.push(rate);
++            }
++        }
++    }
++    rates.sort_unstable();
++    rates
++}
++
++/// How many packets per second an isochronous endpoint carries at a speed
++/// (bInterval is an exponent for full speed and faster: Linux's
++/// `snd_usb_parse_datainterval`).
++pub(crate) fn packets_per_second(full_speed: bool, interval: u8) -> u32 {
++    let exponent = u32::from(interval.clamp(1, 16)) - 1;
++    let base = if full_speed { 1000 } else { 8000 };
++    (base >> exponent.min(13)).max(1)
++}
++
++/// Frames per packet in 16.16 fixed point, from a feedback endpoint's
++/// value: full speed sends 10.14 in 3 bytes, faster speeds 16.16 in 4; some
++/// devices use other shifts. The one that lands near the nominal value is
++/// it (Linux's `snd_usb_handle_sync_urb`), none when nothing does.
++pub(crate) fn feedback_value(raw: u32, nominal: u32) -> Option<u32> {
++    if raw == 0 {
++        return None;
++    }
++    for shift in [0i32, 2, -1, 1, 3, 4] {
++        let value = if shift >= 0 { raw.checked_shl(shift as u32)? } else { raw >> (-shift) as u32 };
++        // Within an eighth of the nominal rate.
++        let low = nominal - nominal / 8;
++        let high = nominal + nominal / 8;
++        if (low..=high).contains(&value) {
++            return Some(value);
++        }
++    }
++    None
++}
++
++#[cfg(ktest)]
++mod tests {
++    use ostd::prelude::ktest;
++
++    use super::*;
++
++    #[ktest]
++    fn names_ids_like_alsa() {
++        assert_eq!(card_id("Logitech USB Headset"), "Headset");
++        assert_eq!(card_id("USB Audio Device"), "Device");
++        assert_eq!(card_id("Plantronics C320-M"), "M");
++        assert_eq!(card_id(""), "Default");
++    }
++
++    #[ktest]
++    fn reads_rate_ranges() {
++        let mut reply = vec![2, 0];
++        for (low, high, step) in [(44100u32, 44100u32, 0u32), (48000, 96000, 48000)] {
++            reply.extend_from_slice(&low.to_le_bytes());
++            reply.extend_from_slice(&high.to_le_bytes());
++            reply.extend_from_slice(&step.to_le_bytes());
++        }
++        assert_eq!(rates_of_range(&reply), vec![44100, 48000, 96000]);
++    }
++
++    #[ktest]
++    fn finds_the_feedback_format() {
++        // 48 frames per millisecond: 10.14 at full speed, 16.16 at high.
++        let nominal = 48 << 16;
++        assert_eq!(feedback_value(48 << 14, nominal), Some(nominal));
++        assert_eq!(feedback_value(nominal, nominal), Some(nominal));
++        assert_eq!(feedback_value(1, nominal), None);
++    }
++}
+diff --git a/kernel/comps/usb/src/desc.rs b/kernel/comps/usb/src/desc.rs
+old mode 100755
+new mode 100644
+index 448e39e..6eae20a
+--- a/kernel/comps/usb/src/desc.rs
++++ b/kernel/comps/usb/src/desc.rs
+@@ -1,9 +1,11 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ //! USB descriptors: the device's, and a configuration's interfaces and
+-//! endpoints, with the HID class descriptor's report length.
++//! endpoints, with the HID class descriptor's report length and the class
++//! descriptors of interfaces and endpoints (USB audio's).
+ //!
+-//! Reference: USB 2.0, chapter 9.6; USB 3.2, 9.6.7; HID 1.11, 6.2.1.
++//! Reference: USB 2.0, chapter 9.6; USB 3.2, 9.6.7; HID 1.11, 6.2.1; USB
++//! Audio 1.0, 4.6.1.1.
+ 
+ use alloc::vec::Vec;
+ 
+@@ -55,6 +57,16 @@ pub(crate) struct Endpoint {
+     pub interval: u8,
+     /// SuperSpeed bursts (from the companion descriptor).
+     pub max_burst: u8,
++    /// SuperSpeed isochronous packets per burst less one (the companion's
++    /// Mult).
++    pub mult: u8,
++    /// An audio endpoint's extra bytes (USB Audio 1.0's 9-byte endpoint
++    /// descriptor): its feedback period and its feedback endpoint.
++    pub refresh: u8,
++    pub synch_address: u8,
++    /// Its class-specific descriptor's attributes (audio: sample rate
++    /// control, max packets only).
++    pub class_attributes: u8,
+ }
+ 
+ impl Endpoint {
+@@ -74,8 +86,20 @@ impl Endpoint {
+     pub(crate) fn dci(&self) -> u8 {
+         self.number() * 2 + u8::from(self.is_in())
+     }
++
++    /// An isochronous endpoint's synchronization (bits 3:2: none,
++    /// asynchronous, adaptive, synchronous).
++    pub(crate) fn sync_type(&self) -> u8 {
++        (self.attributes >> 2) & 3
++    }
++
++    /// Its usage (bits 5:4: data, feedback, implicit feedback data).
++    pub(crate) fn usage(&self) -> u8 {
++        (self.attributes >> 4) & 3
++    }
+ }
+ 
++pub(crate) const TRANSFER_ISOCHRONOUS: u8 = 1;
+ pub(crate) const TRANSFER_BULK: u8 = 2;
+ pub(crate) const TRANSFER_INTERRUPT: u8 = 3;
+ 
+@@ -94,6 +118,7 @@ pub(crate) struct Interface {
+ }
+ 
+ pub(crate) const CS_INTERFACE: u8 = 0x24;
++pub(crate) const CS_ENDPOINT: u8 = 0x25;
+ 
+ impl Interface {
+     /// A CDC functional descriptor of this subtype.
+@@ -149,12 +174,25 @@ pub(crate) fn parse_configuration(b: &[u8]) -> Option<Configuration> {
+                         max_packet: u16::from_le_bytes([d[4], d[5]]),
+                         interval: d[6],
+                         max_burst: 0,
++                        mult: 0,
++                        refresh: if length >= 9 { d[7] } else { 0 },
++                        synch_address: if length >= 9 { d[8] } else { 0 },
++                        class_attributes: 0,
+                     });
+                 }
+             }
++            CS_ENDPOINT if length >= 4 => {
++                if let Some(endpoint) = configuration.interfaces.last_mut().and_then(|i| i.endpoints.last_mut()) {
++                    endpoint.class_attributes = d[3];
++                }
++            }
+             kind::SS_ENDPOINT_COMPANION if length >= 6 => {
+                 if let Some(endpoint) = configuration.interfaces.last_mut().and_then(|i| i.endpoints.last_mut()) {
+                     endpoint.max_burst = d[2];
++                    // Mult, for isochronous endpoints (bmAttributes 1:0).
++                    if endpoint.transfer_type() == TRANSFER_ISOCHRONOUS {
++                        endpoint.mult = d[3] & 3;
++                    }
+                 }
+             }
+             kind::HID if length >= 9 => {
+diff --git a/kernel/comps/usb/src/lib.rs b/kernel/comps/usb/src/lib.rs
+old mode 100755
+new mode 100644
+index 66de3ca..8859265
+--- a/kernel/comps/usb/src/lib.rs
++++ b/kernel/comps/usb/src/lib.rs
+@@ -5,8 +5,9 @@
+ //! Keyboards and mice of any maker work through the HID class (boot
+ //! keyboards with the boot protocol, every other HID device with its report
+ //! descriptor, wheels, extra buttons and media keys included); Bluetooth
+-//! controllers go to the Bluetooth stack (`bt`); `xhci` says which
+-//! controllers and how. Programs reach every device themselves through
++//! controllers go to the Bluetooth stack (`bt`); audio devices (USB Audio
++//! 1.0 and 2.0: headsets, speakers, microphones, sound cards) become sound
++//! cards (`audio`); `xhci` says which controllers and how. Programs reach every device themselves through
+ //! usbfs (`usbfs`: `/dev/bus/usb`, `/sys/bus/usb`), as libusb does.
+ 
+ #![no_std]
+@@ -21,6 +22,7 @@ macro_rules! __log_prefix {
+     };
+ }
+ 
++mod audio;
+ mod bt;
+ mod desc;
+ mod disk;
+diff --git a/kernel/comps/usb/src/xhci.rs b/kernel/comps/usb/src/xhci.rs
+old mode 100755
+new mode 100644
+index 1363e68..18d0b8d
+--- a/kernel/comps/usb/src/xhci.rs
++++ b/kernel/comps/usb/src/xhci.rs
+@@ -7,7 +7,7 @@
+ //! it from the firmware, and then attaches each device that is or becomes
+ //! connected to a root port, gives it an address, reads its descriptors,
+ //! configures it and hands its interfaces to the class drivers
+-//! (`aster_input::hid`). Interrupts wake the task; a timer wakes it too, for
++//! (`aster_input::hid`, `audio`...). Interrupts wake the task; a timer wakes it too, for
+ //! controllers whose interrupts do not reach the kernel and for timeouts.
+ //!
+ //! Reference: eXtensible Host Controller Interface 1.2; Linux's
+@@ -24,7 +24,7 @@ use aster_block::bio::{BioStatus, BioType, SubmittedBio};
+ use aster_input::hid::{self, ReportDescriptor};
+ 
+ use crate::{
+-    bt,
++    audio as uac, bt,
+     desc::{self, Configuration, Endpoint, Interface, TRANSFER_BULK, TRANSFER_INTERRUPT},
+     disk::UsbDisk,
+     netframe::{self, Framing},
+@@ -32,6 +32,7 @@ use crate::{
+     scsi, usbfs, usbnet,
+ };
+ 
++mod audio;
+ mod programs;
+ 
+ /// Completion codes.
+@@ -300,6 +301,10 @@ struct Slot {
+     usbfs: Option<alloc::sync::Arc<usbfs::UsbDevice>>,
+     /// Interfaces the kernel's drivers took: their names.
+     drivers: BTreeMap<u8, &'static str>,
++    /// Its audio functions, as sound cards (`audio`).
++    audio: Vec<audio::AudioFunction>,
++    /// Its manufacturer's and product's string descriptors.
++    string_ids: (u8, u8),
+ }
+ 
+ /// Network interfaces' names: usb0, usb1, ...
+@@ -597,6 +602,7 @@ impl Controller {
+             self.serve_disks();
+             self.check_media();
+             self.serve_programs();
++            self.serve_audio();
+             crate::sleep_idle();
+         }
+     }
+@@ -732,6 +738,8 @@ impl Controller {
+         if let Some(mut slot) = self.slots.remove(&slot_id) {
+             // What programs had on it ends.
+             Self::programs_gone(&mut slot);
++            // Its sound cards go.
++            Self::audio_gone(&slot.audio);
+             // Its hub no longer has it.
+             if let Some((hub_slot, hub_port)) = slot.parent {
+                 if let Some(hub) = self.slots.get_mut(&hub_slot).and_then(|hub| hub.hub.as_mut()) {
+@@ -811,6 +819,8 @@ impl Controller {
+             programs: BTreeMap::new(),
+             usbfs: None,
+             drivers: BTreeMap::new(),
++            audio: Vec::new(),
++            string_ids: (0, 0),
+         };
+         let _ = self.dcbaa.write_val(usize::from(slot_id) * 8, &(slot.output.daddr() as u64));
+         self.slots.insert(slot_id, slot);
+@@ -870,6 +880,7 @@ impl Controller {
+         let device = desc::parse_device(&raw_device).ok_or(Error::Descriptor)?;
+         if let Some(slot) = self.slots.get_mut(&slot_id) {
+             slot.ids = (device.vendor, device.product);
++            slot.string_ids = (raw_device[14], raw_device[15]);
+         }
+         // Each configuration (phones and network adapters offer several).
+         let mut configuration: Option<Configuration> = None;
+@@ -921,6 +932,10 @@ impl Controller {
+             let (started, driver) = match interface.class {
+                 _ if bluetooth => (self.start_bluetooth(slot_id, interface).map(|()| claimed.push(interface.number + 1)), "btusb"),
+                 3 => (self.start_hid(slot_id, interface), "usbhid"),
++                uac::CLASS if interface.subclass == uac::SUBCLASS_CONTROL => (
++                    self.start_audio(slot_id, configuration, interface).map(|taken| claimed.extend(taken)),
++                    "snd-usb-audio",
++                ),
+                 8 => (self.start_storage(slot_id, interface), "usb-storage"),
+                 9 => (self.start_hub(slot_id, interface), "hub"),
+                 _ if net_framing(interface).is_some() => (
+@@ -1065,14 +1080,29 @@ impl Controller {
+         }
+     }
+ 
+-    /// Adds an endpoint to the slot's configuration, with its transfer ring.
++    /// An isochronous endpoint's Interval: an exponent at every speed, in
++    /// frames at full speed (Linux's `xhci_parse_exponent_interval`).
++    fn isoch_interval(speed: u32, endpoint: &Endpoint) -> u32 {
++        let exponent = u32::from(endpoint.interval.clamp(1, 16)) - 1;
++        match speed {
++            SPEED_LOW | SPEED_FULL => (exponent + 3).min(15),
++            _ => exponent,
++        }
++    }
++
++    /// Adds an endpoint to the slot's configuration, with its transfer ring
++    /// (one already there, of another setting, is replaced).
+     fn configure_endpoint(&mut self, slot_id: u8, endpoint: &Endpoint, kind: u32, ring: &ProducerRing) -> Result<()> {
+         let dci = endpoint.dci();
+         let slot = self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?;
+         slot.last_dci = slot.last_dci.max(dci);
+         let (speed, last_dci) = (slot.speed, slot.last_dci);
+         let slot = &self.slots[&slot_id];
++        let enabled = self.output_read(slot, usize::from(dci), 0) & 7 != 0;
+         self.clear_input(slot);
++        if enabled {
++            self.input_write(slot, 0, 0, 1 << dci);
++        }
+         self.input_write(slot, 0, 1, 1 | 1 << dci);
+         // The slot as it is, with its context entries reaching this endpoint
+         // (and, for a hub, its ports and translators).
+@@ -1097,12 +1127,20 @@ impl Controller {
+         let max_packet = u32::from(endpoint.max_packet & 0x7ff);
+         let burst = if speed >= 4 { u32::from(endpoint.max_burst) } else { u32::from((endpoint.max_packet >> 11) & 3) };
+         let entry = 1 + usize::from(dci);
+-        self.input_write(slot, entry, 0, Self::interval(speed, endpoint) << 16);
+-        self.input_write(slot, entry, 1, 3 << 1 | kind << 3 | burst << 8 | max_packet << 16);
++        // Isochronous endpoints never retry (CErr 0), take their Interval
++        // as an exponent and, at SuperSpeed, bursts of Mult + 1.
++        let isochronous = kind == audio::EP_ISOCH_OUT || kind == audio::EP_ISOCH_IN;
++        let (interval, errors, mult) = if isochronous {
++            (Self::isoch_interval(speed, endpoint), 0, if speed >= SPEED_SUPER { u32::from(endpoint.mult) } else { 0 })
++        } else {
++            (Self::interval(speed, endpoint), 3, 0)
++        };
++        self.input_write(slot, entry, 0, interval << 16 | mult << 8);
++        self.input_write(slot, entry, 1, errors << 1 | kind << 3 | burst << 8 | max_packet << 16);
+         let dequeue = ring.dequeue_pointer();
+         self.input_write(slot, entry, 2, dequeue as u32);
+         self.input_write(slot, entry, 3, (dequeue >> 32) as u32);
+-        let payload = max_packet * (burst + 1);
++        let payload = max_packet * (burst + 1) * (mult + 1);
+         self.input_write(slot, entry, 4, max_packet | payload << 16);
+         let input = slot.input.daddr() as u64;
+         self.command(Trb {
+@@ -1190,6 +1228,10 @@ impl Controller {
+             self.program_done(slot_id, dci, event);
+             return;
+         }
++        if self.is_audio_endpoint(slot_id, dci) {
++            self.audio_done(slot_id, dci, event);
++            return;
++        }
+         if self.slots.get(&slot_id).is_some_and(|slot| slot.net.iter().any(|net| net.rx_dci == dci || net.tx_dci == dci)) {
+             self.net_transfer_done(slot_id, dci, event);
+             return;
+diff --git a/kernel/comps/usb/src/xhci/audio.rs b/kernel/comps/usb/src/xhci/audio.rs
+new file mode 100644
+index 0000000..5354e95
+--- /dev/null
++++ b/kernel/comps/usb/src/xhci/audio.rs
+@@ -0,0 +1,1007 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! USB audio devices as ALSA cards, on the controller's task: each audio
++//! function (`crate::audio`) is a card with a playback and a capture stream
++//! and its feature units' volumes and mutes as mixer controls.
++//!
++//! A stream runs on isochronous transfers: one TD per packet, each in a
++//! bounce buffer of its own. Playback copies a packet's frames out of the
++//! PCM buffer as it queues it, and the stream's position is what it has
++//! queued, with the packets in flight as its delay (Linux's
++//! `snd-usb-audio` does the same); capture copies each packet in as it
++//! arrives. Packets carry the rate's frames per packet, the fraction
++//! carried over (44.1 kHz: 44 and 45 frames); an asynchronous device's
++//! feedback endpoint says its own rate, which playback follows. Every TD
++//! interrupts on completion, most with their interrupt blocked: the event
++//! is written, the task wakes about once a millisecond.
++//!
++//! The PCM layer's calls reach the task through each stream's requests
++//! (prepare waits for its answer; start and stop only say so), and mixer
++//! changes through the mixer's queue.
++//!
++//! Reference: xHCI 1.2, 4.11.2.5 (isochronous TRBs), 4.14.2; Linux's
++//! `sound/usb/{endpoint,pcm,mixer,clock}.c`, `drivers/usb/host/xhci-ring.c`
++//! (`xhci_queue_isoc_tx`).
++
++use alloc::{
++    boxed::Box,
++    collections::VecDeque,
++    format,
++    string::{String, ToString},
++    sync::Arc,
++    vec,
++    vec::Vec,
++};
++use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++
++use aster_sound::{
++    Card, CardInfo, Control as AlsaControl, ControlKind, Direction as PcmDirection, Mixer, Pcm, StreamHw,
++    params::{HwLimits, Mask, info},
++    pcm::{Buffer, PcmError, Setup},
++};
++use ostd::{
++    mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent},
++    sync::{SpinLock, WaitQueue},
++};
++
++use super::{Controller, Data, Error, SET_INTERFACE, SHORT_PACKET, SPEED_FULL, SPEED_LOW, SPEED_SUPER, SUCCESS};
++use crate::{
++    audio::{self, Alt, Control, Direction, Entity, FeatureControl, Function, Rates, Version},
++    desc::{Configuration, Endpoint, Interface},
++    ring::{IOC, ProducerRing, Trb},
++};
++
++/// Endpoint context types.
++pub(super) const EP_ISOCH_OUT: u32 = 1;
++pub(super) const EP_ISOCH_IN: u32 = 5;
++/// The isochronous TRB, and its flags: Block Event Interrupt, Start
++/// Isochronous ASAP.
++const TRB_ISOCH: u32 = 5;
++const BEI: u32 = 1 << 9;
++const SIA: u32 = 1 << 31;
++/// Completion codes of isochronous transfers.
++const RING_UNDERRUN: u8 = 14;
++const RING_OVERRUN: u8 = 15;
++const MISSED_SERVICE: u8 = 23;
++
++/// Class requests (version 1: SET_CUR and GET_*; version 2: CUR and RANGE).
++const SET_CUR: u8 = 0x01;
++const GET_CUR: u8 = 0x81;
++const GET_MIN: u8 = 0x82;
++const GET_MAX: u8 = 0x83;
++const GET_RES: u8 = 0x84;
++const CUR_V2: u8 = 0x01;
++const RANGE_V2: u8 = 0x02;
++/// The sampling frequency control, of a version 1 endpoint and of a
++/// version 2 clock source; a clock selector's control.
++const SAMPLING_FREQ_CONTROL: u16 = 0x01;
++const CLOCK_SELECTOR_CONTROL: u16 = 0x01;
++/// Request types: class, to the interface or the endpoint.
++const TO_INTERFACE: u8 = 0x21;
++const FROM_INTERFACE: u8 = 0xa1;
++const TO_ENDPOINT: u8 = 0x22;
++
++/// Milliseconds of audio a stream keeps queued.
++const QUEUED_MS: u32 = 8;
++/// A stream's bounce buffers, and the feedback endpoint's transfers.
++const MAX_QUEUED: usize = 96;
++const FEEDBACK_TDS: usize = 4;
++/// The PCM buffer at most (Linux's `snd_usb_hardware`).
++const BUFFER_BYTES_MAX: u32 = 1024 * 1024;
++
++/// What the PCM layer asks a stream's task to do.
++enum Request {
++    Prepare(Setup, Arc<Buffer>),
++    Release,
++}
++
++/// What a stream shares between the PCM layer and the controller's task.
++pub(crate) struct StreamShared {
++    requests: SpinLock<VecDeque<Request>>,
++    running: AtomicBool,
++    /// Where the stream is in the PCM buffer, in bytes.
++    position: AtomicUsize,
++    /// Frames in flight (playback: queued, not yet played).
++    delay: AtomicU64,
++    answer: SpinLock<Option<Result<(), PcmError>>>,
++    answered: WaitQueue,
++    gone: AtomicBool,
++}
++
++impl StreamShared {
++    fn new() -> Arc<Self> {
++        Arc::new(Self {
++            requests: SpinLock::new(VecDeque::new()),
++            running: AtomicBool::new(false),
++            position: AtomicUsize::new(0),
++            delay: AtomicU64::new(0),
++            answer: SpinLock::new(None),
++            answered: WaitQueue::new(),
++            gone: AtomicBool::new(false),
++        })
++    }
++
++    fn answer(&self, result: Result<(), PcmError>) {
++        *self.answer.lock() = Some(result);
++        self.answered.wake_all();
++    }
++}
++
++/// The PCM layer's side of a stream.
++struct UsbStreamHw(Arc<StreamShared>);
++
++impl StreamHw for UsbStreamHw {
++    fn prepare(&self, setup: &Setup, buffer: &Arc<Buffer>) -> Result<(), PcmError> {
++        if self.0.gone.load(Ordering::Acquire) {
++            return Err(PcmError::Disconnected);
++        }
++        *self.0.answer.lock() = None;
++        self.0.requests.lock().push_back(Request::Prepare(*setup, buffer.clone()));
++        crate::wake();
++        self.0.answered.wait_until(|| {
++            if self.0.gone.load(Ordering::Acquire) {
++                return Some(Err(PcmError::Disconnected));
++            }
++            self.0.answer.lock().take()
++        })
++    }
++
++    fn start(&self) {
++        self.0.running.store(true, Ordering::Release);
++        crate::wake();
++    }
++
++    fn stop(&self) {
++        self.0.running.store(false, Ordering::Release);
++        crate::wake();
++    }
++
++    fn position(&self) -> usize {
++        self.0.position.load(Ordering::Acquire)
++    }
++
++    fn delay(&self) -> u64 {
++        self.0.delay.load(Ordering::Acquire)
++    }
++
++    fn release(&self) {
++        self.0.running.store(false, Ordering::Release);
++        self.0.requests.lock().push_back(Request::Release);
++        crate::wake();
++    }
++}
++
++/// The card's controls, put on the device by the task.
++pub(crate) struct UsbMixer {
++    pending: SpinLock<Vec<(usize, Vec<i64>)>>,
++}
++
++impl Mixer for UsbMixer {
++    fn apply(&self, index: usize, values: &[i64]) {
++        let mut pending = self.pending.lock();
++        pending.retain(|(other, _)| *other != index);
++        pending.push((index, values.to_vec()));
++        drop(pending);
++        crate::wake();
++    }
++}
++
++/// A control's device side: the feature unit, and a volume's range.
++struct MixerControl {
++    feature: FeatureControl,
++    /// The raw range (1/256 dB) and step of a volume.
++    min: i32,
++    max: i32,
++    res: i32,
++}
++
++impl MixerControl {
++    fn raw_of(&self, value: i64) -> i32 {
++        (self.min as i64 + value * self.res as i64).clamp(self.min as i64, self.max as i64) as i32
++    }
++
++    fn value_of(&self, raw: i32) -> i64 {
++        (i64::from(raw.clamp(self.min, self.max)) - i64::from(self.min)) / i64::from(self.res.max(1))
++    }
++}
++
++/// One packet in flight: its TRB, its bounce buffer, its bytes.
++struct Td {
++    trb: u64,
++    slot: usize,
++    bytes: usize,
++}
++
++/// A feedback endpoint's transfers.
++struct Feedback {
++    dci: u8,
++    ring: ProducerRing,
++    buffer: DmaCoherent,
++    in_flight: VecDeque<(u64, usize)>,
++    /// What one of its transfers asks for (3 bytes at full speed, 4 faster).
++    size: usize,
++    /// Frames per (micro)frame the device would have at the nominal rate, 16.16.
++    nominal: u32,
++    /// (Micro)frames per data packet, as a shift.
++    shift: u32,
++}
++
++/// A prepared stream: its setting, endpoint, buffers and packets.
++struct Active {
++    setup: Setup,
++    buffer: Arc<Buffer>,
++    dci: u8,
++    ring: ProducerRing,
++    slots: DmaCoherent,
++    slot_size: usize,
++    free: Vec<usize>,
++    in_flight: VecDeque<Td>,
++    feedback: Option<Feedback>,
++    /// What a packet may hold.
++    packet_max: usize,
++    /// Frames per packet, 16.16: the nominal rate's, or the device's own.
++    freq: u64,
++    accumulator: u64,
++    /// Where the next packet goes in (or comes from) the PCM buffer.
++    offset: usize,
++    /// Packets to keep queued, and every how many one interrupts.
++    queued: usize,
++    interrupt_every: usize,
++    since_interrupt: usize,
++    /// The endpoint's TD layout (bursts at SuperSpeed).
++    max_packet: usize,
++    burst: usize,
++    superspeed: bool,
++    /// Packets queued and done, missed by the controller, and times the
++    /// ring ran dry: the stream's report when it ends.
++    sent: u64,
++    done: u64,
++    missed: u64,
++    dry: u64,
++}
++
++pub(super) struct AudioStream {
++    desc: audio::Stream,
++    pcm: Arc<Pcm>,
++    shared: Arc<StreamShared>,
++    active: Option<Active>,
++}
++
++/// An audio function on a slot: its card, controls and streams.
++pub(super) struct AudioFunction {
++    function: Function,
++    card: Arc<Card>,
++    mixer: Arc<UsbMixer>,
++    controls: Vec<MixerControl>,
++    streams: Vec<AudioStream>,
++}
++
++fn le(value: i64, bytes: usize) -> Vec<u8> {
++    value.to_le_bytes()[..bytes].to_vec()
++}
++
++fn i16_of(bytes: &[u8]) -> Option<i32> {
++    Some(i32::from(i16::from_le_bytes([*bytes.first()?, *bytes.get(1)?])))
++}
++
++/// What a stream's hardware can do: every setting's formats, rates and
++/// channels together; prepare picks the setting that has them.
++fn limits_of(alts: &[Alt]) -> HwLimits {
++    let mut formats = Vec::new();
++    let mut rates: Vec<u32> = Vec::new();
++    let (mut low, mut high, mut bits) = (u32::MAX, 0, 0);
++    for alt in alts {
++        if !formats.contains(&alt.format) {
++            formats.push(alt.format);
++        }
++        for rate in alt.rates.list() {
++            if !rates.contains(&rate) {
++                rates.push(rate);
++            }
++        }
++        low = low.min(u32::from(alt.channels));
++        high = high.max(u32::from(alt.channels));
++        bits = bits.max(u32::from(alt.bits));
++    }
++    rates.sort_unstable();
++    HwLimits {
++        info: info::MMAP | info::MMAP_VALID | info::BATCH | info::INTERLEAVED | info::BLOCK_TRANSFER | info::PAUSE,
++        formats: Mask::of(&formats),
++        rates,
++        channels: (low.min(high), high),
++        period_bytes: (64, 512 * 1024),
++        periods: (2, 1024),
++        buffer_bytes_max: BUFFER_BYTES_MAX,
++        byte_step: 1,
++        msbits: bits,
++    }
++}
++
++/// Linux's `xhci_get_burst_count` and `xhci_get_last_burst_packet_count`:
++/// a TD's TBC and TLBPC fields.
++fn burst_fields(version: u16, superspeed: bool, packets: usize, burst: usize) -> (u32, u32) {
++    if version < 0x100 || packets == 0 {
++        return (0, 0);
++    }
++    if !superspeed {
++        return (0, (packets - 1) as u32);
++    }
++    let bursts = packets.div_ceil(burst + 1);
++    let residue = packets % (burst + 1);
++    ((bursts - 1) as u32, if residue == 0 { burst as u32 } else { (residue - 1) as u32 })
++}
++
++impl Controller {
++    // ── Starting ─────────────────────────────────────────────────────────
++
++    /// An audio control interface: its function becomes a card. Returns the
++    /// streaming interfaces it took.
++    pub(super) fn start_audio(&mut self, slot_id: u8, configuration: &Configuration, control: &Interface) -> super::Result<Vec<u8>> {
++        let mut function = audio::parse(configuration, control).ok_or(Error::Descriptor)?;
++        let interface = u16::from(function.control);
++        // Version 2: each stream's rates are its clock's.
++        if function.version == Version::V2 {
++            for index in 0..function.streams.len() {
++                let stream = function.streams[index].clone();
++                let rates = match function.clock_of(&stream).and_then(|clock| self.clock_source(slot_id, &function, clock)) {
++                    Some(source) => self.clock_rates(slot_id, interface, source),
++                    None => Vec::new(),
++                };
++                let rates = if rates.is_empty() { vec![48000] } else { rates };
++                for alt in &mut function.streams[index].alts {
++                    alt.rates = Rates::List(rates.clone());
++                }
++            }
++        }
++        // Each stream to its zero-bandwidth setting.
++        for stream in &function.streams {
++            let _ = self.control(slot_id, 0x01, SET_INTERFACE, 0, u16::from(stream.interface), Data::None);
++        }
++        // The card's names, as Linux's `usb_audio_make_shortname/longname`.
++        let (manufacturer_id, product_id, ids, speed, path) = {
++            let slot = &self.slots[&slot_id];
++            (slot.string_ids.0, slot.string_ids.1, slot.ids, slot.speed, self.port_path(slot_id))
++        };
++        let product = self.text(slot_id, product_id).filter(|s| !s.is_empty());
++        let manufacturer = self.text(slot_id, manufacturer_id).filter(|s| !s.is_empty());
++        let name = product.unwrap_or_else(|| format!("USB Device {:#06x}:{:#06x}", ids.0, ids.1));
++        let speed_name = match speed {
++            SPEED_LOW => "low",
++            SPEED_FULL => "full",
++            3 => "high",
++            4 => "super",
++            _ => "super-plus",
++        };
++        let location = self.location();
++        let place = path.iter().map(|port| port.to_string()).collect::<Vec<_>>().join(".");
++        let longname = match manufacturer {
++            Some(maker) if !name.contains(&maker) => format!("{} {} at usb-{}-{}, {} speed", maker, name, location, place, speed_name),
++            _ => format!("{} at usb-{}-{}, {} speed", name, location, place, speed_name),
++        };
++        let id = unique_id(&audio::card_id(&name));
++
++        // The streams: one playback and one capture, as most devices have.
++        let mut streams = Vec::new();
++        for direction in [Direction::Playback, Direction::Capture] {
++            let Some(stream) = function.streams.iter().find(|s| s.direction == direction && !s.alts.is_empty()) else { continue };
++            let shared = StreamShared::new();
++            let limits = limits_of(&stream.alts);
++            let pcm_direction = if direction == Direction::Playback { PcmDirection::Playback } else { PcmDirection::Capture };
++            let Some(pcm) = Pcm::new(pcm_direction, limits, "USB Audio".to_string(), "USB Audio".to_string(), Box::new(UsbStreamHw(shared.clone()))) else {
++                continue;
++            };
++            streams.push(AudioStream { desc: stream.clone(), pcm, shared, active: None });
++        }
++        if streams.is_empty() {
++            return Err(Error::Descriptor);
++        }
++
++        // The mixer: each feature control with its range and value now.
++        let mut strings = |index: u8| self.text(slot_id, index);
++        let features = function.controls(&mut strings, &name);
++        let mut controls = Vec::new();
++        let mut alsa_controls = Vec::new();
++        for feature in features {
++            let Some((control, alsa)) = self.mixer_control(slot_id, &function, feature) else { continue };
++            controls.push(control);
++            alsa_controls.push(alsa);
++        }
++        let mixer = Arc::new(UsbMixer { pending: SpinLock::new(Vec::new()) });
++        let info = CardInfo {
++            id,
++            driver: "USB-Audio".to_string(),
++            name: name.clone(),
++            longname,
++            mixer_name: "USB Mixer".to_string(),
++            components: format!("USB{:04x}:{:04x}", ids.0, ids.1),
++            pcm_name: "USB Audio".to_string(),
++        };
++        let playback = streams.iter().find(|s| s.desc.direction == Direction::Playback).map(|s| s.pcm.clone());
++        let capture = streams.iter().find(|s| s.desc.direction == Direction::Capture).map(|s| s.pcm.clone());
++        let mixer_for_card: Arc<dyn Mixer> = mixer.clone();
++        let card = aster_sound::add_card(move |index| Some(Card::external(index, info, playback, capture, alsa_controls, mixer_for_card)))
++            .ok_or(Error::NoMemory)?;
++        ostd::notice!(
++            "{}: sound card {}: {} (USB Audio {}){}{}",
++            self.name,
++            card.index,
++            card.name,
++            if function.version == Version::V2 { "2.0" } else { "1.0" },
++            if card.playback.is_some() { ", playback" } else { "" },
++            if card.capture.is_some() { ", capture" } else { "" }
++        );
++        let taken: Vec<u8> = function.streams.iter().map(|stream| stream.interface).collect();
++        let entry = AudioFunction { function, card, mixer, controls, streams };
++        self.slots.get_mut(&slot_id).ok_or(Error::Descriptor)?.audio.push(entry);
++        Ok(taken)
++    }
++
++    /// The controller's PCI place, as Linux names a bus (`0000:00:14.0`).
++    fn location(&self) -> String {
++        let location = *self._device.location();
++        format!("0000:{:02x}:{:02x}.{}", location.bus, location.device, location.function)
++    }
++
++    /// A string descriptor as text (UTF-16LE after its two-byte header).
++    fn text(&mut self, slot_id: u8, index: u8) -> Option<String> {
++        if index == 0 {
++            return None;
++        }
++        let raw = self.get_string(slot_id, index).ok()?;
++        let units: Vec<u16> = raw.get(2..)?.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
++        let text: String = char::decode_utf16(units).map(|c| c.unwrap_or('?')).collect();
++        Some(text.trim().to_string())
++    }
++
++    /// The clock source behind a clock entity (version 2): a selector's
++    /// current input, a multiplier's source (Linux's `__uac_clock_find_source`).
++    fn clock_source(&mut self, slot_id: u8, function: &Function, mut clock: u8) -> Option<u8> {
++        let interface = u16::from(function.control);
++        for _ in 0..8 {
++            match function.entities.get(&clock)? {
++                Entity::ClockSource { .. } => return Some(clock),
++                Entity::ClockMultiplier { source } => clock = *source,
++                Entity::ClockSelector { sources } => {
++                    let index = u16::from(clock) << 8 | interface;
++                    let pin = self
++                        .control(slot_id, FROM_INTERFACE, CUR_V2, CLOCK_SELECTOR_CONTROL << 8, index, Data::In(1))
++                        .ok()
++                        .and_then(|length| (length == 1).then(|| self.read_reply(slot_id, 1)).flatten())
++                        .and_then(|reply| reply.first().copied())
++                        .filter(|pin| *pin >= 1 && usize::from(*pin) <= sources.len())
++                        .unwrap_or(1);
++                    clock = sources[usize::from(pin) - 1];
++                }
++                _ => return None,
++            }
++        }
++        None
++    }
++
++    fn read_reply(&self, slot_id: u8, length: usize) -> Option<Vec<u8>> {
++        let mut data = vec![0u8; length];
++        self.slots.get(&slot_id)?.buffer.read_bytes(0, &mut data).ok()?;
++        Some(data)
++    }
++
++    /// A version 2 clock source's rates (its sampling frequency RANGE).
++    fn clock_rates(&mut self, slot_id: u8, interface: u16, clock: u8) -> Vec<u32> {
++        let index = u16::from(clock) << 8 | interface;
++        let value = SAMPLING_FREQ_CONTROL << 8;
++        let Ok(2) = self.control(slot_id, FROM_INTERFACE, RANGE_V2, value, index, Data::In(2)) else { return Vec::new() };
++        let Some(head) = self.read_reply(slot_id, 2) else { return Vec::new() };
++        let count = usize::from(u16::from_le_bytes([head[0], head[1]])).min(64);
++        let length = 2 + count * 12;
++        match self.control(slot_id, FROM_INTERFACE, RANGE_V2, value, index, Data::In(length)) {
++            Ok(got) => self.read_reply(slot_id, got).map(|reply| audio::rates_of_range(&reply)).unwrap_or_default(),
++            Err(_) => Vec::new(),
++        }
++    }
++
++    /// A feature control's range and present values, as an ALSA control.
++    fn mixer_control(&mut self, slot_id: u8, function: &Function, feature: FeatureControl) -> Option<(MixerControl, AlsaControl)> {
++        let index = u16::from(feature.unit) << 8 | u16::from(function.control);
++        let selector = (feature.control as u16) << 8;
++        let first = u16::from(feature.channels[0]);
++        let mut control = MixerControl { feature: feature.clone(), min: 0, max: 1, res: 1 };
++        let get = |this: &mut Self, request: u8, channel: u16, length: usize| -> Option<Vec<u8>> {
++            let got = this.control(slot_id, FROM_INTERFACE, request, selector | channel, index, Data::In(length)).ok()?;
++            this.read_reply(slot_id, got)
++        };
++        let kind = match feature.control {
++            Control::Mute => ControlKind::Boolean,
++            Control::Volume => {
++                let (min, max, res) = match function.version {
++                    Version::V1 => (
++                        i16_of(&get(self, GET_MIN, first, 2)?)?,
++                        i16_of(&get(self, GET_MAX, first, 2)?)?,
++                        i16_of(&get(self, GET_RES, first, 2)?)?,
++                    ),
++                    Version::V2 => {
++                        let range = get(self, RANGE_V2, first, 8)?;
++                        (i16_of(range.get(2..)?)?, i16_of(range.get(4..)?)?, i16_of(range.get(6..)?)?)
++                    }
++                };
++                if max <= min {
++                    return None;
++                }
++                control.min = min;
++                control.max = max;
++                control.res = if res <= 0 { 1 } else { res };
++                ControlKind::Integer { min: 0, max: i64::from((max - min + control.res - 1) / control.res) }
++            }
++        };
++        let current_request = if function.version == Version::V1 { GET_CUR } else { CUR_V2 };
++        let width = if feature.control == Control::Mute { 1 } else { 2 };
++        let mut values = Vec::new();
++        for &channel in &feature.channels {
++            let raw = get(self, current_request, u16::from(channel), width);
++            values.push(match (feature.control, raw) {
++                (Control::Mute, Some(raw)) => i64::from(raw.first().copied().unwrap_or(0) == 0),
++                (Control::Mute, None) => 1,
++                (Control::Volume, Some(raw)) => control.value_of(i16_of(&raw).unwrap_or(control.max)),
++                (Control::Volume, None) => control.value_of(control.max),
++            });
++        }
++        // The master behind per-channel controls stays neutral: unmuted, at 0 dB.
++        if feature.master_too {
++            let (payload, setter) = match feature.control {
++                Control::Mute => (vec![0u8], SET_CUR),
++                Control::Volume => (le(0, 2), SET_CUR),
++            };
++            let _ = self.control(slot_id, TO_INTERFACE, setter, selector, index, Data::Out(&payload));
++        }
++        let db = match feature.control {
++            Control::Volume => Some((control.min * 100 / 256, control.max * 100 / 256, false)),
++            Control::Mute => None,
++        };
++        let alsa = AlsaControl::external(feature.name.clone(), kind, feature.channels.len() as u32, db, values);
++        Some((control, alsa))
++    }
++
++    // ── The task's side ──────────────────────────────────────────────────
++
++    /// What the PCM layer and the mixers asked; then each running stream's
++    /// packets.
++    pub(super) fn serve_audio(&mut self) {
++        let slot_ids: Vec<u8> = self.slots.iter().filter(|(_, slot)| !slot.audio.is_empty()).map(|(id, _)| *id).collect();
++        for slot_id in slot_ids {
++            let functions = self.slots.get(&slot_id).map_or(0, |slot| slot.audio.len());
++            for f in 0..functions {
++                self.apply_mixer(slot_id, f);
++                let streams = self.slots.get(&slot_id).and_then(|slot| slot.audio.get(f)).map_or(0, |function| function.streams.len());
++                for s in 0..streams {
++                    loop {
++                        let request = self
++                            .slots
++                            .get(&slot_id)
++                            .and_then(|slot| slot.audio.get(f))
++                            .and_then(|function| function.streams[s].shared.requests.lock().pop_front());
++                        let Some(request) = request else { break };
++                        match request {
++                            Request::Prepare(setup, buffer) => {
++                                let result = self.prepare_stream(slot_id, f, s, setup, buffer);
++                                if let Some(stream) = self.stream(slot_id, f, s) {
++                                    stream.shared.answer(result);
++                                }
++                            }
++                            Request::Release => self.release_stream(slot_id, f, s),
++                        }
++                    }
++                    self.fill(slot_id, f, s);
++                }
++            }
++        }
++    }
++
++    fn stream(&mut self, slot_id: u8, f: usize, s: usize) -> Option<&mut AudioStream> {
++        self.slots.get_mut(&slot_id)?.audio.get_mut(f)?.streams.get_mut(s)
++    }
++
++    /// Puts the controls the card changed on the device.
++    fn apply_mixer(&mut self, slot_id: u8, f: usize) {
++        let pending = match self.slots.get(&slot_id).and_then(|slot| slot.audio.get(f)) {
++            Some(function) => core::mem::take(&mut *function.mixer.pending.lock()),
++            None => return,
++        };
++        for (index, values) in pending {
++            let Some((feature, interface, version, raws)) = self.slots.get(&slot_id).and_then(|slot| slot.audio.get(f)).and_then(|function| {
++                let control = function.controls.get(index)?;
++                let raws: Vec<i32> = values.iter().map(|value| control.raw_of(*value)).collect();
++                Some((control.feature.clone(), function.function.control, function.function.version, raws))
++            }) else {
++                continue;
++            };
++            let unit = u16::from(feature.unit) << 8 | u16::from(interface);
++            let setter = if version == Version::V1 { SET_CUR } else { CUR_V2 };
++            for (position, &channel) in feature.channels.iter().enumerate() {
++                let value = values.get(position).copied().unwrap_or(0);
++                let payload = match feature.control {
++                    Control::Mute => vec![u8::from(value == 0)],
++                    Control::Volume => le(i64::from(raws.get(position).copied().unwrap_or(0)), 2),
++                };
++                let selector = (feature.control as u16) << 8 | u16::from(channel);
++                let _ = self.control(slot_id, TO_INTERFACE, setter, selector, unit, Data::Out(&payload));
++            }
++        }
++    }
++
++    /// Sets a stream up for its parameters: the setting that has them, the
++    /// rate, the endpoints and buffers.
++    fn prepare_stream(&mut self, slot_id: u8, f: usize, s: usize, setup: Setup, buffer: Arc<Buffer>) -> Result<(), PcmError> {
++        self.release_stream(slot_id, f, s);
++        let (desc, function_version, control, clock) = {
++            let function = self.slots.get(&slot_id).and_then(|slot| slot.audio.get(f)).ok_or(PcmError::Disconnected)?;
++            let desc = function.streams[s].desc.clone();
++            let clock = function.function.clock_of(&desc);
++            (desc, function.function.version, function.function.control, clock)
++        };
++        let alt_index = desc
++            .alts
++            .iter()
++            .position(|alt| alt.format == setup.format && u32::from(alt.channels) == setup.channels && alt.rates.has(setup.rate))
++            .ok_or(PcmError::Invalid)?;
++        let alt = desc.alts[alt_index].clone();
++        if setup.frame_bytes != alt.frame_bytes() {
++            return Err(PcmError::Invalid);
++        }
++        let interface = u16::from(desc.interface);
++        // Version 2 sets the clock first; version 1 the setting first, then
++        // the endpoint's rate (Linux's order).
++        if function_version == Version::V2 {
++            let function = self.slots[&slot_id].audio[f].function.clone();
++            if let Some(source) = clock.and_then(|clock| self.clock_source(slot_id, &function, clock)) {
++                let settable = matches!(function.entities.get(&source), Some(Entity::ClockSource { controls, .. }) if controls & 3 == 3);
++                if settable {
++                    let index = u16::from(source) << 8 | u16::from(control);
++                    let _ = self.control(slot_id, TO_INTERFACE, CUR_V2, SAMPLING_FREQ_CONTROL << 8, index, Data::Out(&le(i64::from(setup.rate), 4)));
++                }
++            }
++        }
++        self.control(slot_id, 0x01, SET_INTERFACE, u16::from(alt.alternate), interface, Data::None).map_err(|_| PcmError::Io)?;
++        if function_version == Version::V1 && (alt.rate_control || alt.rates.several()) {
++            let _ = self.control(
++                slot_id,
++                TO_ENDPOINT,
++                SET_CUR,
++                SAMPLING_FREQ_CONTROL << 8,
++                u16::from(alt.endpoint.address),
++                Data::Out(&le(i64::from(setup.rate), 3)),
++            );
++        }
++        let speed = self.slots.get(&slot_id).map_or(SPEED_FULL, |slot| slot.speed);
++        let full_speed = speed == SPEED_FULL || speed == SPEED_LOW;
++        let endpoint = alt.endpoint;
++        let ring = ProducerRing::new().ok_or(PcmError::NoMemory)?;
++        let kind = if endpoint.is_in() { EP_ISOCH_IN } else { EP_ISOCH_OUT };
++        self.configure_endpoint(slot_id, &endpoint, kind, &ring).map_err(|_| PcmError::Io)?;
++        // The packets: their frames at this rate, and what one may hold.
++        let max_packet = usize::from(endpoint.max_packet & 0x7ff);
++        let (burst, mult) = if speed >= SPEED_SUPER {
++            (usize::from(endpoint.max_burst), usize::from(endpoint.mult))
++        } else {
++            (usize::from((endpoint.max_packet >> 11) & 3), 0)
++        };
++        let packet_max = max_packet * (burst + 1) * (mult + 1);
++        let per_second = audio::packets_per_second(full_speed, endpoint.interval);
++        let nominal = (u64::from(setup.rate) << 16) / u64::from(per_second);
++        let slot_size = packet_max.next_power_of_two().max(64);
++        let queued = ((per_second * QUEUED_MS / 1000).max(2) as usize).min(MAX_QUEUED);
++        let slot_count = queued + 2;
++        let pages = (slot_count * slot_size).div_ceil(PAGE_SIZE);
++        let slots = DmaCoherent::alloc(pages, true).map_err(|_| PcmError::NoMemory)?;
++        // An interrupt about once a millisecond.
++        let interrupt_every = (per_second / 1000).max(1) as usize;
++        let feedback = match alt.feedback {
++            Some(feedback) if !endpoint.is_in() => self.start_feedback(slot_id, &feedback, setup.rate, full_speed, endpoint.interval),
++            _ => None,
++        };
++        let active = Active {
++            setup,
++            buffer,
++            dci: endpoint.dci(),
++            ring,
++            slots,
++            slot_size,
++            free: (0..slot_count).rev().collect(),
++            in_flight: VecDeque::new(),
++            feedback,
++            packet_max,
++            freq: nominal,
++            accumulator: 0,
++            offset: 0,
++            queued,
++            interrupt_every,
++            since_interrupt: 0,
++            max_packet: max_packet.max(1),
++            burst,
++            superspeed: speed >= SPEED_SUPER,
++            sent: 0,
++            done: 0,
++            missed: 0,
++            dry: 0,
++        };
++        ostd::notice!(
++            "{}: slot {}: {} at {} Hz, {} channels, format {}: setting {}, {} packets/s of {} bytes at most, {} queued",
++            self.name,
++            slot_id,
++            if desc.direction == Direction::Playback { "playback" } else { "capture" },
++            setup.rate,
++            setup.channels,
++            setup.format,
++            alt.alternate,
++            per_second,
++            packet_max,
++            queued
++        );
++        let stream = self.stream(slot_id, f, s).ok_or(PcmError::Disconnected)?;
++        stream.shared.position.store(0, Ordering::Release);
++        stream.shared.delay.store(0, Ordering::Release);
++        stream.active = Some(active);
++        Ok(())
++    }
++
++    /// An asynchronous playback endpoint's feedback endpoint, with its first
++    /// transfers queued.
++    fn start_feedback(&mut self, slot_id: u8, endpoint: &Endpoint, rate: u32, full_speed: bool, data_interval: u8) -> Option<Feedback> {
++        let ring = ProducerRing::new()?;
++        self.configure_endpoint(slot_id, endpoint, EP_ISOCH_IN, &ring).ok()?;
++        let unit = if full_speed { 1000 } else { 8000 };
++        let mut feedback = Feedback {
++            dci: endpoint.dci(),
++            ring,
++            buffer: DmaCoherent::alloc(1, true).ok()?,
++            in_flight: VecDeque::new(),
++            size: usize::from(endpoint.max_packet & 0x7ff).clamp(3, 64),
++            nominal: ((u64::from(rate) << 16) / unit) as u32,
++            shift: u32::from(data_interval.clamp(1, 16)) - 1,
++        };
++        for index in 0..FEEDBACK_TDS {
++            Self::queue_feedback(&mut feedback, index);
++        }
++        let dci = feedback.dci;
++        self.ring(slot_id, dci);
++        Some(feedback)
++    }
++
++    fn queue_feedback(feedback: &mut Feedback, index: usize) {
++        let address = feedback.buffer.daddr() as u64 + (index * 64) as u64;
++        let trb = feedback.ring.push(Trb {
++            parameter: address,
++            status: feedback.size as u32,
++            control: Trb::with_type(TRB_ISOCH) | IOC | SIA,
++        });
++        feedback.in_flight.push_back((trb, index));
++    }
++
++    /// The stream is let go: its endpoints dropped, its setting back to zero
++    /// bandwidth.
++    fn release_stream(&mut self, slot_id: u8, f: usize, s: usize) {
++        // Playback's packets in flight play out first: a few milliseconds.
++        let deadline = crate::now_ms() + 20;
++        while crate::now_ms() < deadline
++            && self.stream(slot_id, f, s).is_some_and(|stream| {
++                stream.desc.direction == Direction::Playback && stream.active.as_ref().is_some_and(|active| !active.in_flight.is_empty())
++            })
++        {
++            let _ = self.wait_event(&mut |_| false, 1);
++        }
++        let Some(stream) = self.stream(slot_id, f, s) else { return };
++        let Some(active) = stream.active.take() else { return };
++        let interface = u16::from(stream.desc.interface);
++        stream.shared.position.store(0, Ordering::Release);
++        stream.shared.delay.store(0, Ordering::Release);
++        ostd::notice!(
++            "{}: slot {}: stream of interface {} ended: {} packets sent, {} done, {} missed, ring dry {} times",
++            self.name, slot_id, interface, active.sent, active.done, active.missed, active.dry
++        );
++        let mut dcis = vec![active.dci];
++        if let Some(feedback) = &active.feedback {
++            dcis.push(feedback.dci);
++        }
++        self.drop_endpoints(slot_id, &dcis);
++        let _ = self.control(slot_id, 0x01, SET_INTERFACE, 0, interface, Data::None);
++    }
++
++    /// Keeps a running stream's packets queued.
++    fn fill(&mut self, slot_id: u8, f: usize, s: usize) {
++        let version = self.version;
++        let Some(stream) = self.stream(slot_id, f, s) else { return };
++        let running = stream.shared.running.load(Ordering::Acquire);
++        let playback = stream.desc.direction == Direction::Playback;
++        let Some(active) = stream.active.as_mut() else { return };
++        let mut queued_any = false;
++        while running && active.in_flight.len() < active.queued {
++            let Some(slot) = active.free.pop() else { break };
++            let at = slot * active.slot_size;
++            let frame = active.setup.frame_bytes;
++            let bytes = if playback {
++                // The packet's frames: the rate's, the fraction carried over.
++                active.accumulator += active.freq;
++                let frames = (active.accumulator >> 16) as usize;
++                active.accumulator &= 0xffff;
++                let bytes = (frames * frame).min(active.packet_max / frame * frame);
++                // Out of the PCM buffer, wrapping at its end.
++                let total = active.setup.buffer_bytes();
++                let mut copied = 0;
++                let mut chunk = vec![0u8; bytes];
++                while copied < bytes {
++                    let from = (active.offset + copied) % total;
++                    let length = (bytes - copied).min(total - from);
++                    let _ = active.buffer.frames.read_bytes(from, &mut chunk[copied..copied + length]);
++                    copied += length;
++                }
++                let _ = active.slots.write_bytes(at, &chunk);
++                active.offset = (active.offset + bytes) % total;
++                bytes
++            } else {
++                active.packet_max
++            };
++            active.since_interrupt += 1;
++            let interrupt = active.since_interrupt >= active.interrupt_every;
++            if interrupt {
++                active.since_interrupt = 0;
++            }
++            let packets = bytes.div_ceil(active.max_packet).max(1);
++            let (tbc, tlbpc) = burst_fields(version, active.superspeed, packets, active.burst);
++            let trb = active.ring.push(Trb {
++                parameter: active.slots.daddr() as u64 + at as u64,
++                status: bytes as u32,
++                control: Trb::with_type(TRB_ISOCH) | IOC | SIA | if interrupt { 0 } else { BEI } | tbc << 7 | tlbpc << 16,
++            });
++            active.in_flight.push_back(Td { trb, slot, bytes });
++            active.sent += 1;
++            queued_any = true;
++        }
++        if playback {
++            let frame = active.setup.frame_bytes.max(1);
++            let flight: usize = active.in_flight.iter().map(|td| td.bytes).sum();
++            stream.shared.delay.store((flight / frame) as u64, Ordering::Release);
++            stream.shared.position.store(active.offset, Ordering::Release);
++        }
++        let dci = active.dci;
++        let pcm = stream.pcm.clone();
++        if queued_any {
++            self.ring(slot_id, dci);
++        }
++        if playback && queued_any {
++            pcm.update();
++        }
++    }
++
++    /// Whether an event is an audio stream's (its data or feedback endpoint).
++    pub(super) fn is_audio_endpoint(&self, slot_id: u8, dci: u8) -> bool {
++        self.slots.get(&slot_id).is_some_and(|slot| {
++            slot.audio.iter().any(|function| {
++                function.streams.iter().any(|stream| {
++                    stream.active.as_ref().is_some_and(|active| active.dci == dci || active.feedback.as_ref().is_some_and(|fb| fb.dci == dci))
++                })
++            })
++        })
++    }
++
++    /// A packet's end: playback's frees its buffer; capture's frames go to
++    /// the PCM buffer; feedback says the device's rate. More are queued.
++    pub(super) fn audio_done(&mut self, slot_id: u8, dci: u8, event: &Trb) {
++        let Some(slot) = self.slots.get(&slot_id) else { return };
++        let Some((f, s)) = slot.audio.iter().enumerate().find_map(|(f, function)| {
++            function
++                .streams
++                .iter()
++                .position(|stream| {
++                    stream.active.as_ref().is_some_and(|active| active.dci == dci || active.feedback.as_ref().is_some_and(|fb| fb.dci == dci))
++                })
++                .map(|s| (f, s))
++        }) else {
++            return;
++        };
++        let code = event.completion_code();
++        let Some(stream) = self.stream(slot_id, f, s) else { return };
++        let playback = stream.desc.direction == Direction::Playback;
++        let pcm = stream.pcm.clone();
++        let shared = stream.shared.clone();
++        let Some(active) = stream.active.as_mut() else { return };
++        let mut ring_feedback = None;
++        if active.feedback.as_ref().is_some_and(|feedback| feedback.dci == dci) {
++            let feedback = active.feedback.as_mut().unwrap();
++            if let Some(position) = feedback.in_flight.iter().position(|(trb, _)| *trb == event.parameter) {
++                let (_, index) = feedback.in_flight.remove(position).unwrap();
++                if code == SUCCESS || code == SHORT_PACKET {
++                    let mut raw = [0u8; 4];
++                    let _ = feedback.buffer.read_bytes(index * 64, &mut raw);
++                    let received = feedback.size.saturating_sub((event.status & 0xff_ffff) as usize).min(4);
++                    let value = match received {
++                        3 => u32::from(raw[0]) | u32::from(raw[1]) << 8 | u32::from(raw[2]) << 16,
++                        4 => u32::from_le_bytes(raw),
++                        _ => 0,
++                    };
++                    if let Some(per_unit) = audio::feedback_value(value, feedback.nominal) {
++                        active.freq = u64::from(per_unit) << feedback.shift;
++                    }
++                }
++                Self::queue_feedback(feedback, index);
++                ring_feedback = Some(feedback.dci);
++            }
++        } else {
++            match code {
++                // The ring ran dry (each packet reported its own end already:
++                // they all interrupt on completion), as Linux takes it.
++                RING_UNDERRUN | RING_OVERRUN => active.dry += 1,
++                _ => {
++                    // This packet and those before it (a missed one reports
++                    // nothing of its own) are done.
++                    if code == MISSED_SERVICE {
++                        active.missed += 1;
++                    }
++                    if let Some(position) = active.in_flight.iter().position(|td| td.trb == event.parameter) {
++                        active.done += position as u64 + 1;
++                        for _ in 0..position {
++                            if let Some(td) = active.in_flight.pop_front() {
++                                active.free.push(td.slot);
++                            }
++                        }
++                        let td = active.in_flight.pop_front().unwrap();
++                        if !playback && (code == SUCCESS || code == SHORT_PACKET) && code != MISSED_SERVICE {
++                            let received = td.bytes.saturating_sub((event.status & 0xff_ffff) as usize);
++                            let frame = active.setup.frame_bytes.max(1);
++                            let received = received / frame * frame;
++                            if received > 0 && shared.running.load(Ordering::Acquire) {
++                                let mut data = vec![0u8; received];
++                                let _ = active.slots.read_bytes(td.slot * active.slot_size, &mut data);
++                                let total = active.setup.buffer_bytes();
++                                let mut copied = 0;
++                                while copied < received {
++                                    let to = (active.offset + copied) % total;
++                                    let length = (received - copied).min(total - to);
++                                    let _ = active.buffer.frames.write_bytes(to, &data[copied..copied + length]);
++                                    copied += length;
++                                }
++                                active.offset = (active.offset + received) % total;
++                                shared.position.store(active.offset, Ordering::Release);
++                            }
++                        }
++                        active.free.push(td.slot);
++                    }
++                }
++            }
++        }
++        if let Some(feedback_dci) = ring_feedback {
++            self.ring(slot_id, feedback_dci);
++            return;
++        }
++        if !playback {
++            pcm.update();
++        }
++        self.fill(slot_id, f, s);
++    }
++
++    /// The device went: its cards go, whoever has them open sees them
++    /// disconnected.
++    pub(super) fn audio_gone(functions: &[AudioFunction]) {
++        for function in functions {
++            for stream in &function.streams {
++                stream.shared.gone.store(true, Ordering::Release);
++                stream.shared.running.store(false, Ordering::Release);
++                stream.shared.answered.wake_all();
++            }
++            aster_sound::remove_card(&function.card);
++        }
++    }
++}
++
++/// A card ID no other card has: ALSA adds `_1`, `_2`... to a repeated one.
++fn unique_id(id: &str) -> String {
++    let taken: Vec<String> = aster_sound::cards().iter().map(|card| card.id.clone()).collect();
++    if !taken.iter().any(|other| other == id) {
++        return id.to_string();
++    }
++    for number in 1..32 {
++        let suffix = format!("_{}", number);
++        let mut candidate: String = id.chars().take(15 - suffix.len()).collect();
++        candidate.push_str(&suffix);
++        if !taken.contains(&candidate) {
++            return candidate;
++        }
++    }
++    id.to_string()
++}
+diff --git a/kernel/comps/usb/src/xhci/programs.rs b/kernel/comps/usb/src/xhci/programs.rs
+old mode 100755
+new mode 100644
+index 2232032..d6053c0
+--- a/kernel/comps/usb/src/xhci/programs.rs
++++ b/kernel/comps/usb/src/xhci/programs.rs
+@@ -121,7 +121,7 @@ impl Controller {
+     }
+ 
+     /// The ports from the root hub to a slot's device.
+-    fn port_path(&self, slot_id: u8) -> Vec<u8> {
++    pub(super) fn port_path(&self, slot_id: u8) -> Vec<u8> {
+         let mut path = Vec::new();
+         let mut current = slot_id;
+         while let Some(slot) = self.slots.get(&current) {
+@@ -586,7 +586,7 @@ impl Controller {
+     }
+ 
+     /// Drops endpoints from the slot's configuration.
+-    fn drop_endpoints(&mut self, slot_id: u8, dcis: &[u8]) {
++    pub(super) fn drop_endpoints(&mut self, slot_id: u8, dcis: &[u8]) {
+         let Some(slot) = self.slots.get(&slot_id) else { return };
+         self.clear_input(slot);
+         let dropped = dcis.iter().fold(0u32, |flags, dci| flags | 1 << dci);
+diff --git a/kernel/core/src/device/snd/control.rs b/kernel/core/src/device/snd/control.rs
+old mode 100755
+new mode 100644
+index 5e3c7ec..c1d78bf
+--- a/kernel/core/src/device/snd/control.rs
++++ b/kernel/core/src/device/snd/control.rs
+@@ -46,6 +46,9 @@ mod ioctl {
+     pub(super) const TLV_READ: u32 = 0xc008_551a;
+     pub(super) const HWDEP_NEXT_DEVICE: u32 = 0xc004_5520;
+     pub(super) const PCM_NEXT_DEVICE: u32 = 0xc004_5530;
++    /// What `asound.h` defines it as (`_IOR`, though it is read and written),
++    /// which alsa-lib uses.
++    pub(super) const PCM_NEXT_DEVICE_R: u32 = 0x8004_5530;
+     pub(super) const PCM_INFO: u32 = 0xc120_5531;
+     pub(super) const PCM_PREFER_SUBDEVICE: u32 = 0x4004_5532;
+     pub(super) const RAWMIDI_NEXT_DEVICE: u32 = 0xc004_5540;
+@@ -80,6 +83,10 @@ const EVENT_MASK_VALUE: u32 = 1 << 0;
+ /// `SNDRV_CTL_TLVT_DB_SCALE`.
+ const TLV_DB_SCALE: u32 = 1;
+ const TLV_DB_SCALE_MUTE: u32 = 0x10000;
++/// `SNDRV_CTL_TLVT_DB_MINMAX` and its `_MUTE`: the gains of the lowest and
++/// the highest value.
++const TLV_DB_MINMAX: u32 = 4;
++const TLV_DB_MINMAX_MUTE: u32 = 5;
+ 
+ pub(super) struct ControlDevice {
+     card: Arc<Card>,
+@@ -372,7 +379,7 @@ impl PerOpenFileOps for ControlHandle {
+                         if control.writable {
+                             access |= ACCESS_WRITE;
+                         }
+-                        if control.db_scale.is_some() {
++                        if control.db_scale.is_some() || control.db_range.is_some() {
+                             access |= ACCESS_TLV_READ;
+                         }
+                         match control.kind {
+@@ -566,15 +573,24 @@ impl PerOpenFileOps for ControlHandle {
+                     return Ok(0);
+                 }
+                 let control = (numid as usize).checked_sub(1).and_then(|index| card.controls.get(index)).ok_or(Error::new(Errno::ENOENT))?;
+-                let (min, step, mute) = control.db_scale.ok_or(Error::new(Errno::ENXIO))?;
++                let mut tlv = [0u8; 16];
++                match (control.db_scale, control.db_range) {
++                    (Some((min, step, mute)), _) => {
++                        put_u32(&mut tlv, 0, TLV_DB_SCALE);
++                        put_u32(&mut tlv, 8, min as u32);
++                        put_u32(&mut tlv, 12, step | if mute { TLV_DB_SCALE_MUTE } else { 0 });
++                    }
++                    (None, Some((min, max, mute))) => {
++                        put_u32(&mut tlv, 0, if mute { TLV_DB_MINMAX_MUTE } else { TLV_DB_MINMAX });
++                        put_u32(&mut tlv, 8, min as u32);
++                        put_u32(&mut tlv, 12, max as u32);
++                    }
++                    (None, None) => return_errno!(Errno::ENXIO),
++                }
++                put_u32(&mut tlv, 4, 8);
+                 if length < 16 {
+                     return_errno!(Errno::ENOMEM);
+                 }
+-                let mut tlv = [0u8; 16];
+-                put_u32(&mut tlv, 0, TLV_DB_SCALE);
+-                put_u32(&mut tlv, 4, 8);
+-                put_u32(&mut tlv, 8, min as u32);
+-                put_u32(&mut tlv, 12, step | if mute { TLV_DB_SCALE_MUTE } else { 0 });
+                 current_userspace!().write_bytes(arg.checked_add(8).ok_or(Error::new(Errno::EFAULT))?, &tlv)?;
+             }
+             ioctl::TLV_WRITE => {
+@@ -600,7 +616,7 @@ impl PerOpenFileOps for ControlHandle {
+                 }
+                 return Ok(i32::from(changed));
+             }
+-            ioctl::PCM_NEXT_DEVICE => {
++            ioctl::PCM_NEXT_DEVICE | ioctl::PCM_NEXT_DEVICE_R => {
+                 let device: i32 = current_userspace!().read_val(arg)?;
+                 let next = if device < 0 && (card.playback.is_some() || card.capture.is_some()) { 0 } else { -1 };
+                 current_userspace!().write_val(arg, &next)?;
+diff --git a/kernel/core/src/device/snd/mod.rs b/kernel/core/src/device/snd/mod.rs
+old mode 100755
+new mode 100644
+index dcc0e92..39492f1
+--- a/kernel/core/src/device/snd/mod.rs
++++ b/kernel/core/src/device/snd/mod.rs
+@@ -13,6 +13,8 @@ mod control;
+ mod pcm;
+ mod timer;
+ 
++use alloc::format;
++
+ use aster_sound::Card;
+ use device_id::{DeviceId, MajorId, MinorId};
+ 
+@@ -38,6 +40,28 @@ pub(super) fn watch(pollee: &Arc<Pollee>) {
+     POLLEES.lock().push(Arc::downgrade(pollee));
+ }
+ 
++/// What udev and its listeners hear of a card's control device (Linux's
++/// sound class): its number and node. Without a sysfs object behind it,
++/// the card is a virtual device.
++fn card_event(action: &str, card: &Card) {
++    let node = format!("snd/controlC{}", card.index);
++    let minor = format!("{}", card.index * 32);
++    let devpath = format!("/devices/virtual/sound/card{}/controlC{}", card.index, card.index);
++    super::uevent(action, &devpath, "sound", &[("DEVNAME", &node), ("MAJOR", "116"), ("MINOR", &minor)]);
++}
++
++/// A card that went away: its device files go (open ones see its streams
++/// disconnected), and listeners hear of it.
++fn card_gone(card: &Arc<Card>) {
++    let index = card.index;
++    let _ = char::unregister(device_id(index, 0));
++    for pcm in card.pcms() {
++        let minor = if pcm.direction == aster_sound::Direction::Playback { 16 } else { 24 };
++        let _ = char::unregister(device_id(index, minor));
++    }
++    card_event("remove", card);
++}
++
+ /// A card's device files (and, with the first card, the timer device).
+ fn card_ready(card: &Arc<Card>) {
+     static TIMER: spin::Once<()> = spin::Once::new();
+@@ -55,10 +79,12 @@ fn card_ready(card: &Arc<Card>) {
+             warn!("sound: card {} PCM: {:?}", index, error);
+         }
+     }
++    card_event("add", card);
+ }
+ 
+ pub(super) fn init_in_first_kthread() {
+     aster_sound::set_card_hook(card_ready);
++    aster_sound::set_card_gone_hook(card_gone);
+     for card in aster_sound::cards() {
+         card_ready(&card);
+     }
+diff --git a/kernel/core/src/device/snd/pcm.rs b/kernel/core/src/device/snd/pcm.rs
+old mode 100755
+new mode 100644
+index 446409f..8ba24dc
+--- a/kernel/core/src/device/snd/pcm.rs
++++ b/kernel/core/src/device/snd/pcm.rs
+@@ -104,6 +104,7 @@ fn errno(error: PcmError) -> Error {
+         PcmError::NoMemory => Error::new(Errno::ENOMEM),
+         PcmError::Busy => Error::with_message(Errno::EBUSY, "the PCM device is open already"),
+         PcmError::Io => Error::new(Errno::EIO),
++        PcmError::Disconnected => Error::with_message(Errno::ENODEV, "the sound device went away"),
+     }
+ }
+ 

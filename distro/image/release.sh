@@ -9,6 +9,9 @@
 #   release_files <folder> <kernel> <initramfs> <name> <init command...>
 #   release_boot_cfg <name> <init command...>     boot.cfg alone, on stdout
 #
+# RELEASE_EXTRA_ARGS adds kernel arguments (the live medium's signed
+# manifest, build-media.sh).
+#
 # The kernel is Asterinas built with BOOT_PROTOCOL=linux-efi-handover64.
 # SB_KEYS names the folder of OpenShell Native's signing key (sb_key).
 
@@ -31,7 +34,7 @@ release_files() {
 release_boot_cfg() {
     local name=$1
     shift
-    local args="SHELL=/bin/sh LOGNAME=root HOME=/ USER=root PATH=/bin:/usr/bin:/benchmark loglevel=error earlycon console=hvc0 openshell.slot=\$openshell_slot openshell.release=$name openshell.data=\$openshell_data_uuid"
+    local args="SHELL=/bin/sh LOGNAME=root HOME=/ USER=root PATH=/bin:/usr/bin:/benchmark loglevel=error earlycon console=hvc0 openshell.slot=\$openshell_slot openshell.release=$name openshell.data=\$openshell_data_uuid${RELEASE_EXTRA_ARGS:+ $RELEASE_EXTRA_ARGS}"
     # GRUB sets $root, $openshell_slot, $openshell_data_uuid and, with the
     # data partition, $openshell_data (grub.cfg). The echo reaches the serial
     # port; the splash hides it on the screen.

@@ -57,7 +57,8 @@ prepare_compat() {
     install -m 0644 "$compat/initramfs.nix" test/initramfs/nix/openshell-compat.nix
     rm -rf test/initramfs/nix/openshell-probes test/initramfs/nix/openshell-bundle \
         test/initramfs/nix/openshell-shell test/initramfs/nix/openshell-ab test/initramfs/nix/openshell-apps \
-        test/initramfs/nix/openshell-wine test/initramfs/nix/openshell-media test/initramfs/nix/openshell-lock
+        test/initramfs/nix/openshell-wine test/initramfs/nix/openshell-media test/initramfs/nix/openshell-lock \
+        test/initramfs/nix/openshell-setup
     cp -R "$probes" test/initramfs/nix/openshell-probes
     cp -R "$ab_sources" test/initramfs/nix/openshell-ab
     # The Desktop profiles add the OpenShell bundle to the initramfs.
@@ -83,6 +84,8 @@ prepare_compat() {
     # its initramfs, which the installer reads from /dev/initrd.
     if builds_media; then
         prepare_media_payload "$release_version"
+        # The setup screen of the medium's Install and Update boot entries.
+        cp -R "$compat/setup" test/initramfs/nix/openshell-setup
     fi
 }
 
@@ -104,6 +107,9 @@ prepare_media_payload() {
     ) >> "$artifacts/media-payload.log" 2>&1
     install -m 0644 "$image_sources/grub.cfg" "$payload/grub.cfg"
     install -m 0755 "$image_sources/install.sh" "$payload/install.sh"
+    # The updater of installed systems, and what it shares with the installer.
+    install -m 0755 "$image_sources/update.sh" "$payload/update.sh"
+    install -m 0644 "$image_sources/medium.sh" "$payload/medium.sh"
     # The release channel's public key (channel.sh), which updates are checked against.
     prepare_release_key >> "$artifacts/media-payload.log" 2>&1
     mkdir -p "$payload/release-keys"
@@ -542,6 +548,11 @@ if builds_media; then
     fi
     media_status=0
     prepare_secure_boot || media_status=$?
+    # The medium's own release (the payload's signed kernel and boot.cfg,
+    # which the initramfs carries), and the boot menu's font: GRUB's Unifont.
+    export OPENSHELL_MEDIA_PAYLOAD="$PWD/test/initramfs/nix/openshell-media"
+    grub_tools=$(nix-build -E "(import ./distro/nixpkgs.nix {}).grub2_efi" --no-out-link 2>> "$artifacts/media-payload.log") || grub_tools=
+    export OPENSHELL_GRUB_FONT=${grub_tools:+$grub_tools/share/grub/unicode.pf2}
     (( media_status == 0 )) && bash "$image_sources/build-media.sh" "$action" "$release_version" \
         "$kernel_efi" "$desktop_initramfs" \
         "$work/recovery-initramfs" "$artifacts" || media_status=$?
@@ -575,6 +586,29 @@ run_install_test() {
     fi
 }
 
+# The live medium's updater (distro/image/update-test.sh): a small live
+# system of the media profile installs itself on an NVMe disk, then updates
+# that installation from the stick (the boot menu's Update entry), and the
+# disk then boots its slot b on trial.
+run_update_test() {
+    prepare_compat
+    prepare_media_payload 2026.11.0-update-test
+    install -m 0644 "$probes/update-boot.sh" test/initramfs/nix/openshell-probes/compat-boot.sh
+    if ! timeout --kill-after=15s 25m nix-build test/initramfs/nix/openshell-compat.nix \
+        -A image -o "$work/update-initramfs" >> "$artifacts/native-update.log" 2>&1; then
+        record_check native-update failed
+        return 1
+    fi
+    if timeout --kill-after=15s 120m bash "$image_sources/update-test.sh" test/initramfs/nix/openshell-media \
+        "$work/update-initramfs" "$RELEASE_AB" "$artifacts/native-update" >> "$artifacts/native-update.log" 2>&1; then
+        record_check native-update passed
+    else
+        tail -n 40 "$artifacts/native-update.log" >&2
+        record_check native-update failed
+        return 1
+    fi
+}
+
 if [[ "$action" == image || "$action" == desktop-image ]]; then
     prepare_compat
     build_compat_image
@@ -584,6 +618,7 @@ if [[ "$action" == image || "$action" == desktop-image ]]; then
     else
         run_image || image_status=1
         run_install_test || image_status=1
+        run_update_test || image_status=1
     fi
     exit $((control_status || image_status))
 fi

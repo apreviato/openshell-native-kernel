@@ -1,0 +1,2840 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1fe0ed7..93ae621 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -534,6 +534,7 @@ dependencies = [
+  "aster-bluetooth",
+  "aster-cmdline",
+  "aster-core",
++ "aster-device",
+  "aster-input",
+  "aster-network",
+  "aster-pci",
+diff --git a/kernel/comps/usb/Cargo.toml b/kernel/comps/usb/Cargo.toml
+index d9b3a7c..30f7b0f 100755
+--- a/kernel/comps/usb/Cargo.toml
++++ b/kernel/comps/usb/Cargo.toml
+@@ -9,6 +9,7 @@ aster-block.workspace = true
+ aster-bluetooth.workspace = true
+ aster-cmdline.workspace = true
+ aster-core.workspace = true
++aster-device.workspace = true
+ aster-network.workspace = true
+ aster-softirq.workspace = true
+ aster-input.workspace = true
+diff --git a/kernel/comps/usb/src/lib.rs b/kernel/comps/usb/src/lib.rs
+index 559afde..66de3ca 100755
+--- a/kernel/comps/usb/src/lib.rs
++++ b/kernel/comps/usb/src/lib.rs
+@@ -6,7 +6,8 @@
+ //! keyboards with the boot protocol, every other HID device with its report
+ //! descriptor, wheels, extra buttons and media keys included); Bluetooth
+ //! controllers go to the Bluetooth stack (`bt`); `xhci` says which
+-//! controllers and how.
++//! controllers and how. Programs reach every device themselves through
++//! usbfs (`usbfs`: `/dev/bus/usb`, `/sys/bus/usb`), as libusb does.
+ 
+ #![no_std]
+ #![deny(unsafe_code)]
+@@ -26,6 +27,7 @@ mod disk;
+ mod netframe;
+ mod ring;
+ mod scsi;
++mod usbfs;
+ mod usbnet;
+ mod xhci;
+ 
+@@ -190,10 +192,13 @@ fn init() -> Result<(), ComponentInitError> {
+ // One task per controller, once there is a scheduler.
+ #[init_component(kthread)]
+ fn start() -> Result<(), ComponentInitError> {
+-    for (device, msix, msi, name) in core::mem::take(&mut *PENDING.lock()) {
++    let pending = core::mem::take(&mut *PENDING.lock());
++    for (index, (device, msix, msi, name)) in pending.into_iter().enumerate() {
++        // Bus numbers: the controllers in order, from 1.
++        let bus = index as u8 + 1;
+         aster_core::spawn_kernel_thread(move || {
+             let _interrupt = (msix, msi);
+-            match xhci::Controller::new(device, name) {
++            match xhci::Controller::new(device, name, bus) {
+                 Some(controller) => controller.run(),
+                 None => ostd::warn!("an xHCI controller did not start"),
+             }
+diff --git a/kernel/comps/usb/src/ring.rs b/kernel/comps/usb/src/ring.rs
+index 14237e7..708a239 100755
+--- a/kernel/comps/usb/src/ring.rs
++++ b/kernel/comps/usb/src/ring.rs
+@@ -6,7 +6,7 @@
+ //!
+ //! Reference: xHCI 1.2, section 4.9.
+ 
+-use ostd::mm::{HasDaddr, VmIo, VmIoOnce, dma::DmaCoherent};
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, VmIoOnce, dma::DmaCoherent};
+ 
+ /// One TRB: a parameter, a status and a control word.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -26,6 +26,7 @@ pub(crate) mod trb_type {
+     pub(crate) const DATA: u32 = 3;
+     pub(crate) const STATUS: u32 = 4;
+     pub(crate) const LINK: u32 = 6;
++    pub(crate) const NOOP: u32 = 8;
+     pub(crate) const ENABLE_SLOT: u32 = 9;
+     pub(crate) const DISABLE_SLOT: u32 = 10;
+     pub(crate) const ADDRESS_DEVICE: u32 = 11;
+@@ -94,24 +95,56 @@ fn read_trb(dma: &DmaCoherent, index: usize) -> Trb {
+ /// A ring software produces: commands, or one endpoint's transfers.
+ pub(crate) struct ProducerRing {
+     dma: DmaCoherent,
++    /// Its TRBs, the link included.
++    trbs: usize,
+     enqueue: usize,
+     cycle: bool,
+ }
+ 
+ impl ProducerRing {
+     pub(crate) fn new() -> Option<Self> {
+-        let dma = DmaCoherent::alloc(1, true).ok()?;
+-        let ring = Self { dma, enqueue: 0, cycle: true };
++        Self::with_pages(1)
++    }
++
++    /// A ring of `pages` pages (a program's transfers of several MiB).
++    pub(crate) fn with_pages(pages: usize) -> Option<Self> {
++        let dma = DmaCoherent::alloc(pages, true).ok()?;
++        let trbs = pages * PAGE_SIZE / TRB_SIZE;
++        let ring = Self { dma, trbs, enqueue: 0, cycle: true };
+         // The last TRB links back to the first and toggles the cycle.
+         let link = Trb {
+             parameter: ring.dma.daddr() as u64,
+             status: 0,
+             control: Trb::with_type(trb_type::LINK) | TOGGLE_CYCLE,
+         };
+-        write_trb(&ring.dma, RING_TRBS - 1, link);
++        write_trb(&ring.dma, trbs - 1, link);
+         Some(ring)
+     }
+ 
++    /// The TRBs it holds at most.
++    pub(crate) fn capacity(&self) -> usize {
++        self.trbs - 1
++    }
++
++    /// Makes the TRB at `address`, of a TD taken back, a No Op that ends
++    /// there, its cycle bit kept (Linux's `trb_to_noop`).
++    pub(crate) fn to_noop(&self, address: u64) {
++        let Some(offset) = address.checked_sub(self.dma.daddr() as u64) else { return };
++        let index = offset as usize / TRB_SIZE;
++        if index >= self.trbs - 1 {
++            return;
++        }
++        let trb = read_trb(&self.dma, index);
++        write_trb(&self.dma, index, Trb { parameter: 0, status: 0, control: (trb.control & CYCLE) | Trb::with_type(trb_type::NOOP) });
++    }
++
++    /// The link no longer chains (a TD across it was taken back).
++    pub(crate) fn unchain_link(&self) {
++        let mut link = read_trb(&self.dma, self.trbs - 1);
++        link.control &= !CHAIN;
++        write_trb(&self.dma, self.trbs - 1, link);
++    }
++
+     pub(crate) fn base(&self) -> u64 {
+         self.dma.daddr() as u64
+     }
+@@ -127,12 +160,12 @@ impl ProducerRing {
+         let address = (self.dma.daddr() + self.enqueue * TRB_SIZE) as u64;
+         write_trb(&self.dma, self.enqueue, trb);
+         self.enqueue += 1;
+-        if self.enqueue == RING_TRBS - 1 {
++        if self.enqueue == self.trbs - 1 {
+             // Hand the link TRB over with the current cycle, then wrap. Inside
+             // a chained transfer, the link is part of it (xHCI 1.2, 4.11.5.1).
+-            let mut link = read_trb(&self.dma, RING_TRBS - 1);
++            let mut link = read_trb(&self.dma, self.trbs - 1);
+             link.control = (link.control & !(CYCLE | CHAIN)) | u32::from(self.cycle) | (trb.control & CHAIN);
+-            write_trb(&self.dma, RING_TRBS - 1, link);
++            write_trb(&self.dma, self.trbs - 1, link);
+             self.enqueue = 0;
+             self.cycle = !self.cycle;
+         }
+diff --git a/kernel/comps/usb/src/usbfs.rs b/kernel/comps/usb/src/usbfs.rs
+new file mode 100755
+index 0000000..5a7b8b8
+--- /dev/null
++++ b/kernel/comps/usb/src/usbfs.rs
+@@ -0,0 +1,1328 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Programs' own access to USB devices, as Linux's usbfs gives it. Each
++//! device is `/dev/bus/usb/BBB/DDD` and `/sys/bus/usb/devices/B-P.P`
++//! (`busnum`, `devnum`, `descriptors`, `bConfigurationValue`, `speed`...),
++//! its arrival and departure are kernel uevents, and programs move data
++//! with the usbfs ioctls: control, bulk and interrupt transfers, waited for
++//! or submitted as URBs and reaped later, claims, configurations, alternate
++//! settings, halts. That is what libusb needs without udev, and with it
++//! CUPS's `usb` backend (printers), SANE (scanners), libmtp and gphoto2
++//! (phones and cameras), adb and fastboot, pcsc-lite's CCID driver (smart
++//! card readers), fwupd and dfu-util (firmware), and USB serial adapters
++//! without a kernel driver (libftdi).
++//!
++//! The controller's task does the transfers (`xhci::programs`); this side
++//! checks what a program asks, copies its data and gives back what is done.
++//! Interfaces a kernel driver took (keyboards, disks, network adapters,
++//! Bluetooth controllers, hubs) stay the kernel's: a program may not claim
++//! them, as on Linux while their driver is bound, though it may still read
++//! the device's descriptors and talk to its default control endpoint.
++//! Isochronous transfers are not offered.
++//!
++//! Reference: Linux's `drivers/usb/core/devio.c` and `sysfs.c`,
++//! `include/uapi/linux/usbdevice_fs.h`.
++
++use alloc::{
++    boxed::Box,
++    collections::{BTreeMap, VecDeque},
++    format,
++    string::String,
++    sync::{Arc, Weak},
++    vec,
++    vec::Vec,
++};
++use core::{
++    fmt::Write,
++    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
++};
++
++use aster_core::{
++    context::with_current_userspace,
++    device::{Device, DeviceType, registry::char},
++    events::IoEvents,
++    fs::{
++        devtmpfs::DevtmpfsNodeMeta,
++        file::{PerOpenFileOps, StatusFlags},
++        vfs::{inode::FileOps, path::Path},
++    },
++    prelude::*,
++    process::signal::{PollHandle, PollSource, Pollable},
++    util::ioctl::RawIoctl,
++};
++use aster_device::{
++    bus::{self, Bus, BusDevice, BusHandle},
++    common::{AnyDevice, Attr, DevNode, DevNum, DeviceType as SysDeviceType, SysStr},
++};
++use device_id::{DeviceId, MajorId, MinorId};
++use ostd::{
++    mm::{FallibleVmWrite, HasDaddr, PAGE_SIZE, VmIo, VmReader, VmWriter, dma::DmaCoherent},
++    sync::{SpinLock, WaitQueue},
++};
++
++use crate::desc::{self, Configuration, Endpoint, TRANSFER_BULK, TRANSFER_INTERRUPT};
++
++/// The character device major of USB devices (`usb_device`), as on Linux.
++const USB_DEVICE_MAJOR: u16 = 189;
++/// The memory programs' transfers may hold at once (Linux's `usbfs_memory_mb`).
++const MEMORY_LIMIT: usize = 16 << 20;
++/// The pages of one DMA piece of a transfer's data.
++const SEGMENT_PAGES: usize = 16;
++
++static MEMORY: AtomicUsize = AtomicUsize::new(0);
++static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
++
++/// URB types (`USBDEVFS_URB_TYPE_*`).
++pub(crate) mod urb_type {
++    pub(crate) const ISO: u8 = 0;
++    pub(crate) const INTERRUPT: u8 = 1;
++    pub(crate) const CONTROL: u8 = 2;
++    pub(crate) const BULK: u8 = 3;
++}
++
++/// URB flags (`USBDEVFS_URB_*`).
++pub(crate) const URB_SHORT_NOT_OK: u32 = 0x01;
++pub(crate) const URB_ZERO_PACKET: u32 = 0x40;
++
++/// What the device files can do (`USBDEVFS_CAP_*`): zero-length packets,
++/// transfers of any size in one URB, URBs reaped after the device went,
++/// dropped privileges and the long connection information.
++const CAPABILITIES: u32 = 0x01 | 0x04 | 0x08 | 0x10 | 0x40 | 0x80;
++
++/// The errors transfers end with (written to a URB as negative numbers).
++pub(crate) mod errno {
++    pub(crate) const ENOENT: i32 = 2;
++    pub(crate) const ENOMEM: i32 = 12;
++    pub(crate) const EBUSY: i32 = 16;
++    pub(crate) const ENODEV: i32 = 19;
++    pub(crate) const EINVAL: i32 = 22;
++    pub(crate) const ENOSPC: i32 = 28;
++    pub(crate) const EPIPE: i32 = 32;
++    pub(crate) const ENODATA: i32 = 61;
++    pub(crate) const EPROTO: i32 = 71;
++    pub(crate) const EOVERFLOW: i32 = 75;
++    pub(crate) const ESHUTDOWN: i32 = 108;
++    pub(crate) const ETIMEDOUT: i32 = 110;
++    pub(crate) const EREMOTEIO: i32 = 121;
++}
++
++/// The usbfs ioctls (`'U'`, by number).
++mod nr {
++    pub(super) const CONTROL: u32 = 0;
++    pub(super) const BULK: u32 = 2;
++    pub(super) const RESETEP: u32 = 3;
++    pub(super) const SETINTERFACE: u32 = 4;
++    pub(super) const SETCONFIGURATION: u32 = 5;
++    pub(super) const GETDRIVER: u32 = 8;
++    pub(super) const SUBMITURB: u32 = 10;
++    pub(super) const DISCARDURB: u32 = 11;
++    pub(super) const REAPURB: u32 = 12;
++    pub(super) const REAPURBNDELAY: u32 = 13;
++    pub(super) const DISCSIGNAL: u32 = 14;
++    pub(super) const CLAIMINTERFACE: u32 = 15;
++    pub(super) const RELEASEINTERFACE: u32 = 16;
++    pub(super) const CONNECTINFO: u32 = 17;
++    pub(super) const IOCTL: u32 = 18;
++    pub(super) const RESET: u32 = 20;
++    pub(super) const CLEAR_HALT: u32 = 21;
++    pub(super) const DISCONNECT: u32 = 22;
++    pub(super) const CONNECT: u32 = 23;
++    pub(super) const CLAIM_PORT: u32 = 24;
++    pub(super) const RELEASE_PORT: u32 = 25;
++    pub(super) const GET_CAPABILITIES: u32 = 26;
++    pub(super) const DISCONNECT_CLAIM: u32 = 27;
++    pub(super) const ALLOC_STREAMS: u32 = 28;
++    pub(super) const FREE_STREAMS: u32 = 29;
++    pub(super) const DROP_PRIVILEGES: u32 = 30;
++    pub(super) const GET_SPEED: u32 = 31;
++    pub(super) const CONNINFO_EX: u32 = 32;
++    pub(super) const FORBID_SUSPEND: u32 = 33;
++    pub(super) const ALLOW_SUSPEND: u32 = 34;
++    pub(super) const WAIT_FOR_RESUME: u32 = 35;
++}
++
++/// `USBDEVFS_DISCONNECT_CLAIM`'s flags.
++const CLAIM_IF_DRIVER: u32 = 0x01;
++const CLAIM_EXCEPT_DRIVER: u32 = 0x02;
++
++/// Standard requests the ioctls make themselves.
++const SET_CONFIGURATION: u8 = 0x09;
++const SET_INTERFACE: u8 = 0x0b;
++
++/// xHCI speeds: Linux's `enum usb_device_speed` and sysfs's `speed`.
++fn speed_of(speed: u32) -> (i32, &'static str) {
++    match speed {
++        1 => (2, "12"),
++        2 => (1, "1.5"),
++        3 => (3, "480"),
++        4 => (5, "5000"),
++        7 => (6, "20000"),
++        5 | 6 => (6, "10000"),
++        _ => (0, "unknown"),
++    }
++}
++
++fn fail(code: i32, message: &'static str) -> Error {
++    Error::with_message(Errno::try_from(code).unwrap_or(Errno::EIO), message)
++}
++
++fn read_user(address: usize, bytes: &mut [u8]) -> Result<()> {
++    with_current_userspace(|user| user.read_bytes(address, bytes))?;
++    Ok(())
++}
++
++fn write_user(address: usize, bytes: &[u8]) -> Result<()> {
++    with_current_userspace(|user| user.write_bytes(address, bytes))?;
++    Ok(())
++}
++
++fn read_u32(address: usize) -> Result<u32> {
++    let mut bytes = [0u8; 4];
++    read_user(address, &mut bytes)?;
++    Ok(u32::from_le_bytes(bytes))
++}
++
++fn u32_at(bytes: &[u8], at: usize) -> u32 {
++    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
++}
++
++fn u64_at(bytes: &[u8], at: usize) -> u64 {
++    let mut value = [0u8; 8];
++    value.copy_from_slice(&bytes[at..at + 8]);
++    u64::from_le_bytes(value)
++}
++
++fn interface_of(value: u32) -> Result<u8> {
++    u8::try_from(value).map_err(|_| fail(errno::EINVAL, "there is no such interface"))
++}
++
++// ── What programs ask of a controller's task ────────────────────────────
++
++/// A controller's queue of what programs ask of its task.
++pub(crate) struct Host {
++    pub(crate) bus: u8,
++    requests: SpinLock<VecDeque<Request>>,
++}
++
++pub(crate) enum Request {
++    Submit(Arc<Urb>),
++    Cancel(Arc<Urb>),
++    Command(Arc<Command>),
++}
++
++impl Host {
++    pub(crate) fn new(bus: u8) -> Arc<Self> {
++        Arc::new(Self { bus, requests: SpinLock::new(VecDeque::new()) })
++    }
++
++    fn ask(&self, request: Request) {
++        self.requests.lock().push_back(request);
++        crate::wake();
++    }
++
++    pub(crate) fn take(&self) -> VecDeque<Request> {
++        core::mem::take(&mut *self.requests.lock())
++    }
++}
++
++/// A change to a device the controller's task makes.
++#[derive(Clone, Copy)]
++pub(crate) enum Action {
++    /// `SET_CONFIGURATION` (−1: unconfigured).
++    Configuration(i32),
++    /// `SET_INTERFACE`: interface, alternate setting.
++    Interface(u8, u8),
++    /// The device's endpoint halt cleared, and the controller's.
++    ClearHalt(u8),
++    /// The controller's endpoint reset (its data toggle).
++    ResetEndpoint(u8),
++    /// The device reset: its configuration and settings again.
++    Reset,
++}
++
++pub(crate) struct Command {
++    pub(crate) device: Arc<UsbDevice>,
++    pub(crate) action: Action,
++    result: SpinLock<Option<i32>>,
++    done: WaitQueue,
++}
++
++impl Command {
++    /// Its end: 0, or a negative error.
++    pub(crate) fn finish(&self, result: i32) {
++        *self.result.lock() = Some(result);
++        self.done.wake_all();
++    }
++}
++
++/// A transfer a program asked for.
++pub(crate) struct Urb {
++    pub(crate) device: Arc<UsbDevice>,
++    /// The file of an asynchronous transfer (none: a program waits for it).
++    file: Option<Weak<FileState>>,
++    /// The program's `struct usbdevfs_urb`.
++    user: usize,
++    pub(crate) kind: u8,
++    pub(crate) endpoint: Endpoint,
++    pub(crate) flags: u32,
++    pub(crate) setup: [u8; 8],
++    /// Its data's length (a control transfer's without the setup packet).
++    pub(crate) length: usize,
++    /// Where its data is in the program.
++    buffer: usize,
++    /// Its data, in pieces the controller reaches: memory, bytes used.
++    segments: Vec<(DmaCoherent, usize)>,
++    /// When a waited-for transfer times out (ms since boot).
++    pub(crate) deadline: Option<u64>,
++    reserved: usize,
++    /// How it ended: status (0 or a negative error) and bytes moved.
++    result: SpinLock<Option<(i32, usize)>>,
++    done: WaitQueue,
++}
++
++impl Urb {
++    #[allow(clippy::too_many_arguments)]
++    fn new(
++        device: &Arc<UsbDevice>,
++        file: Option<&Arc<FileState>>,
++        user: usize,
++        kind: u8,
++        endpoint: Endpoint,
++        flags: u32,
++        setup: [u8; 8],
++        length: usize,
++        buffer: usize,
++        timeout_ms: u32,
++    ) -> Result<Arc<Self>> {
++        if length > MEMORY_LIMIT || MEMORY.fetch_add(length, Ordering::Relaxed) + length > MEMORY_LIMIT {
++            if length <= MEMORY_LIMIT {
++                MEMORY.fetch_sub(length, Ordering::Relaxed);
++            }
++            return Err(fail(errno::ENOMEM, "the transfers hold too much memory"));
++        }
++        let mut segments = Vec::new();
++        let mut left = length;
++        while left > 0 {
++            let mut pages = left.div_ceil(PAGE_SIZE).min(SEGMENT_PAGES);
++            let memory = loop {
++                match DmaCoherent::alloc(pages, true) {
++                    Ok(memory) => break Some(memory),
++                    Err(_) if pages > 1 => pages = 1,
++                    Err(_) => break None,
++                }
++            };
++            let Some(memory) = memory else {
++                MEMORY.fetch_sub(length, Ordering::Relaxed);
++                return Err(fail(errno::ENOMEM, "no memory for the transfer"));
++            };
++            let bytes = (pages * PAGE_SIZE).min(left);
++            segments.push((memory, bytes));
++            left -= bytes;
++        }
++        let urb = Arc::new(Self {
++            device: device.clone(),
++            file: file.map(Arc::downgrade),
++            user,
++            kind,
++            endpoint,
++            flags,
++            setup,
++            length,
++            buffer,
++            segments,
++            deadline: (timeout_ms > 0).then(|| crate::now_ms() + u64::from(timeout_ms)),
++            reserved: length,
++            result: SpinLock::new(None),
++            done: WaitQueue::new(),
++        });
++        // What goes out is copied now.
++        if !urb.inward() {
++            let mut offset = 0;
++            for (memory, bytes) in &urb.segments {
++                let mut chunk = vec![0u8; *bytes];
++                read_user(buffer + offset, &mut chunk)?;
++                memory.write_bytes(0, &chunk)?;
++                offset += bytes;
++            }
++        }
++        Ok(urb)
++    }
++
++    /// Its device context index: the default control endpoint's is 1.
++    pub(crate) fn dci(&self) -> u8 {
++        if self.kind == urb_type::CONTROL { 1 } else { self.endpoint.dci() }
++    }
++
++    pub(crate) fn inward(&self) -> bool {
++        if self.kind == urb_type::CONTROL { self.setup[0] & 0x80 != 0 } else { self.endpoint.is_in() }
++    }
++
++    /// Its data as the controller takes it: (bus address, bytes), none
++    /// across a 64 KiB boundary.
++    pub(crate) fn pieces(&self) -> Vec<(u64, usize)> {
++        let mut pieces = Vec::new();
++        for (memory, bytes) in &self.segments {
++            let mut address = memory.daddr() as u64;
++            let mut left = *bytes;
++            while left > 0 {
++                let boundary = (address | 0xffff) + 1;
++                let piece = left.min((boundary - address) as usize);
++                pieces.push((address, piece));
++                address += piece as u64;
++                left -= piece;
++            }
++        }
++        pieces
++    }
++
++    /// The controller is done with it.
++    pub(crate) fn complete(self: &Arc<Self>, status: i32, actual: usize) {
++        {
++            let mut result = self.result.lock();
++            if result.is_some() {
++                return;
++            }
++            *result = Some((status, actual.min(self.length)));
++        }
++        self.done.wake_all();
++        if let Some(file) = self.file.as_ref().and_then(Weak::upgrade) {
++            file.completed.lock().push_back(self.clone());
++            file.pollee.notify(IoEvents::OUT);
++        }
++    }
++
++    fn result(&self) -> Option<(i32, usize)> {
++        *self.result.lock()
++    }
++
++    /// Copies what came in to the program.
++    fn copy_out(&self, actual: usize) -> Result<()> {
++        let mut offset = 0;
++        for (memory, bytes) in &self.segments {
++            let length = (*bytes).min(actual - offset);
++            if length == 0 {
++                break;
++            }
++            let mut chunk = vec![0u8; length];
++            memory.read_bytes(0, &mut chunk)?;
++            write_user(self.buffer + offset, &chunk)?;
++            offset += length;
++        }
++        Ok(())
++    }
++
++    /// Hands it to the controller and waits for it.
++    fn run(self: &Arc<Self>) -> (i32, usize) {
++        self.device.host.ask(Request::Submit(self.clone()));
++        self.done.wait_until(|| self.result())
++    }
++}
++
++impl Drop for Urb {
++    fn drop(&mut self) {
++        MEMORY.fetch_sub(self.reserved, Ordering::Relaxed);
++    }
++}
++
++// ── Devices ──────────────────────────────────────────────────────────────
++
++/// A USB device as programs see it.
++pub(crate) struct UsbDevice {
++    pub(crate) host: Arc<Host>,
++    /// Its slot (0: the controller's root hub).
++    pub(crate) slot_id: u8,
++    pub(crate) devnum: u8,
++    /// Its sysfs name (`usb1`, `1-2`, `1-2.4`).
++    pub(crate) name: String,
++    /// The ports from the root hub to it.
++    ports: Vec<u8>,
++    /// Its xHCI speed.
++    speed: u32,
++    /// Its device descriptor and every configuration descriptor, as read.
++    descriptors: Vec<u8>,
++    configurations: Vec<Configuration>,
++    /// Manufacturer, product, serial number.
++    strings: [Option<String>; 3],
++    /// A hub's ports.
++    hub_ports: u8,
++    pub(crate) state: SpinLock<DeviceState>,
++    sysfs: SpinLock<Option<Arc<BusDevice<UsbBus>>>>,
++    weak: Weak<Self>,
++}
++
++pub(crate) struct DeviceState {
++    /// The configuration in use (0: none).
++    pub(crate) active: u8,
++    /// Interfaces' alternate settings other than 0.
++    pub(crate) alternates: BTreeMap<u8, u8>,
++    /// Interfaces a kernel driver took: its name.
++    drivers: BTreeMap<u8, &'static str>,
++    /// Interfaces programs claimed: the file.
++    claims: BTreeMap<u8, u64>,
++    gone: bool,
++    files: Vec<Weak<FileState>>,
++}
++
++/// What the controller knows of a device it gives programs.
++pub(crate) struct NewDevice {
++    pub(crate) host: Arc<Host>,
++    pub(crate) slot_id: u8,
++    pub(crate) devnum: u8,
++    pub(crate) ports: Vec<u8>,
++    pub(crate) speed: u32,
++    pub(crate) descriptors: Vec<u8>,
++    pub(crate) configurations: Vec<Configuration>,
++    pub(crate) strings: [Option<String>; 3],
++    pub(crate) hub_ports: u8,
++    pub(crate) active: u8,
++    pub(crate) drivers: BTreeMap<u8, &'static str>,
++}
++
++impl UsbDevice {
++    pub(crate) fn new(new: NewDevice) -> Arc<Self> {
++        let name = if new.ports.is_empty() {
++            format!("usb{}", new.host.bus)
++        } else {
++            let path: Vec<String> = new.ports.iter().map(|port| format!("{}", port)).collect();
++            format!("{}-{}", new.host.bus, path.join("."))
++        };
++        Arc::new_cyclic(|weak| Self {
++            host: new.host,
++            slot_id: new.slot_id,
++            devnum: new.devnum,
++            name,
++            ports: new.ports,
++            speed: new.speed,
++            descriptors: new.descriptors,
++            configurations: new.configurations,
++            strings: new.strings,
++            hub_ports: new.hub_ports,
++            state: SpinLock::new(DeviceState {
++                active: new.active,
++                alternates: BTreeMap::new(),
++                drivers: new.drivers,
++                claims: BTreeMap::new(),
++                gone: false,
++                files: Vec::new(),
++            }),
++            sysfs: SpinLock::new(None),
++            weak: weak.clone(),
++        })
++    }
++
++    /// A controller's root hub (`usbN`): the hub its ports are, as Linux
++    /// shows it (1d6b:0002), for the tree of devices.
++    pub(crate) fn root_hub(host: Arc<Host>, ports: u8) -> Arc<Self> {
++        let mut descriptors = vec![18, 1, 0x00, 0x02, 9, 0, 1, 64, 0x6b, 0x1d, 0x02, 0x00, 0x00, 0x01, 0, 0, 0, 1];
++        let configuration = [9, 2, 25, 0, 1, 1, 0, 0xe0, 0, 9, 4, 0, 0, 1, 9, 0, 0, 0, 7, 5, 0x81, 3, 4, 0, 12];
++        descriptors.extend_from_slice(&configuration);
++        let configurations = desc::parse_configuration(&configuration).into_iter().collect();
++        Self::new(NewDevice {
++            host,
++            slot_id: 0,
++            devnum: 1,
++            ports: Vec::new(),
++            speed: 3,
++            descriptors,
++            configurations,
++            strings: [None, Some(String::from("xHCI Host Controller")), None],
++            hub_ports: ports,
++            active: 1,
++            drivers: BTreeMap::from([(0, "hub")]),
++        })
++    }
++
++    fn minor(&self) -> u32 {
++        u32::from(self.host.bus - 1) * 128 + u32::from(self.devnum) - 1
++    }
++
++    fn node_path(&self) -> String {
++        format!("bus/usb/{:03}/{:03}", self.host.bus, self.devnum)
++    }
++
++    /// Its sysfs path, as uevents give it.
++    fn devpath(&self) -> String {
++        let mut path = format!("/devices/usb{}", self.host.bus);
++        let mut name = format!("{}-", self.host.bus);
++        for (index, port) in self.ports.iter().enumerate() {
++            if index > 0 {
++                name.push('.');
++            }
++            name.push_str(&format!("{}", port));
++            path.push('/');
++            path.push_str(&name);
++        }
++        path
++    }
++
++    fn descriptor_u16(&self, at: usize) -> u16 {
++        u16::from_le_bytes([self.descriptors[at], self.descriptors[at + 1]])
++    }
++
++    fn max_packet0(&self) -> u16 {
++        let size = u16::from(self.descriptors[7]);
++        if self.descriptor_u16(2) >= 0x0300 { 1 << size.min(9) } else { size }
++    }
++
++    /// The default control endpoint.
++    fn ep0(&self) -> Endpoint {
++        Endpoint { address: 0, max_packet: self.max_packet0(), ..Endpoint::default() }
++    }
++
++    /// The header of the configuration in use, as read.
++    fn active_header(&self) -> Option<&[u8]> {
++        let active = self.state.lock().active;
++        let mut at = 18;
++        while at + 9 <= self.descriptors.len() {
++            let total = usize::from(self.descriptor_u16(at + 2)).max(9);
++            if self.descriptors[at + 5] == active {
++                return Some(&self.descriptors[at..at + 9]);
++            }
++            at += total;
++        }
++        None
++    }
++
++    fn is_gone(&self) -> bool {
++        self.state.lock().gone
++    }
++
++    /// The configuration in use.
++    fn active(&self) -> Option<&Configuration> {
++        let active = self.state.lock().active;
++        self.configurations.iter().find(|configuration| active != 0 && configuration.value == active)
++    }
++
++    /// The endpoint with this address in its interface's current setting,
++    /// and the interface.
++    fn find_endpoint(&self, address: u8) -> Option<(u8, Endpoint)> {
++        let configuration = self.active()?;
++        let alternates = self.state.lock().alternates.clone();
++        configuration
++            .interfaces
++            .iter()
++            .filter(|interface| interface.alternate == alternates.get(&interface.number).copied().unwrap_or(0))
++            .find_map(|interface| {
++                interface.endpoints.iter().find(|endpoint| endpoint.address == address).map(|endpoint| (interface.number, *endpoint))
++            })
++    }
++
++    /// The settings an interface has (0: it is not there).
++    pub(crate) fn settings_of(&self, interface: u8) -> usize {
++        self.active().map_or(0, |configuration| configuration.interfaces.iter().filter(|each| each.number == interface).count())
++    }
++
++    /// The device context indexes an interface's endpoints may have.
++    pub(crate) fn interface_dcis(&self, interface: u8) -> Vec<u8> {
++        let mut dcis: Vec<u8> = self
++            .active()
++            .map(|configuration| {
++                configuration
++                    .interfaces
++                    .iter()
++                    .filter(|each| each.number == interface)
++                    .flat_map(|each| each.endpoints.iter().map(Endpoint::dci))
++                    .collect()
++            })
++            .unwrap_or_default();
++        dcis.sort_unstable();
++        dcis.dedup();
++        dcis
++    }
++
++    /// A program's file takes an interface (Linux's `claimintf`).
++    fn claim(&self, file: u64, interface: u8) -> Result<()> {
++        if self.settings_of(interface) == 0 {
++            return Err(fail(errno::ENOENT, "the configuration has no such interface"));
++        }
++        let mut state = self.state.lock();
++        if state.gone {
++            return Err(fail(errno::ENODEV, "the device is gone"));
++        }
++        match state.claims.get(&interface) {
++            Some(owner) if *owner == file => return Ok(()),
++            Some(_) => return Err(fail(errno::EBUSY, "another program has the interface")),
++            None => {}
++        }
++        if state.drivers.contains_key(&interface) {
++            return Err(fail(errno::EBUSY, "a kernel driver has the interface"));
++        }
++        state.claims.insert(interface, file);
++        Ok(())
++    }
++
++    fn release(&self, file: u64, interface: u8) -> Result<()> {
++        let mut state = self.state.lock();
++        if state.claims.get(&interface) != Some(&file) {
++            return Err(fail(errno::EINVAL, "the interface is not the program's"));
++        }
++        state.claims.remove(&interface);
++        Ok(())
++    }
++
++    /// Asks the controller's task to change the device, and waits.
++    fn command(&self, action: Action) -> Result<()> {
++        let device = self.weak.upgrade().ok_or_else(|| fail(errno::ENODEV, "the device is gone"))?;
++        let command = Arc::new(Command { device, action, result: SpinLock::new(None), done: WaitQueue::new() });
++        self.host.ask(Request::Command(command.clone()));
++        match command.done.wait_until(|| *command.result.lock()) {
++            0 => Ok(()),
++            code => Err(fail(-code, "the device did not take the request")),
++        }
++    }
++
++    /// Its uevent's variables (and its `uevent` attribute's).
++    fn environment(&self) -> Vec<(&'static str, String)> {
++        let mut environment = Vec::new();
++        if self.slot_id != 0 {
++            environment.push(("MAJOR", format!("{}", USB_DEVICE_MAJOR)));
++            environment.push(("MINOR", format!("{}", self.minor())));
++            environment.push(("DEVNAME", self.node_path()));
++        }
++        environment.push(("DEVTYPE", String::from("usb_device")));
++        environment.push(("DRIVER", String::from("usb")));
++        environment.push((
++            "PRODUCT",
++            format!("{:x}/{:x}/{:x}", self.descriptor_u16(8), self.descriptor_u16(10), self.descriptor_u16(12)),
++        ));
++        environment.push(("TYPE", format!("{}/{}/{}", self.descriptors[4], self.descriptors[5], self.descriptors[6])));
++        environment.push(("BUSNUM", format!("{:03}", self.host.bus)));
++        environment.push(("DEVNUM", format!("{:03}", self.devnum)));
++        environment
++    }
++
++    fn uevent(&self, action: &str) {
++        let environment = self.environment();
++        let pairs: Vec<(&str, &str)> = environment.iter().map(|(key, value)| (*key, value.as_str())).collect();
++        aster_core::device::uevent(action, &self.devpath(), "usb", &pairs);
++    }
++}
++
++impl Device for UsbDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        DeviceId::new(MajorId::new(USB_DEVICE_MAJOR), MinorId::new(self.minor()))
++    }
++
++    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
++        // The device model makes the node (`/dev/bus/usb/BBB/DDD`).
++        None
++    }
++
++    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
++        let device = self.weak.upgrade().ok_or_else(|| fail(errno::ENODEV, "the device is gone"))?;
++        let file = Arc::new(FileState {
++            device,
++            id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
++            pending: SpinLock::new(Vec::new()),
++            completed: SpinLock::new(VecDeque::new()),
++            pollee: PollSource::new(),
++        });
++        let mut state = self.state.lock();
++        if state.gone {
++            return Err(fail(errno::ENODEV, "the device is gone"));
++        }
++        state.files.retain(|each| each.strong_count() > 0);
++        state.files.push(Arc::downgrade(&file));
++        drop(state);
++        Ok(Box::new(UsbFile(file)))
++    }
++}
++
++/// Gives programs a device: its device file, its sysfs directory, and the
++/// uevent that says it came.
++pub(crate) fn publish(device: &Arc<UsbDevice>, parent: Option<&Arc<UsbDevice>>) {
++    let Some(bus) = bus() else { return };
++    let mut builder = BusDevice::builder(bus, device.name.clone(), device.clone()).dev_type(&USB_DEVICE);
++    let parent = parent.and_then(|parent| parent.sysfs.lock().clone());
++    if let Some(parent) = parent {
++        builder = builder.parent(parent as Arc<dyn AnyDevice>);
++    }
++    let node = device.slot_id != 0 && device.devnum <= 128;
++    if node {
++        if let Err(error) = char::register(device.clone() as Arc<dyn Device>) {
++            ostd::notice!("{}: no device file: {:?}", device.name, error);
++            return;
++        }
++        builder = builder.devnum(DevNum::char(device.id()));
++    }
++    let sysfs = builder.build();
++    if let Err(error) = aster_device::add_device(&sysfs) {
++        ostd::notice!("{}: not in sysfs: {:?}", device.name, error);
++        if node {
++            let _ = char::unregister(device.id());
++        }
++        return;
++    }
++    *device.sysfs.lock() = Some(sysfs);
++    device.uevent("add");
++}
++
++/// The device went: programs' files see it, its sysfs directory and device
++/// file go, and a uevent says so.
++pub(crate) fn remove(device: &Arc<UsbDevice>) {
++    let files = {
++        let mut state = device.state.lock();
++        state.gone = true;
++        state.claims.clear();
++        core::mem::take(&mut state.files)
++    };
++    for file in files.iter().filter_map(Weak::upgrade) {
++        file.pollee.notify(IoEvents::HUP | IoEvents::ERR);
++    }
++    let sysfs = device.sysfs.lock().take();
++    let Some(sysfs) = sysfs else { return };
++    device.uevent("remove");
++    let _ = aster_device::remove_device(&sysfs);
++    if device.slot_id != 0 && device.devnum <= 128 {
++        let _ = char::unregister(device.id());
++    }
++}
++
++// ── Device files ─────────────────────────────────────────────────────────
++
++struct FileState {
++    device: Arc<UsbDevice>,
++    id: u64,
++    /// URBs submitted and not reaped.
++    pending: SpinLock<Vec<Arc<Urb>>>,
++    /// URBs done, to reap.
++    completed: SpinLock<VecDeque<Arc<Urb>>>,
++    pollee: PollSource,
++}
++
++struct UsbFile(Arc<FileState>);
++
++impl Drop for UsbFile {
++    // What the program left is taken back and its interfaces let go
++    // (Linux's `usbdev_release`).
++    fn drop(&mut self) {
++        let file = &self.0;
++        let running: Vec<Arc<Urb>> = file.pending.lock().iter().filter(|urb| urb.result().is_none()).cloned().collect();
++        for urb in running {
++            file.device.host.ask(Request::Cancel(urb));
++        }
++        let mut state = file.device.state.lock();
++        state.claims.retain(|_, owner| *owner != file.id);
++        state.files.retain(|each| each.strong_count() > 0 && !core::ptr::eq(each.as_ptr(), Arc::as_ptr(file)));
++    }
++}
++
++impl UsbFile {
++    /// Checks what a control request addresses (Linux's `check_ctrlrecip`):
++    /// an interface, or an endpoint's, must be the program's.
++    fn check_control(&self, setup: &[u8; 8]) -> Result<()> {
++        let device = &self.0.device;
++        let (request_type, request) = (setup[0], setup[1]);
++        let index = u16::from_le_bytes([setup[4], setup[5]]);
++        // Vendor requests go through.
++        if request_type & 0x60 == 0x40 {
++            return Ok(());
++        }
++        // The printer class's GET_DEVICE_ID, which CUPS asks of any printer.
++        if request_type == 0xa1 && request == 0 {
++            let printer = device.active().is_some_and(|configuration| {
++                configuration.interfaces.iter().any(|interface| {
++                    u16::from(interface.number) == index >> 8 && u16::from(interface.alternate) == index & 0xff && interface.class == 7
++                })
++            });
++            if printer {
++                return Ok(());
++            }
++        }
++        let index = (index & 0xff) as u8;
++        match request_type & 0x1f {
++            // An endpoint.
++            2 => {
++                if index & !0x80 == 0 {
++                    return Ok(());
++                }
++                let found = device.find_endpoint(index).or_else(|| device.find_endpoint(index ^ 0x80));
++                let (interface, _) = found.ok_or_else(|| fail(errno::ENOENT, "there is no such endpoint"))?;
++                device.claim(self.0.id, interface)
++            }
++            // An interface.
++            1 => device.claim(self.0.id, index),
++            _ => Ok(()),
++        }
++    }
++
++    /// `USBDEVFS_CONTROL`: a control transfer, waited for.
++    fn control(&self, arg: usize) -> Result<i32> {
++        let mut raw = [0u8; 24];
++        read_user(arg, &mut raw)?;
++        let mut setup = [0u8; 8];
++        setup.copy_from_slice(&raw[..8]);
++        let timeout = u32_at(&raw, 8);
++        let data = u64_at(&raw, 16) as usize;
++        self.check_control(&setup)?;
++        let value = u16::from_le_bytes([setup[2], setup[3]]);
++        let index = u16::from_le_bytes([setup[4], setup[5]]);
++        // Configuration changes are the ioctls' own, so endpoints follow.
++        if (setup[0], setup[1]) == (0x00, SET_CONFIGURATION) {
++            return self.set_configuration(i32::from(value)).map(|()| 0);
++        }
++        if (setup[0], setup[1]) == (0x01, SET_INTERFACE) {
++            return self.set_interface(u32::from(index), u32::from(value)).map(|()| 0);
++        }
++        let device = &self.0.device;
++        let length = usize::from(u16::from_le_bytes([setup[6], setup[7]]));
++        let urb = Urb::new(device, None, 0, urb_type::CONTROL, device.ep0(), 0, setup, length, data, timeout)?;
++        let (status, actual) = urb.run();
++        if status < 0 {
++            return Err(fail(-status, "the control transfer failed"));
++        }
++        if urb.inward() && actual > 0 {
++            urb.copy_out(actual)?;
++        }
++        Ok(actual as i32)
++    }
++
++    /// `USBDEVFS_BULK`: a bulk or interrupt transfer, waited for.
++    fn bulk(&self, arg: usize) -> Result<i32> {
++        let mut raw = [0u8; 24];
++        read_user(arg, &mut raw)?;
++        let address = u32_at(&raw, 0) as u8;
++        let length = u32_at(&raw, 4) as usize;
++        let timeout = u32_at(&raw, 8);
++        let data = u64_at(&raw, 16) as usize;
++        let device = &self.0.device;
++        let (interface, endpoint) = device.find_endpoint(address).ok_or_else(|| fail(errno::ENOENT, "there is no such endpoint"))?;
++        let kind = match endpoint.transfer_type() {
++            TRANSFER_BULK => urb_type::BULK,
++            TRANSFER_INTERRUPT => urb_type::INTERRUPT,
++            _ => return Err(fail(errno::EINVAL, "not a bulk or interrupt endpoint")),
++        };
++        device.claim(self.0.id, interface)?;
++        let urb = Urb::new(device, None, 0, kind, endpoint, 0, [0; 8], length, data, timeout)?;
++        let (status, actual) = urb.run();
++        if status < 0 {
++            return Err(fail(-status, "the transfer failed"));
++        }
++        if urb.inward() && actual > 0 {
++            urb.copy_out(actual)?;
++        }
++        Ok(actual as i32)
++    }
++
++    /// `USBDEVFS_SUBMITURB`: a transfer to reap later.
++    fn submit(&self, arg: usize) -> Result<()> {
++        let mut raw = [0u8; 56];
++        read_user(arg, &mut raw)?;
++        let (kind, address) = (raw[0], raw[1]);
++        let flags = u32_at(&raw, 8);
++        let buffer = u64_at(&raw, 16) as usize;
++        let buffer_length = u32_at(&raw, 24) as i32;
++        if buffer_length < 0 {
++            return Err(fail(errno::EINVAL, "the buffer's length is negative"));
++        }
++        let device = &self.0.device;
++        let (kind, endpoint, setup, length, data) = match kind {
++            urb_type::CONTROL => {
++                if buffer_length < 8 || address & 0x7f != 0 {
++                    return Err(fail(errno::EINVAL, "a control URB needs its setup packet, on endpoint 0"));
++                }
++                let mut setup = [0u8; 8];
++                read_user(buffer, &mut setup)?;
++                let length = usize::from(u16::from_le_bytes([setup[6], setup[7]]));
++                if length > buffer_length as usize - 8 {
++                    return Err(fail(errno::EINVAL, "the setup packet asks for more than the buffer holds"));
++                }
++                self.check_control(&setup)?;
++                (urb_type::CONTROL, device.ep0(), setup, length, buffer + 8)
++            }
++            urb_type::BULK | urb_type::INTERRUPT => {
++                let (interface, endpoint) =
++                    device.find_endpoint(address).ok_or_else(|| fail(errno::ENOENT, "there is no such endpoint"))?;
++                // A bulk URB on an interrupt endpoint is a single-shot interrupt transfer.
++                let kind = match (kind, endpoint.transfer_type()) {
++                    (_, TRANSFER_INTERRUPT) => urb_type::INTERRUPT,
++                    (urb_type::BULK, TRANSFER_BULK) => urb_type::BULK,
++                    _ => return Err(fail(errno::EINVAL, "the endpoint is of another type")),
++                };
++                device.claim(self.0.id, interface)?;
++                (kind, endpoint, [0; 8], buffer_length as usize, buffer)
++            }
++            urb_type::ISO => return Err(fail(errno::EINVAL, "isochronous transfers are not offered")),
++            _ => return Err(fail(errno::EINVAL, "unknown URB type")),
++        };
++        let urb = Urb::new(device, Some(&self.0), arg, kind, endpoint, flags, setup, length, data, 0)?;
++        self.0.pending.lock().push(urb.clone());
++        device.host.ask(Request::Submit(urb));
++        Ok(())
++    }
++
++    /// `USBDEVFS_DISCARDURB`: takes a submitted URB back.
++    fn discard(&self, arg: usize) -> Result<i32> {
++        let urb = self.0.pending.lock().iter().find(|urb| urb.user == arg && urb.result().is_none()).cloned();
++        let urb = urb.ok_or_else(|| fail(errno::EINVAL, "no such URB is running"))?;
++        self.0.device.host.ask(Request::Cancel(urb));
++        Ok(0)
++    }
++
++    /// `USBDEVFS_REAPURB(NDELAY)`: gives back a URB that is done.
++    fn reap(&self, arg: usize, block: bool) -> Result<i32> {
++        let file = &self.0;
++        let try_reap = || -> Result<i32> {
++            let urb = file.completed.lock().pop_front();
++            file.pollee.invalidate();
++            let Some(urb) = urb else {
++                if file.device.is_gone() {
++                    return Err(fail(errno::ENODEV, "the device is gone"));
++                }
++                return_errno_with_message!(Errno::EAGAIN, "no URB is done");
++            };
++            file.pending.lock().retain(|each| !Arc::ptr_eq(each, &urb));
++            let (status, actual) = urb.result().unwrap_or((-errno::EPROTO, 0));
++            if urb.inward() && actual > 0 {
++                urb.copy_out(actual)?;
++            }
++            write_user(urb.user + 4, &status.to_le_bytes())?;
++            write_user(urb.user + 28, &(actual as i32).to_le_bytes())?;
++            write_user(urb.user + 32, &0i32.to_le_bytes())?;
++            write_user(urb.user + 40, &0i32.to_le_bytes())?;
++            write_user(arg, &(urb.user as u64).to_le_bytes())?;
++            Ok(0)
++        };
++        if block { self.wait_events(IoEvents::OUT, None, try_reap) } else { try_reap() }
++    }
++
++    fn set_configuration(&self, value: i32) -> Result<()> {
++        let device = &self.0.device;
++        if value != -1 && value != 0 && !device.configurations.iter().any(|configuration| i32::from(configuration.value) == value) {
++            return Err(fail(errno::EINVAL, "there is no such configuration"));
++        }
++        {
++            let state = device.state.lock();
++            if !state.drivers.is_empty() || !state.claims.is_empty() {
++                return Err(fail(errno::EBUSY, "an interface is in use"));
++            }
++        }
++        device.command(Action::Configuration(value))
++    }
++
++    fn set_interface(&self, interface: u32, alternate: u32) -> Result<()> {
++        let device = &self.0.device;
++        let interface = interface_of(interface)?;
++        device.claim(self.0.id, interface)?;
++        let alternate = u8::try_from(alternate).map_err(|_| fail(errno::EINVAL, "there is no such setting"))?;
++        let exists = device.active().is_some_and(|configuration| {
++            configuration.interfaces.iter().any(|each| each.number == interface && each.alternate == alternate)
++        });
++        if !exists {
++            return Err(fail(errno::EINVAL, "there is no such setting"));
++        }
++        device.command(Action::Interface(interface, alternate))
++    }
++
++    /// The driver an interface has: a kernel driver's name, `usbfs` for a
++    /// program's.
++    fn driver_of(&self, interface: u8) -> Option<&'static str> {
++        let state = self.0.device.state.lock();
++        if state.claims.contains_key(&interface) {
++            return Some("usbfs");
++        }
++        state.drivers.get(&interface).copied()
++    }
++
++    /// `USBDEVFS_IOCTL`: an ioctl for an interface's driver (detaching one
++    /// or attaching it again).
++    fn interface_ioctl(&self, arg: usize) -> Result<i32> {
++        let mut raw = [0u8; 16];
++        read_user(arg, &mut raw)?;
++        let interface = interface_of(u32_at(&raw, 0))?;
++        let code = u32_at(&raw, 4);
++        if (code >> 8) & 0xff != u32::from(b'U') {
++            return_errno_with_message!(Errno::ENOTTY, "the interface's driver has no such ioctl");
++        }
++        let device = &self.0.device;
++        let mut state = device.state.lock();
++        match code & 0xff {
++            nr::DISCONNECT => {
++                if state.claims.remove(&interface).is_some() {
++                    return Ok(0);
++                }
++                if state.drivers.contains_key(&interface) {
++                    return Err(fail(errno::EBUSY, "the kernel's driver stays"));
++                }
++                Err(fail(errno::ENODATA, "the interface has no driver"))
++            }
++            nr::CONNECT => {
++                if state.claims.contains_key(&interface) {
++                    return Err(fail(errno::EBUSY, "a program has the interface"));
++                }
++                Ok(0)
++            }
++            _ => return_errno_with_message!(Errno::ENOTTY, "the interface's driver has no such ioctl"),
++        }
++    }
++
++    /// `USBDEVFS_DISCONNECT_CLAIM`: claims an interface, its driver let go.
++    fn disconnect_claim(&self, arg: usize) -> Result<i32> {
++        let mut raw = [0u8; 264];
++        read_user(arg, &mut raw)?;
++        let interface = interface_of(u32_at(&raw, 0))?;
++        let flags = u32_at(&raw, 4);
++        let name = &raw[8..];
++        let name = &name[..name.iter().position(|byte| *byte == 0).unwrap_or(name.len())];
++        if let Some(driver) = self.driver_of(interface) {
++            let same = driver.as_bytes() == name;
++            if (flags & CLAIM_IF_DRIVER != 0 && !same) || (flags & CLAIM_EXCEPT_DRIVER != 0 && same) {
++                return Err(fail(errno::EBUSY, "the interface's driver stays"));
++            }
++            if driver != "usbfs" {
++                return Err(fail(errno::EBUSY, "the kernel's driver stays"));
++            }
++        }
++        self.0.device.claim(self.0.id, interface)?;
++        Ok(0)
++    }
++
++    /// The interface of an endpoint a request names, claimed.
++    fn claim_endpoint(&self, address: u32) -> Result<u8> {
++        let address = address as u8;
++        let (interface, _) = self.0.device.find_endpoint(address).ok_or_else(|| fail(errno::ENOENT, "there is no such endpoint"))?;
++        self.0.device.claim(self.0.id, interface)?;
++        Ok(address)
++    }
++}
++
++impl Pollable for UsbFile {
++    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
++        let file = &self.0;
++        file.pollee.poll_with(mask, poller, || {
++            let mut events = IoEvents::empty();
++            if !file.completed.lock().is_empty() {
++                events |= IoEvents::OUT;
++            }
++            if file.device.is_gone() {
++                events |= IoEvents::HUP | IoEvents::ERR;
++            }
++            events
++        })
++    }
++}
++
++impl FileOps for UsbFile {
++    // The descriptors, as Linux's `usbdev_read` gives them.
++    fn read_at(&self, offset: usize, writer: &mut VmWriter, _status_flags: StatusFlags) -> Result<usize> {
++        let descriptors = &self.0.device.descriptors;
++        if offset >= descriptors.len() {
++            return Ok(0);
++        }
++        Ok(writer.write_fallible(&mut VmReader::from(&descriptors[offset..]))?)
++    }
++
++    fn write_at(&self, _offset: usize, _reader: &mut VmReader, _status_flags: StatusFlags) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "a USB device file is not written");
++    }
++}
++
++impl PerOpenFileOps for UsbFile {
++    fn check_seekable(&self) -> Result<()> {
++        Ok(())
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        true
++    }
++
++    fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
++        let (cmd, arg) = (raw_ioctl.cmd(), raw_ioctl.arg());
++        if (cmd >> 8) & 0xff != u32::from(b'U') {
++            return_errno_with_message!(Errno::ENOTTY, "not a usbfs ioctl");
++        }
++        let size = ((cmd >> 16) & 0x3fff) as usize;
++        let file = &self.0;
++        let device = &file.device;
++        match cmd & 0xff {
++            nr::REAPURB => self.reap(arg, true),
++            nr::REAPURBNDELAY => self.reap(arg, false),
++            nr::GET_CAPABILITIES => {
++                write_user(arg, &CAPABILITIES.to_le_bytes())?;
++                Ok(0)
++            }
++            _ if device.is_gone() => Err(fail(errno::ENODEV, "the device is gone")),
++            nr::CONTROL => self.control(arg),
++            nr::BULK => self.bulk(arg),
++            nr::SUBMITURB => self.submit(arg).map(|()| 0),
++            nr::DISCARDURB => self.discard(arg),
++            nr::CLAIMINTERFACE => device.claim(file.id, interface_of(read_u32(arg)?)?).map(|()| 0),
++            nr::RELEASEINTERFACE => device.release(file.id, interface_of(read_u32(arg)?)?).map(|()| 0),
++            nr::SETINTERFACE => {
++                let mut raw = [0u8; 8];
++                read_user(arg, &mut raw)?;
++                self.set_interface(u32_at(&raw, 0), u32_at(&raw, 4)).map(|()| 0)
++            }
++            nr::SETCONFIGURATION => self.set_configuration(read_u32(arg)? as i32).map(|()| 0),
++            nr::GETDRIVER => {
++                let interface = interface_of(read_u32(arg)?)?;
++                let driver = self.driver_of(interface).ok_or_else(|| fail(errno::ENODATA, "the interface has no driver"))?;
++                let mut name = [0u8; 256];
++                name[..driver.len()].copy_from_slice(driver.as_bytes());
++                write_user(arg + 4, &name)?;
++                Ok(0)
++            }
++            nr::CONNECTINFO => {
++                let mut raw = [0u8; 8];
++                raw[..4].copy_from_slice(&u32::from(device.devnum).to_le_bytes());
++                raw[4] = u8::from(device.speed == 2);
++                write_user(arg, &raw)?;
++                Ok(0)
++            }
++            nr::CONNINFO_EX => {
++                let mut raw = [0u8; 24];
++                raw[..4].copy_from_slice(&24u32.to_le_bytes());
++                raw[4..8].copy_from_slice(&u32::from(device.host.bus).to_le_bytes());
++                raw[8..12].copy_from_slice(&u32::from(device.devnum).to_le_bytes());
++                raw[12..16].copy_from_slice(&(speed_of(device.speed).0 as u32).to_le_bytes());
++                raw[16] = device.ports.len() as u8;
++                for (at, port) in device.ports.iter().take(7).enumerate() {
++                    raw[17 + at] = *port;
++                }
++                write_user(arg, &raw[..size.min(raw.len())])?;
++                Ok(0)
++            }
++            nr::IOCTL => self.interface_ioctl(arg),
++            nr::DISCONNECT_CLAIM => self.disconnect_claim(arg),
++            nr::RESET => device.command(Action::Reset).map(|()| 0),
++            nr::CLEAR_HALT => {
++                let address = self.claim_endpoint(read_u32(arg)?)?;
++                device.command(Action::ClearHalt(address)).map(|()| 0)
++            }
++            nr::RESETEP => {
++                let address = self.claim_endpoint(read_u32(arg)?)?;
++                device.command(Action::ResetEndpoint(address)).map(|()| 0)
++            }
++            nr::GET_SPEED => Ok(speed_of(device.speed).0),
++            // Signals on disconnection are not sent; the rest has nothing to do here.
++            nr::DISCSIGNAL | nr::DROP_PRIVILEGES | nr::FORBID_SUSPEND | nr::ALLOW_SUSPEND | nr::WAIT_FOR_RESUME => Ok(0),
++            nr::CLAIM_PORT | nr::RELEASE_PORT | nr::ALLOC_STREAMS | nr::FREE_STREAMS | nr::DISCONNECT | nr::CONNECT => {
++                Err(fail(errno::EINVAL, "not offered"))
++            }
++            _ => return_errno_with_message!(Errno::ENOTTY, "unknown usbfs ioctl"),
++        }
++    }
++}
++
++// ── sysfs: `/sys/bus/usb` ────────────────────────────────────────────────
++
++pub(crate) struct UsbBus;
++
++type SysDevice = BusDevice<UsbBus>;
++
++impl Bus for UsbBus {
++    const NAME: &'static str = "usb";
++    type Device = Arc<UsbDevice>;
++    type MatchData = ();
++
++    fn matches(&self, _device: &Arc<UsbDevice>, _data: &()) -> bool {
++        false
++    }
++
++    fn dev_attrs(&self) -> &'static [Attr<SysDevice>] {
++        ATTRS
++    }
++}
++
++static BUS: spin::Once<Option<Arc<BusHandle<UsbBus>>>> = spin::Once::new();
++
++fn bus() -> Option<&'static Arc<BusHandle<UsbBus>>> {
++    BUS.call_once(|| match bus::register(UsbBus) {
++        Ok(bus) => Some(bus),
++        Err(error) => {
++            ostd::notice!("no /sys/bus/usb: {:?}", error);
++            None
++        }
++    })
++    .as_ref()
++}
++
++static USB_DEVICE: SysDeviceType<SysDevice> =
++    SysDeviceType { name: "usb_device", attrs: &[], devnode: Some(devnode), has_device_link: true };
++
++/// `/dev/bus/usb/BBB/DDD`: anyone may use a device no kernel driver took,
++/// as the session's person may on Debian (udev's `uaccess`); the others
++/// may be read.
++fn devnode(device: &SysDevice) -> Option<DevNode> {
++    let free = device.state.lock().drivers.is_empty();
++    Some(DevNode { path: Some(SysStr::from(device.node_path())), mode: Some(if free { 0o666 } else { 0o664 }) })
++}
++
++fn show(w: &mut dyn Write, value: impl core::fmt::Display) -> aster_device::common::Result<()> {
++    writeln!(w, "{}", value)?;
++    Ok(())
++}
++
++fn show_string(w: &mut dyn Write, value: &Option<String>) -> aster_device::common::Result<()> {
++    if let Some(value) = value {
++        show(w, value)?;
++    }
++    Ok(())
++}
++
++fn show_header(device: &SysDevice, w: &mut dyn Write, field: fn(&[u8], u32) -> String) -> aster_device::common::Result<()> {
++    if let Some(header) = device.active_header() {
++        show(w, field(header, device.speed))?;
++    }
++    Ok(())
++}
++
++const ATTRS: &[Attr<SysDevice>] = &[
++    Attr::ro("busnum", |device, w| show(w, device.host.bus)),
++    Attr::ro("devnum", |device, w| show(w, device.devnum)),
++    Attr::ro("devpath", |device, w| {
++        if device.ports.is_empty() {
++            return show(w, 0);
++        }
++        let path: Vec<String> = device.ports.iter().map(|port| format!("{}", port)).collect();
++        show(w, path.join("."))
++    }),
++    Attr::ro("speed", |device, w| show(w, speed_of(device.speed).1)),
++    Attr::ro("version", |device, w| {
++        let bcd = device.descriptor_u16(2);
++        show(w, format_args!("{:2x}.{:02x}", bcd >> 8, bcd & 0xff))
++    }),
++    Attr::ro("idVendor", |device, w| show(w, format_args!("{:04x}", device.descriptor_u16(8)))),
++    Attr::ro("idProduct", |device, w| show(w, format_args!("{:04x}", device.descriptor_u16(10)))),
++    Attr::ro("bcdDevice", |device, w| show(w, format_args!("{:04x}", device.descriptor_u16(12)))),
++    Attr::ro("bDeviceClass", |device, w| show(w, format_args!("{:02x}", device.descriptors[4]))),
++    Attr::ro("bDeviceSubClass", |device, w| show(w, format_args!("{:02x}", device.descriptors[5]))),
++    Attr::ro("bDeviceProtocol", |device, w| show(w, format_args!("{:02x}", device.descriptors[6]))),
++    Attr::ro("bMaxPacketSize0", |device, w| show(w, device.descriptors[7])),
++    Attr::ro("bNumConfigurations", |device, w| show(w, device.descriptors[17])),
++    Attr::ro("bConfigurationValue", |device, w| {
++        let active = device.state.lock().active;
++        if active != 0 {
++            show(w, active)?;
++        }
++        Ok(())
++    }),
++    Attr::ro("bNumInterfaces", |device, w| show_header(device, w, |header, _| format!("{:2}", header[4]))),
++    Attr::ro("bmAttributes", |device, w| show_header(device, w, |header, _| format!("{:2x}", header[7]))),
++    Attr::ro("bMaxPower", |device, w| {
++        show_header(device, w, |header, speed| format!("{}mA", u32::from(header[8]) * if speed >= 4 { 8 } else { 2 }))
++    }),
++    Attr::ro("maxchild", |device, w| show(w, device.hub_ports)),
++    Attr::ro("manufacturer", |device, w| show_string(w, &device.strings[0])),
++    Attr::ro("product", |device, w| show_string(w, &device.strings[1])),
++    Attr::ro("serial", |device, w| show_string(w, &device.strings[2])),
++    Attr::ro("removable", |_device, w| show(w, "unknown")),
++    Attr::ro("authorized", |_device, w| show(w, 1)),
++    Attr::ro("avoid_reset_port", |_device, w| show(w, 0)),
++    Attr::ro("quirks", |_device, w| show(w, "0x0")),
++    Attr::ro("ltm_capable", |_device, w| show(w, "no")),
++    Attr::ro("urbnum", |_device, w| show(w, 0)),
++    Attr::ro("rx_lanes", |_device, w| show(w, 1)),
++    Attr::ro("tx_lanes", |_device, w| show(w, 1)),
++    Attr::bin("descriptors", |device| device.descriptors.clone()),
++    Attr::ro("uevent", |device, w| {
++        for (key, value) in device.environment() {
++            writeln!(w, "{}={}", key, value)?;
++        }
++        Ok(())
++    }),
++];
+diff --git a/kernel/comps/usb/src/xhci.rs b/kernel/comps/usb/src/xhci.rs
+index 7a4dfd4..1363e68 100755
+--- a/kernel/comps/usb/src/xhci.rs
++++ b/kernel/comps/usb/src/xhci.rs
+@@ -29,9 +29,11 @@ use crate::{
+     disk::UsbDisk,
+     netframe::{self, Framing},
+     ring::{CHAIN, EventRing, IDT, IOC, ISP, ProducerRing, Trb, trb_type},
+-    scsi, usbnet,
++    scsi, usbfs, usbnet,
+ };
+ 
++mod programs;
++
+ /// Completion codes.
+ const SUCCESS: u8 = 1;
+ const STALL: u8 = 6;
+@@ -292,6 +294,12 @@ struct Slot {
+     ids: (u16, u16),
+     /// The highest device context index configured.
+     last_dci: u8,
++    /// What programs have on its endpoints (`programs`).
++    programs: BTreeMap<u8, programs::ProgramEndpoint>,
++    /// The device as programs see it, once its drivers started.
++    usbfs: Option<alloc::sync::Arc<usbfs::UsbDevice>>,
++    /// Interfaces the kernel's drivers took: their names.
++    drivers: BTreeMap<u8, &'static str>,
+ }
+ 
+ /// Network interfaces' names: usb0, usb1, ...
+@@ -361,6 +369,14 @@ pub(crate) struct Controller {
+     /// When removable media are next looked at.
+     next_media_check: u64,
+     name: alloc::string::String,
++    /// What programs ask of this task (`usbfs`).
++    host: alloc::sync::Arc<usbfs::Host>,
++    /// The next device number to give (2–127).
++    next_devnum: u8,
++    /// The root hub, for programs' tree of devices.
++    root: Option<alloc::sync::Arc<usbfs::UsbDevice>>,
++    /// Changes programs made with requests of their own.
++    changes: Vec<(u8, programs::Change)>,
+     _device: PciCommonDevice,
+ }
+ 
+@@ -399,7 +415,7 @@ impl Controller {
+     }
+ 
+     /// Takes the controller from the firmware and brings it up.
+-    pub(crate) fn new(mut device: PciCommonDevice, name: alloc::string::String) -> Option<Self> {
++    pub(crate) fn new(mut device: PciCommonDevice, name: alloc::string::String, bus: u8) -> Option<Self> {
+         let location = *device.location();
+         let id = *device.device_id();
+         let mmio = device.bar_manager_mut().bar_mut(0)?.acquire().ok()?;
+@@ -479,6 +495,10 @@ impl Controller {
+             hub_changed: Vec::new(),
+             next_media_check: 0,
+             name,
++            host: usbfs::Host::new(bus),
++            next_devnum: 2,
++            root: None,
++            changes: Vec::new(),
+             _device: device,
+         };
+         controller.start().then_some(())?;
+@@ -563,6 +583,7 @@ impl Controller {
+ 
+     /// The controller's task: attaches what is plugged in, forever.
+     pub(crate) fn run(mut self) -> ! {
++        self.publish_root();
+         loop {
+             self.process_events(&mut |_| false);
+             while let Some(port) = self.changed.pop() {
+@@ -575,6 +596,7 @@ impl Controller {
+             self.send_bluetooth();
+             self.serve_disks();
+             self.check_media();
++            self.serve_programs();
+             crate::sleep_idle();
+         }
+     }
+@@ -707,7 +729,9 @@ impl Controller {
+         for child in children {
+             self.detach_slot(child);
+         }
+-        if let Some(slot) = self.slots.remove(&slot_id) {
++        if let Some(mut slot) = self.slots.remove(&slot_id) {
++            // What programs had on it ends.
++            Self::programs_gone(&mut slot);
+             // Its hub no longer has it.
+             if let Some((hub_slot, hub_port)) = slot.parent {
+                 if let Some(hub) = self.slots.get_mut(&hub_slot).and_then(|hub| hub.hub.as_mut()) {
+@@ -784,6 +808,9 @@ impl Controller {
+             bt: Vec::new(),
+             ids: (0, 0),
+             last_dci: 1,
++            programs: BTreeMap::new(),
++            usbfs: None,
++            drivers: BTreeMap::new(),
+         };
+         let _ = self.dcbaa.write_val(usize::from(slot_id) * 8, &(slot.output.daddr() as u64));
+         self.slots.insert(slot_id, slot);
+@@ -839,20 +866,24 @@ impl Controller {
+                 ..Trb::default()
+             })?;
+         }
+-        let device = desc::parse_device(&self.get_descriptor(slot_id, 0x80, desc::kind::DEVICE, 0, 18)?).ok_or(Error::Descriptor)?;
++        let raw_device = self.get_descriptor(slot_id, 0x80, desc::kind::DEVICE, 0, 18)?;
++        let device = desc::parse_device(&raw_device).ok_or(Error::Descriptor)?;
+         if let Some(slot) = self.slots.get_mut(&slot_id) {
+             slot.ids = (device.vendor, device.product);
+         }
+         // Each configuration (phones and network adapters offer several).
+         let mut configuration: Option<Configuration> = None;
++        // Each one as read, for programs.
++        let mut all: Vec<(Vec<u8>, Configuration)> = Vec::new();
+         for index in 0..device.configurations.clamp(1, 8) {
+             let Ok(head) = self.get_config(slot_id, index, 9) else { continue };
+             let Some(total) = head.get(2..4).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]]))) else { continue };
+             let Ok(full) = self.get_config(slot_id, index, total.min(4096)) else { continue };
+             let Some(parsed) = desc::parse_configuration(&full) else { continue };
+             if configuration.as_ref().is_none_or(|best| configuration_rank(&parsed) > configuration_rank(best)) {
+-                configuration = Some(parsed);
++                configuration = Some(parsed.clone());
+             }
++            all.push((full, parsed));
+         }
+         let configuration = configuration.ok_or(Error::Descriptor)?;
+         self.control(slot_id, 0x00, SET_CONFIGURATION, u16::from(configuration.value), 0, Data::None)?;
+@@ -862,6 +893,7 @@ impl Controller {
+             configuration.interfaces.len()
+         );
+         self.start_drivers(slot_id, &configuration);
++        self.publish_device(slot_id, raw_device, all, configuration.value);
+         Ok(())
+     }
+ 
+@@ -885,14 +917,31 @@ impl Controller {
+             let vendor = self.slots.get(&slot_id).map_or(0, |slot| slot.ids.0);
+             let bluetooth = bt::is_controller(vendor, interface.class, interface.subclass, interface.protocol)
+                 && interface.endpoints.iter().any(|endpoint| endpoint.is_in() && endpoint.transfer_type() == TRANSFER_INTERRUPT);
+-            let started = match interface.class {
+-                _ if bluetooth => self.start_bluetooth(slot_id, interface).map(|()| claimed.push(interface.number + 1)),
+-                3 => self.start_hid(slot_id, interface),
+-                8 => self.start_storage(slot_id, interface),
+-                9 => self.start_hub(slot_id, interface),
+-                _ if net_framing(interface).is_some() => self.start_net(slot_id, interface, configuration).map(|data| claimed.push(data)),
+-                _ => Err(Error::Descriptor),
++            let before = claimed.len();
++            let (started, driver) = match interface.class {
++                _ if bluetooth => (self.start_bluetooth(slot_id, interface).map(|()| claimed.push(interface.number + 1)), "btusb"),
++                3 => (self.start_hid(slot_id, interface), "usbhid"),
++                8 => (self.start_storage(slot_id, interface), "usb-storage"),
++                9 => (self.start_hub(slot_id, interface), "hub"),
++                _ if net_framing(interface).is_some() => (
++                    self.start_net(slot_id, interface, configuration).map(|data| claimed.push(data)),
++                    match net_framing(interface) {
++                        Some(Framing::Ncm) => "cdc_ncm",
++                        Some(Framing::Rndis) => "rndis_host",
++                        _ => "cdc_ether",
++                    },
++                ),
++                _ => (Err(Error::Descriptor), ""),
+             };
++            // The interfaces it took are the kernel's, not programs'.
++            if started.is_ok() {
++                let taken: Vec<u8> = core::iter::once(interface.number).chain(claimed[before..].iter().copied()).collect();
++                if let Some(slot) = self.slots.get_mut(&slot_id) {
++                    for number in taken {
++                        slot.drivers.insert(number, driver);
++                    }
++                }
++            }
+             match started {
+                 Ok(()) => ostd::notice!(
+                     "{}: interface {} (class {:02x}/{:02x}/{:02x}) started",
+@@ -934,7 +983,7 @@ impl Controller {
+             (_, false) => 2,
+             (_, true) => 3,
+         };
+-        slot.ep0.push(Trb { parameter: setup, status: 8, control: Trb::with_type(trb_type::SETUP) | IDT | transfer_type << 16 });
++        let setup_trb = slot.ep0.push(Trb { parameter: setup, status: 8, control: Trb::with_type(trb_type::SETUP) | IDT | transfer_type << 16 });
+         let mut data_trb = None;
+         if length > 0 {
+             data_trb = Some(slot.ep0.push(Trb {
+@@ -946,6 +995,7 @@ impl Controller {
+         // The status stage goes the other way (IN when there is no data).
+         let status_in = length == 0 || !inward;
+         let status_trb = slot.ep0.push(Trb { control: Trb::with_type(trb_type::STATUS) | IOC | u32::from(status_in) << 16, ..Trb::default() });
++        let after = slot.ep0.dequeue_pointer();
+         self.ring(slot_id, 1);
+         let mut received = length;
+         let mut short = false;
+@@ -953,7 +1003,12 @@ impl Controller {
+             // After a short data stage, some controllers (QEMU's) report no
+             // status stage: the transfer is done once it has been quiet.
+             let waited = self.wait_event(
+-                &mut |event| event.kind() == trb_type::TRANSFER_EVENT && event.slot() == slot_id && event.endpoint() == 1,
++                &mut |event| {
++                    event.kind() == trb_type::TRANSFER_EVENT
++                        && event.slot() == slot_id
++                        && event.endpoint() == 1
++                        && (event.parameter == setup_trb || Some(event.parameter) == data_trb || event.parameter == status_trb)
++                },
+                 if short { 100 } else { TRANSFER_TIMEOUT_MS },
+             );
+             let event = match waited {
+@@ -974,7 +1029,7 @@ impl Controller {
+                     self.name, slot_id, request_type, request, value, index, length, code, stage
+                 );
+                 if code == STALL {
+-                    self.recover_control(slot_id);
++                    self.recover_control(slot_id, after);
+                 }
+                 return Err(Error::Completion(code));
+             }
+@@ -985,13 +1040,14 @@ impl Controller {
+     }
+ 
+     /// After a stall, the default endpoint is reset and moved past the
+-    /// failed transfer.
+-    fn recover_control(&mut self, slot_id: u8) {
++    /// failed transfer (`after`: programs' TDs behind it go on).
++    fn recover_control(&mut self, slot_id: u8, after: u64) {
+         let _ = self.command(Trb { control: Trb::with_type(trb_type::RESET_ENDPOINT) | 1 << 16 | u32::from(slot_id) << 24, ..Trb::default() });
+-        let Some(slot) = self.slots.get(&slot_id) else { return };
+-        let dequeue = slot.ep0.dequeue_pointer();
++        if !self.slots.contains_key(&slot_id) {
++            return;
++        }
+         let _ = self.command(Trb {
+-            parameter: dequeue,
++            parameter: after,
+             control: Trb::with_type(trb_type::SET_TR_DEQUEUE) | 1 << 16 | u32::from(slot_id) << 24,
+             ..Trb::default()
+         });
+@@ -1130,6 +1186,10 @@ impl Controller {
+     fn transfer_done(&mut self, event: &Trb) {
+         let (slot_id, dci) = (event.slot(), event.endpoint());
+         let code = event.completion_code();
++        if self.slots.get(&slot_id).is_some_and(|slot| slot.programs.contains_key(&dci)) {
++            self.program_done(slot_id, dci, event);
++            return;
++        }
+         if self.slots.get(&slot_id).is_some_and(|slot| slot.net.iter().any(|net| net.rx_dci == dci || net.tx_dci == dci)) {
+             self.net_transfer_done(slot_id, dci, event);
+             return;
+diff --git a/kernel/comps/usb/src/xhci/programs.rs b/kernel/comps/usb/src/xhci/programs.rs
+new file mode 100755
+index 0000000..2232032
+--- /dev/null
++++ b/kernel/comps/usb/src/xhci/programs.rs
+@@ -0,0 +1,689 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Programs' transfers, on the controller's task (`crate::usbfs`): their TDs
++//! on the device's rings (an endpoint's own, or the default control
++//! endpoint's beside the kernel's requests), their completions, cancels
++//! and timeouts, the endpoints that halted, and the requests that change a
++//! device's configuration or reset its endpoints. A device is published
++//! for programs once its drivers started, and taken back when it goes.
++//!
++//! Reference: Linux's `drivers/usb/host/xhci-ring.c` (`td_to_noop`,
++//! `xhci_handle_halted_endpoint`) and `drivers/usb/core/message.c`.
++
++use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
++
++use ostd::mm::HasDaddr;
++
++use super::{
++    CLEAR_FEATURE, Controller, Data, Error, SET_CONFIGURATION, SET_INTERFACE, SHORT_PACKET, STALL, SUCCESS, Slot,
++    td_remainder,
++};
++use crate::{
++    desc::{Configuration, Endpoint},
++    ring::{CHAIN, IDT, IOC, ISP, ProducerRing, RING_TRBS, Trb, trb_type},
++    usbfs::{self, Action, Command, NewDevice, Request, URB_SHORT_NOT_OK, URB_ZERO_PACKET, Urb, UsbDevice, errno, urb_type},
++};
++
++/// Completion codes of transfers programs see.
++const DATA_BUFFER: u8 = 2;
++const BABBLE: u8 = 3;
++const RESOURCE: u8 = 7;
++const BANDWIDTH: u8 = 21;
++const STOPPED: u8 = 26;
++const STOPPED_LENGTH_INVALID: u8 = 27;
++const STOPPED_SHORT_PACKET: u8 = 28;
++
++/// The pages of a program endpoint's ring: room for one transfer of 16 MiB
++/// in 64 KiB pieces.
++const RING_PAGES: usize = 4;
++/// What programs' TDs may hold of the default control endpoint's ring; the
++/// rest is the kernel's own requests'.
++const EP0_ROOM: usize = RING_TRBS - 1 - 32;
++
++/// What programs have on one endpoint of a device.
++pub(super) struct ProgramEndpoint {
++    /// Its ring (none: the default control endpoint, the slot's own).
++    ring: Option<ProducerRing>,
++    /// TDs on the ring, in order.
++    tds: VecDeque<Td>,
++    /// Transfers waiting for room on the ring, or for the endpoint's reset.
++    waiting: VecDeque<Arc<Urb>>,
++    /// TRBs the TDs hold.
++    used: usize,
++    /// It halted: where it goes once reset, past the TD that failed.
++    halted: Option<u64>,
++}
++
++impl ProgramEndpoint {
++    fn new(ring: Option<ProducerRing>) -> Self {
++        Self { ring, tds: VecDeque::new(), waiting: VecDeque::new(), used: 0, halted: None }
++    }
++
++    fn room(&self) -> usize {
++        self.ring.as_ref().map_or(EP0_ROOM, |ring| ring.capacity() - 2)
++    }
++}
++
++/// A transfer on a ring.
++struct Td {
++    urb: Arc<Urb>,
++    /// Its TRBs: address, data bytes, whether it moves data.
++    trbs: Vec<(u64, usize, bool)>,
++    /// Where the ring is after it, with its cycle bit.
++    after: u64,
++    /// The TRBs it holds of the ring's room.
++    cost: usize,
++}
++
++/// A change a program made with a request of its own.
++pub(super) enum Change {
++    Configuration(u8),
++    Interface(u8, u8),
++}
++
++/// The error a transfer or a request ends with.
++fn errno_of(error: Error) -> i32 {
++    match error {
++        Error::Completion(STALL) => -errno::EPIPE,
++        Error::Completion(BANDWIDTH | RESOURCE) => -errno::ENOSPC,
++        Error::Completion(_) => -errno::EPROTO,
++        Error::Timeout => -errno::ETIMEDOUT,
++        Error::NoMemory => -errno::ENOMEM,
++        Error::Descriptor | Error::NoMedium => -errno::EINVAL,
++    }
++}
++
++/// The endpoint context's type: OUT 1–3, IN 5–7.
++fn kind_of(endpoint: &Endpoint) -> u32 {
++    u32::from(endpoint.transfer_type()) + if endpoint.is_in() { 4 } else { 0 }
++}
++
++fn target(slot_id: u8, dci: u8) -> u32 {
++    u32::from(dci) << 16 | u32::from(slot_id) << 24
++}
++
++/// A string descriptor's text.
++fn text_of(descriptor: &[u8]) -> Option<String> {
++    let units = descriptor.get(2..)?.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
++    let text: String = char::decode_utf16(units).map(|unit| unit.unwrap_or('?')).collect();
++    let text = String::from(text.trim_end_matches('\0').trim());
++    (!text.is_empty()).then_some(text)
++}
++
++impl Controller {
++    // ── Devices ──────────────────────────────────────────────────────────
++
++    /// The root hub, for the tree of devices.
++    pub(super) fn publish_root(&mut self) {
++        let root = UsbDevice::root_hub(self.host.clone(), self.max_ports);
++        usbfs::publish(&root, None);
++        self.root = Some(root);
++    }
++
++    /// The ports from the root hub to a slot's device.
++    fn port_path(&self, slot_id: u8) -> Vec<u8> {
++        let mut path = Vec::new();
++        let mut current = slot_id;
++        while let Some(slot) = self.slots.get(&current) {
++            match slot.parent {
++                Some((hub, port)) => {
++                    path.push(port);
++                    current = hub;
++                }
++                None => {
++                    path.push(slot.port);
++                    break;
++                }
++            }
++            if path.len() > 7 {
++                break;
++            }
++        }
++        path.reverse();
++        path
++    }
++
++    /// A device number not in use, cycling as Linux's do (2–127; the root
++    /// hub is 1).
++    fn allocate_devnum(&mut self) -> Option<u8> {
++        let used: Vec<u8> = self.slots.values().filter_map(|slot| slot.usbfs.as_ref().map(|device| device.devnum)).collect();
++        for _ in 0..126 {
++            let candidate = self.next_devnum;
++            self.next_devnum = if candidate >= 127 { 2 } else { candidate + 1 };
++            if !used.contains(&candidate) {
++                return Some(candidate);
++            }
++        }
++        None
++    }
++
++    /// Gives programs a device whose drivers started: its descriptors as
++    /// read, its configurations, the interfaces its drivers took.
++    pub(super) fn publish_device(&mut self, slot_id: u8, mut device: Vec<u8>, configurations: Vec<(Vec<u8>, Configuration)>, active: u8) {
++        if device.len() < 18 {
++            return;
++        }
++        // The configurations it has here, should one not have been read.
++        device[17] = configurations.len() as u8;
++        let mut strings: [Option<String>; 3] = [None, None, None];
++        for (at, string) in strings.iter_mut().enumerate() {
++            let index = device[14 + at];
++            if index != 0 {
++                *string = self.get_string(slot_id, index).ok().and_then(|descriptor| text_of(&descriptor));
++            }
++        }
++        let ports = self.port_path(slot_id);
++        let Some(devnum) = self.allocate_devnum() else { return };
++        let Some(slot) = self.slots.get(&slot_id) else { return };
++        let parent = match slot.parent {
++            Some((hub, _)) => self.slots.get(&hub).and_then(|hub| hub.usbfs.clone()),
++            None => self.root.clone(),
++        };
++        let mut descriptors = device;
++        let mut parsed = Vec::with_capacity(configurations.len());
++        for (raw, configuration) in configurations {
++            descriptors.extend_from_slice(&raw);
++            parsed.push(configuration);
++        }
++        let usbfs = UsbDevice::new(NewDevice {
++            host: self.host.clone(),
++            slot_id,
++            devnum,
++            ports,
++            speed: slot.speed,
++            descriptors,
++            configurations: parsed,
++            strings,
++            hub_ports: slot.hub.as_ref().map_or(0, |hub| hub.ports),
++            active,
++            drivers: slot.drivers.clone(),
++        });
++        usbfs::publish(&usbfs, parent.as_ref());
++        if let Some(slot) = self.slots.get_mut(&slot_id) {
++            slot.usbfs = Some(usbfs);
++        }
++    }
++
++    /// A device went: what programs had on it ends.
++    pub(super) fn programs_gone(slot: &mut Slot) {
++        for (_, endpoint) in core::mem::take(&mut slot.programs) {
++            for td in endpoint.tds {
++                td.urb.complete(-errno::ESHUTDOWN, 0);
++            }
++            for urb in endpoint.waiting {
++                urb.complete(-errno::ESHUTDOWN, 0);
++            }
++        }
++        if let Some(device) = slot.usbfs.take() {
++            usbfs::remove(&device);
++        }
++    }
++
++    fn owns(&self, device: &Arc<UsbDevice>) -> bool {
++        self.slots
++            .get(&device.slot_id)
++            .and_then(|slot| slot.usbfs.as_ref())
++            .is_some_and(|own| Arc::ptr_eq(own, device))
++    }
++
++    // ── Serving programs ─────────────────────────────────────────────────
++
++    /// Serves programs: endpoints that halted are reset, changes programs
++    /// made are followed, waited-for transfers past their time end, what
++    /// programs asked is done, and transfers that waited for room go.
++    pub(super) fn serve_programs(&mut self) {
++        self.recover_endpoints();
++        for (slot_id, change) in core::mem::take(&mut self.changes) {
++            self.apply_change(slot_id, change);
++        }
++        self.expire_transfers();
++        for request in self.host.take() {
++            match request {
++                Request::Submit(urb) => self.start_transfer(urb),
++                Request::Cancel(urb) => self.cancel_transfer(&urb, -errno::ENOENT),
++                Request::Command(command) => {
++                    let result = self.run_command(&command);
++                    command.finish(result);
++                }
++            }
++        }
++        self.push_waiting();
++    }
++
++    fn start_transfer(&mut self, urb: Arc<Urb>) {
++        if !self.owns(&urb.device) {
++            urb.complete(-errno::ENODEV, 0);
++            return;
++        }
++        let slot_id = urb.device.slot_id;
++        let dci = urb.dci();
++        if !self.slots[&slot_id].programs.contains_key(&dci) {
++            let ring = if dci == 1 {
++                None
++            } else {
++                let Some(ring) = ProducerRing::with_pages(RING_PAGES) else {
++                    urb.complete(-errno::ENOMEM, 0);
++                    return;
++                };
++                if let Err(error) = self.configure_endpoint(slot_id, &urb.endpoint, kind_of(&urb.endpoint), &ring) {
++                    ostd::notice!("{}: slot {}: endpoint {:02x} not configured: {:?}", self.name, slot_id, urb.endpoint.address, error);
++                    urb.complete(errno_of(error), 0);
++                    return;
++                }
++                Some(ring)
++            };
++            if let Some(slot) = self.slots.get_mut(&slot_id) {
++                slot.programs.insert(dci, ProgramEndpoint::new(ring));
++            }
++        }
++        let queued = self
++            .slots
++            .get(&slot_id)
++            .and_then(|slot| slot.programs.get(&dci))
++            .is_none_or(|endpoint| endpoint.halted.is_some() || !endpoint.waiting.is_empty());
++        if queued || !self.push_td(slot_id, dci, &urb) {
++            if let Some(endpoint) = self.slots.get_mut(&slot_id).and_then(|slot| slot.programs.get_mut(&dci)) {
++                endpoint.waiting.push_back(urb);
++            }
++        }
++    }
++
++    /// Puts a transfer's TD on its ring and rings; `false` when the ring has
++    /// no room for it yet.
++    fn push_td(&mut self, slot_id: u8, dci: u8, urb: &Arc<Urb>) -> bool {
++        let version = self.version;
++        let Some(slot) = self.slots.get_mut(&slot_id) else { return false };
++        let Slot { ep0, programs, .. } = slot;
++        let Some(endpoint) = programs.get_mut(&dci) else { return false };
++        let control = urb.kind == urb_type::CONTROL;
++        let inward = urb.inward();
++        let max_packet = usize::from(urb.endpoint.max_packet & 0x7ff).max(1);
++        let mut pieces = urb.pieces();
++        if !control {
++            if pieces.is_empty() {
++                pieces.push((0, 0));
++            }
++            if !inward && urb.flags & URB_ZERO_PACKET != 0 && urb.length > 0 && urb.length % max_packet == 0 {
++                pieces.push((0, 0));
++            }
++        }
++        // Its TRBs, its setup and status stages, a link it may cross.
++        let cost = pieces.len() + 3;
++        if cost > endpoint.room() {
++            urb.complete(-errno::ENOMEM, 0);
++            return true;
++        }
++        if endpoint.used + cost > endpoint.room() {
++            return false;
++        }
++        let ring = match endpoint.ring.as_mut() {
++            Some(ring) => ring,
++            None => ep0,
++        };
++        let total = urb.length;
++        let mut trbs = Vec::with_capacity(cost);
++        if control {
++            let transfer_type = match (total, inward) {
++                (0, _) => 0,
++                (_, false) => 2,
++                (_, true) => 3,
++            };
++            let setup = Trb {
++                parameter: u64::from_le_bytes(urb.setup),
++                status: 8,
++                control: Trb::with_type(trb_type::SETUP) | IDT | transfer_type << 16,
++            };
++            trbs.push((ring.push(setup), 0, false));
++        }
++        let count = pieces.len();
++        let mut transferred = 0;
++        for (index, &(address, length)) in pieces.iter().enumerate() {
++            let last = index + 1 == count;
++            let mut flags = if inward { ISP } else { 0 };
++            let kind = if control && index == 0 {
++                flags |= u32::from(inward) << 16;
++                trb_type::DATA
++            } else {
++                trb_type::NORMAL
++            };
++            flags |= match (control, last) {
++                (_, false) => CHAIN,
++                (false, true) => IOC,
++                (true, true) => 0,
++            };
++            let remainder = td_remainder(version, transferred, length, total, max_packet, !last);
++            let trb = Trb { parameter: address, status: length as u32 | remainder.min(31) << 17, control: Trb::with_type(kind) | flags };
++            trbs.push((ring.push(trb), length, true));
++            transferred += length;
++        }
++        if control {
++            let status_in = total == 0 || !inward;
++            let status = Trb { control: Trb::with_type(trb_type::STATUS) | IOC | u32::from(status_in) << 16, ..Trb::default() };
++            trbs.push((ring.push(status), 0, false));
++        }
++        let after = ring.dequeue_pointer();
++        endpoint.used += cost;
++        endpoint.tds.push_back(Td { urb: urb.clone(), trbs, after, cost });
++        self.ring(slot_id, dci);
++        true
++    }
++
++    /// A transfer event on a program's endpoint.
++    pub(super) fn program_done(&mut self, slot_id: u8, dci: u8, event: &Trb) {
++        let code = event.completion_code();
++        // A stop programs asked for: the TD goes on once the endpoint does.
++        if matches!(code, STOPPED | STOPPED_LENGTH_INVALID | STOPPED_SHORT_PACKET) {
++            return;
++        }
++        let Some(endpoint) = self.slots.get_mut(&slot_id).and_then(|slot| slot.programs.get_mut(&dci)) else { return };
++        let Some(index) = endpoint.tds.iter().position(|td| td.trbs.iter().any(|trb| trb.0 == event.parameter)) else {
++            return;
++        };
++        let residual = (event.status & 0xff_ffff) as usize;
++        let td = &endpoint.tds[index];
++        let mut actual = 0;
++        for &(address, length, data) in &td.trbs {
++            if address == event.parameter {
++                if data {
++                    actual += length.saturating_sub(residual);
++                }
++                break;
++            }
++            if data {
++                actual += length;
++            }
++        }
++        let last = td.trbs.last().is_some_and(|trb| trb.0 == event.parameter);
++        let status = match code {
++            // An event the TD did not ask for.
++            SUCCESS if !last => return,
++            SUCCESS => 0,
++            SHORT_PACKET if td.urb.flags & URB_SHORT_NOT_OK != 0 => -errno::EREMOTEIO,
++            SHORT_PACKET => 0,
++            STALL => -errno::EPIPE,
++            DATA_BUFFER | BABBLE => -errno::EOVERFLOW,
++            _ => -errno::EPROTO,
++        };
++        let Some(td) = endpoint.tds.remove(index) else { return };
++        endpoint.used -= td.cost;
++        if !matches!(code, SUCCESS | SHORT_PACKET) {
++            endpoint.halted = Some(td.after);
++        }
++        if status == 0 && td.urb.kind == urb_type::CONTROL {
++            let setup = td.urb.setup;
++            match (setup[0], setup[1]) {
++                (0x00, SET_CONFIGURATION) => self.changes.push((slot_id, Change::Configuration(setup[2]))),
++                (0x01, SET_INTERFACE) => self.changes.push((slot_id, Change::Interface(setup[4], setup[2]))),
++                _ => {}
++            }
++        }
++        td.urb.complete(status, actual);
++    }
++
++    /// Endpoints that halted (a stall, a transaction error) are reset and
++    /// moved past the TD that failed; the TDs after it go on.
++    fn recover_endpoints(&mut self) {
++        let halted: Vec<(u8, u8, u64)> = self
++            .slots
++            .iter()
++            .flat_map(|(&slot_id, slot)| {
++                slot.programs.iter().filter_map(move |(&dci, endpoint)| endpoint.halted.map(|after| (slot_id, dci, after)))
++            })
++            .collect();
++        for (slot_id, dci, after) in halted {
++            let target = target(slot_id, dci);
++            if self.command(Trb { control: Trb::with_type(trb_type::RESET_ENDPOINT) | target, ..Trb::default() }).is_err() {
++                let _ = self.command(Trb { control: Trb::with_type(trb_type::STOP_ENDPOINT) | target, ..Trb::default() });
++            }
++            let _ = self.command(Trb { parameter: after, control: Trb::with_type(trb_type::SET_TR_DEQUEUE) | target, ..Trb::default() });
++            if let Some(endpoint) = self.slots.get_mut(&slot_id).and_then(|slot| slot.programs.get_mut(&dci)) {
++                endpoint.halted = None;
++            }
++            self.ring(slot_id, dci);
++        }
++    }
++
++    /// Waited-for transfers past their time end (`ETIMEDOUT`).
++    fn expire_transfers(&mut self) {
++        let now = crate::now_ms();
++        let expired: Vec<Arc<Urb>> = self
++            .slots
++            .values()
++            .flat_map(|slot| slot.programs.values())
++            .flat_map(|endpoint| endpoint.tds.iter().map(|td| &td.urb).chain(endpoint.waiting.iter()))
++            .filter(|urb| urb.deadline.is_some_and(|deadline| deadline <= now))
++            .cloned()
++            .collect();
++        for urb in expired {
++            self.cancel_transfer(&urb, -errno::ETIMEDOUT);
++        }
++    }
++
++    /// Takes a transfer back: the endpoint stops, its TD's TRBs become No
++    /// Ops (and the endpoint moves past it if it was on it), and it goes
++    /// on with the others (Linux's `td_to_noop`).
++    fn cancel_transfer(&mut self, urb: &Arc<Urb>, status: i32) {
++        let slot_id = urb.device.slot_id;
++        let dci = urb.dci();
++        if !self.owns(&urb.device) {
++            urb.complete(status, 0);
++            return;
++        }
++        let halted = {
++            let Some(endpoint) = self.slots.get_mut(&slot_id).and_then(|slot| slot.programs.get_mut(&dci)) else {
++                urb.complete(status, 0);
++                return;
++            };
++            if let Some(at) = endpoint.waiting.iter().position(|each| Arc::ptr_eq(each, urb)) {
++                if let Some(urb) = endpoint.waiting.remove(at) {
++                    urb.complete(status, 0);
++                }
++                return;
++            }
++            if !endpoint.tds.iter().any(|td| Arc::ptr_eq(&td.urb, urb)) {
++                return;
++            }
++            endpoint.halted.is_some()
++        };
++        let target = target(slot_id, dci);
++        let stopped = !halted && self.command(Trb { control: Trb::with_type(trb_type::STOP_ENDPOINT) | target, ..Trb::default() }).is_ok();
++        // Where the controller stopped.
++        let dequeue = self.slots.get(&slot_id).map_or(0, |slot| {
++            (u64::from(self.output_read(slot, usize::from(dci), 2)) | u64::from(self.output_read(slot, usize::from(dci), 3)) << 32) & !0xf
++        });
++        let Some(slot) = self.slots.get_mut(&slot_id) else { return };
++        let Slot { ep0, programs, .. } = slot;
++        let Some(endpoint) = programs.get_mut(&dci) else { return };
++        let Some(index) = endpoint.tds.iter().position(|td| Arc::ptr_eq(&td.urb, urb)) else {
++            // It ended while the endpoint stopped.
++            if stopped {
++                self.ring(slot_id, dci);
++            }
++            return;
++        };
++        let Some(td) = endpoint.tds.remove(index) else { return };
++        endpoint.used -= td.cost;
++        let ring: &ProducerRing = endpoint.ring.as_ref().unwrap_or(ep0);
++        for &(address, _, _) in &td.trbs {
++            ring.to_noop(address);
++        }
++        if td.trbs.windows(2).any(|pair| pair[1].0 < pair[0].0) {
++            ring.unchain_link();
++        }
++        let inside = td.trbs.iter().any(|trb| trb.0 == dequeue);
++        td.urb.complete(status, 0);
++        if stopped && inside {
++            let _ = self.command(Trb { parameter: td.after, control: Trb::with_type(trb_type::SET_TR_DEQUEUE) | target, ..Trb::default() });
++        }
++        if !halted {
++            self.ring(slot_id, dci);
++        }
++    }
++
++    /// Transfers that waited go, as their rings have room.
++    fn push_waiting(&mut self) {
++        let ready: Vec<(u8, u8)> = self
++            .slots
++            .iter()
++            .flat_map(|(&slot_id, slot)| {
++                slot.programs
++                    .iter()
++                    .filter(|(_, endpoint)| endpoint.halted.is_none() && !endpoint.waiting.is_empty())
++                    .map(move |(&dci, _)| (slot_id, dci))
++            })
++            .collect();
++        for (slot_id, dci) in ready {
++            loop {
++                let next = self.slots.get(&slot_id).and_then(|slot| slot.programs.get(&dci)).and_then(|endpoint| endpoint.waiting.front().cloned());
++                let Some(urb) = next else { break };
++                if !self.push_td(slot_id, dci, &urb) {
++                    break;
++                }
++                if let Some(endpoint) = self.slots.get_mut(&slot_id).and_then(|slot| slot.programs.get_mut(&dci)) {
++                    endpoint.waiting.pop_front();
++                }
++            }
++        }
++    }
++
++    // ── Configurations and endpoints ─────────────────────────────────────
++
++    /// The endpoints programs used on a slot (not the default one).
++    fn program_dcis(&self, slot_id: u8) -> Vec<u8> {
++        self.slots.get(&slot_id).map_or(Vec::new(), |slot| slot.programs.keys().copied().filter(|dci| *dci != 1).collect())
++    }
++
++    /// Endpoints programs used are let go: their transfers end with
++    /// `status`, the controller drops them (their data toggles start over
++    /// when they are used again).
++    fn forget_endpoints(&mut self, slot_id: u8, dcis: &[u8], status: i32) {
++        let known: Vec<u8> = match self.slots.get(&slot_id) {
++            Some(slot) => dcis.iter().copied().filter(|dci| *dci != 1 && slot.programs.contains_key(dci)).collect(),
++            None => return,
++        };
++        if known.is_empty() {
++            return;
++        }
++        for &dci in &known {
++            let busy = self.slots.get(&slot_id).and_then(|slot| slot.programs.get(&dci)).is_some_and(|endpoint| !endpoint.tds.is_empty());
++            if busy {
++                let _ = self.command(Trb { control: Trb::with_type(trb_type::STOP_ENDPOINT) | target(slot_id, dci), ..Trb::default() });
++            }
++        }
++        let mut ended = Vec::new();
++        if let Some(slot) = self.slots.get_mut(&slot_id) {
++            for dci in &known {
++                if let Some(endpoint) = slot.programs.remove(dci) {
++                    ended.extend(endpoint.tds.into_iter().map(|td| td.urb));
++                    ended.extend(endpoint.waiting);
++                }
++            }
++        }
++        self.drop_endpoints(slot_id, &known);
++        for urb in ended {
++            urb.complete(status, 0);
++        }
++    }
++
++    /// Drops endpoints from the slot's configuration.
++    fn drop_endpoints(&mut self, slot_id: u8, dcis: &[u8]) {
++        let Some(slot) = self.slots.get(&slot_id) else { return };
++        self.clear_input(slot);
++        let dropped = dcis.iter().fold(0u32, |flags, dci| flags | 1 << dci);
++        self.input_write(slot, 0, 0, dropped);
++        self.input_write(slot, 0, 1, 1);
++        for dword in 0..4 {
++            let value = if dword == 3 { 0 } else { self.output_read(slot, 0, dword) };
++            self.input_write(slot, 1, dword, value);
++        }
++        let input = slot.input.daddr() as u64;
++        let _ = self.command(Trb {
++            parameter: input,
++            control: Trb::with_type(trb_type::CONFIGURE_ENDPOINT) | u32::from(slot_id) << 24,
++            ..Trb::default()
++        });
++    }
++
++    fn apply_change(&mut self, slot_id: u8, change: Change) {
++        let Some(device) = self.slots.get(&slot_id).and_then(|slot| slot.usbfs.clone()) else { return };
++        match change {
++            Change::Configuration(value) => {
++                let dcis = self.program_dcis(slot_id);
++                self.forget_endpoints(slot_id, &dcis, -errno::ESHUTDOWN);
++                let mut state = device.state.lock();
++                state.active = value;
++                state.alternates.clear();
++            }
++            Change::Interface(interface, alternate) => {
++                let dcis = device.interface_dcis(interface);
++                self.forget_endpoints(slot_id, &dcis, -errno::ESHUTDOWN);
++                device.state.lock().alternates.insert(interface, alternate);
++            }
++        }
++    }
++
++    /// Does what a program asked of a device; returns 0 or a negative error.
++    fn run_command(&mut self, command: &Command) -> i32 {
++        let device = &command.device;
++        if !self.owns(device) {
++            return -errno::ENODEV;
++        }
++        let slot_id = device.slot_id;
++        match command.action {
++            Action::Configuration(value) => {
++                let value = value.clamp(0, 255) as u16;
++                let dcis = self.program_dcis(slot_id);
++                self.forget_endpoints(slot_id, &dcis, -errno::ESHUTDOWN);
++                if let Err(error) = self.control(slot_id, 0x00, SET_CONFIGURATION, value, 0, Data::None) {
++                    return errno_of(error);
++                }
++                let mut state = device.state.lock();
++                state.active = value as u8;
++                state.alternates.clear();
++                0
++            }
++            Action::Interface(interface, alternate) => {
++                let dcis = device.interface_dcis(interface);
++                self.forget_endpoints(slot_id, &dcis, -errno::ESHUTDOWN);
++                match self.control(slot_id, 0x01, SET_INTERFACE, u16::from(alternate), u16::from(interface), Data::None) {
++                    Ok(_) => {}
++                    // A device with one setting may refuse the request (Linux's `usb_set_interface`).
++                    Err(Error::Completion(STALL)) if device.settings_of(interface) == 1 => {}
++                    Err(error) => return errno_of(error),
++                }
++                if alternate == 0 {
++                    device.state.lock().alternates.remove(&interface);
++                } else {
++                    device.state.lock().alternates.insert(interface, alternate);
++                }
++                0
++            }
++            Action::ClearHalt(address) => {
++                let result = self.control(slot_id, 0x02, CLEAR_FEATURE, 0, u16::from(address), Data::None);
++                let dci = Endpoint { address, ..Endpoint::default() }.dci();
++                self.forget_endpoints(slot_id, &[dci], -errno::ENOENT);
++                result.map_or_else(errno_of, |_| 0)
++            }
++            Action::ResetEndpoint(address) => {
++                let dci = Endpoint { address, ..Endpoint::default() }.dci();
++                self.forget_endpoints(slot_id, &[dci], -errno::ENOENT);
++                0
++            }
++            Action::Reset => {
++                let dcis = self.program_dcis(slot_id);
++                self.forget_endpoints(slot_id, &dcis, -errno::ESHUTDOWN);
++                let (active, alternates) = {
++                    let state = device.state.lock();
++                    (state.active, state.alternates.clone())
++                };
++                if let Err(error) = self.control(slot_id, 0x00, SET_CONFIGURATION, u16::from(active), 0, Data::None) {
++                    return errno_of(error);
++                }
++                for (interface, alternate) in alternates {
++                    let _ = self.control(slot_id, 0x01, SET_INTERFACE, u16::from(alternate), u16::from(interface), Data::None);
++                }
++                0
++            }
++        }
++    }
++}
+diff --git a/kernel/core/comps/device/src/common/attr.rs b/kernel/core/comps/device/src/common/attr.rs
+index 9ad02c6..096effa 100644
+--- a/kernel/core/comps/device/src/common/attr.rs
++++ b/kernel/core/comps/device/src/common/attr.rs
+@@ -23,7 +23,7 @@ use core::fmt::{self, Write};
+ use aster_systree::{MAX_ATTR_SIZE, SysAttrSet, SysAttrSetBuilder, SysPerms};
+ use aster_util::printer::VmPrinter;
+ use ostd::{
+-    mm::{FallibleVmRead, VmReader, VmWriter},
++    mm::{FallibleVmRead, FallibleVmWrite, VmReader, VmWriter},
+     sync::RwMutex,
+ };
+ 
+@@ -38,12 +38,16 @@ pub type ShowFn<D> = fn(&D, &mut dyn Write) -> Result<()>;
+ /// A function that consumes the text written to an attribute.
+ pub type StoreFn<D> = fn(&D, &str) -> Result<()>;
+ 
++/// A function that produces the bytes of a binary attribute.
++pub type BytesFn<D> = fn(&D) -> Vec<u8>;
++
+ /// A statically declared attribute of devices of type `D`.
+ pub struct Attr<D: ?Sized> {
+     name: &'static str,
+     perms: SysPerms,
+     show: Option<ShowFn<D>>,
+     store: Option<StoreFn<D>>,
++    bytes: Option<BytesFn<D>>,
+ }
+ 
+ impl<D: ?Sized> Attr<D> {
+@@ -54,6 +58,19 @@ impl<D: ?Sized> Attr<D> {
+             perms: SysPerms::DEFAULT_RO_ATTR_PERMS,
+             show: Some(show),
+             store: None,
++            bytes: None,
++        }
++    }
++
++    /// Creates a read-only binary attribute (Linux's `bin_attribute`): its
++    /// bytes, as they are, of any length (a USB device's `descriptors`).
++    pub const fn bin(name: &'static str, bytes: BytesFn<D>) -> Self {
++        Self {
++            name,
++            perms: SysPerms::DEFAULT_RO_ATTR_PERMS,
++            show: None,
++            store: None,
++            bytes: Some(bytes),
+         }
+     }
+ 
+@@ -64,6 +81,7 @@ impl<D: ?Sized> Attr<D> {
+             perms: SysPerms::DEFAULT_RW_ATTR_PERMS,
+             show: Some(show),
+             store: Some(store),
++            bytes: None,
+         }
+     }
+ 
+@@ -74,6 +92,7 @@ impl<D: ?Sized> Attr<D> {
+             perms: SysPerms::OWNER_W,
+             show: None,
+             store: Some(store),
++            bytes: None,
+         }
+     }
+ 
+@@ -112,6 +131,7 @@ pub struct TyErasedAttr {
+     perms: SysPerms,
+     show: Option<TyErasedShowFn>,
+     store: Option<TyErasedStoreFn>,
++    bytes: Option<TyErasedBytesFn>,
+ }
+ 
+ impl fmt::Debug for TyErasedAttr {
+@@ -143,11 +163,18 @@ impl TyErasedAttr {
+                 store(dev, s)
+             })
+         });
++        let bytes = attr.bytes.map(|bytes| -> TyErasedBytesFn {
++            Arc::new(move |dev: &dyn AnyDevice| {
++                let dev = dev.as_any().downcast_ref::<D>().unwrap();
++                bytes(dev)
++            })
++        });
+         Self {
+             name: attr.name,
+             perms: attr.perms,
+             show,
+             store,
++            bytes,
+         }
+     }
+ 
+@@ -182,11 +209,23 @@ impl TyErasedAttr {
+                     store(dev, s)
+                 })
+             });
++            let bytes = attr.bytes.map(|bytes| -> TyErasedBytesFn {
++                let owner = Arc::downgrade(driver);
++                Arc::new(move |dev| {
++                    let dev = dev.as_any().downcast_ref::<BusDevice<B>>().unwrap();
++                    let _guard = dev.bind_lock().lock();
++                    match dev.driver() {
++                        Some(driver) if Weak::ptr_eq(&owner, &Arc::downgrade(&driver)) => bytes(dev),
++                        _ => Vec::new(),
++                    }
++                })
++            });
+             attrs.push(Self {
+                 name: attr.name,
+                 perms: attr.perms,
+                 show,
+                 store,
++                bytes,
+             });
+         }
+         attrs
+@@ -201,6 +240,7 @@ impl TyErasedAttr {
+             store: attr
+                 .store
+                 .map(|store| -> TyErasedStoreFn { Arc::new(store) }),
++            bytes: attr.bytes.map(|bytes| -> TyErasedBytesFn { Arc::new(bytes) }),
+         }
+     }
+ }
+@@ -291,13 +331,19 @@ impl AttrTable {
+         offset: usize,
+         writer: &mut VmWriter,
+     ) -> aster_systree::Result<usize> {
+-        let show = {
++        let (show, bytes) = {
+             let inner = self.inner.read();
+             let attr = inner.ops.get(name).ok_or(aster_systree::Error::NotFound)?;
+-            attr.show
+-                .clone()
+-                .ok_or(aster_systree::Error::PermissionDenied)?
++            (attr.show.clone(), attr.bytes.clone())
+         };
++        if let Some(bytes) = bytes {
++            let bytes = bytes(dev);
++            let rest = &bytes[offset.min(bytes.len())..];
++            return writer
++                .write_fallible(&mut VmReader::from(rest))
++                .map_err(|_| aster_systree::Error::PageFault);
++        }
++        let show = show.ok_or(aster_systree::Error::PermissionDenied)?;
+         let mut printer = VmPrinter::new_skip(writer, offset);
+         show(dev, &mut printer)?;
+         Ok(printer.bytes_written())
+@@ -352,3 +398,4 @@ struct TableInner {
+ 
+ type TyErasedShowFn = Arc<dyn Fn(&dyn AnyDevice, &mut dyn Write) -> Result<()> + Send + Sync>;
+ type TyErasedStoreFn = Arc<dyn Fn(&dyn AnyDevice, &str) -> Result<()> + Send + Sync>;
++type TyErasedBytesFn = Arc<dyn Fn(&dyn AnyDevice) -> Vec<u8> + Send + Sync>;
+diff --git a/kernel/core/comps/device/src/common/mod.rs b/kernel/core/comps/device/src/common/mod.rs
+index d27fc7b..68bd938 100644
+--- a/kernel/core/comps/device/src/common/mod.rs
++++ b/kernel/core/comps/device/src/common/mod.rs
+@@ -46,7 +46,7 @@ use self::{
+     node::{Dir, SysTreeEdit},
+ };
+ pub use self::{
+-    attr::{Attr, ShowFn, StoreFn},
++    attr::{Attr, BytesFn, ShowFn, StoreFn},
+     bare_device::BareDevice,
+     devnum::{DEFAULT_DEVNODE_MODE, DevKind, DevNum},
+     error::{Error, Result},
+diff --git a/kernel/core/src/context.rs b/kernel/core/src/context.rs
+index 3314522..8824c95 100644
+--- a/kernel/core/src/context.rs
++++ b/kernel/core/src/context.rs
+@@ -59,6 +59,12 @@ macro_rules! current_userspace {
+ 
+ pub(crate) use current_userspace;
+ 
++/// Runs `f` with the current task's user space: for a device whose ioctls
++/// follow pointers inside their argument (usbfs's transfers and URBs).
++pub fn with_current_userspace<R>(f: impl FnOnce(&CurrentUserSpace<'_>) -> R) -> R {
++    f(&current_userspace!())
++}
++
+ impl<'a> CurrentUserSpace<'a> {
+     /// Creates a new `CurrentUserSpace` from the current task.
+     ///
+diff --git a/kernel/core/src/device/mod.rs b/kernel/core/src/device/mod.rs
+index da1ef05..55adde0 100644
+--- a/kernel/core/src/device/mod.rs
++++ b/kernel/core/src/device/mod.rs
+@@ -46,6 +46,15 @@ impl Debug for dyn Device {
+     }
+ }
+ 
++/// Tells user space that a device came or went (`add`, `remove`,
++/// `change`...): a kernel uevent to the netlink sockets listening for
++/// them, as Linux sends one when a device is added or removed. `devpath`
++/// is the device's sysfs path (`/devices/...`).
++pub fn uevent(action: &str, devpath: &str, subsystem: &str, envs: &[(&str, &str)]) {
++    let envs = envs.iter().map(|(key, value)| (String::from(*key), String::from(*value))).collect();
++    crate::net::socket::netlink::broadcast_uevent(action, devpath, subsystem, envs);
++}
++
+ /// Device type
+ #[derive(Debug)]
+ pub enum DeviceType {
+diff --git a/kernel/core/src/net/socket/ip/stream/connected.rs b/kernel/core/src/net/socket/ip/stream/connected.rs
+index 1064f32..0859308 100644
+--- a/kernel/core/src/net/socket/ip/stream/connected.rs
++++ b/kernel/core/src/net/socket/ip/stream/connected.rs
+@@ -139,7 +139,7 @@ impl ConnectedStream {
+     }
+ 
+     pub(super) fn local_endpoint(&self) -> IpEndpoint {
+-        self.tcp_conn.local_endpoint()
++        self.tcp_conn.connection_local_endpoint()
+     }
+ 
+     pub(super) fn remote_endpoint(&self) -> IpEndpoint {
+diff --git a/kernel/core/src/net/socket/netlink/kobject_uevent/message/mod.rs b/kernel/core/src/net/socket/netlink/kobject_uevent/message/mod.rs
+index 629e239..41d6509 100644
+--- a/kernel/core/src/net/socket/netlink/kobject_uevent/message/mod.rs
++++ b/kernel/core/src/net/socket/netlink/kobject_uevent/message/mod.rs
+@@ -1,12 +1,14 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-#![cfg_attr(not(ktest), expect(dead_code))]
++#![cfg_attr(not(ktest), allow(dead_code))]
+ 
+-use uevent::Uevent;
++use uevent::{SysObjAction, Uevent};
+ 
+ use crate::{
+     net::socket::netlink::{
+-        NetlinkSocketAddr, receiver::QueueableMessage, table::MulticastMessage,
++        GroupIdSet, NetlinkSocketAddr,
++        receiver::QueueableMessage,
++        table::{self, MulticastMessage, NetlinkUeventProtocol, SupportedNetlinkProtocol},
+     },
+     prelude::*,
+     util::MultiWrite,
+@@ -50,6 +52,21 @@ impl UeventMessage {
+     }
+ }
+ 
++/// The group the kernel's uevents go to (udev's tools, libusb's hotplug).
++const KERNEL_GROUP: u32 = 1;
++
++/// Sends a uevent from the kernel (port 0) to the sockets in its group, as
++/// Linux's `kobject_uevent` does when a device comes or goes.
++pub(crate) fn broadcast(action: &str, devpath: &str, subsystem: &str, envs: Vec<(String, String)>) {
++    let Ok(action) = action.parse::<SysObjAction>() else { return };
++    if !table::is_ready() || !devpath.starts_with('/') {
++        return;
++    }
++    let groups = GroupIdSet::new(KERNEL_GROUP);
++    let uevent = Uevent::new(action, devpath.to_string(), subsystem.to_string(), envs);
++    let _ = NetlinkUeventProtocol::multicast(groups, UeventMessage::new(uevent, NetlinkSocketAddr::new(0, groups)));
++}
++
+ impl QueueableMessage for UeventMessage {
+     fn total_len(&self) -> usize {
+         self.uevent.len()
+diff --git a/kernel/core/src/net/socket/netlink/kobject_uevent/message/uevent.rs b/kernel/core/src/net/socket/netlink/kobject_uevent/message/uevent.rs
+index d61c237..7241fc4 100644
+--- a/kernel/core/src/net/socket/netlink/kobject_uevent/message/uevent.rs
++++ b/kernel/core/src/net/socket/netlink/kobject_uevent/message/uevent.rs
+@@ -97,7 +97,7 @@ pub(super) struct Uevent {
+ 
+ impl Uevent {
+     /// Creates a new uevent.
+-    fn new(
++    pub(super) fn new(
+         action: SysObjAction,
+         devpath: String,
+         subsystem: String,
+diff --git a/kernel/core/src/net/socket/netlink/kobject_uevent/mod.rs b/kernel/core/src/net/socket/netlink/kobject_uevent/mod.rs
+index 774e3d9..ed7ada2 100644
+--- a/kernel/core/src/net/socket/netlink/kobject_uevent/mod.rs
++++ b/kernel/core/src/net/socket/netlink/kobject_uevent/mod.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ pub(super) use message::UeventMessage;
++pub(crate) use message::broadcast;
+ 
+ use crate::net::socket::netlink::{common::NetlinkSocket, table::NetlinkUeventProtocol};
+ 
+diff --git a/kernel/core/src/net/socket/netlink/mod.rs b/kernel/core/src/net/socket/netlink/mod.rs
+index 1ba8ce5..84b0eab 100644
+--- a/kernel/core/src/net/socket/netlink/mod.rs
++++ b/kernel/core/src/net/socket/netlink/mod.rs
+@@ -49,7 +49,7 @@ mod table;
+ 
+ pub(crate) use addr::{GroupIdSet, NetlinkSocketAddr};
+ pub(crate) use generic::NetlinkGenericSocket;
+-pub(crate) use kobject_uevent::NetlinkUeventSocket;
++pub(crate) use kobject_uevent::{NetlinkUeventSocket, broadcast as broadcast_uevent};
+ pub(crate) use options::{AddMembership, DropMembership};
+ pub(super) use receiver::NETLINK_DEFAULT_BUF_SIZE;
+ pub(crate) use route::NetlinkRouteSocket;
+diff --git a/kernel/core/src/net/socket/netlink/table/mod.rs b/kernel/core/src/net/socket/netlink/table/mod.rs
+index ab16069..af75094 100644
+--- a/kernel/core/src/net/socket/netlink/table/mod.rs
++++ b/kernel/core/src/net/socket/netlink/table/mod.rs
+@@ -283,6 +283,11 @@ pub(super) fn init() {
+     NETLINK_SOCKET_TABLE.call_once(NetlinkSocketTable::new);
+ }
+ 
++/// Whether the sockets' table is there (messages can be sent).
++pub(super) fn is_ready() -> bool {
++    NETLINK_SOCKET_TABLE.get().is_some()
++}
++
+ /// Returns whether the `protocol` is valid.
+ pub(crate) fn is_valid_protocol(protocol: NetlinkProtocolId) -> bool {
+     protocol < MAX_ALLOWED_PROTOCOL_ID
+diff --git a/kernel/core/src/process/signal/mod.rs b/kernel/core/src/process/signal/mod.rs
+index 19fabb8..b28e70b 100644
+--- a/kernel/core/src/process/signal/mod.rs
++++ b/kernel/core/src/process/signal/mod.rs
+@@ -24,7 +24,7 @@ use ostd::{
+ pub(crate) use pause::{Pause, PauseReason, with_sigmask_changed};
+ pub(crate) use pending::{DequeuedSignal, HandlePendingSignal};
+ pub(crate) use poll::{PollAdaptor, Pollee, Poller};
+-pub use poll::{PollHandle, Pollable};
++pub use poll::{PollHandle, PollSource, Pollable};
+ use sig_action::{SigAction, SigActionFlags, SigDefaultAction};
+ use sig_mask::SigMask;
+ use sig_num::SigNum;
+diff --git a/kernel/core/src/process/signal/poll.rs b/kernel/core/src/process/signal/poll.rs
+index e3002b4..e583068 100644
+--- a/kernel/core/src/process/signal/poll.rs
++++ b/kernel/core/src/process/signal/poll.rs
+@@ -331,6 +331,39 @@ impl Observer<IoEvents> for Waker {
+ /// This trait is added instead of creating a new method in [`Pollee`] because sometimes we do not
+ /// have access to the internal [`Pollee`], but there is a method that provides the same semantics
+ /// as [`Pollable::poll`] and we need to perform event-based operations using that method.
++/// A [`Pollee`] for components outside this crate: the events of a device
++/// file and the pollers waiting for them.
++#[derive(Clone)]
++pub struct PollSource(Pollee);
++
++impl PollSource {
++    /// Creates a poll source with no events.
++    pub fn new() -> Self {
++        Self(Pollee::new())
++    }
++
++    /// See [`Pollee::poll_with`].
++    pub fn poll_with(&self, mask: IoEvents, poller: Option<&mut PollHandle>, check: impl FnOnce() -> IoEvents) -> IoEvents {
++        self.0.poll_with(mask, poller, check)
++    }
++
++    /// See [`Pollee::notify`].
++    pub fn notify(&self, events: IoEvents) {
++        self.0.notify(events)
++    }
++
++    /// See [`Pollee::invalidate`].
++    pub fn invalidate(&self) {
++        self.0.invalidate()
++    }
++}
++
++impl Default for PollSource {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
+ pub trait Pollable {
+     /// Returns the interesting events now and monitors their occurrence in the future if the
+     /// poller is provided.
+diff --git a/kernel/libs/aster-bigtcp/src/socket/bound/tcp_conn.rs b/kernel/libs/aster-bigtcp/src/socket/bound/tcp_conn.rs
+index e2d0642..6eef848 100644
+--- a/kernel/libs/aster-bigtcp/src/socket/bound/tcp_conn.rs
++++ b/kernel/libs/aster-bigtcp/src/socket/bound/tcp_conn.rs
+@@ -342,6 +342,13 @@ impl<E: Ext> TcpConnection<E> {
+         Ok(connection)
+     }
+ 
++    /// Returns the connection's own address: the one its peer reached, as
++    /// Linux's `getsockname` gives it (for a connection a listener on the
++    /// any address accepted, not the listener's address).
++    pub fn connection_local_endpoint(&self) -> IpEndpoint {
++        self.0.connection_key().local_endpoint()
++    }
++
+     /// Returns the state of the connecting procedure.
+     pub fn connect_state(&self) -> ConnectState {
+         let socket = self.0.inner.lock();
+diff --git a/kernel/libs/aster-bigtcp/src/socket_table.rs b/kernel/libs/aster-bigtcp/src/socket_table.rs
+index 286f1a4..5aca472 100644
+--- a/kernel/libs/aster-bigtcp/src/socket_table.rs
++++ b/kernel/libs/aster-bigtcp/src/socket_table.rs
+@@ -87,6 +87,10 @@ impl ConnectionKey {
+     pub(crate) const fn remote_endpoint(&self) -> IpEndpoint {
+         IpEndpoint::new(self.remote_addr, self.remote_port)
+     }
++
++    pub(crate) const fn local_endpoint(&self) -> IpEndpoint {
++        IpEndpoint::new(self.local_addr, self.local_port)
++    }
+ }
+ 
+ impl From<(IpEndpoint, IpEndpoint)> for ConnectionKey {

@@ -2,6 +2,11 @@ let
   upstream = import ./default.nix { };
   pkgs = import ../../../distro/nixpkgs.nix { };
   inherit (pkgs) lib;
+  # USB devices for programs as the kernel gives them without udev: usbfs's
+  # /dev/bus/usb, /sys/bus/usb and the kernel's uevents (kernel/patches
+  # 0052), where libusb finds them and hears them come and go. Every program
+  # here that talks to USB devices itself takes this one.
+  libusb = pkgs.libusb1.override { enableUdev = false; };
   node = pkgs.nodejs_24;
   python = pkgs.python3;
   probes = ./openshell-probes;
@@ -16,6 +21,16 @@ let
       pkgs.writeShellScriptBin "openshell-native-install" ''
         export PATH=${lib.makeBinPath [ pkgs.parted pkgs.e2fsprogs pkgs.dosfstools pkgs.mtools ]}:$PATH
         ${builtins.readFile ./openshell-media/install.sh}
+      ''
+    else
+      null;
+  # Updating an installed system from the live medium (distro/image/update.sh):
+  # the boot menu's "Update installed OpenShell Native".
+  updater =
+    if media then
+      pkgs.writeShellScriptBin "openshell-native-update" ''
+        export PATH=${lib.makeBinPath [ pkgs.e2fsprogs ]}:$PATH
+        ${builtins.readFile ./openshell-media/update.sh}
       ''
     else
       null;
@@ -109,6 +124,10 @@ let
           in
           {
             supplicant = pkgs.wpa_supplicant;
+            # Bluetooth: BlueZ's daemon on the system bus (installed-session.sh
+            # starts it) and bluetoothctl, which hostd runs for Settings ▸
+            # Bluetooth, as on Live; the kernel serves the controllers.
+            bluetooth = pkgs.bluez;
             firmware = pkgs.runCommand "openshell-wireless-firmware-${pkgs.linux-firmware.version}" { } ''
               mkdir -p "$out/lib/firmware"
               cd ${pkgs.linux-firmware}/lib/firmware
@@ -119,8 +138,17 @@ let
                   found=1
                   mkdir -p "$out/lib/firmware/$(dirname "$file")"
                   # linux-firmware links the names drivers ask for to the
-                  # files: the image gets the files under those names.
-                  cp -L "$file" "$out/lib/firmware/$file"
+                  # files (many names to one file, as Intel's Bluetooth
+                  # firmware): the image gets the names as links and each
+                  # file once.
+                  target=$(realpath --relative-to=. "$file")
+                  if [ ! -e "$out/lib/firmware/$target" ]; then
+                    mkdir -p "$out/lib/firmware/$(dirname "$target")"
+                    cp "$target" "$out/lib/firmware/$target"
+                  fi
+                  if [ "$target" != "$file" ] && [ ! -e "$out/lib/firmware/$file" ]; then
+                    ln -s "$(realpath --relative-to="$(dirname "$file")" "$file")" "$out/lib/firmware/$file"
+                  fi
                 done
                 if [ -z "$found" ]; then
                   echo "linux-firmware ${pkgs.linux-firmware.version} has no $pattern" >&2
@@ -147,11 +175,18 @@ let
         # cups-filters and Ghostscript, which turn a PDF or an image into
         # what a printer that takes neither prints (PWG and Apple raster,
         # PCL, PostScript).
+        # The `usb` backend reaches USB printers through libusb, which finds
+        # them as the kernel gives them without udev (`libusb` above).
+        # ipp-usb, as on Debian, gives each printer that speaks IPP over USB
+        # (most made since 2015) as a printer on this computer that Avahi
+        # announces: Settings lists it with the network's and CUPS prints to
+        # it without a driver (installed-session.sh starts it).
         printing = rec {
-          cups = pkgs.cups;
+          cups = pkgs.cups.override { libusb1 = libusb; };
+          ippUsb = pkgs.ipp-usb.override { libusb1 = libusb; };
           programs = pkgs.buildEnv {
             name = "openshell-cups-programs";
-            paths = [ pkgs.cups.out pkgs.libcupsfilters pkgs.cups-filters pkgs.ghostscript ];
+            paths = [ cups.out pkgs.libcupsfilters pkgs.cups-filters pkgs.ghostscript ];
             pathsToLink = [ "/lib" "/share/cups" "/bin" ];
             ignoreCollisions = true;
           };
@@ -445,6 +480,26 @@ let
       }
     else
       null;
+  # The live medium's setup screen (setup/openshell_setup.py), on its own
+  # session: what the boot menu's Install and Update entries open instead of
+  # the Desktop, in OpenShell Live's updater's look. GTK in Python, as the
+  # lock screen is.
+  setup =
+    if lock != null && media && builtins.pathExists ./openshell-setup then
+      pkgs.stdenv.mkDerivation {
+        name = "openshell-setup";
+        src = ./openshell-setup;
+        nativeBuildInputs = [ pkgs.wrapGAppsHook3 pkgs.gobject-introspection ];
+        buildInputs = [ pkgs.gtk3 lock.python ];
+        installPhase = ''
+          install -Dm0644 -t "$out/lib/openshell-setup" setup_model.py openshell_setup.py
+          mkdir -p "$out/bin"
+          printf '#!%s\nexec %s -I %s "$@"\n' "${pkgs.runtimeShell}" "${lock.python}/bin/python3" "$out/lib/openshell-setup/openshell_setup.py" > "$out/bin/openshell-setup"
+          chmod 0755 "$out/bin/openshell-setup"
+        '';
+      }
+    else
+      null;
   # The applications the Desktop finds where Debian has them (/usr/share/applications).
   applications = pkgs.symlinkJoin {
     name = "openshell-applications";
@@ -571,8 +626,8 @@ let
       ++ lib.optional (!media) graphics.mesa
       ++ graphics.tools
       ++ [ graphics.sound.pulseaudio graphics.sound.alsaUtils graphics.sound.asoundConf ]
-      ++ [ graphics.wireless.supplicant graphics.wireless.firmware ]
-      ++ [ graphics.remote.vnc graphics.remote.ssh graphics.printing.cups graphics.printing.programs ]
+      ++ [ graphics.wireless.supplicant graphics.wireless.bluetooth graphics.wireless.firmware ]
+      ++ [ graphics.remote.vnc graphics.remote.ssh graphics.printing.cups graphics.printing.programs graphics.printing.ippUsb ]
       ++ [ pkgs.dbus graphics.discovery.avahi graphics.discovery.busConfig graphics.discovery.avahiConfig ]
       ++ [ graphics.discovery.nss graphics.discovery.nameService graphics.discovery.nsswitch ]
       ++ [ graphics.ntfs ]
@@ -586,6 +641,8 @@ let
     ++ lib.optional (llama != null) llama
     ++ lib.optional (ab != null) ab
     ++ lib.optional (installer != null) installer
+    ++ lib.optional (updater != null) updater
+    ++ lib.optional (setup != null) setup
   );
   extended = pkgs.runCommand "openshell-native-compat-root" { } ''
     mkdir -p "$out"
@@ -668,6 +725,11 @@ let
       done
       chmod u+w "$out/usr/lib"
       ln -sfn ${graphics.wireless.firmware}/lib/firmware "$out/usr/lib/firmware"
+      # Bluetooth (graphics.wireless.bluetooth): the daemon, the client hostd
+      # runs, the management and monitor tools to look into it by hand.
+      for program in libexec/bluetooth/bluetoothd bin/bluetoothctl bin/btmgmt bin/btmon; do
+        ln -sf ${graphics.wireless.bluetooth}/$program "$out/opt/openshell-compat/bin/"
+      done
       # Remote access (graphics.remote): the screen's server for hostd, and
       # the SSH server with the tool that makes its host keys.
       ln -s ${graphics.remote.vnc}/bin/x11vnc "$out/opt/openshell-compat/bin/"
@@ -684,6 +746,7 @@ let
         [ -n "$program_path" ] || { echo "CUPS has no $program" >&2; exit 1; }
         ln -s "$program_path" "$out/opt/openshell-compat/bin/"
       done
+      ln -s ${graphics.printing.ippUsb}/bin/ipp-usb "$out/opt/openshell-compat/bin/"
       ln -s ${graphics.printing.programs} "$out/opt/openshell-compat/cups"
       # Service discovery (graphics.discovery): the system bus with Avahi's
       # policy, and Avahi's settings where it reads them.
@@ -694,6 +757,7 @@ let
       mkdir -p "$out/etc/dbus-1/system.d" "$out/etc/avahi/services"
       ln -s ${graphics.discovery.busConfig}/etc/dbus-1/system.conf "$out/etc/dbus-1/system.conf"
       ln -s ${graphics.discovery.avahi}/share/dbus-1/system.d/avahi-dbus.conf "$out/etc/dbus-1/system.d/"
+      ln -s ${graphics.wireless.bluetooth}/share/dbus-1/system.d/bluetooth.conf "$out/etc/dbus-1/system.d/"
       ln -s ${graphics.discovery.avahiConfig} "$out/etc/avahi/avahi-daemon.conf"
       ln -sf ${graphics.discovery.nameService}/bin/nsncd "$out/opt/openshell-compat/bin/"
       ln -s ${graphics.discovery.nss}/lib "$out/opt/openshell-compat/nss"
@@ -750,6 +814,10 @@ let
       mkdir -p "$out/opt/openshell-media"
       cp -R ${./openshell-media}/. "$out/opt/openshell-media/"
       ln -s ${installer}/bin/openshell-native-install "$out/opt/openshell-compat/bin/openshell-native-install"
+      ln -s ${updater}/bin/openshell-native-update "$out/opt/openshell-compat/bin/openshell-native-update"
+    ''}
+    ${lib.optionalString (setup != null) ''
+      ln -s ${setup}/bin/openshell-setup "$out/opt/openshell-compat/bin/openshell-setup"
     ''}
     rm "$out/test/boot_hello.sh"
     install -m 0755 ${probes}/compat-boot.sh "$out/test/boot_hello.sh"

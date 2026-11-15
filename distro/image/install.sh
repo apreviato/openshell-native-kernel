@@ -31,24 +31,16 @@ media=${OPENSHELL_MEDIA:-/opt/openshell-media}
 compat=/opt/openshell-compat
 MIB=1048576
 MIN_DISK=$((16 * 1024 * MIB))
+# The disks (live_medium, whole_disks) and the medium's release, shared
+# with the updater.
+. "$media/medium.sh"
 
 progress() { echo "PROGRESS $1 $2"; }
 fail() { echo "FAILED $*" >&2; exit 1; }
 
-# Whether a disk is a live medium of OpenShell Native (an ISO 9660 volume
-# named OPENSHELL_NATIVE, build-media.sh), such as the stick this system
-# started from: never offered.
-live_medium() {
-    [ "$(dd if="$1" bs=1 skip=32769 count=5 2>/dev/null)" = CD001 ] &&
-        [ "$(dd if="$1" bs=1 skip=32808 count=16 2>/dev/null)" = OPENSHELL_NATIVE ]
-}
-
-# Whole disks the kernel offers (NVMe, SATA and USB, VirtIO), never their
-# partitions, nor a live medium.
+# The disks to install to: big enough, and never a live medium.
 disks() {
-    for device in /dev/nvme[0-9]*n[0-9]* /dev/sd[a-z] /dev/sd[a-z][a-z] /dev/vd[a-z]; do
-        case "$device" in *p[0-9]*) continue ;; esac
-        [ -b "$device" ] || continue
+    for device in $(whole_disks); do
         size=$(blockdev --getsize64 "$device" 2>/dev/null) || continue
         [ "$size" -ge "$MIN_DISK" ] || continue
         live_medium "$device" && continue
@@ -80,6 +72,12 @@ install)
     hash=${OPENSHELL_INSTALL_PASSWORD_HASH:-}
     case "$hash" in '$6$'*) ;; *) fail "no password was chosen" ;; esac
 
+    # A medium with its signed manifest: what the computer read from it must
+    # be what was built (a stick read badly installs nothing).
+    if release_dir "$work/release"; then
+        progress 1 "Checking the USB stick"
+        release_intact "$work/release" || fail "the USB stick could not be read correctly; write it again"
+    fi
     progress 2 "Reading the system"
     mkdir -p "$work/slot" "$work/recovery" "$work/data/openshell/ab"
     # The account and the computer's settings: root's, as the supervisor keeps them.

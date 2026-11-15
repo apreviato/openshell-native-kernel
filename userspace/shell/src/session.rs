@@ -43,6 +43,8 @@ pub struct SessionConfig {
     pub login: Option<crate::login::LoginConfig>,
     /// The live session's installer (install.rs), which the supervisor runs as root.
     pub installer: Option<CommandLine>,
+    /// The live medium's updater of installed systems (usb_update.rs), as root.
+    pub usb_updater: Option<CommandLine>,
     /// Where the time zone and the account's name are kept across boots
     /// (settings.rs); without it, they last until the computer stops.
     pub settings_dir: Option<PathBuf>,
@@ -80,6 +82,7 @@ impl SessionConfig {
         let (mut greeter, mut password_file, mut password_tool) = (None, None, None);
         let mut lock = None;
         let (mut installer, mut settings_dir, mut updates_dir) = (None, None, None);
+        let mut usb_updater = None;
         let mut env = Vec::new();
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -114,6 +117,7 @@ impl SessionConfig {
                 "password_tool" => password_tool = Some(command(value, key)?),
                 "lock" => lock = Some(command(value, key)?),
                 "installer" => installer = Some(command(value, key)?),
+                "usb_updater" => usb_updater = Some(command(value, key)?),
                 "settings_dir" => settings_dir = Some(absolute(value, key)?),
                 "updates_dir" => updates_dir = Some(absolute(value, key)?),
                 "confirm_after" => {
@@ -162,6 +166,7 @@ impl SessionConfig {
             confirm_after,
             login,
             installer,
+            usb_updater,
             settings_dir,
             updates_dir,
         })

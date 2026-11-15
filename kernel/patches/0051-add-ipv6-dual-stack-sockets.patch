@@ -1,0 +1,264 @@
+diff --git a/kernel/core/src/net/socket/ip/options.rs b/kernel/core/src/net/socket/ip/options.rs
+index 955359c..5ded333 100644
+--- a/kernel/core/src/net/socket/ip/options.rs
++++ b/kernel/core/src/net/socket/ip/options.rs
+@@ -120,6 +120,7 @@ impl_socket_options!(
+     pub(crate) struct DropMembership(super::multicast::GroupRequest);
+     pub(crate) struct McastJoinGroup(super::multicast::McastGroupRequest);
+     pub(crate) struct McastLeaveGroup(super::multicast::McastGroupRequest);
++    pub(crate) struct V6Only(bool);
+ );
+ 
+ #[derive(Clone, Copy, Debug)]
+diff --git a/kernel/core/src/net/socket/ip/stream/mod.rs b/kernel/core/src/net/socket/ip/stream/mod.rs
+index 2b992a0..331b3e1 100644
+--- a/kernel/core/src/net/socket/ip/stream/mod.rs
++++ b/kernel/core/src/net/socket/ip/stream/mod.rs
+@@ -1,9 +1,11 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use core::sync::atomic::{AtomicBool, Ordering};
++
+ use aster_bigtcp::{
+     socket::{NeedIfacePoll, RawTcpOption, RawTcpSetOption},
+     time::Duration,
+-    wire::IpEndpoint,
++    wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address},
+ };
+ use connected::{ConnectedStream, close_and_linger};
+ use connecting::{ConnResult, ConnectingStream};
+@@ -21,7 +23,7 @@ use util::{Retrans, TcpOptionSet};
+ use super::{
+     addr::IpAddressFamily,
+     ioctl::ipv4_ioctl,
+-    options::{IpOptionSet, SetIpLevelOption},
++    options::{IpOptionSet, SetIpLevelOption, V6Only},
+ };
+ use crate::{
+     events::IoEvents,
+@@ -62,6 +64,8 @@ pub(crate) struct StreamSocket {
+     // and other locks in `aster-bigtcp`), which will break the atomic mode.
+     state: RwLock<Takeable<State>>,
+     family: IpAddressFamily,
++    /// An IPv6 socket that does not reach IPv4 (`IPV6_V6ONLY`).
++    v6only: AtomicBool,
+     options: RwLock<OptionSet>,
+     timeouts: SocketTimeouts,
+ 
+@@ -111,6 +115,7 @@ impl StreamSocket {
+         Arc::new(Self {
+             state: RwLock::new(Takeable::new(State::Init(init_stream))),
+             family,
++            v6only: AtomicBool::new(false),
+             options: RwLock::new(OptionSet::new()),
+             timeouts: SocketTimeouts::new(),
+             pollee: Pollee::new(),
+@@ -162,6 +167,7 @@ impl StreamSocket {
+         Arc::new(Self {
+             state: RwLock::new(Takeable::new(State::Connected(connected_stream))),
+             family,
++            v6only: AtomicBool::new(false),
+             options: RwLock::new(options),
+             timeouts: listener_timeouts.clone(),
+             pollee,
+@@ -217,9 +223,43 @@ impl StreamSocket {
+         state
+     }
+ 
++    /// The endpoint the stack takes for one a program gives, and its family.
++    /// The network is IPv4's: an IPv6 socket that is not `IPV6_V6ONLY`
++    /// reaches it, as dual-stack sockets do on Linux (`::` is any address,
++    /// `::1` the loopback, `::ffff:a.b.c.d` IPv4's own address).
++    fn inward(&self, endpoint: IpEndpoint) -> (IpEndpoint, IpAddressFamily) {
++        if self.family != IpAddressFamily::IPv6 || self.v6only.load(Ordering::Relaxed) {
++            return (endpoint, self.family);
++        }
++        let IpAddress::Ipv6(address) = endpoint.addr else { return (endpoint, self.family) };
++        let ipv4 = if address.is_unspecified() {
++            Some(Ipv4Address::UNSPECIFIED)
++        } else if address.is_loopback() {
++            Some(Ipv4Address::LOCALHOST)
++        } else {
++            address.to_ipv4_mapped()
++        };
++        match ipv4 {
++            Some(ipv4) => (IpEndpoint::new(IpAddress::Ipv4(ipv4), endpoint.port), IpAddressFamily::IPv4),
++            None => (endpoint, self.family),
++        }
++    }
++
++    /// The address a program sees: an IPv6 socket's IPv4 endpoints are
++    /// IPv4-mapped (any address: `::`).
++    fn outward(&self, endpoint: IpEndpoint) -> SocketAddr {
++        if self.family == IpAddressFamily::IPv6
++            && let IpAddress::Ipv4(address) = endpoint.addr
++        {
++            let address = if address.is_unspecified() { Ipv6Address::UNSPECIFIED } else { address.to_ipv6_mapped() };
++            return SocketAddr::IPv6(address, endpoint.port);
++        }
++        endpoint.into()
++    }
++
+     // Returns `None` to block the task and wait for the connection to be established, and returns
+     // `Some(_)` if blocking is not necessary or not allowed.
+-    fn start_connect(&self, remote_endpoint: &IpEndpoint) -> Option<Result<()>> {
++    fn start_connect(&self, remote_endpoint: &IpEndpoint, family: IpAddressFamily) -> Option<Result<()>> {
+         let is_nonblocking = self.is_nonblocking();
+ 
+         let mut state = self.write_updated_state();
+@@ -267,7 +307,7 @@ impl StreamSocket {
+ 
+             let (target_state, iface_to_poll) = match init_stream.connect(
+                 remote_endpoint,
+-                self.family,
++                family,
+                 &raw_option,
+                 options.socket.reuse_addr(),
+                 StreamObserver::new(self.pollee.clone()),
+@@ -340,7 +380,7 @@ impl StreamSocket {
+                 &self.timeouts,
+                 is_nonblocking,
+             );
+-            (accepted_socket as _, remote_endpoint.into())
++            (accepted_socket as _, self.outward(remote_endpoint))
+         });
+         let iface_to_poll = listen_stream.iface().clone();
+ 
+@@ -492,7 +532,7 @@ impl SocketPrivate for StreamSocket {
+ 
+ impl Socket for StreamSocket {
+     fn bind(&self, socket_addr: SocketAddr) -> Result<()> {
+-        let endpoint = socket_addr.try_into()?;
++        let (endpoint, family) = self.inward(socket_addr.try_into()?);
+ 
+         let mut state = self.write_updated_state();
+         let State::Init(init_stream) = state.as_mut() else {
+@@ -500,13 +540,13 @@ impl Socket for StreamSocket {
+         };
+ 
+         let can_reuse = self.options.read().socket.reuse_addr();
+-        init_stream.bind(&endpoint, self.family, can_reuse)
++        init_stream.bind(&endpoint, family, can_reuse)
+     }
+ 
+     fn connect(&self, socket_addr: SocketAddr) -> Result<()> {
+-        let remote_endpoint = socket_addr.try_into()?;
++        let (remote_endpoint, family) = self.inward(socket_addr.try_into()?);
+ 
+-        if let Some(result) = self.start_connect(&remote_endpoint) {
++        if let Some(result) = self.start_connect(&remote_endpoint, family) {
+             return result;
+         }
+ 
+@@ -595,7 +635,7 @@ impl Socket for StreamSocket {
+             State::Listen(listen_stream) => listen_stream.local_endpoint(),
+             State::Connected(connected_stream) => connected_stream.local_endpoint(),
+         };
+-        Ok(local_endpoint.into())
++        Ok(self.outward(local_endpoint))
+     }
+ 
+     fn peer_addr(&self) -> Result<SocketAddr> {
+@@ -619,7 +659,7 @@ impl Socket for StreamSocket {
+                 connected_stream.remote_endpoint()
+             }
+         };
+-        Ok(remote_endpoint.into())
++        Ok(self.outward(remote_endpoint))
+     }
+ 
+     fn sendmsg(
+@@ -683,6 +723,13 @@ impl Socket for StreamSocket {
+                 socket_errors.set(self.test_and_clear_error());
+                 return Ok(());
+             }
++            v6only @ V6Only => {
++                if self.family != IpAddressFamily::IPv6 {
++                    return_errno_with_message!(Errno::ENOPROTOOPT, "not an IPv6 socket");
++                }
++                v6only.set(self.v6only.load(Ordering::Relaxed));
++                return Ok(());
++            }
+             _ => (),
+         });
+ 
+@@ -774,6 +821,21 @@ impl Socket for StreamSocket {
+     }
+ 
+     fn set_option(&self, option: &dyn SocketOption) -> Result<()> {
++        sock_option_ref!(match option {
++            v6only @ V6Only => {
++                if self.family != IpAddressFamily::IPv6 {
++                    return_errno_with_message!(Errno::ENOPROTOOPT, "not an IPv6 socket");
++                }
++                // Only before the socket has an address, as Linux has it.
++                let bound = !matches!(self.read_updated_state().as_ref(), State::Init(init) if init.local_endpoint().is_none());
++                if bound {
++                    return_errno_with_message!(Errno::EINVAL, "the socket has an address already");
++                }
++                self.v6only.store(*v6only.get().unwrap(), Ordering::Relaxed);
++                return Ok(());
++            }
++            _ => (),
++        });
+         let mut state = self.write_updated_state();
+         let mut options = self.options.write();
+ 
+diff --git a/kernel/core/src/util/net/options/ip.rs b/kernel/core/src/util/net/options/ip.rs
+index 44aa9a4..b7d8e04 100644
+--- a/kernel/core/src/util/net/options/ip.rs
++++ b/kernel/core/src/util/net/options/ip.rs
+@@ -13,7 +13,7 @@ use crate::{
+         options::{
+             AddMembership, DropMembership, Hdrincl, IpTtl, McastJoinGroup, McastLeaveGroup,
+             MulticastAll, MulticastIf, MulticastLoop, MulticastTtl, Pktinfo, RecvTtl, Recverr,
+-            Tos, Ttl,
++            Tos, Ttl, V6Only,
+         },
+     },
+     prelude::*,
+@@ -96,6 +96,15 @@ pub(crate) fn new_ip_option(name: i32) -> Result<Box<dyn RawSocketOption>> {
+     }
+ }
+ 
++/// Socket options of IPv6 sockets (`SOL_IPV6`): `IPV6_V6ONLY`.
++pub(crate) fn new_ipv6_option(name: i32) -> Result<Box<dyn RawSocketOption>> {
++    const IPV6_V6ONLY: i32 = 26;
++    match name {
++        IPV6_V6ONLY => Ok(Box::new(V6Only::new())),
++        _ => return_errno_with_message!(Errno::ENOPROTOOPT, "unsupported ipv6 level option"),
++    }
++}
++
+ trait ReadIpOption: Sized {
+     fn read_ip_option(addr: Vaddr, max_len: u32) -> Result<Self>;
+ }
+@@ -130,6 +139,7 @@ macro_rules! impl_raw_ip_socket_option {
+ impl_raw_ip_socket_option!(Ttl);
+ impl_raw_ip_socket_option!(Tos);
+ impl_raw_ip_socket_option!(Hdrincl);
++impl_raw_ip_socket_option!(V6Only);
+ impl_raw_ip_socket_option!(Recverr);
+ impl_raw_ip_socket_option!(Pktinfo);
+ impl_raw_ip_socket_option!(RecvTtl);
+diff --git a/kernel/core/src/util/net/options/mod.rs b/kernel/core/src/util/net/options/mod.rs
+index 027133e..40e38e4 100644
+--- a/kernel/core/src/util/net/options/mod.rs
++++ b/kernel/core/src/util/net/options/mod.rs
+@@ -51,7 +51,7 @@
+ //! At the syscall level, the interface is unified for all options and does not need to be modified.
+ //!
+ 
+-use ip::new_ip_option;
++use ip::{new_ip_option, new_ipv6_option};
+ use netlink::new_netlink_option;
+ 
+ use crate::{net::socket::options::SocketOption, prelude::*};
+@@ -170,6 +170,7 @@ pub(crate) fn new_raw_socket_option(
+     match level {
+         CSocketOptionLevel::SOL_SOCKET => new_socket_option(name),
+         CSocketOptionLevel::SOL_IP => new_ip_option(name),
++        CSocketOptionLevel::SOL_IPV6 => new_ipv6_option(name),
+         CSocketOptionLevel::SOL_TCP => new_tcp_option(name),
+         CSocketOptionLevel::SOL_NETLINK => new_netlink_option(name),
+         CSocketOptionLevel::SOL_ALG => alg::new_alg_option(name),

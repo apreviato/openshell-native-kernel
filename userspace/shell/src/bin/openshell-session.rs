@@ -30,6 +30,7 @@ use openshell_shell::power::PowerAction;
 use openshell_shell::settings::{Saved, Setting, SystemFiles};
 use openshell_shell::ssh::{self, Ssh};
 use openshell_shell::update::{self, Updates};
+use openshell_shell::usb_update::{self, UsbUpdater};
 use openshell_shell::wifi::{self, ControlSockets, Wifi};
 use openshell_shell::session::{
     boot_log_dir, CommandLine, HealthWatch, RestartBudget, SessionConfig,
@@ -256,6 +257,8 @@ struct Supervisor {
     power: Option<PowerAction>,
     /// The lock screen's password check passed since the last sign-in began.
     unlocked: bool,
+    /// The live medium's updater of installed systems (its update screen).
+    usb_updater: Option<UsbUpdater>,
 }
 
 fn describe(status: i32) -> String {
@@ -556,6 +559,15 @@ impl Supervisor {
                     }
                     None => "invalid".to_owned(),
                 }
+            } else if usb_update::is_request(line) {
+                let answer = match &self.usb_updater {
+                    Some(updater) => updater.answer(line),
+                    None => "unavailable".to_owned(),
+                };
+                if answer == "started" {
+                    self.journal.note(&format!("the updater started ({line})"));
+                }
+                answer
             } else if let Some(installer) = installer {
                 installer.answer(line)
             } else if line.starts_with(INSTALL_PREFIX) {
@@ -847,7 +859,19 @@ fn main() -> ExitCode {
         let journal_file = OpenOptions::new().create(true).append(true).mode(0o640).open(logs.join("session.log"))?;
         std::os::unix::fs::fchown(&journal_file, Some(0), Some(config.gid))?;
         let journal = Journal(journal_file);
-        let mut supervisor = Supervisor { config, logs, journal, members: Vec::new(), signed_in: false, greeter_socket: None, system: None, power: None, unlocked: false };
+        let usb_updater = config.usb_updater.clone().map(UsbUpdater::new);
+        let mut supervisor = Supervisor {
+            config,
+            logs,
+            journal,
+            members: Vec::new(),
+            signed_in: false,
+            greeter_socket: None,
+            system: None,
+            power: None,
+            unlocked: false,
+            usb_updater,
+        };
         supervisor.open_system_socket()?;
         // The time zone and the account's name chosen in Settings, before the session.
         if let Some(folder) = supervisor.config.settings_dir.clone() {

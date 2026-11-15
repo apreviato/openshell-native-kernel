@@ -14,8 +14,8 @@ use openshell_ab::bootenv::{BootEnv, BLOCK_SIZE};
 use openshell_ab::sha256::{hex, Sha256};
 use openshell_ab::signature;
 use openshell_ab::{
-    begin_update, choose_boot, confirm, finish_update, load, record_boot, request_trial, Boot, Error, Manifest,
-    Selector, Slot, State, Store,
+    begin_update, choose_boot, confirm, finish_update, load, record_boot, request_trial, restore_previous, Boot, Error,
+    Manifest, Selector, Slot, State, Store,
 };
 
 const USAGE: &str = "Usage: openshell-ab <disk-dir> <command>
@@ -26,6 +26,10 @@ const USAGE: &str = "Usage: openshell-ab <disk-dir> <command>
                                          then write, verify and stage the other slot
   update-mounted <source-dir> <manifest> <schema> <keys-dir> <slot-mount>
                                          update the mounted inactive partition and schedule a trial
+  update-offline <source-dir> <manifest> <schema> <keys-dir> <slot-mount>
+                                         the same from another system (the USB stick's updater):
+                                         the partition of the slot that is not confirmed
+  restore                                the previous release (the slot not confirmed) on trial
   trial                                  boot the staged slot on trial
   boot                                   choose the slot to boot: a, b or recovery
   booted <a|b|recovery>                  record the boot GRUB chose (its grubenv)
@@ -130,17 +134,41 @@ fn signed_manifest(path: &str, schema: &str, keys: &str) -> Result<Manifest, Box
     Ok(manifest)
 }
 
+/// The slot the running system booted, from its command line.
+fn booted_slot() -> Result<(Option<Slot>, Option<String>), Box<dyn std::error::Error>> {
+    let cmdline = fs::read_to_string("/proc/cmdline")?;
+    let value = |key| cmdline.split_whitespace().find_map(|word| word.strip_prefix(key)).map(str::to_owned);
+    Ok((value("openshell.slot=").as_deref().and_then(Slot::parse), value("openshell.release=")))
+}
+
 /// This updater uses the GPT layout made by distro/image/mkimage.sh. Derive
 /// the expected partition from the mounted data disk and the running slot.
 fn mounted_target(disk: &Path, target: &Path, selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let cmdline = fs::read_to_string("/proc/cmdline")?;
-    let value = |key| cmdline.split_whitespace().find_map(|word| word.strip_prefix(key));
-    let running = value("openshell.slot=").and_then(Slot::parse).ok_or("not booted from a system slot")?;
+    let (running, release) = booted_slot()?;
+    let running = running.ok_or("not booted from a system slot")?;
     let current = selector.slot(running);
-    if selector.confirmed != Some(running) || current.state != State::Good ||
-        value("openshell.release=") != Some(current.release.as_str()) {
+    if selector.confirmed != Some(running) || current.state != State::Good || release.as_deref() != Some(current.release.as_str()) {
         return Err("the running release must be the confirmed slot".into());
     }
+    partition_target(disk, target, running)
+}
+
+/// The same from another system (the USB stick's updater): the confirmed
+/// slot is the one that stays, its other one is written.
+fn offline_target(disk: &Path, target: &Path, selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if booted_slot()?.0.is_some() {
+        return Err("an installed system updates itself with update-mounted".into());
+    }
+    let confirmed = selector.confirmed.ok_or("the installation has no confirmed slot")?;
+    if selector.slot(confirmed).state != State::Good {
+        return Err("the installation's confirmed slot is not good".into());
+    }
+    partition_target(disk, target, confirmed)
+}
+
+/// `target` must be the inactive system partition (the other one than
+/// `running`'s) of the disk whose partition 5 is the mounted data.
+fn partition_target(disk: &Path, target: &Path, running: Slot) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let disk = disk.canonicalize()?;
     let target = target.canonicalize()?;
     let data = disk.parent().and_then(Path::parent).ok_or("expected <data>/openshell/ab")?;
@@ -180,7 +208,7 @@ fn mounted_target(disk: &Path, target: &Path, selector: &Selector) -> Result<Pat
 }
 
 fn update_mounted(
-    store: &mut DirectoryStore, source: &Path, target: &Path, manifest: &Manifest,
+    store: &mut DirectoryStore, source: &Path, target: &Path, manifest: &Manifest, offline: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for required in ["kernel", "initramfs.cpio.gz", "boot.cfg"] {
         if !manifest.files.iter().any(|(name, size, _)| name == required && *size > 0) {
@@ -188,7 +216,7 @@ fn update_mounted(
         }
     }
     let selector = load(store).ok_or(Error::NoSelector)?;
-    let target = mounted_target(&store.0, target, &selector)?;
+    let target = if offline { offline_target(&store.0, target, &selector)? } else { mounted_target(&store.0, target, &selector)? };
     let source = source.canonicalize()?;
     if source.starts_with(&target) {
         return Err("source must be outside the inactive partition".into());
@@ -289,7 +317,16 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         ("update-mounted", [source, manifest, schema, keys, target]) => {
             let manifest = signed_manifest(manifest, schema, keys)?;
-            update_mounted(&mut store, Path::new(source), Path::new(target), &manifest)?;
+            update_mounted(&mut store, Path::new(source), Path::new(target), &manifest, false)?;
+        }
+        ("update-offline", [source, manifest, schema, keys, target]) => {
+            let manifest = signed_manifest(manifest, schema, keys)?;
+            update_mounted(&mut store, Path::new(source), Path::new(target), &manifest, true)?;
+        }
+        ("restore", []) => {
+            let slot = restore_previous(&mut store)?;
+            let selector = load(&store).ok_or(Error::NoSelector)?;
+            println!("restoring {} in slot {}", selector.slot(slot).release, slot.name());
         }
         ("trial", []) => {
             let selector = load(&store).ok_or(Error::NoSelector)?;

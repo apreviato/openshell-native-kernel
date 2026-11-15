@@ -9,3 +9,5 @@
 *.py text eol=lf
 *.nix text eol=lf
 distro/image/grub.cfg text eol=lf
+distro/image/splash.cfg text eol=lf
+distro/image/menu-theme.txt text eol=lf
