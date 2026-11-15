@@ -1,0 +1,724 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c66d788..caf6d4a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -356,6 +356,16 @@ dependencies = [
+  "ostd",
+ ]
+ 
++[[package]]
++name = "aster-linuxkpi"
++version = "0.1.0"
++dependencies = [
++ "aster-core",
++ "aster-firmware",
++ "aster-pci",
++ "ostd",
++]
++
+ [[package]]
+ name = "aster-logger"
+ version = "0.1.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 7d2c776..f0e39ee 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -40,6 +40,7 @@ members = [
+     "kernel/comps/bluetooth",
+     "kernel/comps/firmware",
+     "kernel/comps/iwlwifi",
++    "kernel/comps/linuxkpi",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -105,6 +106,7 @@ default-members = [
+     "kernel/comps/bluetooth",
+     "kernel/comps/firmware",
+     "kernel/comps/iwlwifi",
++    "kernel/comps/linuxkpi",
+     "kernel/core",
+     "kernel/core/comps/block",
+     "kernel/core/comps/cmdline",
+@@ -197,6 +199,7 @@ aster-wlan = { path = "kernel/comps/wlan" }
+ aster-bluetooth = { path = "kernel/comps/bluetooth" }
+ aster-firmware = { path = "kernel/comps/firmware" }
+ aster-iwlwifi = { path = "kernel/comps/iwlwifi" }
++aster-linuxkpi = { path = "kernel/comps/linuxkpi" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+ aster-sound = { path = "kernel/comps/sound" }
+ aster-simpledrm = { path = "kernel/comps/simpledrm" }
+diff --git a/kernel/comps/linuxkpi/Cargo.toml b/kernel/comps/linuxkpi/Cargo.toml
+new file mode 100644
+index 0000000..ae12083
+--- /dev/null
++++ b/kernel/comps/linuxkpi/Cargo.toml
+@@ -0,0 +1,13 @@
++[package]
++name = "aster-linuxkpi"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-core.workspace = true
++aster-firmware.workspace = true
++aster-pci.workspace = true
++ostd.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/linuxkpi/src/bits.rs b/kernel/comps/linuxkpi/src/bits.rs
+new file mode 100644
+index 0000000..a36247e
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/bits.rs
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `linux/bits.h`, `linux/bitfield.h` and the unaligned little-endian
++//! accessors (`get_unaligned_le32` and the like) over byte buffers.
++
++/// `BIT(n)`.
++pub const fn bit(n: u32) -> u32 {
++    1 << n
++}
++
++/// `GENMASK(high, low)`: bits `low` to `high`, both included.
++pub const fn genmask(high: u32, low: u32) -> u32 {
++    (u32::MAX >> (31 - high)) & (u32::MAX << low)
++}
++
++/// `FIELD_GET(mask, value)`.
++pub const fn field_get(mask: u32, value: u32) -> u32 {
++    (value & mask) >> mask.trailing_zeros()
++}
++
++/// `FIELD_PREP(mask, value)`.
++pub const fn field_prep(mask: u32, value: u32) -> u32 {
++    (value << mask.trailing_zeros()) & mask
++}
++
++/// `u32_replace_bits`: `value` with the field under `mask` set to `field`.
++pub const fn replace_bits(value: u32, field: u32, mask: u32) -> u32 {
++    (value & !mask) | field_prep(mask, field)
++}
++
++/// `get_unaligned_le16` at a byte offset; 0 past the end.
++pub fn get_le16(data: &[u8], at: usize) -> u16 {
++    data.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
++}
++
++/// `get_unaligned_le32` at a byte offset; 0 past the end.
++pub fn get_le32(data: &[u8], at: usize) -> u32 {
++    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++/// `get_unaligned_le64` at a byte offset; 0 past the end.
++pub fn get_le64(data: &[u8], at: usize) -> u64 {
++    data.get(at..at + 8).map_or(0, |b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
++}
++
++/// `put_unaligned_le16`; nothing past the end.
++pub fn put_le16(data: &mut [u8], at: usize, value: u16) {
++    if let Some(field) = data.get_mut(at..at + 2) {
++        field.copy_from_slice(&value.to_le_bytes());
++    }
++}
++
++/// `put_unaligned_le32`; nothing past the end.
++pub fn put_le32(data: &mut [u8], at: usize, value: u32) {
++    if let Some(field) = data.get_mut(at..at + 4) {
++        field.copy_from_slice(&value.to_le_bytes());
++    }
++}
++
++/// `put_unaligned_le64`; nothing past the end.
++pub fn put_le64(data: &mut [u8], at: usize, value: u64) {
++    if let Some(field) = data.get_mut(at..at + 8) {
++        field.copy_from_slice(&value.to_le_bytes());
++    }
++}
+diff --git a/kernel/comps/linuxkpi/src/delay.rs b/kernel/comps/linuxkpi/src/delay.rs
+new file mode 100644
+index 0000000..0355d95
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/delay.rs
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `linux/delay.h`, `linux/iopoll.h` and the clock drivers read: busy
++//! waits measured by the TSC (the timer ticks once a millisecond, too
++//! coarse for a chip's handshakes) and milliseconds since boot.
++
++use ostd::timer::Jiffies;
++
++/// Milliseconds since boot (`jiffies_to_msecs(jiffies)`).
++pub fn now_ms() -> u64 {
++    Jiffies::elapsed().as_duration().as_millis() as u64
++}
++
++/// `udelay`: a busy wait of at least `us` microseconds. Without a known
++/// TSC frequency it falls back on the millisecond clock.
++pub fn udelay(us: u64) {
++    let frequency = ostd::arch::tsc_freq();
++    if frequency == 0 {
++        let deadline = now_ms() + us.div_ceil(1000) + 1;
++        while now_ms() < deadline {
++            core::hint::spin_loop();
++        }
++        return;
++    }
++    let cycles = us * (frequency / 1_000_000).max(1);
++    let start = ostd::arch::read_tsc();
++    while ostd::arch::read_tsc().wrapping_sub(start) < cycles {
++        core::hint::spin_loop();
++    }
++}
++
++/// `mdelay`.
++pub fn mdelay(ms: u64) {
++    udelay(ms * 1000);
++}
++
++/// `read_poll_timeout`: calls `read` every `delay_us` until `done` holds
++/// for its value or `timeout_us` passed. `Ok` with the last value when it
++/// held, `Err` with the last value when the time ran out.
++pub fn read_poll_timeout<T>(mut read: impl FnMut() -> T, done: impl Fn(&T) -> bool, delay_us: u64, timeout_us: u64) -> Result<T, T> {
++    let mut waited = 0u64;
++    loop {
++        let value = read();
++        if done(&value) {
++            return Ok(value);
++        }
++        if waited >= timeout_us {
++            return Err(value);
++        }
++        udelay(delay_us.max(1));
++        waited += delay_us.max(1);
++    }
++}
+diff --git a/kernel/comps/linuxkpi/src/dma.rs b/kernel/comps/linuxkpi/src/dma.rs
+new file mode 100644
+index 0000000..3dc749c
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/dma.rs
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `dma_alloc_coherent`, and the same under `dma_set_mask(DMA_BIT_MASK(32))`
++//! for devices whose descriptors hold 32-bit addresses.
++
++use alloc::vec::Vec;
++
++use ostd::mm::{HasDaddr, PAGE_SIZE, dma::DmaCoherent};
++
++/// How many times memory above 4 GiB is set aside before giving up.
++const TRIES_BELOW_4G: usize = 64;
++
++fn pages(bytes: usize) -> usize {
++    bytes.div_ceil(PAGE_SIZE).max(1)
++}
++
++/// `dma_alloc_coherent`: zeroed, contiguous, cache-coherent memory.
++pub fn alloc_coherent(bytes: usize) -> Option<DmaCoherent> {
++    DmaCoherent::alloc(pages(bytes), true).ok()
++}
++
++/// `dma_alloc_coherent` under a 32-bit DMA mask: memory that lies below
++/// 4 GiB, asked for again (the blocks above held meanwhile) until it does.
++pub fn alloc_coherent32(bytes: usize) -> Option<DmaCoherent> {
++    let pages = pages(bytes);
++    let mut held = Vec::new();
++    for _ in 0..TRIES_BELOW_4G {
++        let block = DmaCoherent::alloc(pages, true).ok()?;
++        if (block.daddr() as u64) + (pages * PAGE_SIZE) as u64 <= 1 << 32 {
++            return Some(block);
++        }
++        held.push(block);
++    }
++    None
++}
+diff --git a/kernel/comps/linuxkpi/src/firmware.rs b/kernel/comps/linuxkpi/src/firmware.rs
+new file mode 100644
+index 0000000..9df8dd8
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/firmware.rs
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `linux/firmware.h` over `aster-firmware` (`/lib/firmware`, read through
++//! the system's root once it is there).
++
++use alloc::sync::Arc;
++
++/// `request_firmware`: the file, waiting a while for the system's files.
++pub fn request_firmware(name: &str) -> Option<Arc<[u8]>> {
++    aster_firmware::load(name)
++}
++
++/// `firmware_request_nowarn`: the file if it is there now.
++pub fn request_firmware_nowarn(name: &str) -> Option<Arc<[u8]>> {
++    aster_firmware::try_load(name)
++}
++
++/// The first of `names` that is there (newest first, as drivers walk their
++/// API versions down), with its name; waits as [`request_firmware`].
++pub fn request_firmware_first<'a>(names: impl IntoIterator<Item = &'a str> + Clone) -> Option<(&'a str, Arc<[u8]>)> {
++    aster_firmware::load_first(names)
++}
+diff --git a/kernel/comps/linuxkpi/src/io.rs b/kernel/comps/linuxkpi/src/io.rs
+new file mode 100644
+index 0000000..c948eb2
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/io.rs
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `ioread*`/`iowrite*` over a mapped BAR, with the helpers drivers build
++//! on them: read-modify-write and polling a register.
++
++use aster_pci::cfg_space::BarAccess;
++
++use crate::delay::read_poll_timeout;
++
++/// A device's registers (`void __iomem *`). Reads of a device gone from the
++/// bus give all ones, as on Linux.
++pub struct Mmio(BarAccess);
++
++impl Mmio {
++    pub fn new(bar: BarAccess) -> Self {
++        Self(bar)
++    }
++
++    pub fn ioread8(&self, at: usize) -> u8 {
++        self.0.read_once::<u8>(at).unwrap_or(u8::MAX)
++    }
++
++    pub fn ioread16(&self, at: usize) -> u16 {
++        self.0.read_once::<u16>(at).unwrap_or(u16::MAX)
++    }
++
++    pub fn ioread32(&self, at: usize) -> u32 {
++        self.0.read_once::<u32>(at).unwrap_or(u32::MAX)
++    }
++
++    pub fn iowrite8(&self, at: usize, value: u8) {
++        let _ = self.0.write_once::<u8>(at, value);
++    }
++
++    pub fn iowrite16(&self, at: usize, value: u16) {
++        let _ = self.0.write_once::<u16>(at, value);
++    }
++
++    pub fn iowrite32(&self, at: usize, value: u32) {
++        let _ = self.0.write_once::<u32>(at, value);
++    }
++
++    /// The register with the bits of `clear` cleared and those of `set` set.
++    pub fn rmw32(&self, at: usize, clear: u32, set: u32) {
++        self.iowrite32(at, (self.ioread32(at) & !clear) | set);
++    }
++
++    pub fn set32(&self, at: usize, bits: u32) {
++        self.rmw32(at, 0, bits);
++    }
++
++    pub fn clear32(&self, at: usize, bits: u32) {
++        self.rmw32(at, bits, 0);
++    }
++
++    /// Waits until `(register & mask) == value`, polling every `delay_us`
++    /// for `timeout_us` at most; whether it did.
++    pub fn poll32(&self, at: usize, mask: u32, value: u32, delay_us: u64, timeout_us: u64) -> bool {
++        read_poll_timeout(|| self.ioread32(at), |read| read & mask == value & mask, delay_us, timeout_us).is_ok()
++    }
++
++    /// Whether the device still answers (a read that is not all ones).
++    pub fn present(&self, at: usize) -> bool {
++        self.ioread32(at) != u32::MAX
++    }
++}
+diff --git a/kernel/comps/linuxkpi/src/lib.rs b/kernel/comps/linuxkpi/src/lib.rs
+new file mode 100644
+index 0000000..571b66e
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/lib.rs
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The part of Linux's in-kernel driver interface that the drivers ported
++//! from Linux use, in safe Rust: a LinuxKPI in the sense of FreeBSD's, so
++//! that a port reads like the Linux driver it comes from and the drivers
++//! share one implementation of it.
++//!
++//! - [`delay`]: `udelay`, `mdelay`, `msleep`, `read_poll_timeout`, jiffies.
++//! - [`wait`]: the wait queue a driver's task sleeps on, woken by the
++//!   device's interrupt and by the timer (for interrupts that do not come
++//!   and for time-outs).
++//! - [`pci`]: `pci_register_driver` with a device table, a task per device
++//!   (Linux's `probe`), `pci_iomap`, `pci_alloc_irq_vectors` with one vector
++//!   (MSI-X, MSI, or polled), the configuration space helpers drivers call
++//!   (`pci_find_capability`, ASPM, completion time-out, subsystem IDs).
++//! - [`dma`]: `dma_alloc_coherent`, also under a 32-bit DMA mask.
++//! - [`firmware`]: `request_firmware`, `firmware_request_nowarn`, and the
++//!   first of several names (a chip's newest firmware first).
++//! - [`bits`]: `BIT`, `GENMASK`, `FIELD_GET`, `FIELD_PREP`, little-endian
++//!   fields in byte buffers.
++//! - [`io`]: `ioread32`/`iowrite32` and the read-modify-write and polling
++//!   helpers over a mapped BAR.
++//!
++//! What is not here, by design: the C ABI. The Linux drivers themselves
++//! are not compiled against this; their logic is ported, which keeps the
++//! kernel free of `unsafe` driver code and of mac80211 (GPL-2.0 only),
++//! whose station logic `aster-wlan` provides.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++pub mod bits;
++pub mod delay;
++pub mod dma;
++pub mod firmware;
++pub mod io;
++pub mod pci;
++pub mod wait;
+diff --git a/kernel/comps/linuxkpi/src/pci.rs b/kernel/comps/linuxkpi/src/pci.rs
+new file mode 100644
+index 0000000..d0957a0
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/pci.rs
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! `linux/pci.h` as drivers use it: a driver registered with its device
++//! table, a task per device found (where Linux calls `probe`), the BARs
++//! mapped, one interrupt vector, and the configuration space helpers.
++
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++
++use aster_pci::{
++    PCI_BUS, PciDeviceId, PciDeviceLocation,
++    bus::{PciDevice, PciDriver},
++    capability::{msi::CapabilityMsiData, msix::CapabilityMsixData},
++    cfg_space::BarAccess,
++    common_device::PciCommonDevice,
++};
++use ostd::{bus::BusProbeError, irq::IrqLine, sync::SpinLock};
++
++// The configuration space (`linux/pci_regs.h`).
++const PCI_COMMAND: u16 = 0x04;
++const PCI_COMMAND_MEMORY: u16 = 0x2;
++const PCI_COMMAND_MASTER: u16 = 0x4;
++const PCI_SUBSYSTEM_VENDOR_ID: u16 = 0x2c;
++const PCI_SUBSYSTEM_ID: u16 = 0x2e;
++const PCI_CAPABILITY_LIST: u16 = 0x34;
++/// The retry time-out Intel's drivers clear.
++const PCI_RETRY_TIMEOUT: u16 = 0x41;
++pub const PCI_CAP_ID_EXP: u8 = 0x10;
++const PCI_EXP_LNKCTL: u16 = 0x10;
++const PCI_EXP_LNKCTL_ASPMC: u16 = 0x0003;
++const PCI_EXP_DEVCTL2: u16 = 0x28;
++const PCI_EXP_DEVCTL2_COMP_TMOUT_DIS: u16 = 0x0010;
++
++#[derive(Debug)]
++struct Claimed(PciDeviceId);
++
++impl PciDevice for Claimed {
++    fn device_id(&self) -> PciDeviceId {
++        self.0
++    }
++}
++
++/// A driver on the bus: its device table as a function of vendor and
++/// device.
++#[derive(Debug)]
++struct Driver {
++    claims: fn(u16, u16) -> bool,
++    found: SpinLock<Vec<PciCommonDevice>>,
++}
++
++impl PciDriver for Driver {
++    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
++        let id = *device.device_id();
++        if !(self.claims)(id.vendor_id, id.device_id) {
++            return Err((BusProbeError::DeviceNotMatch, device));
++        }
++        self.found.lock().push(device);
++        Ok(Arc::new(Claimed(id)))
++    }
++}
++
++/// The devices a driver claimed, until their tasks start.
++pub struct Devices(SpinLock<Vec<PciCommonDevice>>);
++
++impl Devices {
++    pub const fn new() -> Self {
++        Self(SpinLock::new(Vec::new()))
++    }
++
++    /// `pci_register_driver`: the devices `claims` accepts are kept for
++    /// [`Devices::spawn`]; whether there are any.
++    pub fn register(&self, claims: fn(u16, u16) -> bool) -> bool {
++        let driver = Arc::new(Driver { claims, found: SpinLock::new(Vec::new()) });
++        PCI_BUS.lock().register_driver(driver.clone());
++        let found = core::mem::take(&mut *driver.found.lock());
++        let any = !found.is_empty();
++        self.0.lock().extend(found);
++        any
++    }
++
++    /// Linux probes a device from the bus; here each gets its own task
++    /// once there is a scheduler (a driver reads its firmware from the
++    /// system's files and sleeps on its device for as long as it runs).
++    pub fn spawn(&self, probe: fn(usize, PciCommonDevice)) {
++        for (index, device) in core::mem::take(&mut *self.0.lock()).into_iter().enumerate() {
++            aster_core::spawn_kernel_thread(move || probe(index, device));
++        }
++    }
++}
++
++impl Default for Devices {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// `dev_name`-like: the driver, its index and the device's address.
++pub fn device_name(driver: &str, index: usize, location: &PciDeviceLocation) -> String {
++    format!("{} {} ({:02x}:{:02x}.{})", driver, index, location.bus, location.device, location.function)
++}
++
++/// `pci_enable_device_mem` and `pci_set_master`.
++pub fn enable_device(location: &PciDeviceLocation) {
++    location.write16(PCI_COMMAND, location.read16(PCI_COMMAND) | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++}
++
++/// Clears the retry time-out (Intel's drivers: retries would disturb the
++/// chip's low-power states).
++pub fn clear_retry_timeout(location: &PciDeviceLocation) {
++    location.write8(PCI_RETRY_TIMEOUT, 0);
++}
++
++/// `pci_find_capability`.
++pub fn find_capability(location: &PciDeviceLocation, id: u8) -> Option<u16> {
++    let mut at = location.read8(PCI_CAPABILITY_LIST) & 0xfc;
++    // At most 48 capabilities fit in the configuration space.
++    for _ in 0..48 {
++        if at < 0x40 {
++            return None;
++        }
++        if location.read8(at as u16) == id {
++            return Some(at as u16);
++        }
++        at = location.read8(at as u16 + 1) & 0xfc;
++    }
++    None
++}
++
++/// `pci_disable_link_state(PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1)`:
++/// ASPM off on the device's side of the link.
++pub fn disable_aspm(location: &PciDeviceLocation) {
++    if let Some(cap) = find_capability(location, PCI_CAP_ID_EXP) {
++        let control = location.read16(cap + PCI_EXP_LNKCTL);
++        location.write16(cap + PCI_EXP_LNKCTL, control & !PCI_EXP_LNKCTL_ASPMC);
++    }
++}
++
++/// `pcie_capability_set_word(PCI_EXP_DEVCTL2, PCI_EXP_DEVCTL2_COMP_TMOUT_DIS)`.
++pub fn disable_completion_timeout(location: &PciDeviceLocation) {
++    if let Some(cap) = find_capability(location, PCI_CAP_ID_EXP) {
++        let control = location.read16(cap + PCI_EXP_DEVCTL2);
++        location.write16(cap + PCI_EXP_DEVCTL2, control | PCI_EXP_DEVCTL2_COMP_TMOUT_DIS);
++    }
++}
++
++/// The subsystem's vendor and device (`pdev->subsystem_vendor`,
++/// `pdev->subsystem_device`).
++pub fn subsystem_ids(location: &PciDeviceLocation) -> (u16, u16) {
++    (location.read16(PCI_SUBSYSTEM_VENDOR_ID), location.read16(PCI_SUBSYSTEM_ID))
++}
++
++/// `pci_iomap` of a BAR.
++pub fn iomap(device: &mut PciCommonDevice, bar: u8) -> Option<BarAccess> {
++    device.bar_manager_mut().bar_mut(bar).and_then(|bar| bar.acquire().ok())
++}
++
++/// The interrupt vector a device got (`pci_alloc_irq_vectors` with one
++/// vector): kept for as long as the device is driven.
++pub enum Vectors {
++    MsiX(CapabilityMsixData),
++    Msi(CapabilityMsiData),
++    /// No message-signalled interrupt: the driver's timer looks instead.
++    Polled,
++}
++
++impl Vectors {
++    pub fn is_msix(&self) -> bool {
++        matches!(self, Vectors::MsiX(_))
++    }
++
++    pub fn is_polled(&self) -> bool {
++        matches!(self, Vectors::Polled)
++    }
++}
++
++fn attach(irq: &mut IrqLine, name: &str, handler: impl Fn() + Send + Sync + 'static) {
++    let counter = aster_pci::irq_stats::interrupt_counter(irq.num(), name);
++    irq.on_active(move |_| {
++        counter.count();
++        handler();
++    });
++}
++
++/// `pci_alloc_irq_vectors(1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI)` and
++/// `request_irq`: MSI-X vector 0 when `msix` and the device has it, else
++/// MSI's one message, else none. `handler` runs in the interrupt; it is
++/// counted in `/proc/interrupts` under `name`.
++pub fn alloc_irq_vector(device: &mut PciCommonDevice, msix: bool, name: &str, handler: impl Fn() + Send + Sync + Clone + 'static) -> Vectors {
++    if msix
++        && let Ok(Some(mut capability)) = device.acquire_msix_capability()
++        && let Ok(irq) = IrqLine::alloc()
++    {
++        capability.set_interrupt_vector(irq, 0);
++        if let Some(irq) = capability.irq_mut(0) {
++            attach(irq, name, handler.clone());
++        }
++        return Vectors::MsiX(capability);
++    }
++    if let (Some(mut capability), Ok(mut irq)) = (device.acquire_msi_capability(), IrqLine::alloc()) {
++        attach(&mut irq, name, handler);
++        capability.set_interrupt_vector(irq);
++        return Vectors::Msi(capability);
++    }
++    Vectors::Polled
++}
+diff --git a/kernel/comps/linuxkpi/src/wait.rs b/kernel/comps/linuxkpi/src/wait.rs
+new file mode 100644
+index 0000000..bea7237
+--- /dev/null
++++ b/kernel/comps/linuxkpi/src/wait.rs
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The wait queue of a driver's task (Linux drivers sleep on a
++//! `wait_queue_head_t` or a completion, woken from their interrupt
++//! handler): woken by the device's interrupt and by the timer, which also
++//! keeps time-outs going and looks at devices whose interrupts do not
++//! arrive.
++
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use ostd::sync::WaitQueue;
++
++use crate::delay::now_ms;
++
++pub struct Waker {
++    queue: WaitQueue,
++    woken: AtomicBool,
++    ticks: AtomicUsize,
++    /// Timer ticks between wake-ups when nothing hurries it.
++    idle_period: usize,
++    /// Tasks sleeping on a time-out: woken every tick.
++    waiting: AtomicUsize,
++    /// Devices whose interrupts were not seen yet: woken every other tick.
++    hurried: AtomicUsize,
++    started: AtomicBool,
++}
++
++impl Waker {
++    /// A waker the timer also wakes every `idle_period` ticks (the timer
++    /// ticks once a millisecond).
++    pub const fn new(idle_period: usize) -> Self {
++        Self {
++            queue: WaitQueue::new(),
++            woken: AtomicBool::new(false),
++            ticks: AtomicUsize::new(0),
++            idle_period,
++            waiting: AtomicUsize::new(0),
++            hurried: AtomicUsize::new(0),
++            started: AtomicBool::new(false),
++        }
++    }
++
++    /// The timer starts waking this waker (once; from the driver's init).
++    pub fn start_timer(&'static self) {
++        if self.started.swap(true, Ordering::AcqRel) {
++            return;
++        }
++        ostd::timer::register_callback_on_cpu(move || self.tick());
++    }
++
++    fn tick(&self) {
++        let ticks = self.ticks.fetch_add(1, Ordering::Relaxed);
++        let period = if self.waiting.load(Ordering::Relaxed) > 0 {
++            1
++        } else if self.hurried.load(Ordering::Relaxed) > 0 {
++            2
++        } else {
++            self.idle_period.max(1)
++        };
++        if ticks % period == 0 {
++            self.wake();
++        }
++    }
++
++    /// `wake_up`: from an interrupt handler or another task.
++    pub fn wake(&self) {
++        self.woken.store(true, Ordering::Release);
++        self.queue.wake_all();
++    }
++
++    /// Sleeps until woken.
++    pub fn sleep(&self) {
++        self.queue.wait_until(|| self.woken.swap(false, Ordering::AcqRel).then_some(()));
++    }
++
++    /// `msleep`: sleeps at least `ms` milliseconds.
++    pub fn msleep(&self, ms: u64) {
++        let deadline = now_ms() + ms;
++        let _waiting = self.waiting();
++        while now_ms() < deadline {
++            self.sleep();
++        }
++    }
++
++    /// `wait_event_timeout`: sleeps until `done` holds or `ms` passed;
++    /// whether it held.
++    pub fn wait_event_timeout(&self, mut done: impl FnMut() -> bool, ms: u64) -> bool {
++        let deadline = now_ms() + ms;
++        let _waiting = self.waiting();
++        loop {
++            if done() {
++                return true;
++            }
++            if now_ms() >= deadline {
++                return false;
++            }
++            self.sleep();
++        }
++    }
++
++    /// While the guard lives, the timer wakes this waker every tick (a task
++    /// waits on a time-out).
++    pub fn waiting(&self) -> Guard<'_> {
++        self.waiting.fetch_add(1, Ordering::AcqRel);
++        Guard(&self.waiting)
++    }
++
++    /// While the guard lives, the timer wakes this waker every other tick
++    /// (a device whose interrupts were not seen to arrive).
++    pub fn hurried(&self) -> Guard<'_> {
++        self.hurried.fetch_add(1, Ordering::AcqRel);
++        Guard(&self.hurried)
++    }
++}
++
++/// Undoes [`Waker::waiting`] or [`Waker::hurried`] when dropped.
++pub struct Guard<'a>(&'a AtomicUsize);
++
++impl Drop for Guard<'_> {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::AcqRel);
++    }
++}

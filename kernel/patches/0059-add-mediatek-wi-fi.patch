@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index a656523..0622808 100644
+index 0ac8474..797a933 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -388,6 +388,19 @@ dependencies = [
+@@ -399,6 +399,20 @@ dependencies = [
   "zerocopy",
  ]
  
@@ -13,6 +13,7 @@ index a656523..0622808 100644
 + "aster-cmdline",
 + "aster-core",
 + "aster-firmware",
++ "aster-linuxkpi",
 + "aster-pci",
 + "aster-wlan",
 + "component",
@@ -22,7 +23,7 @@ index a656523..0622808 100644
  [[package]]
  name = "aster-network"
  version = "0.1.0"
-@@ -624,6 +637,7 @@ dependencies = [
+@@ -635,6 +649,7 @@ dependencies = [
   "aster-firmware",
   "aster-i8042",
   "aster-iwlwifi",
@@ -31,7 +32,7 @@ index a656523..0622808 100644
   "aster-uart",
   "aster-usb",
 diff --git a/Cargo.toml b/Cargo.toml
-index 7d2c776..0760126 100644
+index f0e39ee..d34c659 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -40,6 +40,7 @@ members = [
@@ -39,25 +40,25 @@ index 7d2c776..0760126 100644
      "kernel/comps/firmware",
      "kernel/comps/iwlwifi",
 +    "kernel/comps/mt7921",
+     "kernel/comps/linuxkpi",
      "kernel/core",
      "kernel/core/comps/block",
-     "kernel/core/comps/cmdline",
-@@ -105,6 +106,7 @@ default-members = [
+@@ -106,6 +107,7 @@ default-members = [
      "kernel/comps/bluetooth",
      "kernel/comps/firmware",
      "kernel/comps/iwlwifi",
 +    "kernel/comps/mt7921",
+     "kernel/comps/linuxkpi",
      "kernel/core",
      "kernel/core/comps/block",
-     "kernel/core/comps/cmdline",
-@@ -197,6 +199,7 @@ aster-wlan = { path = "kernel/comps/wlan" }
+@@ -199,6 +201,7 @@ aster-wlan = { path = "kernel/comps/wlan" }
  aster-bluetooth = { path = "kernel/comps/bluetooth" }
  aster-firmware = { path = "kernel/comps/firmware" }
  aster-iwlwifi = { path = "kernel/comps/iwlwifi" }
 +aster-mt7921 = { path = "kernel/comps/mt7921" }
+ aster-linuxkpi = { path = "kernel/comps/linuxkpi" }
  aster-ethernet = { path = "kernel/comps/ethernet" }
  aster-sound = { path = "kernel/comps/sound" }
- aster-simpledrm = { path = "kernel/comps/simpledrm" }
 diff --git a/Components.toml b/Components.toml
 index 727db46..0ef6f12 100644
 --- a/Components.toml
@@ -84,10 +85,10 @@ index 87e07b4..634794b 100644
  [target.x86_64-unknown-none.dependencies]
 diff --git a/kernel/comps/mt7921/Cargo.toml b/kernel/comps/mt7921/Cargo.toml
 new file mode 100644
-index 0000000..91411d8
+index 0000000..b38d8c6
 --- /dev/null
 +++ b/kernel/comps/mt7921/Cargo.toml
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +[package]
 +name = "aster-mt7921"
 +version = "0.1.0"
@@ -97,6 +98,7 @@ index 0000000..91411d8
 +aster-cmdline.workspace = true
 +aster-core.workspace = true
 +aster-firmware.workspace = true
++aster-linuxkpi.workspace = true
 +aster-pci.workspace = true
 +aster-wlan.workspace = true
 +component.workspace = true
@@ -104,12 +106,42 @@ index 0000000..91411d8
 +
 +[lints]
 +workspace = true
+diff --git a/kernel/comps/mt7921/NOTICE b/kernel/comps/mt7921/NOTICE
+new file mode 100644
+index 0000000..eb3e371
+--- /dev/null
++++ b/kernel/comps/mt7921/NOTICE
+@@ -0,0 +1,24 @@
++aster-mt7921 is a Rust port of parts of Linux's mt76 driver
++(drivers/net/wireless/mediatek/mt76: mt7921, mt792x and mt76_connac, Linux
++6.18): the WFDMA rings, the firmware download, the MCU commands' sequence,
++layouts and constants, and the TX/RX descriptors. Linux licenses those files
++under the ISC licence, reproduced below. The port's own code is under the
++MPL-2.0, like the rest of this kernel.
++
++Copyright (C) 2020 MediaTek Inc.
++
++Permission to use, copy, modify, and/or distribute this software for any
++purpose with or without fee is hereby granted, provided that the above
++copyright notice and this permission notice appear in all copies.
++
++THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++The firmware the driver loads (mediatek/WIFI_*.bin) is MediaTek's, from
++linux-firmware, redistributed under its LICENCE.mediatek, which the image
++ships beside the files.
 diff --git a/kernel/comps/mt7921/src/hw.rs b/kernel/comps/mt7921/src/hw.rs
 new file mode 100644
-index 0000000..acc6879
+index 0000000..1a2f874
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/hw.rs
-@@ -0,0 +1,742 @@
+@@ -0,0 +1,731 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip as Linux's mt76 drives it over PCIe (`mt7921/pci.c`,
@@ -255,18 +287,7 @@ index 0000000..acc6879
 +/// DMA memory the WFDMA can address: its pointers are 32 bits, so the
 +/// memory must lie below 4 GiB. Asked for again until it does (ostd has no
 +/// 32-bit zone; early in the boot low memory is free).
-+pub(crate) fn dma32(bytes: usize) -> Option<DmaCoherent> {
-+    let pages = bytes.div_ceil(PAGE_SIZE).max(1);
-+    let mut rejected = Vec::new();
-+    for _ in 0..64 {
-+        let block = DmaCoherent::alloc(pages, true).ok()?;
-+        if (block.daddr() as u64) + (pages * PAGE_SIZE) as u64 <= 1 << 32 {
-+            return Some(block);
-+        }
-+        rejected.push(block);
-+    }
-+    None
-+}
++pub(crate) use aster_linuxkpi::dma::alloc_coherent32 as dma32;
 +
 +/// A WFDMA ring: descriptors (`struct mt76_desc`: buf0, ctrl, buf1, info)
 +/// and a buffer each.
@@ -716,7 +737,7 @@ index 0000000..acc6879
 +            return Ok(Vec::new());
 +        }
 +        let deadline = crate::now_ms() + MCU_TIMEOUT_MS;
-+        crate::WAITING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
++        let waiting = crate::WAKER.waiting();
 +        let result = loop {
 +            let mut found = None;
 +            for which in [RXQ_MCU, RXQ_MCU_WA, RXQ_DATA] {
@@ -740,7 +761,7 @@ index 0000000..acc6879
 +            }
 +            crate::sleep();
 +        };
-+        crate::WAITING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
++        drop(waiting);
 +        let packet = result?;
 +        let skip = if matches!(cmd, Cmd::Legacy(MCU_CMD_PATCH_SEM_CONTROL) | Cmd::Legacy(MCU_CMD_PATCH_FINISH_REQ)) { MCU_RXD - 4 } else { MCU_RXD };
 +        Ok(packet.get(skip..).unwrap_or(&[]).to_vec())
@@ -854,10 +875,10 @@ index 0000000..acc6879
 +}
 diff --git a/kernel/comps/mt7921/src/lib.rs b/kernel/comps/mt7921/src/lib.rs
 new file mode 100644
-index 0000000..4a2114f
+index 0000000..ddd130d
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/lib.rs
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,199 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! MediaTek Wi-Fi: the MT7921 (AMD RZ608), MT7922 (AMD RZ616) and MT7920
@@ -886,64 +907,32 @@ index 0000000..4a2114f
 +mod hw;
 +mod mac;
 +
-+use alloc::{format, string::String, sync::Arc, vec::Vec};
-+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use alloc::{sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, Ordering};
 +
-+use aster_pci::{
-+    PCI_BUS, PciDeviceId,
-+    bus::{PciDevice, PciDriver},
-+    common_device::PciCommonDevice,
++use aster_linuxkpi::{
++    pci::{self as kpi_pci, Devices},
++    wait::Waker,
 +};
++pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms};
++use aster_pci::common_device::PciCommonDevice;
 +use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
 +use component::{ComponentInitError, init_component};
-+use ostd::{
-+    bus::BusProbeError,
-+    irq::IrqLine,
-+    sync::{Mutex, SpinLock, WaitQueue},
-+    timer::Jiffies,
-+};
++use ostd::sync::Mutex;
 +
 +use crate::{
 +    hw::{BUFFER, Chip},
 +    mac::{Mt7921, TOKENS},
 +};
 +
-+/// Wakes the cards' tasks: an interrupt, or the timer.
-+static WAKE: WaitQueue = WaitQueue::new();
-+static WOKEN: AtomicBool = AtomicBool::new(false);
-+static TICKS: AtomicUsize = AtomicUsize::new(0);
-+/// Tasks that wait on a time-out: the timer wakes them each tick.
-+pub(crate) static WAITING: AtomicUsize = AtomicUsize::new(0);
-+
-+pub(crate) fn now_ms() -> u64 {
-+    Jiffies::elapsed().as_duration().as_millis() as u64
-+}
-+
-+fn wake() {
-+    WOKEN.store(true, Ordering::Release);
-+    WAKE.wake_all();
-+}
++/// The cards' tasks sleep here: woken by their interrupt, by the timer
++/// every tick while one waits on a time-out, else every 20 (cards whose
++/// interrupt does not arrive still get looked at).
++pub(crate) static WAKER: Waker = Waker::new(20);
++static DEVICES: Devices = Devices::new();
 +
 +pub(crate) fn sleep() {
-+    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
-+}
-+
-+/// A short busy wait, for the chip's register handshakes.
-+pub(crate) fn delay_ms(ms: u64) {
-+    let deadline = now_ms() + ms + 1;
-+    while now_ms() < deadline {
-+        core::hint::spin_loop();
-+    }
-+}
-+
-+/// The timer: every tick while a task waits on a time-out, else every 20
-+/// (cards whose interrupt does not arrive still get looked at).
-+fn tick() {
-+    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
-+    let period = if WAITING.load(Ordering::Relaxed) > 0 { 1 } else { 20 };
-+    if ticks % period == 0 {
-+        wake();
-+    }
++    WAKER.sleep();
 +}
 +
 +const VENDOR_MEDIATEK: u16 = 0x14c3;
@@ -964,56 +953,20 @@ index 0000000..4a2114f
 +    }
 +}
 +
-+#[derive(Debug)]
-+struct Claimed(PciDeviceId);
-+
-+impl PciDevice for Claimed {
-+    fn device_id(&self) -> PciDeviceId {
-+        self.0
-+    }
-+}
-+
-+#[derive(Debug)]
-+struct Driver {
-+    found: SpinLock<Vec<PciCommonDevice>>,
-+}
-+
-+impl PciDriver for Driver {
-+    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
-+        let id = *device.device_id();
-+        if !claims(id.vendor_id, id.device_id) {
-+            return Err((BusProbeError::DeviceNotMatch, device));
-+        }
-+        self.found.lock().push(device);
-+        Ok(Arc::new(Claimed(id)))
-+    }
-+}
-+
-+static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
 +static DISABLED: AtomicBool = AtomicBool::new(false);
 +aster_cmdline::define_flag_param!("mt7921.off", DISABLED);
 +
 +#[init_component]
 +fn init() -> Result<(), ComponentInitError> {
-+    if DISABLED.load(Ordering::Relaxed) {
-+        return Ok(());
++    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
++        WAKER.start_timer();
 +    }
-+    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
-+    PCI_BUS.lock().register_driver(driver.clone());
-+    let cards = core::mem::take(&mut *driver.found.lock());
-+    if cards.is_empty() {
-+        return Ok(());
-+    }
-+    ostd::timer::register_callback_on_cpu(tick);
-+    *PENDING.lock() = cards;
 +    Ok(())
 +}
 +
 +#[init_component(kthread)]
 +fn start() -> Result<(), ComponentInitError> {
-+    for (index, device) in core::mem::take(&mut *PENDING.lock()).into_iter().enumerate() {
-+        aster_core::spawn_kernel_thread(move || run(index, device));
-+    }
++    DEVICES.spawn(run);
 +    Ok(())
 +}
 +
@@ -1085,36 +1038,11 @@ index 0000000..4a2114f
 +fn run(index: usize, mut device: PciCommonDevice) {
 +    let id = *device.device_id();
 +    let location = *device.location();
-+    let name: String = format!("mt7921 {} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
-+    // Memory decoding and bus mastering.
-+    location.write16(0x04, location.read16(0x04) | 0x06);
++    let name = kpi_pci::device_name("mt7921", index, &location);
++    kpi_pci::enable_device(&location);
 +    // One interrupt: MSI-X vector 0, or MSI, or none (the timer looks).
-+    let msix = match device.acquire_msix_capability() {
-+        Ok(Some(mut msix)) => match IrqLine::alloc() {
-+            Ok(irq) => {
-+                msix.set_interrupt_vector(irq, 0);
-+                if let Some(irq) = msix.irq_mut(0) {
-+                    irq.on_active(|_| wake());
-+                }
-+                Some(msix)
-+            }
-+            Err(_) => None,
-+        },
-+        _ => None,
-+    };
-+    let msi = if msix.is_some() {
-+        None
-+    } else {
-+        match (device.acquire_msi_capability(), IrqLine::alloc()) {
-+            (Some(mut msi), Ok(mut irq)) => {
-+                irq.on_active(|_| wake());
-+                msi.set_interrupt_vector(irq);
-+                Some(msi)
-+            }
-+            _ => None,
-+        }
-+    };
-+    let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
++    let vectors = kpi_pci::alloc_irq_vector(&mut device, true, &name, || WAKER.wake());
++    let Some(mmio) = kpi_pci::iomap(&mut device, 0) else {
 +        ostd::warn!("{}: no registers", name);
 +        return;
 +    };
@@ -1148,11 +1076,11 @@ index 0000000..4a2114f
 +        }
 +    }
 +    // The interrupt's capability and the device stay until the task ends.
-+    drop((msix, msi, device));
++    drop((vectors, device));
 +}
 diff --git a/kernel/comps/mt7921/src/mac.rs b/kernel/comps/mt7921/src/mac.rs
 new file mode 100644
-index 0000000..813a58a
+index 0000000..48f8be3
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mac.rs
 @@ -0,0 +1,1077 @@
@@ -1722,14 +1650,14 @@ index 0000000..813a58a
 +        }
 +        self.roc_active = true;
 +        let deadline = crate::now_ms() + ROC_GRANT_MS;
-+        crate::WAITING.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
++        let waiting = crate::WAKER.waiting();
 +        while !self.roc_granted && !self.dead && crate::now_ms() < deadline {
 +            self.poll();
 +            if !self.roc_granted {
 +                crate::sleep();
 +            }
 +        }
-+        crate::WAITING.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
++        drop(waiting);
 +        if !self.roc_granted {
 +            ostd::warn!("{}: the firmware did not grant the channel; joining anyway", self.name);
 +        }

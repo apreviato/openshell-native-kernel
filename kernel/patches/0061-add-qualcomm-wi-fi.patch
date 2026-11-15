@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 96f521e..8928bc0 100644
+index 0a8653b..576bef2 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -88,6 +88,19 @@ dependencies = [
+@@ -88,6 +88,20 @@ dependencies = [
   "ostd",
  ]
  
@@ -13,6 +13,7 @@ index 96f521e..8928bc0 100644
 + "aster-cmdline",
 + "aster-core",
 + "aster-firmware",
++ "aster-linuxkpi",
 + "aster-pci",
 + "aster-wlan",
 + "component",
@@ -22,7 +23,7 @@ index 96f521e..8928bc0 100644
  [[package]]
  name = "aster-backlight"
  version = "0.1.0"
-@@ -642,6 +655,7 @@ name = "asterinas"
+@@ -655,6 +669,7 @@ name = "asterinas"
  version = "0.1.0"
  dependencies = [
   "aster-ahci",
@@ -31,7 +32,7 @@ index 96f521e..8928bc0 100644
   "aster-bluetooth",
   "aster-core",
 diff --git a/Cargo.toml b/Cargo.toml
-index 9569117..34665c7 100644
+index ee25581..bdb76e6 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -42,6 +42,7 @@ members = [
@@ -39,25 +40,25 @@ index 9569117..34665c7 100644
      "kernel/comps/mt7921",
      "kernel/comps/rtw88",
 +    "kernel/comps/ath10k",
+     "kernel/comps/linuxkpi",
      "kernel/core",
      "kernel/core/comps/block",
-     "kernel/core/comps/cmdline",
-@@ -109,6 +110,7 @@ default-members = [
+@@ -110,6 +111,7 @@ default-members = [
      "kernel/comps/iwlwifi",
      "kernel/comps/mt7921",
      "kernel/comps/rtw88",
 +    "kernel/comps/ath10k",
+     "kernel/comps/linuxkpi",
      "kernel/core",
      "kernel/core/comps/block",
-     "kernel/core/comps/cmdline",
-@@ -203,6 +205,7 @@ aster-firmware = { path = "kernel/comps/firmware" }
+@@ -205,6 +207,7 @@ aster-firmware = { path = "kernel/comps/firmware" }
  aster-iwlwifi = { path = "kernel/comps/iwlwifi" }
  aster-mt7921 = { path = "kernel/comps/mt7921" }
  aster-rtw88 = { path = "kernel/comps/rtw88" }
 +aster-ath10k = { path = "kernel/comps/ath10k" }
+ aster-linuxkpi = { path = "kernel/comps/linuxkpi" }
  aster-ethernet = { path = "kernel/comps/ethernet" }
  aster-sound = { path = "kernel/comps/sound" }
- aster-simpledrm = { path = "kernel/comps/simpledrm" }
 diff --git a/Components.toml b/Components.toml
 index 261df42..9f7762a 100644
 --- a/Components.toml
@@ -84,10 +85,10 @@ index 6e9cb44..1243db4 100644
  [target.x86_64-unknown-none.dependencies]
 diff --git a/kernel/comps/ath10k/Cargo.toml b/kernel/comps/ath10k/Cargo.toml
 new file mode 100644
-index 0000000..432115b
+index 0000000..4689f5c
 --- /dev/null
 +++ b/kernel/comps/ath10k/Cargo.toml
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +[package]
 +name = "aster-ath10k"
 +version = "0.1.0"
@@ -97,6 +98,7 @@ index 0000000..432115b
 +aster-cmdline.workspace = true
 +aster-core.workspace = true
 +aster-firmware.workspace = true
++aster-linuxkpi.workspace = true
 +aster-pci.workspace = true
 +aster-wlan.workspace = true
 +component.workspace = true
@@ -104,6 +106,41 @@ index 0000000..432115b
 +
 +[lints]
 +workspace = true
+diff --git a/kernel/comps/ath10k/NOTICE b/kernel/comps/ath10k/NOTICE
+new file mode 100644
+index 0000000..d19b009
+--- /dev/null
++++ b/kernel/comps/ath10k/NOTICE
+@@ -0,0 +1,29 @@
++aster-ath10k is a Rust port of parts of Linux's ath10k driver
++(drivers/net/wireless/ath/ath10k, Linux 6.18): the copy engines and the PCI
++resets, BMI and the firmware files, HTC, the WMI-TLV commands and events,
++HTT and the RX descriptors, and the station's command sequence. Linux
++licenses those files under the ISC licence, reproduced below. The port's own
++code is under the MPL-2.0, like the rest of this kernel.
++
++Copyright (c) 2005-2011 Atheros Communications Inc.
++Copyright (c) 2011-2017 Qualcomm Atheros, Inc.
++Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
++Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
++Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++
++Permission to use, copy, modify, and/or distribute this software for any
++purpose with or without fee is hereby granted, provided that the above
++copyright notice and this permission notice appear in all copies.
++
++THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++The firmware the driver loads (ath10k/*/firmware-N.bin, board*.bin) is
++Qualcomm's, from linux-firmware, redistributed under its
++LICENSE.QualcommAtheros_ath10k and the notice_ath10k_firmware-N.txt files,
++which the image ships beside the files.
 diff --git a/kernel/comps/ath10k/src/boot.rs b/kernel/comps/ath10k/src/boot.rs
 new file mode 100644
 index 0000000..06e6020
@@ -1252,10 +1289,10 @@ index 0000000..69e0fb4
 +}
 diff --git a/kernel/comps/ath10k/src/lib.rs b/kernel/comps/ath10k/src/lib.rs
 new file mode 100644
-index 0000000..898a772
+index 0000000..2b614bb
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/lib.rs
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,302 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Qualcomm Atheros Wi-Fi of Linux's ath10k family on PCIe: the QCA6174
@@ -1292,21 +1329,17 @@ index 0000000..898a772
 +mod wmi;
 +
 +use alloc::{format, string::String, sync::Arc, vec::Vec};
-+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use core::sync::atomic::{AtomicBool, Ordering};
 +
-+use aster_pci::{
-+    PCI_BUS, PciDeviceId,
-+    bus::{PciDevice, PciDriver},
-+    common_device::PciCommonDevice,
++use aster_linuxkpi::{
++    pci::{self as kpi_pci, Devices},
++    wait::Waker,
 +};
++pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms, udelay as delay_us};
++use aster_pci::common_device::PciCommonDevice;
 +use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
 +use component::{ComponentInitError, init_component};
-+use ostd::{
-+    bus::BusProbeError,
-+    irq::IrqLine,
-+    sync::{Mutex, SpinLock, WaitQueue},
-+    timer::Jiffies,
-+};
++use ostd::sync::Mutex;
 +
 +use crate::{
 +    boot::{Bmi, CodeSwap, FirmwareFile},
@@ -1314,43 +1347,11 @@ index 0000000..898a772
 +    sta::Ath10k,
 +};
 +
-+static WAKE: WaitQueue = WaitQueue::new();
-+static WOKEN: AtomicBool = AtomicBool::new(false);
-+static TICKS: AtomicUsize = AtomicUsize::new(0);
-+
-+pub(crate) fn now_ms() -> u64 {
-+    Jiffies::elapsed().as_duration().as_millis() as u64
-+}
-+
-+fn wake() {
-+    WOKEN.store(true, Ordering::Release);
-+    WAKE.wake_all();
-+}
-+
-+fn sleep() {
-+    WAKE.wait_until(|| WOKEN.swap(false, Ordering::AcqRel).then_some(()));
-+}
-+
-+/// A busy wait for the chip's handshakes (the timer is too coarse).
-+pub(crate) fn delay_us(us: u64) {
-+    let start = ostd::arch::read_tsc();
-+    let cycles = us * (ostd::arch::tsc_freq() / 1_000_000).max(1);
-+    while ostd::arch::read_tsc().wrapping_sub(start) < cycles {
-+        core::hint::spin_loop();
-+    }
-+}
-+
-+pub(crate) fn delay_ms(ms: u64) {
-+    delay_us(ms * 1000);
-+}
-+
-+/// The timer wakes the tasks every few ticks: scans time out and
-+/// interrupts that do not arrive are made up for.
-+fn tick() {
-+    if TICKS.fetch_add(1, Ordering::Relaxed) % 5 == 0 {
-+        wake();
-+    }
-+}
++/// The cards' tasks sleep here: woken by their interrupt, and by the timer
++/// every 5 ms (scans time out, interrupts that do not arrive are made up
++/// for).
++static WAKER: Waker = Waker::new(5);
++static DEVICES: Devices = Devices::new();
 +
 +const VENDOR_QUALCOMM_ATHEROS: u16 = 0x168c;
 +/// The firmware files, newest interface first (`ATH10K_FW_API_MAX` down).
@@ -1403,56 +1404,25 @@ index 0000000..898a772
 +    }
 +}
 +
-+#[derive(Debug)]
-+struct Claimed(PciDeviceId);
-+
-+impl PciDevice for Claimed {
-+    fn device_id(&self) -> PciDeviceId {
-+        self.0
-+    }
++/// The device table (`ath10k_pci_id_table`, the chips on the TLV firmware).
++fn claims(vendor: u16, device: u16) -> bool {
++    Model::of(vendor, device).is_some()
 +}
 +
-+#[derive(Debug)]
-+struct Driver {
-+    found: SpinLock<Vec<PciCommonDevice>>,
-+}
-+
-+impl PciDriver for Driver {
-+    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
-+        let id = *device.device_id();
-+        if Model::of(id.vendor_id, id.device_id).is_none() {
-+            return Err((BusProbeError::DeviceNotMatch, device));
-+        }
-+        self.found.lock().push(device);
-+        Ok(Arc::new(Claimed(id)))
-+    }
-+}
-+
-+static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
 +static DISABLED: AtomicBool = AtomicBool::new(false);
 +aster_cmdline::define_flag_param!("ath10k.off", DISABLED);
 +
 +#[init_component]
 +fn init() -> Result<(), ComponentInitError> {
-+    if DISABLED.load(Ordering::Relaxed) {
-+        return Ok(());
++    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
++        WAKER.start_timer();
 +    }
-+    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
-+    PCI_BUS.lock().register_driver(driver.clone());
-+    let cards = core::mem::take(&mut *driver.found.lock());
-+    if cards.is_empty() {
-+        return Ok(());
-+    }
-+    ostd::timer::register_callback_on_cpu(tick);
-+    *PENDING.lock() = cards;
 +    Ok(())
 +}
 +
 +#[init_component(kthread)]
 +fn start() -> Result<(), ComponentInitError> {
-+    for (index, device) in core::mem::take(&mut *PENDING.lock()).into_iter().enumerate() {
-+        aster_core::spawn_kernel_thread(move || run(index, device));
-+    }
++    DEVICES.spawn(run);
 +    Ok(())
 +}
 +
@@ -1481,7 +1451,7 @@ index 0000000..898a772
 +
 +    fn abort_scan(&self) {
 +        self.card.state.lock().abort_scan();
-+        wake();
++        WAKER.wake();
 +    }
 +
 +    fn join(&self, network: &Join) -> radio::Result<()> {
@@ -1519,21 +1489,6 @@ index 0000000..898a772
 +    fn link_stats(&self) -> LinkStats {
 +        LinkStats { signal: self.card.state.lock().signal, tx_rate: None }
 +    }
-+}
-+
-+/// The PCI Express capability's offset in the configuration space.
-+fn pcie_capability(location: &aster_pci::PciDeviceLocation) -> Option<u16> {
-+    let mut at = location.read8(0x34) & 0xfc;
-+    for _ in 0..48 {
-+        if at < 0x40 {
-+            return None;
-+        }
-+        if location.read8(at as u16) == 0x10 {
-+            return Some(at as u16);
-+        }
-+        at = location.read8(at as u16 + 1) & 0xfc;
-+    }
-+    None
 +}
 +
 +/// `ath10k_pci_hif_power_up`: the chip reset, the copy engines, the
@@ -1575,22 +1530,13 @@ index 0000000..898a772
 +    let id = *device.device_id();
 +    let Some(model) = Model::of(id.vendor_id, id.device_id) else { return };
 +    let location = *device.location();
-+    let name: String = format!("ath10k {} ({:02x}:{:02x}.{})", index, location.bus, location.device, location.function);
-+    location.write16(0x04, location.read16(0x04) | 0x06);
++    let name = kpi_pci::device_name("ath10k", index, &location);
++    kpi_pci::enable_device(&location);
 +    // Linux keeps ASPM off while the firmware boots; it stays off here.
-+    if let Some(cap) = pcie_capability(&location) {
-+        location.write16(cap + 0x10, location.read16(cap + 0x10) & !0x0003);
-+    }
-+    // MSI, or none (the timer looks).
-+    let msi = match (device.acquire_msi_capability(), IrqLine::alloc()) {
-+        (Some(mut msi), Ok(mut irq)) => {
-+            irq.on_active(|_| wake());
-+            msi.set_interrupt_vector(irq);
-+            Some(msi)
-+        }
-+        _ => None,
-+    };
-+    let Some(mmio) = device.bar_manager_mut().bar_mut(0).and_then(|bar| bar.acquire().ok()) else {
++    kpi_pci::disable_aspm(&location);
++    // MSI (as Linux's ath10k), or none (the timer looks).
++    let vectors = kpi_pci::alloc_irq_vector(&mut device, false, &name, || WAKER.wake());
++    let Some(mmio) = kpi_pci::iomap(&mut device, 0) else {
 +        ostd::warn!("{}: no registers in BAR 0", name);
 +        return;
 +    };
@@ -1618,14 +1564,14 @@ index 0000000..898a772
 +    let wlan = aster_wlan::register(info, Arc::new(AtherosRadio { card: card.clone() }));
 +    card.state.lock().device = Some(wlan);
 +    loop {
-+        sleep();
++        WAKER.sleep();
 +        let mut state = card.state.lock();
 +        state.poll();
 +        if state.dead {
 +            break;
 +        }
 +    }
-+    drop((msi, device));
++    drop((vectors, device));
 +}
 +
 +/// Power up, find the target's files, power up again (as Linux does
@@ -1634,7 +1580,8 @@ index 0000000..898a772
 +    power_up(pci, model)?;
 +    let (version, target_type) = Bmi { pci }.target_info()?;
 +    let dir = model.firmware_dir(version).ok_or_else(|| format!("{model:?} target version {version:#x} (type {target_type}) is not known"))?;
-+    let board_name = format!("bus=pci,vendor={:04x},device={:04x},subsystem-vendor={:04x},subsystem-device={:04x}", VENDOR_QUALCOMM_ATHEROS, device_id, location.read16(0x2c), location.read16(0x2e));
++    let (subsystem_vendor, subsystem_device) = kpi_pci::subsystem_ids(location);
++    let board_name = format!("bus=pci,vendor={:04x},device={:04x},subsystem-vendor={:04x},subsystem-device={:04x}", VENDOR_QUALCOMM_ATHEROS, device_id, subsystem_vendor, subsystem_device);
 +    ostd::notice!("{}: {:?} chip {:#x}, target {:#x}, {}", name, model, pci.chip_id, version, dir);
 +    let (firmware, board) = firmware_files(dir, &board_name)?;
 +    ostd::notice!("{}: firmware {}", name, firmware.version);
@@ -1650,10 +1597,10 @@ index 0000000..898a772
 +}
 diff --git a/kernel/comps/ath10k/src/pci.rs b/kernel/comps/ath10k/src/pci.rs
 new file mode 100644
-index 0000000..eb91dca
+index 0000000..fd049bb
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/pci.rs
-@@ -0,0 +1,667 @@
+@@ -0,0 +1,655 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The QCA6174/QCA9377 over PCIe as Linux's ath10k `pci.c` and `ce.c` run
@@ -1665,7 +1612,7 @@ index 0000000..eb91dca
 +use alloc::{format, string::String, vec, vec::Vec};
 +
 +use aster_pci::cfg_space::BarAccess;
-+use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
 +
 +// `qca6174_regs` and `hw.h`.
 +const RTC_SOC_BASE: u32 = 0x0000_0800;
@@ -1770,20 +1717,8 @@ index 0000000..eb91dca
 +    [0, 0, 0],
 +];
 +
-+/// DMA memory the 32-bit descriptors can name, asked for again until it
-+/// lies below 4 GiB.
-+pub(crate) fn dma32(bytes: usize) -> Option<DmaCoherent> {
-+    let pages = bytes.div_ceil(PAGE_SIZE).max(1);
-+    let mut rejected = Vec::new();
-+    for _ in 0..64 {
-+        let block = DmaCoherent::alloc(pages, true).ok()?;
-+        if (block.daddr() as u64) + (pages * PAGE_SIZE) as u64 <= 1 << 32 {
-+            return Some(block);
-+        }
-+        rejected.push(block);
-+    }
-+    None
-+}
++/// DMA memory the 32-bit descriptors can name.
++pub(crate) use aster_linuxkpi::dma::alloc_coherent32 as dma32;
 +
 +/// A CE ring: its descriptors and a buffer per slot.
 +struct Ring {
