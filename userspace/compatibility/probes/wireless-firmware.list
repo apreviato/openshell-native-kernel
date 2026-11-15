@@ -57,12 +57,13 @@ mediatek/WIFI_RAM_CODE_MT7961_1a.bin
 mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin
 mediatek/WIFI_RAM_CODE_MT7922_1.bin
 
-# Realtek Wi-Fi (kernel/comps/rtw88): the RTL8821CE's, RTL8822BE's and
-# RTL8822CE's firmware (its licence is the Realtek one under Bluetooth
-# below).
+# Realtek Wi-Fi (kernel/comps/rtw88): the RTL8821CE's, RTL8822BE's,
+# RTL8822CE's and RTL8723DE's firmware (its licence is the Realtek one
+# under Bluetooth below).
 rtw88/rtw8821c_fw.bin
 rtw88/rtw8822b_fw.bin
 rtw88/rtw8822c_fw.bin
+rtw88/rtw8723d_fw.bin
 
 # Qualcomm Atheros Wi-Fi (kernel/comps/ath10k): each chip revision's
 # firmware over PCIe (firmware-N.bin, the newest interface the driver tries

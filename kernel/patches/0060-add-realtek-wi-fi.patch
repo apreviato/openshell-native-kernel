@@ -153,10 +153,10 @@ index 0000000..7171eaf
 +the image ships beside the files.
 diff --git a/kernel/comps/rtw88/src/chip.rs b/kernel/comps/rtw88/src/chip.rs
 new file mode 100644
-index 0000000..2b2face
+index 0000000..5d915ba
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/chip.rs
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,411 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip's registers as Linux's rtw88 reaches them over PCIe (BAR 2),
@@ -189,6 +189,23 @@ index 0000000..2b2face
 +    pub(crate) cut_mask: u16,
 +}
 +
++/// The LTE coexistence window's registers (`struct rtw_ltecoex_addr`).
++#[derive(Clone, Copy)]
++pub(crate) struct Ltecoex {
++    pub(crate) ctrl: u32,
++    pub(crate) wdata: u32,
++    pub(crate) rdata: u32,
++}
++
++/// The 11n chips' RF read registers of a path (`struct rtw_rf_sipi_addr`).
++#[derive(Clone, Copy)]
++pub(crate) struct SipiRead {
++    pub(crate) hssi_1: u32,
++    pub(crate) hssi_2: u32,
++    pub(crate) lssi_read: u32,
++    pub(crate) lssi_read_pi: u32,
++}
++
 +/// The register's field selected by `mask`, shifted down.
 +fn field(value: u32, mask: u32) -> u32 {
 +    if mask == 0 { 0 } else { (value & mask) >> mask.trailing_zeros() }
@@ -200,11 +217,16 @@ index 0000000..2b2face
 +    /// `hal.cut_version` and the RF paths (`REG_SYS_CFG1`).
 +    pub(crate) cut: u8,
 +    pub(crate) rf_paths: u8,
++    /// An 8051 CPU's chip (`RTW_WCPU_8051`) and its LTE window; the
++    /// chip's [`crate::hw::Spec`] sets them.
++    pub(crate) wcpu_8051: bool,
++    pub(crate) ltecoex: Ltecoex,
 +}
 +
 +impl Chip {
 +    pub(crate) fn new(mmio: BarAccess, name: String) -> Self {
-+        let mut chip = Self { mmio, name, cut: 0, rf_paths: 1 };
++        let ltecoex = Ltecoex { ctrl: LTECOEX_ACCESS_CTRL, wdata: LTECOEX_WRITE_DATA, rdata: LTECOEX_READ_DATA };
++        let mut chip = Self { mmio, name, cut: 0, rf_paths: 1, wcpu_8051: false, ltecoex };
 +        let version = chip.r32(REG_SYS_CFG1);
 +        chip.cut = field(version, BITS_CHIP_VER) as u8;
 +        chip.rf_paths = if version & BIT_RF_TYPE_ID != 0 { 2 } else { 1 };
@@ -341,9 +363,15 @@ index 0000000..2b2face
 +        false
 +    }
 +
-+    /// Linux's `rtw_mac_pre_system_cfg` (PCIe, 3081 CPU).
++    /// Linux's `rtw_mac_pre_system_cfg` (PCIe): the 8051 CPU's chips choose
++    /// their regulator only.
 +    pub(crate) fn pre_system_cfg(&self) {
 +        self.w8(REG_RSV_CTRL, 0);
++        if self.wcpu_8051 {
++            let regulator = if self.r32(REG_SYS_CFG1) & BIT_LDO != 0 { LDO_SEL } else { SPS_SEL };
++            self.w8(REG_LDO_SWR_CTRL, regulator as u8);
++            return;
++        }
 +        self.set32(REG_HCI_OPT_CTRL, BIT_USB_SUS_DIS);
 +        self.set32(REG_PAD_CTRL1, BIT_PAPE_WLBT_SEL | BIT_LNAON_WLBT_SEL);
 +        self.clr32(REG_LED_CFG, BIT_PAPE_SEL_EN | BIT_LNAON_SEL_EN);
@@ -355,17 +383,30 @@ index 0000000..2b2face
 +    }
 +
 +    /// Whether the MAC is powered (`rtw_mac_power_switch`'s check), after
-+    /// the firmware's RPWM toggle when one runs.
++    /// the 3081 firmware's RPWM toggle when one runs.
 +    pub(crate) fn powered(&self) -> bool {
-+        let rpwm = self.r8(RPWM_ADDR);
-+        if self.r16(REG_MCUFW_CTRL) == 0xc078 {
-+            self.w8(RPWM_ADDR, (rpwm ^ BIT_RPWM_TOGGLE as u8) & BIT_RPWM_TOGGLE as u8);
++        if !self.wcpu_8051 {
++            let rpwm = self.r8(RPWM_ADDR);
++            if self.r16(REG_MCUFW_CTRL) == 0xc078 {
++                self.w8(RPWM_ADDR, (rpwm ^ BIT_RPWM_TOGGLE as u8) & BIT_RPWM_TOGGLE as u8);
++            }
 +        }
 +        self.r8(REG_CR) != 0xea
 +    }
 +
-+    /// Linux's `__rtw_mac_init_system_cfg`.
++    /// Linux's `__rtw_mac_init_system_cfg`, or `_legacy` on the 8051 CPU's
++    /// chips.
 +    pub(crate) fn init_system_cfg(&self, sys_func_en: u8) {
++        if self.wcpu_8051 {
++            self.w8(REG_CR, 0xff);
++            crate::delay_ms(2);
++            self.w8(REG_HWSEQ_CTRL, 0x7f);
++            crate::delay_ms(2);
++            self.set8(REG_SYS_CLKR, BIT_WAKEPAD_EN);
++            self.w16(REG_GPIO_MUXCFG, self.r16(REG_GPIO_MUXCFG) & !(BIT_EN_SIC as u16));
++            self.w16(REG_CR, 0x2ff);
++            return;
++        }
 +        self.set32(REG_CPU_DMEM_CON, BIT_WL_PLATFORM_RST | BIT_DDMA_EN);
 +        self.set8(REG_SYS_FUNC_EN + 1, sys_func_en as u32);
 +        let value = (self.r8(REG_CR_EXT + 3) & 0xf0) | 0x0c;
@@ -441,35 +482,46 @@ index 0000000..2b2face
 +        self.r32_mask(base + ((addr & 0xff) << 2), mask & RFREG_MASK)
 +    }
 +
-+    /// Linux's `rtw_phy_write_rf_reg_sipi`.
-+    pub(crate) fn write_rf_sipi(&self, base: u32, sipi: u32, addr: u32, mask: u32, data: u32) {
-+        let addr = addr & 0xff;
-+        let mask = mask & RFREG_MASK;
-+        let mut data = data;
-+        if mask != RFREG_MASK {
-+            let old = self.read_rf(base, addr, RFREG_MASK);
-+            data = (old & !mask) | (data << mask.trailing_zeros());
-+        }
-+        self.w32(sipi, ((addr << 20) | (data & 0x000f_ffff)) & 0x0fff_ffff);
++    /// Linux's `rtw_phy_write_rf_reg_sipi`: a whole RF register (the
++    /// caller merges a masked write with what [`crate::hw::Hw::read_rf_path`]
++    /// reads).
++    pub(crate) fn write_rf_sipi(&self, sipi: u32, addr: u32, data: u32) {
++        self.w32(sipi, (((addr & 0xff) << 20) | (data & 0x000f_ffff)) & 0x0fff_ffff);
 +        crate::delay_us(13);
++    }
++
++    /// Linux's `rtw_phy_read_rf_sipi`: the 11n chips' RF read, the address
++    /// through the path's HSSI, path A's read edge toggled, the data from
++    /// the LSSI (or its PI register).
++    pub(crate) fn read_rf_sipi(&self, read: &[SipiRead; 2], path: usize, addr: u32, mask: u32) -> u32 {
++        let (own, a) = (&read[path], &read[0]);
++        let value = (self.r32(own.hssi_2) & !LSSI_READ_ADDR_MASK) | ((addr & 0xff) << 23);
++        self.w32(own.hssi_2, value);
++        let edge = self.r32(a.hssi_2);
++        self.w32(a.hssi_2, edge & !LSSI_READ_EDGE_MASK);
++        self.w32(a.hssi_2, edge | LSSI_READ_EDGE_MASK);
++        crate::delay_us(120);
++        let pi = self.r32(own.hssi_1) & (1 << 8) != 0;
++        let data = self.r32_mask(if pi { own.lssi_read_pi } else { own.lssi_read }, LSSI_READ_DATA_MASK);
++        field(data, mask)
 +    }
 +
 +    // ---- The LTE coexistence window (`ltecoex_read_reg`). ----
 +
 +    pub(crate) fn ltecoex_read(&self, offset: u16) -> Option<u32> {
-+        if !self.ready(LTECOEX_ACCESS_CTRL, LTECOEX_READY, 1) {
++        if !self.ready(self.ltecoex.ctrl, LTECOEX_READY, 1) {
 +            return None;
 +        }
-+        self.w32(LTECOEX_ACCESS_CTRL, 0x800f_0000 | offset as u32);
-+        Some(self.r32(LTECOEX_READ_DATA))
++        self.w32(self.ltecoex.ctrl, 0x800f_0000 | offset as u32);
++        Some(self.r32(self.ltecoex.rdata))
 +    }
 +
 +    pub(crate) fn ltecoex_write(&self, offset: u16, value: u32) -> bool {
-+        if !self.ready(LTECOEX_ACCESS_CTRL, LTECOEX_READY, 1) {
++        if !self.ready(self.ltecoex.ctrl, LTECOEX_READY, 1) {
 +            return false;
 +        }
-+        self.w32(LTECOEX_WRITE_DATA, value);
-+        self.w32(LTECOEX_ACCESS_CTRL, 0xc00f_0000 | offset as u32);
++        self.w32(self.ltecoex.wdata, value);
++        self.w32(self.ltecoex.ctrl, 0xc00f_0000 | offset as u32);
 +        true
 +    }
 +
@@ -518,10 +570,10 @@ index 0000000..2b2face
 +pub(crate) const RPWM_ADDR: u32 = 0x03d9;
 diff --git a/kernel/comps/rtw88/src/hw.rs b/kernel/comps/rtw88/src/hw.rs
 new file mode 100644
-index 0000000..523aedf
+index 0000000..5be8328
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/hw.rs
-@@ -0,0 +1,1397 @@
+@@ -0,0 +1,1674 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip brought up as Linux's rtw88 does it (`rtw_power_on`): MAC
@@ -529,14 +581,17 @@ index 0000000..523aedf
 +//! the H2C queue, the MAC's protocol settings, the PHY tables, the channel,
 +//! the TX power, the BT coexistence's antenna and the firmware's commands
 +//! (H2C). What differs between chips is in each chip's module
-+//! ([`crate::rtw8821c`], [`crate::rtw8822b`], [`crate::rtw8822c`]) and its
-+//! [`Spec`], as Linux's `rtw_chip_info` and `rtw_chip_ops`.
++//! ([`crate::rtw8821c`], [`crate::rtw8822b`], [`crate::rtw8822c`],
++//! [`crate::rtw8723d`]) and its [`Spec`], as Linux's `rtw_chip_info` and
++//! `rtw_chip_ops`. The RTL8723D's 8051 CPU takes the older ways Linux keeps
++//! for it (`rtw_chip_wcpu_8051`): its firmware written page by page, the
++//! FIFO's pages without the H2C queue, no general and PHY information.
 +
 +use alloc::{format, string::String, vec::Vec};
 +
 +use crate::{
-+    chip::{Chip, IntfPara, PwrCmd},
-+    pci::{Pci, TX_DESC, TxInfo},
++    chip::{Chip, IntfPara, Ltecoex, PwrCmd, SipiRead},
++    pci::{Pci, TxInfo},
 +    regs::*,
 +    tables,
 +};
@@ -556,6 +611,8 @@ index 0000000..523aedf
 +    pub(crate) rfe_btg: bool,
 +    pub(crate) share_ant: bool,
 +    pub(crate) btcoex: bool,
++    /// The RTL8723D's AFE option (`efuse->afe`).
++    pub(crate) afe: u8,
 +    /// Each path's TX power index table (`struct rtw_txpwr_idx`, 42 bytes).
 +    pub(crate) txpwr: [[u8; 42]; 2],
 +}
@@ -574,6 +631,7 @@ index 0000000..523aedf
 +            rfe_btg: false,
 +            share_ant: false,
 +            btcoex: false,
++            afe: 0,
 +            txpwr: [[0; 42]; 2],
 +        }
 +    }
@@ -596,6 +654,7 @@ index 0000000..523aedf
 +    Rtl8821c,
 +    Rtl8822b,
 +    Rtl8822c,
++    Rtl8723d,
 +}
 +
 +/// A chip's facts (`struct rtw_chip_info`).
@@ -644,7 +703,37 @@ index 0000000..523aedf
 +    /// DPD off on every rate (`en_dis_dpd`, `DIS_DPD_RATEALL`): those rates'
 +    /// power 6 dB lower (`rtw_phy_get_dis_dpd_by_rate_diff`).
 +    pub(crate) dpd_disabled: bool,
++    /// The CPU an 8051 (`RTW_WCPU_8051`) rather than a 3081.
++    pub(crate) wcpu_8051: bool,
++    /// The TX descriptor's size (`tx_pkt_desc_sz`), and its rate fallback
++    /// limit set (`old_datarate_fb_limit`).
++    pub(crate) tx_desc: usize,
++    pub(crate) old_datarate_fb_limit: bool,
++    /// 5 GHz as well as 2.4 GHz (`RTW_BAND_5G`).
++    pub(crate) band_5g: bool,
++    /// The 11n chips' RF reads through the LSSI (`rf_sipi_read_addr`); the
++    /// others read the RF's direct window at `rf_base`.
++    pub(crate) sipi_read: Option<[SipiRead; 2]>,
++    /// The LTE coexistence window (`ltecoex_addr`).
++    pub(crate) ltecoex: Ltecoex,
++    /// The register and bit that give the BT-shared antenna to WLAN with
++    /// the coexistence's control (`btg_reg`).
++    pub(crate) btg_reg: Option<(u32, u32)>,
++    /// The HT capability's A-MPDU spacing (`ampdu_density`).
++    pub(crate) ampdu_density: u8,
 +}
++
++/// The 11ac chips' LTE window, and the 11n chips' (`rtw8723x_common`).
++const LTECOEX_88XX: Ltecoex = Ltecoex { ctrl: LTECOEX_ACCESS_CTRL, wdata: LTECOEX_WRITE_DATA, rdata: LTECOEX_READ_DATA };
++const LTECOEX_8723X: Ltecoex = Ltecoex { ctrl: REG_LTECOEX_CTRL, wdata: REG_LTECOEX_WRITE_DATA, rdata: REG_LTECOEX_READ_DATA };
++/// The 11n chips' RF read registers of paths A and B (`rf_sipi_addr`).
++const SIPI_READ_8723X: [SipiRead; 2] = [
++    SipiRead { hssi_1: 0x820, hssi_2: 0x824, lssi_read: 0x8a0, lssi_read_pi: 0x8b8 },
++    SipiRead { hssi_1: 0x828, hssi_2: 0x82c, lssi_read: 0x8a4, lssi_read_pi: 0x8bc },
++];
++/// `IEEE80211_HT_MPDU_DENSITY_2` and `_16`.
++const MPDU_DENSITY_2US: u8 = 4;
++const MPDU_DENSITY_16US: u8 = 7;
 +
 +static SPEC_8821C: Spec = Spec {
 +    firmware: "rtw88/rtw8821c_fw.bin",
@@ -676,6 +765,14 @@ index 0000000..523aedf
 +    rfk_init: &[],
 +    rf_direct: false,
 +    dpd_disabled: false,
++    wcpu_8051: false,
++    tx_desc: 48,
++    old_datarate_fb_limit: false,
++    band_5g: true,
++    sipi_read: None,
++    ltecoex: LTECOEX_88XX,
++    btg_reg: None,
++    ampdu_density: MPDU_DENSITY_2US,
 +};
 +
 +static SPEC_8822B: Spec = Spec {
@@ -708,6 +805,14 @@ index 0000000..523aedf
 +    rfk_init: &[],
 +    rf_direct: false,
 +    dpd_disabled: false,
++    wcpu_8051: false,
++    tx_desc: 48,
++    old_datarate_fb_limit: false,
++    band_5g: true,
++    sipi_read: None,
++    ltecoex: LTECOEX_88XX,
++    btg_reg: None,
++    ampdu_density: MPDU_DENSITY_2US,
 +};
 +
 +static SPEC_8822C: Spec = Spec {
@@ -740,6 +845,55 @@ index 0000000..523aedf
 +    rfk_init: &tables::ARRAY_MP_CAL_INIT_8822C,
 +    rf_direct: true,
 +    dpd_disabled: true,
++    wcpu_8051: false,
++    tx_desc: 48,
++    old_datarate_fb_limit: false,
++    band_5g: true,
++    sipi_read: None,
++    ltecoex: LTECOEX_88XX,
++    btg_reg: None,
++    ampdu_density: MPDU_DENSITY_2US,
++};
++
++static SPEC_8723D: Spec = Spec {
++    firmware: "rtw88/rtw8723d_fw.bin",
++    sys_func_en: 0xfd,
++    efuse_sizes: (512, 512, 96 + 1),
++    txff_size: 32768,
++    rxff_size: 16384,
++    pages: [12, 2, 2, 0, 1],
++    power_on: &tables::CARD_ENABLE_FLOW_8723D,
++    power_off: &tables::CARD_DISABLE_FLOW_8723D,
++    pcie_gen1: &tables::PCIE_GEN1_8723D,
++    pcie_gen2: &tables::PCIE_GEN2_8723D,
++    mac: &tables::MAC_8723D,
++    bb: &tables::BB_8723D,
++    agc: &tables::AGC_8723D,
++    rf: [&tables::RF_A_8723D, &[]],
++    // No direct window: the RF is read through the LSSI (`sipi_read`).
++    rf_base: [0, 0],
++    rf_sipi: [0x840, 0x844],
++    rfes: &tables::RFE_8723D,
++    rfe_tables: tables::rfe_8723d,
++    coex_sant: [(0xffff_ffff, 0xffff_ffff), (0x5555_5555, 0x5555_5555), (0x6655_5555, 0x6655_5555)],
++    coex_nsant: [(0xffff_ffff, 0xffff_ffff), (0x5555_5555, 0x5555_5555), (0x6655_5555, 0x6655_5555)],
++    rsvd_drv_pages: 8,
++    csi_pages: 0,
++    max_power_index: 0x3f,
++    txgi_factor: 1,
++    mac_offset: 0xd0,
++    crystal_mask: 0x3f,
++    rfk_init: &[],
++    rf_direct: false,
++    dpd_disabled: false,
++    wcpu_8051: true,
++    tx_desc: 40,
++    old_datarate_fb_limit: true,
++    band_5g: false,
++    sipi_read: Some(SIPI_READ_8723X),
++    ltecoex: LTECOEX_8723X,
++    btg_reg: Some((REG_BTG_SEL, BIT_MASK_BTG_WL)),
++    ampdu_density: MPDU_DENSITY_16US,
 +};
 +
 +impl Model {
@@ -748,6 +902,7 @@ index 0000000..523aedf
 +            Model::Rtl8821c => &SPEC_8821C,
 +            Model::Rtl8822b => &SPEC_8822B,
 +            Model::Rtl8822c => &SPEC_8822C,
++            Model::Rtl8723d => &SPEC_8723D,
 +        }
 +    }
 +
@@ -815,12 +970,15 @@ index 0000000..523aedf
 +}
 +
 +impl Hw {
-+    pub(crate) fn new(chip: Chip, pci: Pci, model: Model, firmware: Vec<u8>) -> Self {
++    pub(crate) fn new(mut chip: Chip, pci: Pci, model: Model, firmware: Vec<u8>) -> Self {
++        let spec = model.spec();
++        chip.wcpu_8051 = spec.wcpu_8051;
++        chip.ltecoex = spec.ltecoex;
 +        Self {
 +            chip,
 +            pci,
 +            model,
-+            spec: model.spec(),
++            spec,
 +            efuse: Efuse::default(),
 +            physical: Vec::new(),
 +            rfe: None,
@@ -884,7 +1042,14 @@ index 0000000..523aedf
 +            chip.w8(REG_LDO_EFUSE_CTRL + 3, if enable { value | BIT_LDO25_EN as u8 } else { value & !(BIT_LDO25_EN as u8) });
 +        };
 +        let (physical, logical, protect) = self.spec.efuse_sizes;
++        let grant = self.model == Model::Rtl8723d;
++        if grant {
++            self.efuse_grant_8723x(true);
++        }
 +        let map = self.chip.read_efuse(physical, logical, protect, ldo25);
++        if grant {
++            self.efuse_grant_8723x(false);
++        }
 +        // The hardware's features (`rtw_dump_hw_feature`): only read, to
 +        // clear the report.
 +        if self.chip.r8(REG_C2HEVT) == C2H_HW_FEATURE_REPORT as u8 {
@@ -897,29 +1062,34 @@ index 0000000..523aedf
 +        if map.len() < mac_at + 6 {
 +            return Err(String::from("the efuse is too short"));
 +        }
-+        // `struct rtw88xx_efuse`: the TX power tables at 0x10, 42 bytes a
-+        // path, the rest after the four paths, the PCIe MAC address at 0xd0.
-+        let e = &mut self.efuse;
-+        for (path, table) in e.txpwr.iter_mut().enumerate() {
-+            let at = 0x10 + 42 * path;
-+            table.copy_from_slice(&map[at..at + 42]);
-+        }
-+        e.crystal_cap = map[0xb9] & self.spec.crystal_mask;
-+        e.rf_board_option = map[0xc1];
-+        e.bt_setting = map[0xc3];
-+        e.tx_bb_swing_2g = map[0xc6];
-+        e.tx_bb_swing_5g = map[0xc7];
-+        e.rfe_option = map[0xca];
-+        e.address.copy_from_slice(&map[mac_at..mac_at + 6]);
-+        for value in [&mut e.crystal_cap, &mut e.rf_board_option, &mut e.tx_bb_swing_2g, &mut e.tx_bb_swing_5g] {
-+            if *value == 0xff {
-+                *value = 0;
++        if self.model == Model::Rtl8723d {
++            self.efuse_8723d(&map);
++        } else {
++            // `struct rtw88xx_efuse`: the TX power tables at 0x10, 42 bytes
++            // a path, the rest after the four paths, the PCIe MAC address
++            // at 0xd0.
++            let e = &mut self.efuse;
++            for (path, table) in e.txpwr.iter_mut().enumerate() {
++                let at = 0x10 + 42 * path;
++                table.copy_from_slice(&map[at..at + 42]);
 +            }
-+        }
-+        e.share_ant = e.bt_setting & 1 != 0;
-+        e.btcoex = e.rf_board_option & 0xe0 == 0x20;
-+        if self.model == Model::Rtl8821c {
-+            self.efuse_8821c();
++            e.crystal_cap = map[0xb9] & self.spec.crystal_mask;
++            e.rf_board_option = map[0xc1];
++            e.bt_setting = map[0xc3];
++            e.tx_bb_swing_2g = map[0xc6];
++            e.tx_bb_swing_5g = map[0xc7];
++            e.rfe_option = map[0xca];
++            e.address.copy_from_slice(&map[mac_at..mac_at + 6]);
++            for value in [&mut e.crystal_cap, &mut e.rf_board_option, &mut e.tx_bb_swing_2g, &mut e.tx_bb_swing_5g] {
++                if *value == 0xff {
++                    *value = 0;
++                }
++            }
++            e.share_ant = e.bt_setting & 1 != 0;
++            e.btcoex = e.rf_board_option & 0xe0 == 0x20;
++            if self.model == Model::Rtl8821c {
++                self.efuse_8821c();
++            }
 +        }
 +        let e = &self.efuse;
 +        if !self.spec.rfes.contains(&e.rfe_option) {
@@ -939,9 +1109,16 @@ index 0000000..523aedf
 +        self.download_firmware()?;
 +        self.mac_init()?;
 +        self.phy_set_param();
++        // `rtw_mac_postinit`.
++        if self.model == Model::Rtl8723d {
++            self.mac_postinit_8723x();
++        }
 +        self.pci.enable_interrupts(&self.chip);
-+        self.send_general_info();
-+        self.send_phydm_info();
++        // The 8051 CPU's firmware takes neither.
++        if !self.spec.wcpu_8051 {
++            self.send_general_info();
++            self.send_phydm_info();
++        }
 +        self.coex_power_on_setting();
 +        self.coex_init_hw_config(!self.efuse.btcoex);
 +        self.enable_sec_engine();
@@ -951,11 +1128,15 @@ index 0000000..523aedf
 +
 +    // ---- Firmware. ----
 +
-+    /// Linux's `rtw_download_firmware` (the 3081 CPU's).
++    /// Linux's `rtw_download_firmware`: the 3081 CPU's, or the 8051's
++    /// (`__rtw_download_firmware_legacy`).
 +    fn download_firmware(&mut self) -> Result<(), String> {
 +        let firmware = core::mem::take(&mut self.firmware);
-+        let result = self.download(&firmware);
++        let result = if self.spec.wcpu_8051 { self.download_legacy(&firmware) } else { self.download(&firmware) };
 +        self.firmware = firmware;
++        if self.spec.wcpu_8051 {
++            return result;
++        }
 +        if result.is_err() {
 +            self.chip.clr8(REG_MCUFW_CTRL, BIT_MCUFWDL_EN);
 +            self.chip.set8(REG_SYS_FUNC_EN + 1, BIT_FEN_CPUEN);
@@ -1041,6 +1222,77 @@ index 0000000..523aedf
 +        Ok(())
 +    }
 +
++    /// The 8051 CPU's download: the code after its header
++    /// (`struct rtw_fw_hdr_legacy`), 4 KiB pages through the window at
++    /// `FW_START_ADDR_LEGACY`, the check report, the CPU restarted on it.
++    fn download_legacy(&mut self, data: &[u8]) -> Result<(), String> {
++        const HEADER: usize = 32;
++        if data.len() <= HEADER {
++            return Err(String::from("the firmware is too short"));
++        }
++        // `en_download_firmware_legacy`.
++        self.wlan_cpu(false);
++        self.wlan_cpu(true);
++        let c = &self.chip;
++        c.set8(REG_MCUFW_CTRL, BIT_MCUFWDL_EN);
++        let mut ready = false;
++        for _ in 0..10 {
++            if c.r8(REG_MCUFW_CTRL) as u32 & BIT_MCUFWDL_EN != 0 {
++                ready = true;
++                break;
++            }
++            c.set8(REG_MCUFW_CTRL, BIT_MCUFWDL_EN);
++            crate::sleep_ms(20);
++        }
++        if !ready {
++            ostd::warn!("{}: the firmware download did not get ready", c.name);
++        }
++        c.clr32(REG_MCUFW_CTRL, BIT_ROM_DLEN);
++        // `download_firmware_legacy`.
++        c.set8(REG_MCUFW_CTRL, BIT_FWDL_CHK_RPT);
++        for (page, chunk) in data[HEADER..].chunks(DLFW_PAGE_SIZE_LEGACY as usize).enumerate() {
++            self.write_firmware_page(page as u32, chunk);
++        }
++        let c = &self.chip;
++        let reported = c.ready(REG_MCUFW_CTRL, BIT_FWDL_CHK_RPT, 1);
++        c.clr8(REG_MCUFW_CTRL, BIT_MCUFWDL_EN);
++        if !reported {
++            return Err(String::from("the firmware's download was not reported"));
++        }
++        // `download_firmware_validate_legacy`.
++        let value = (c.r32(REG_MCUFW_CTRL) | BIT_MCUFWDL_RDY) & !BIT_WINTINI_RDY;
++        c.w32(REG_MCUFW_CTRL, value);
++        self.wlan_cpu(false);
++        self.wlan_cpu(true);
++        let mut started = false;
++        for _ in 0..10 {
++            if self.chip.r32(REG_MCUFW_CTRL) & FW_READY_LEGACY == FW_READY_LEGACY {
++                started = true;
++                break;
++            }
++            crate::sleep_ms(20);
++        }
++        if !started {
++            return Err(format!("the firmware did not start ({:#x})", self.chip.r32(REG_MCUFW_CTRL)));
++        }
++        self.pci.setup(&self.chip);
++        self.h2c_box = 0;
++        self.h2c_seq = 0;
++        Ok(())
++    }
++
++    /// `rtw_write_firmware_page`: the page's number, then its words.
++    fn write_firmware_page(&self, page: u32, data: &[u8]) {
++        let c = &self.chip;
++        let value = (c.r32(REG_MCUFW_CTRL) & !BIT_ROM_PGE) | ((page << BIT_SHIFT_ROM_PGE) & BIT_ROM_PGE);
++        c.w32(REG_MCUFW_CTRL, value);
++        for (index, word) in data.chunks(4).enumerate() {
++            let mut bytes = [0u8; 4];
++            bytes[..word.len()].copy_from_slice(word);
++            c.w32(FW_START_ADDR_LEGACY + 4 * index as u32, u32::from_le_bytes(bytes));
++        }
++    }
++
 +    fn wlan_cpu(&self, enable: bool) {
 +        if enable {
 +            self.chip.set8(REG_RSV_CTRL + 1, BIT_WLMCU_IOIF);
@@ -1067,7 +1319,7 @@ index 0000000..523aedf
 +            if !first {
 +                control |= BIT_DDMACH0_CHKSUM_CONT;
 +            }
-+            self.chip.w32(REG_DDMA_CH0SA, OCPBASE_TXBUF_88XX + TX_DESC as u32);
++            self.chip.w32(REG_DDMA_CH0SA, OCPBASE_TXBUF_88XX + self.pci.tx_desc() as u32);
 +            self.chip.w32(REG_DDMA_CH0DA, dst + offset as u32);
 +            self.chip.w32(REG_DDMA_CH0CTRL, control);
 +            if !self.chip.ready(REG_DDMA_CH0CTRL, BIT_DDMACH0_OWN, 0) {
@@ -1103,7 +1355,7 @@ index 0000000..523aedf
 +        // `rtw_tx_rsvd_page_pkt_info_update` for the first (beacon) page.
 +        let ghz2 = self.channel <= 14;
 +        let info = TxInfo {
-+            offset: TX_DESC as u8,
++            offset: self.pci.tx_desc() as u8,
 +            bmc: data.get(4).is_some_and(|byte| byte & 1 != 0),
 +            ls: true,
 +            dis_qselseq: true,
@@ -1224,12 +1476,69 @@ index 0000000..523aedf
 +        c.w16(REG_TXDMA_PQ_MAP, map as u16);
 +        c.w8(REG_CR, 0);
 +        c.w8(REG_CR, MAC_TRX_ENABLE as u8);
-+        c.w32(REG_H2CQ_CSR, BIT_H2CQ_FULL);
-+        // `rtw_set_trx_fifo_info` and `priority_queue_cfg` (`page_table[1]`).
++        let legacy = self.spec.wcpu_8051;
++        if !legacy {
++            c.w32(REG_H2CQ_CSR, BIT_H2CQ_FULL);
++        }
++        // `rtw_set_trx_fifo_info` and `priority_queue_cfg` (`page_table[1]`):
++        // the 8051 CPU's chips reserve the driver's pages only.
 +        let txff_pg_num = self.spec.txff_size / PAGE_SIZE;
-+        let rsvd_pg_num = self.spec.rsvd_drv_pages + RSVD_PG_H2C_EXTRAINFO_NUM + RSVD_PG_H2C_STATICINFO_NUM + RSVD_PG_H2CQ_NUM + RSVD_PG_CPU_INSTRUCTION_NUM + RSVD_PG_FW_TXBUF_NUM + self.spec.csi_pages;
++        let rsvd_pg_num = if legacy {
++            self.spec.rsvd_drv_pages
++        } else {
++            self.spec.rsvd_drv_pages + RSVD_PG_H2C_EXTRAINFO_NUM + RSVD_PG_H2C_STATICINFO_NUM + RSVD_PG_H2CQ_NUM + RSVD_PG_CPU_INSTRUCTION_NUM + RSVD_PG_FW_TXBUF_NUM + self.spec.csi_pages
++        };
 +        let acq_pg_num = txff_pg_num - rsvd_pg_num;
 +        self.rsvd_boundary = txff_pg_num - rsvd_pg_num;
++        let [hq, nq, lq, exq, gapq] = self.spec.pages;
++        let pubq = acq_pg_num - hq - lq - nq - exq - gapq;
++        if legacy {
++            self.priority_queue_cfg_legacy(pubq)?;
++        } else {
++            self.priority_queue_cfg(pubq)?;
++        }
++        match self.model {
++            Model::Rtl8821c => self.mac_init_8821c(),
++            Model::Rtl8822b => self.mac_init_8822b(),
++            Model::Rtl8822c => self.mac_init_8822c(),
++            Model::Rtl8723d => self.mac_init_8723x(),
++        }
++        // `rtw_drv_info_cfg`.
++        let c = &self.chip;
++        c.w8(REG_RX_DRVINFO_SZ, PHY_STATUS_SIZE as u8);
++        if !legacy {
++            c.w8(REG_TRXFF_BNDY + 1, (c.r8(REG_TRXFF_BNDY + 1) & 0xf0) | 0x0f);
++        }
++        c.set32(REG_RCR, BIT_APP_PHYSTS);
++        c.clr32(REG_WMAC_OPTION_FUNCTION + 4, (1 << 8) | (1 << 9));
++        Ok(())
++    }
++
++    /// `__priority_queue_cfg_legacy`: the queues' pages and the FIFO's
++    /// boundaries in the older registers, the link list built.
++    fn priority_queue_cfg_legacy(&self, pubq: u32) -> Result<(), String> {
++        let [hq, nq, lq, exq, _] = self.spec.pages;
++        let boundary = self.rsvd_boundary;
++        let c = &self.chip;
++        c.w32(REG_RQPN_NPQ, ((nq & BIT_MASK_NPQ) << BIT_SHIFT_NPQ) | ((exq & BIT_MASK_EPQ) << BIT_SHIFT_EPQ));
++        c.w32(REG_RQPN, BIT_LD_RQPN | ((hq & BIT_MASK_HPQ) << BIT_SHIFT_HPQ) | ((lq & BIT_MASK_LPQ) << BIT_SHIFT_LPQ) | ((pubq & BIT_MASK_PUBQ) << BIT_SHIFT_PUBQ));
++        c.w8(REG_TRXFF_BNDY, boundary as u8);
++        c.w16(REG_TRXFF_BNDY + 2, (self.spec.rxff_size - REPORT_BUF - 1) as u16);
++        c.w8(REG_DWBCN0_CTRL + 1, boundary as u8);
++        c.w8(REG_BCNQ_BDNY, boundary as u8);
++        c.w8(REG_MGQ_BDNY, boundary as u8);
++        c.w8(REG_WMAC_LBK_BF_HD, boundary as u8);
++        c.set32(REG_AUTO_LLT, BIT_AUTO_INIT_LLT);
++        if !c.ready(REG_AUTO_LLT, BIT_AUTO_INIT_LLT, 0) {
++            return Err(String::from("the FIFO's link list did not initialise"));
++        }
++        Ok(())
++    }
++
++    /// `__priority_queue_cfg` and `init_h2c` (the 3081 CPU's): the
++    /// reserved pages' addresses, the queues' pages, the H2C queue.
++    fn priority_queue_cfg(&mut self, pubq: u32) -> Result<(), String> {
++        let txff_pg_num = self.spec.txff_size / PAGE_SIZE;
 +        let mut cur = txff_pg_num;
 +        // The 3081 CPU's CSI buffer first (`rsvd_csibuf_addr`).
 +        cur -= self.spec.csi_pages;
@@ -1238,8 +1547,7 @@ index 0000000..523aedf
 +        cur -= RSVD_PG_CPU_INSTRUCTION_NUM;
 +        cur -= RSVD_PG_H2CQ_NUM;
 +        self.rsvd_h2cq_addr = cur;
-+        let [hq, nq, lq, exq, gapq] = self.spec.pages;
-+        let pubq = acq_pg_num - hq - lq - nq - exq - gapq;
++        let [hq, nq, lq, exq, _] = self.spec.pages;
 +        let c = &self.chip;
 +        c.w16(REG_FIFOPAGE_INFO_1, hq as u16);
 +        c.w16(REG_FIFOPAGE_INFO_2, lq as u16);
@@ -1272,17 +1580,6 @@ index 0000000..523aedf
 +        if free != h2cq_size {
 +            return Err(String::from("the H2C queue does not match"));
 +        }
-+        match self.model {
-+            Model::Rtl8821c => self.mac_init_8821c(),
-+            Model::Rtl8822b => self.mac_init_8822b(),
-+            Model::Rtl8822c => self.mac_init_8822c(),
-+        }
-+        // `rtw_drv_info_cfg`.
-+        let c = &self.chip;
-+        c.w8(REG_RX_DRVINFO_SZ, PHY_STATUS_SIZE as u8);
-+        c.w8(REG_TRXFF_BNDY + 1, (c.r8(REG_TRXFF_BNDY + 1) & 0xf0) | 0x0f);
-+        c.set32(REG_RCR, BIT_APP_PHYSTS);
-+        c.clr32(REG_WMAC_OPTION_FUNCTION + 4, (1 << 8) | (1 << 9));
 +        Ok(())
 +    }
 +
@@ -1337,16 +1634,23 @@ index 0000000..523aedf
 +    /// (`rtw_phy_write_rf_reg_mix`: but for register 0).
 +    pub(crate) fn write_rf_path(&self, path: usize, addr: u32, mask: u32, data: u32) {
 +        let addr = addr & 0xff;
++        let mask = mask & RFREG_MASK;
 +        if self.spec.rf_direct && addr != 0 {
-+            self.chip.w32_mask(self.spec.rf_base[path] + (addr << 2), mask & RFREG_MASK, data);
++            self.chip.w32_mask(self.spec.rf_base[path] + (addr << 2), mask, data);
 +            crate::delay_us(1);
-+        } else {
-+            self.chip.write_rf_sipi(self.spec.rf_base[path], self.spec.rf_sipi[path], addr, mask, data);
++            return;
 +        }
++        let data = if mask == RFREG_MASK { data } else { (self.read_rf_path(path, addr, RFREG_MASK) & !mask) | (data << mask.trailing_zeros()) };
++        self.chip.write_rf_sipi(self.spec.rf_sipi[path], addr, data);
 +    }
 +
++    /// `rtw_read_rf`: the direct window, or the 11n chips' LSSI
++    /// (`rtw_phy_read_rf_sipi`).
 +    pub(crate) fn read_rf_path(&self, path: usize, addr: u32, mask: u32) -> u32 {
-+        self.chip.read_rf(self.spec.rf_base[path], addr, mask)
++        match &self.spec.sipi_read {
++            Some(read) => self.chip.read_rf_sipi(read, path, addr, mask),
++            None => self.chip.read_rf(self.spec.rf_base[path], addr, mask),
++        }
 +    }
 +
 +    pub(crate) fn write_rf(&self, addr: u32, mask: u32, data: u32) {
@@ -1465,6 +1769,7 @@ index 0000000..523aedf
 +            Model::Rtl8821c => self.phy_set_param_8821c(),
 +            Model::Rtl8822b => self.phy_set_param_8822b(),
 +            Model::Rtl8822c => self.phy_set_param_8822c(),
++            Model::Rtl8723d => self.phy_set_param_8723d(),
 +        }
 +    }
 +
@@ -1484,6 +1789,7 @@ index 0000000..523aedf
 +            Model::Rtl8821c => self.set_channel_8821c(channel),
 +            Model::Rtl8822b => self.set_channel_8822b(channel),
 +            Model::Rtl8822c => self.set_channel_8822c(channel),
++            Model::Rtl8723d => self.set_channel_8723d(channel),
 +        }
 +        if channel > 14 {
 +            self.coex_band_5g();
@@ -1501,6 +1807,10 @@ index 0000000..523aedf
 +        let c = &self.chip;
 +        c.w8(REG_DATA_SC, 0);
 +        c.clr32(REG_WMAC_TRXPTCL_CTL, BIT_RFMOD);
++        // The 8051 CPU's chips keep their MAC clock.
++        if self.spec.wcpu_8051 {
++            return;
++        }
 +        let value = (c.r32(REG_AFE_CTRL1) & !BIT_MAC_CLK_SEL) | (MAC_CLK_HW_DEF_80M << BIT_SHIFT_MAC_CLK_SEL);
 +        c.w32(REG_AFE_CTRL1, value);
 +        c.w8(REG_USTIME_TSF, MAC_CLK_SPEED as u8);
@@ -1519,9 +1829,10 @@ index 0000000..523aedf
 +            return;
 +        }
 +        self.need_rfk = false;
-+        if self.model == Model::Rtl8822c {
-+            self.do_iqk_8822c();
-+            return;
++        match self.model {
++            Model::Rtl8822c => return self.do_iqk_8822c(),
++            Model::Rtl8723d => return self.do_iqk_8723d(),
++            Model::Rtl8821c | Model::Rtl8822b => {}
 +        }
 +        self.h2c_packet(H2C_PKT_IQK as u8, &[(associated as u8) << 1]);
 +        for _ in 0..300 {
@@ -1540,9 +1851,10 @@ index 0000000..523aedf
 +    /// four rates to a register.
 +    fn set_tx_power(&self, channel: u8) {
 +        let Some(tables) = &self.rfe else { return };
-+        if self.model == Model::Rtl8822c {
-+            self.set_tx_power_8822c(tables, channel);
-+            return;
++        match self.model {
++            Model::Rtl8822c => return self.set_tx_power_8822c(tables, channel),
++            Model::Rtl8723d => return self.set_tx_power_8723d(tables, channel),
++            Model::Rtl8821c | Model::Rtl8822b => {}
 +        }
 +        let streams = self.paths();
 +        for path in 0..streams {
@@ -1634,6 +1946,7 @@ index 0000000..523aedf
 +                _ => None,
 +            },
 +            Model::Rtl8822c => self.phy_signal_8822c(status),
++            Model::Rtl8723d => self.phy_signal_8723d(status),
 +        }
 +    }
 +
@@ -1673,11 +1986,19 @@ index 0000000..523aedf
 +        }
 +    }
 +
++    /// `rtw_coex_coex_ctrl_owner`.
 +    fn ctrl_owner(&self, wifi: bool) {
 +        if wifi {
 +            self.chip.set8(REG_SYS_SDIO_CTRL + 3, BIT_LTE_MUX_CTRL_PATH >> 24);
 +        } else {
 +            self.chip.clr8(REG_SYS_SDIO_CTRL + 3, BIT_LTE_MUX_CTRL_PATH >> 24);
++        }
++        if let Some((register, bit)) = self.spec.btg_reg {
++            if wifi {
++                self.chip.set8(register, bit);
++            } else {
++                self.chip.clr8(register, bit);
++            }
 +        }
 +    }
 +
@@ -1686,8 +2007,8 @@ index 0000000..523aedf
 +        match self.model {
 +            Model::Rtl8821c => self.ant_switch_8821c(ctrl, position),
 +            Model::Rtl8822b => self.ant_switch_8822b(ctrl, position),
-+            // No switch of its own (`coex_set_ant_switch` is NULL).
-+            Model::Rtl8822c => {}
++            // No switch of their own (`coex_set_ant_switch` is NULL).
++            Model::Rtl8822c | Model::Rtl8723d => {}
 +        }
 +    }
 +
@@ -1717,6 +2038,10 @@ index 0000000..523aedf
 +        self.coex_table(1);
 +        self.chip.w8(0xff1a, 0x0);
 +        // The chip's `coex_set_gnt_debug`.
++        if self.model == Model::Rtl8723d {
++            self.coex_gnt_debug_8723d();
++            return;
++        }
 +        let c = &self.chip;
 +        c.clr32(REG_PAD_CTRL1, BIT_BTGP_SPI_EN);
 +        c.clr32(REG_PAD_CTRL1, BIT_BTGP_JTAG_EN);
@@ -1737,12 +2062,14 @@ index 0000000..523aedf
 +            Model::Rtl8821c => {}
 +            Model::Rtl8822b => self.coex_rfe_type_8822b(),
 +            Model::Rtl8822c => self.coex_rfe_type_8822c(),
++            Model::Rtl8723d => self.coex_rfe_type_8723d(),
 +        }
 +        // The 5 ms slot extension off (`rtw_coex_wl_slot_extend`).
 +        let command = [H2C_CMD_BT_WIFI_CONTROL as u8, COEX_H2C69_WL_LEAKAP as u8, PARA1_H2C69_DIS_5MS as u8, 0, 0, 0, 0, 0];
 +        self.h2c(&command);
 +        // The chip's `coex_set_init` (the RTL8821C's also puts beacons
-+        // first).
++        // first; the RTL8723D's, `rtw8723x_coex_cfg_init`, stops at the
++        // PTA's TX).
 +        let c = &self.chip;
 +        c.set8(REG_BCN_CTRL, BIT_EN_BCN_FUNCTION);
 +        c.w8_mask(REG_BT_TDMA_TIME, BIT_MASK_SAMPLE_RATE, 0x5);
@@ -1750,11 +2077,13 @@ index 0000000..523aedf
 +        c.set32(REG_GPIO_MUXCFG, BIT_BT_PTA_EN);
 +        c.set32(REG_GPIO_MUXCFG, BIT_PO_BT_PTA_PINS);
 +        c.set8(REG_QUEUE_CTRL, BIT_PTA_WL_TX_EN);
-+        c.clr8(REG_QUEUE_CTRL, BIT_PTA_EDCCA_EN);
-+        c.set16(REG_BT_COEX_V2, BIT_GNT_BT_POLARITY);
++        if self.model != Model::Rtl8723d {
++            c.clr8(REG_QUEUE_CTRL, BIT_PTA_EDCCA_EN);
++            c.set16(REG_BT_COEX_V2, BIT_GNT_BT_POLARITY);
++        }
 +        match self.model {
 +            Model::Rtl8821c => c.w8_mask(REG_BT_COEX_TABLE_H + 3, BIT_BCN_QUEUE, BCN_PRI_EN),
-+            Model::Rtl8822b => {}
++            Model::Rtl8822b | Model::Rtl8723d => {}
 +            Model::Rtl8822c => self.coex_cfg_init_8822c(),
 +        }
 +        let c = &self.chip;
@@ -1921,30 +2250,32 @@ index 0000000..523aedf
 +}
 diff --git a/kernel/comps/rtw88/src/lib.rs b/kernel/comps/rtw88/src/lib.rs
 new file mode 100644
-index 0000000..7bf86d2
+index 0000000..cd49308
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/lib.rs
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,230 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Realtek Wi-Fi of Linux's rtw88 family on PCIe, as Linux's `rtw88_pci`
 +//! runs them: the RTL8821CE (10ec:b821, 10ec:c821; one path, Bluetooth on
-+//! the same antenna), the RTL8822BE (10ec:b822; two paths) and the
-+//! RTL8822CE (10ec:c822, 10ec:c82f; two paths, its DAC calibrated at power
-+//! on).
++//! the same antenna), the RTL8822BE (10ec:b822; two paths), the RTL8822CE
++//! (10ec:c822, 10ec:c82f; two paths, its DAC calibrated at power on) and
++//! the RTL8723DE (10ec:d723; 802.11n at 2.4 GHz, one path, an 8051 CPU,
++//! Bluetooth on the same antenna).
 +//!
 +//! The chip ([`chip`], [`pci`]) is brought up by the host ([`hw`], with
-+//! each chip's own part in [`rtw8821c`], [`rtw8822b`] and [`rtw8822c`]): power
-+//! sequences, the firmware (linux-firmware's `rtw88/rtw8821c_fw.bin`)
-+//! through the reserved pages, the MAC, the PHY tables ([`tables`],
-+//! generated from Linux's), the channel, the TX power, the antenna shared
-+//! with Bluetooth. The station on it is [`sta`]: a software scan, the
-+//! firmware's rate adaptation, keys in the security CAM.
++//! each chip's own part in [`rtw8821c`], [`rtw8822b`], [`rtw8822c`] and
++//! [`rtw8723d`]): power sequences, the firmware (linux-firmware's
++//! `rtw88/rtw8821c_fw.bin` and the others) through the reserved pages or,
++//! on the RTL8723DE, page by page, the MAC, the PHY tables ([`tables`],
++//! generated from Linux's), the channel, the TX power, the calibrations,
++//! the antenna shared with Bluetooth. The station on it is [`sta`]: a
++//! software scan, the firmware's rate adaptation, keys in the security CAM.
 +//!
-+//! Not yet: the RTL8723DE (its own tables, calibrations and channel code),
-+//! the RTL8822CE's TX gain gap calibration and DPK (its DPD stays off),
-+//! 40/80 MHz, VHT, power save, the dynamic sensitivity (DIG) and
-+//! the BT coexistence's run-time decisions beyond the band. `dmesg | grep
++//! Not yet: the RTL8822CE's TX gain gap calibration and DPK (its DPD stays
++//! off), 40/80 MHz, VHT, power save, the thermal power tracking, the
++//! dynamic sensitivity (DIG) and the BT coexistence's run-time decisions
++//! beyond the band. `dmesg | grep
 +//! rtw88` says how far a card gets; `rtw88.off` leaves the cards alone.
 +
 +#![no_std]
@@ -1963,6 +2294,7 @@ index 0000000..7bf86d2
 +mod pci;
 +#[allow(clippy::all)]
 +mod regs;
++mod rtw8723d;
 +mod rtw8821c;
 +mod rtw8822b;
 +mod rtw8822c;
@@ -2002,6 +2334,7 @@ index 0000000..7bf86d2
 +        (VENDOR_REALTEK, 0xb821 | 0xc821) => Some(Model::Rtl8821c),
 +        (VENDOR_REALTEK, 0xb822) => Some(Model::Rtl8822b),
 +        (VENDOR_REALTEK, 0xc822 | 0xc82f) => Some(Model::Rtl8822c),
++        (VENDOR_REALTEK, 0xd723) => Some(Model::Rtl8723d),
 +        _ => None,
 +    }
 +}
@@ -2116,7 +2449,7 @@ index 0000000..7bf86d2
 +        ostd::warn!("{}: {} is not in /lib/firmware", name, model.firmware());
 +        return;
 +    };
-+    let Some(pci) = Pci::new() else {
++    let Some(pci) = Pci::new(model.spec()) else {
 +        ostd::warn!("{}: no DMA memory below 4 GiB", name);
 +        return;
 +    };
@@ -2153,10 +2486,10 @@ index 0000000..7bf86d2
 +}
 diff --git a/kernel/comps/rtw88/src/pci.rs b/kernel/comps/rtw88/src/pci.rs
 new file mode 100644
-index 0000000..3b3ac49
+index 0000000..115473c
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/pci.rs
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,326 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The PCIe side as Linux's rtw88 `pci.c` runs it: a ring of buffer
@@ -2167,7 +2500,7 @@ index 0000000..3b3ac49
 +
 +use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
 +
-+use crate::{chip::Chip, regs::*};
++use crate::{chip::Chip, hw::Spec, regs::*};
 +
 +/// The queues, in Linux's order (`enum rtw_tx_queue_type`).
 +pub(crate) const QUEUE_BK: usize = 0;
@@ -2180,9 +2513,10 @@ index 0000000..3b3ac49
 +pub(crate) const QUEUE_H2C: usize = 7;
 +const QUEUES: usize = 8;
 +
-+/// The TX descriptor of the 8821C/8822B/8822C (`tx_pkt_desc_sz`) and the
-+/// buffer descriptors (`tx_buf_desc_sz`, `rx_buf_desc_sz`).
-+pub(crate) const TX_DESC: usize = 48;
++/// The largest TX descriptor (`tx_pkt_desc_sz`: the 8821C's, 8822B's and
++/// 8822C's; the RTL8723D's is its first 40 bytes) and the buffer
++/// descriptors (`tx_buf_desc_sz`, `rx_buf_desc_sz`).
++const TX_DESC_MAX: usize = 48;
 +const TX_BD: usize = 16;
 +const RX_BD: usize = 8;
 +/// A TX slot: a page (the beacon queue two, for 4 KiB of firmware).
@@ -2248,18 +2582,22 @@ index 0000000..3b3ac49
 +}
 +
 +impl TxInfo {
-+    /// `rtw_tx_fill_tx_desc`.
-+    fn descriptor(&self, size: usize) -> [u8; TX_DESC] {
++    /// `rtw_tx_fill_tx_desc`; with `fb_limit`, the rate fallback's limit at
++    /// its widest (`old_datarate_fb_limit`).
++    fn descriptor(&self, size: usize, fb_limit: bool) -> [u8; TX_DESC_MAX] {
 +        let mut w = [0u32; 12];
 +        let more_data = self.qsel == TX_DESC_QSEL_HIGH as u8;
 +        w[0] = (size as u32 & 0xffff) | ((self.offset as u32) << 16) | ((self.bmc as u32) << 24) | ((self.ls as u32) << 26) | ((self.dis_qselseq as u32) << 31);
 +        w[1] = (self.mac_id as u32 & 0x7f) | ((self.qsel as u32 & 0x1f) << 8) | ((self.rate_id as u32 & 0x1f) << 16) | ((self.sec_type as u32 & 3) << 22) | ((more_data as u32) << 29);
 +        w[3] = ((self.use_rate as u32) << 8) | ((self.dis_rate_fallback as u32) << 10);
 +        w[4] = self.rate as u32 & 0x7f;
++        if fb_limit {
++            w[4] |= 0x1f << 8;
++        }
 +        w[6] = self.sn as u32 & 0xfff;
 +        w[8] = (self.en_hwseq as u32) << 15;
 +        w[9] = (self.seq as u32 & 0xfff) << 12;
-+        let mut out = [0u8; TX_DESC];
++        let mut out = [0u8; TX_DESC_MAX];
 +        for (index, word) in w.iter().enumerate() {
 +            out[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
 +        }
@@ -2272,11 +2610,17 @@ index 0000000..3b3ac49
 +    rx: RxRing,
 +    /// Interrupts to take (`irq_mask`).
 +    mask: [u32; 4],
++    /// The chip's TX descriptor and its rate fallback limit, and whether it
++    /// has the H2C queue and its interrupts (the 3081 CPU's chips, not the
++    /// 8051's).
++    tx_desc: usize,
++    fb_limit: bool,
++    h2c_queue: bool,
 +}
 +
 +impl Pci {
-+    /// Linux's `rtw_pci_init`: the rings.
-+    pub(crate) fn new() -> Option<Self> {
++    /// Linux's `rtw_pci_init`: the rings, for the chip of `spec`.
++    pub(crate) fn new(spec: &Spec) -> Option<Self> {
 +        let mut tx = Vec::with_capacity(QUEUES);
 +        for queue in 0..QUEUES {
 +            let (len, slot) = match queue {
@@ -2293,7 +2637,12 @@ index 0000000..3b3ac49
 +            0,
 +            IMR_H2CDOK,
 +        ];
-+        Some(Self { tx, rx, mask })
++        Some(Self { tx, rx, mask, tx_desc: spec.tx_desc.min(TX_DESC_MAX), fb_limit: spec.old_datarate_fb_limit, h2c_queue: !spec.wcpu_8051 })
++    }
++
++    /// The TX descriptor's size (its `offset` field).
++    pub(crate) fn tx_desc(&self) -> usize {
++        self.tx_desc
 +    }
 +
 +    /// Linux's `rtw_pci_setup` (`rtw_pci_reset_buf_desc`, `rtw_pci_dma_reset`).
@@ -2301,6 +2650,9 @@ index 0000000..3b3ac49
 +        let value = chip.r8(RTK_PCI_CTRL + 3);
 +        chip.w8(RTK_PCI_CTRL + 3, value | 0xf7);
 +        for (queue, ring) in self.tx.iter_mut().enumerate() {
++            if queue == QUEUE_H2C && !self.h2c_queue {
++                continue;
++            }
 +            let (desa, num, _) = registers(queue);
 +            ring.wp = 0;
 +            for slot in 0..ring.len {
@@ -2318,7 +2670,9 @@ index 0000000..3b3ac49
 +        chip.w16(RTK_PCI_RXBD_NUM_MPDUQ, (RX_SLOTS as u32 & TRX_BD_IDX_MASK) as u16);
 +        chip.w32(RTK_PCI_RXBD_DESA_MPDUQ, self.rx.bds.daddr() as u32);
 +        chip.w32(RTK_PCI_TXBD_RWPTR_CLR, 0xffff_ffff);
-+        chip.set32(RTK_PCI_TXBD_H2CQ_CSR, BIT_CLR_H2CQ_HOST_IDX | BIT_CLR_H2CQ_HW_IDX);
++        if self.h2c_queue {
++            chip.set32(RTK_PCI_TXBD_H2CQ_CSR, BIT_CLR_H2CQ_HOST_IDX | BIT_CLR_H2CQ_HW_IDX);
++        }
 +        // The DMA's reset and the RX tag.
 +        chip.set32(RTK_PCI_CTRL, BIT_RST_TRXDMA_INTF | BIT_RX_TAG_EN);
 +        self.rx.tag = 0;
@@ -2335,13 +2689,17 @@ index 0000000..3b3ac49
 +    pub(crate) fn enable_interrupts(&self, chip: &Chip) {
 +        chip.w32(RTK_PCI_HIMR0, self.mask[0]);
 +        chip.w32(RTK_PCI_HIMR1, self.mask[1]);
-+        chip.w32(RTK_PCI_HIMR3, self.mask[3]);
++        if self.h2c_queue {
++            chip.w32(RTK_PCI_HIMR3, self.mask[3]);
++        }
 +    }
 +
 +    pub(crate) fn disable_interrupts(&self, chip: &Chip) {
 +        chip.w32(RTK_PCI_HIMR0, 0);
 +        chip.w32(RTK_PCI_HIMR1, 0);
-+        chip.w32(RTK_PCI_HIMR3, 0);
++        if self.h2c_queue {
++            chip.w32(RTK_PCI_HIMR3, 0);
++        }
 +    }
 +
 +    /// The interrupt status, cleared (`rtw_pci_irq_recognized`).
@@ -2350,11 +2708,13 @@ index 0000000..3b3ac49
 +            chip.r32(RTK_PCI_HISR0) & self.mask[0],
 +            chip.r32(RTK_PCI_HISR1) & self.mask[1],
 +            0,
-+            chip.r32(RTK_PCI_HISR3) & self.mask[3],
++            if self.h2c_queue { chip.r32(RTK_PCI_HISR3) & self.mask[3] } else { 0 },
 +        ];
 +        chip.w32(RTK_PCI_HISR0, status[0]);
 +        chip.w32(RTK_PCI_HISR1, status[1]);
-+        chip.w32(RTK_PCI_HISR3, status[3]);
++        if self.h2c_queue {
++            chip.w32(RTK_PCI_HISR3, status[3]);
++        }
 +        status
 +    }
 +
@@ -2373,26 +2733,27 @@ index 0000000..3b3ac49
 +        if queue != QUEUE_BCN && self.free_slots(chip, queue) == 0 {
 +            return Err(());
 +        }
++        let (desc, fb_limit) = (self.tx_desc, self.fb_limit);
 +        let ring = &mut self.tx[queue];
-+        if TX_DESC + data.len() > ring.slot {
++        if desc + data.len() > ring.slot {
 +            return Err(());
 +        }
 +        let slot = ring.wp;
 +        let at = slot * ring.slot;
-+        ring.buffers.write_bytes(at, &info.descriptor(data.len())).map_err(|_| ())?;
-+        ring.buffers.write_bytes(at + TX_DESC, data).map_err(|_| ())?;
++        ring.buffers.write_bytes(at, &info.descriptor(data.len(), fb_limit)[..desc]).map_err(|_| ())?;
++        ring.buffers.write_bytes(at + desc, data).map_err(|_| ())?;
 +        let address = (ring.buffers.daddr() + at) as u32;
-+        let total = TX_DESC + data.len();
++        let total = desc + data.len();
 +        let mut psb = ((total - 1) / 128 + 1) as u16;
 +        if queue == QUEUE_BCN {
 +            psb |= 1 << RTK_PCI_TXBD_OWN_OFFSET;
 +        }
 +        let mut bd = [0u8; TX_BD];
-+        bd[0..2].copy_from_slice(&(TX_DESC as u16).to_le_bytes());
++        bd[0..2].copy_from_slice(&(desc as u16).to_le_bytes());
 +        bd[2..4].copy_from_slice(&psb.to_le_bytes());
 +        bd[4..8].copy_from_slice(&address.to_le_bytes());
 +        bd[8..10].copy_from_slice(&(data.len() as u16).to_le_bytes());
-+        bd[12..16].copy_from_slice(&(address + TX_DESC as u32).to_le_bytes());
++        bd[12..16].copy_from_slice(&(address + desc as u32).to_le_bytes());
 +        ring.bds.write_bytes(slot * TX_BD, &bd).map_err(|_| ())?;
 +        if queue == QUEUE_BCN {
 +            return Ok(());
@@ -2411,8 +2772,11 @@ index 0000000..3b3ac49
 +        Ok(())
 +    }
 +
-+    /// Linux's `rtw_pci_write_data_h2c`.
++    /// Linux's `rtw_pci_write_data_h2c` (the 3081 CPU's chips only).
 +    pub(crate) fn write_h2c(&mut self, chip: &Chip, packet: &[u8]) -> Result<(), ()> {
++        if !self.h2c_queue {
++            return Err(());
++        }
 +        let info = TxInfo { qsel: TX_DESC_QSEL_H2C as u8, ..TxInfo::default() };
 +        self.write(chip, QUEUE_H2C, &info, packet)
 +    }
@@ -2454,10 +2818,10 @@ index 0000000..3b3ac49
 +}
 diff --git a/kernel/comps/rtw88/src/regs.rs b/kernel/comps/rtw88/src/regs.rs
 new file mode 100644
-index 0000000..6d5f424
+index 0000000..a7e530f
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/regs.rs
-@@ -0,0 +1,670 @@
+@@ -0,0 +1,854 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright(c) 2018-2019 Realtek Corporation
 +
@@ -2474,6 +2838,7 @@ index 0000000..6d5f424
 +pub(crate) const BITS_DBI_WREN: u32 = 0xf000;
 +pub(crate) const BITS_EF_ADDR: u32 = 0x3ff00;
 +pub(crate) const BITS_MDIO_ADDR_MASK: u32 = 0x1f;
++pub(crate) const BITS_PLL: u32 = 0xf0;
 +pub(crate) const BITS_RRSR_RSC: u32 = 0x600000;
 +pub(crate) const BITS_RXAGC_CCK: u32 = 0xf000;
 +pub(crate) const BITS_RXAGC_OFDM: u32 = 0x1f0;
@@ -2484,12 +2849,14 @@ index 0000000..6d5f424
 +pub(crate) const BIT_3WIRE_TX_EN: u32 = 0x1;
 +pub(crate) const BIT_AB: u32 = 0x8;
 +pub(crate) const BIT_AM: u32 = 0x4;
++pub(crate) const BIT_ANA8M: u32 = 0x2;
 +pub(crate) const BIT_ANAPAR_UPDATE: u32 = 0x20000000;
 +pub(crate) const BIT_APM: u32 = 0x2;
 +pub(crate) const BIT_APP_FCS: u32 = 0x80000000;
 +pub(crate) const BIT_APP_ICV: u32 = 0x20000000;
 +pub(crate) const BIT_APP_MIC: u32 = 0x40000000;
 +pub(crate) const BIT_APP_PHYSTS: u32 = 0x10000000;
++pub(crate) const BIT_AUTO_INIT_LLT: u32 = 0x10000;
 +pub(crate) const BIT_AUTO_INIT_LLT_V1: u32 = 0x1;
 +pub(crate) const BIT_BA_PARSER_EN: u32 = 0x20;
 +pub(crate) const BIT_BB_CCK_CHECK_EN: u32 = 0x40000;
@@ -2499,13 +2866,16 @@ index 0000000..6d5f424
 +pub(crate) const BIT_BTCCA_CTRL: u32 = 0x3;
 +pub(crate) const BIT_BTGP_JTAG_EN: u32 = 0x1000000;
 +pub(crate) const BIT_BTGP_SPI_EN: u32 = 0x100000;
++pub(crate) const BIT_BT_BTG_SEL: u32 = 0x80000000;
 +pub(crate) const BIT_BT_INT_EN: u32 = 0x8000;
 +pub(crate) const BIT_BT_PTA_EN: u32 = 0x20;
 +pub(crate) const BIT_CBSSID_BCN: u32 = 0x80;
 +pub(crate) const BIT_CBSSID_DATA: u32 = 0x40;
++pub(crate) const BIT_CCKEN: u32 = 0x1000000;
 +pub(crate) const BIT_CCK_OFDM_BLK_EN: u32 = 0x3;
 +pub(crate) const BIT_CHECK_CCK_EN: u32 = 0x80;
 +pub(crate) const BIT_CHECK_SUM_OK: u32 = 0x50;
++pub(crate) const BIT_CK320M_AFE_EN: u32 = 0x10;
 +pub(crate) const BIT_CLR_H2CQ_HOST_IDX: u32 = 0x10000;
 +pub(crate) const BIT_CLR_H2CQ_HW_IDX: u32 = 0x100;
 +pub(crate) const BIT_CPU_CLK_EN: u32 = 0x4000;
@@ -2529,57 +2899,107 @@ index 0000000..6d5f424
 +pub(crate) const BIT_DMEM_DW_OK: u32 = 0x20;
 +pub(crate) const BIT_DPDT_SEL_EN: u32 = 0x800000;
 +pub(crate) const BIT_DPDT_WL_SEL: u32 = 0x1000000;
++pub(crate) const BIT_DROP_DATA_EN: u32 = 0x200;
 +pub(crate) const BIT_DUMMY_FCS_READY_MASK_EN: u32 = 0x200;
 +pub(crate) const BIT_EF_FLAG: u32 = 0x80000000;
 +pub(crate) const BIT_ENSWBCN: u32 = 0x100;
 +pub(crate) const BIT_EN_BCNQ_DL: u32 = 0x400000;
 +pub(crate) const BIT_EN_BCN_FUNCTION: u32 = 0x8;
++pub(crate) const BIT_EN_CFOTRK: u32 = 0x10000000;
 +pub(crate) const BIT_EN_EOF_V1: u32 = 0x4;
 +pub(crate) const BIT_EN_FREE_CNT: u32 = 0x8;
 +pub(crate) const BIT_EN_MU_MIMO: u32 = 0x80;
 +pub(crate) const BIT_EN_PRECNT: u32 = 0x800;
++pub(crate) const BIT_EN_RXDSP: u32 = 0x200;
++pub(crate) const BIT_EN_SIC: u32 = 0x1000;
++pub(crate) const BIT_EN_SINGLE_APMDU: u32 = 0x80;
++pub(crate) const BIT_EN_SYN: u32 = 0x8000;
++pub(crate) const BIT_EN_TXBCN_RPT: u32 = 0x4;
 +pub(crate) const BIT_EN_WR_FREE_TAIL: u32 = 0x100000;
 +pub(crate) const BIT_FEN_BB_GLB_RST: u32 = 0x2;
 +pub(crate) const BIT_FEN_BB_RSTB: u32 = 0x1;
 +pub(crate) const BIT_FEN_CPUEN: u32 = 0x4;
++pub(crate) const BIT_FEN_ELDR: u32 = 0x1000;
 +pub(crate) const BIT_FEN_EN: u32 = 0x4000000;
++pub(crate) const BIT_FEN_EN_25_1: u32 = 0x2000;
 +pub(crate) const BIT_FEN_PCIEA: u32 = 0x40;
 +pub(crate) const BIT_FSPI_EN: u32 = 0x80000;
++pub(crate) const BIT_FWDL_CHK_RPT: u32 = 0x4;
 +pub(crate) const BIT_FW_DW_RDY: u32 = 0x4000;
 +pub(crate) const BIT_GNT_BT_POLARITY: u32 = 0x1000;
 +pub(crate) const BIT_H2CQ_FULL: u32 = 0x80000000;
 +pub(crate) const BIT_HCI_TXDMA_EN: u32 = 0x1;
++pub(crate) const BIT_HIQ_NO_LMT_EN_ROOT: u32 = 0x1;
 +pub(crate) const BIT_HTC_LOC_CTRL: u32 = 0x4000;
 +pub(crate) const BIT_IMEM_CHKSUM_OK: u32 = 0x10;
 +pub(crate) const BIT_IMEM_DW_OK: u32 = 0x8;
++pub(crate) const BIT_IQK_DONE: u32 = 0x4000000;
++pub(crate) const BIT_IQK_RX_FAIL: u32 = 0x8000000;
++pub(crate) const BIT_IQK_TX_FAIL: u32 = 0x10000000;
++pub(crate) const BIT_LCK: u32 = 0x8000;
++pub(crate) const BIT_LDO: u32 = 0x1000000;
 +pub(crate) const BIT_LDO25_EN: u32 = 0x80;
 +pub(crate) const BIT_LD_RQPN: u32 = 0x80000000;
 +pub(crate) const BIT_LED1DIS: u32 = 0x8000;
 +pub(crate) const BIT_LNAON_SEL_EN: u32 = 0x4000000;
 +pub(crate) const BIT_LNAON_WLBT_SEL: u32 = 0x10000000;
++pub(crate) const BIT_LOADER_CLK_EN: u32 = 0x20;
 +pub(crate) const BIT_LTE_COEX_EN: u32 = 0x80;
 +pub(crate) const BIT_LTE_MUX_CTRL_PATH: u32 = 0x4000000;
 +pub(crate) const BIT_MAC_CLK_SEL: u32 = 0x300000;
 +pub(crate) const BIT_MASK_AIFS: u32 = 0xff;
 +pub(crate) const BIT_MASK_BCN_HEAD_1_V1: u32 = 0xfff;
++pub(crate) const BIT_MASK_BTG_WL: u32 = 0x80;
 +pub(crate) const BIT_MASK_CSI_RATE: u32 = 0x3f000000;
++pub(crate) const BIT_MASK_CTX_TYPE: u32 = 0x70;
 +pub(crate) const BIT_MASK_CWMAX: u32 = 0xf000;
 +pub(crate) const BIT_MASK_CWMIN: u32 = 0xf00;
 +pub(crate) const BIT_MASK_DDMACH0_DLEN: u32 = 0x3ffff;
 +pub(crate) const BIT_MASK_EFUSE_BANK_SEL: u32 = 0x300;
 +pub(crate) const BIT_MASK_EF_ADDR: u32 = 0x3ff;
 +pub(crate) const BIT_MASK_EF_DATA: u32 = 0xff;
++pub(crate) const BIT_MASK_EPQ: u32 = 0xff;
++pub(crate) const BIT_MASK_HPQ: u32 = 0xff;
++pub(crate) const BIT_MASK_IQK_MOD: u32 = 0xffffff00;
++pub(crate) const BIT_MASK_LPQ: u32 = 0xff;
++pub(crate) const BIT_MASK_NPQ: u32 = 0xff;
++pub(crate) const BIT_MASK_OFDM0_EXT_A: u32 = 0x80000000;
++pub(crate) const BIT_MASK_OFDM0_EXT_C: u32 = 0x20000000;
++pub(crate) const BIT_MASK_PUBQ: u32 = 0xff;
++pub(crate) const BIT_MASK_RES_RX: u32 = 0x3ff0000;
++pub(crate) const BIT_MASK_RES_RY: u32 = 0x3ff0000;
++pub(crate) const BIT_MASK_RES_TX: u32 = 0x3ff0000;
++pub(crate) const BIT_MASK_RES_TY: u32 = 0x3ff0000;
 +pub(crate) const BIT_MASK_RFE_INV89: u32 = 0x3;
 +pub(crate) const BIT_MASK_RFE_SEL89: u32 = 0xff;
++pub(crate) const BIT_MASK_RFMOD: u32 = 0x1;
++pub(crate) const BIT_MASK_RXBB_DFIR: u32 = 0xf000000;
++pub(crate) const BIT_MASK_RXDSP: u32 = 0x1f000000;
++pub(crate) const BIT_MASK_RXIQ_S1_X: u32 = 0x3ff;
++pub(crate) const BIT_MASK_RXIQ_S1_Y1: u32 = 0xfc00;
++pub(crate) const BIT_MASK_RXIQ_S1_Y2: u32 = 0xf0000000;
++pub(crate) const BIT_MASK_RXIQ_X_S0: u32 = 0x3ff;
++pub(crate) const BIT_MASK_RXIQ_Y_S0: u32 = 0x3ff000;
 +pub(crate) const BIT_MASK_R_MU_RL: u32 = 0xf000;
 +pub(crate) const BIT_MASK_R_MU_TABLE_VALID: u32 = 0x3f;
 +pub(crate) const BIT_MASK_R_RFE_SEL_15: u32 = 0xf0000000;
 +pub(crate) const BIT_MASK_SAMPLE_RATE: u32 = 0x3f;
++pub(crate) const BIT_MASK_TXIQ_A_EXT_S0: u32 = 0x1;
++pub(crate) const BIT_MASK_TXIQ_A_S0: u32 = 0x7fe;
++pub(crate) const BIT_MASK_TXIQ_C_EXT_S0: u32 = 0x1;
++pub(crate) const BIT_MASK_TXIQ_C_S0: u32 = 0x7fe;
++pub(crate) const BIT_MASK_TXIQ_D_S0: u32 = 0x7fe000;
++pub(crate) const BIT_MASK_TXIQ_ELM_A: u32 = 0x3ff;
++pub(crate) const BIT_MASK_TXIQ_ELM_C: u32 = 0x3f0000;
++pub(crate) const BIT_MASK_TXIQ_ELM_D: u32 = 0xffc00000;
 +pub(crate) const BIT_MASK_TXOP_LMT: u32 = 0x7ff0000;
++pub(crate) const BIT_MASK_XTAL: u32 = 0xfff000;
 +pub(crate) const BIT_MCUFWDL_EN: u32 = 0x1;
++pub(crate) const BIT_MCUFWDL_RDY: u32 = 0x2;
 +pub(crate) const BIT_MDIO_WFLAG_V1: u32 = 0x20;
 +pub(crate) const BIT_MU_P1_WAIT_STATE_EN: u32 = 0x10000;
 +pub(crate) const BIT_NBI_EN: u32 = 0x40000000;
++pub(crate) const BIT_OFDMEN: u32 = 0x2000000;
 +pub(crate) const BIT_PAPE_SEL_EN: u32 = 0x2000000;
 +pub(crate) const BIT_PAPE_WLBT_SEL: u32 = 0x20000000;
 +pub(crate) const BIT_PCI_BCNQ_FLAG: u32 = 0x10;
@@ -2591,15 +3011,19 @@ index 0000000..6d5f424
 +pub(crate) const BIT_PTA_EDCCA_EN: u32 = 0x20;
 +pub(crate) const BIT_PTA_WL_TX_EN: u32 = 0x10;
 +pub(crate) const BIT_PT_OPT: u32 = 0x200000;
++pub(crate) const BIT_RCR_ADF: u32 = 0x800;
 +pub(crate) const BIT_RFE_BUF_EN: u32 = 0x8;
 +pub(crate) const BIT_RFMOD: u32 = 0x180;
 +pub(crate) const BIT_RF_EN: u32 = 0x1;
 +pub(crate) const BIT_RF_RSTB: u32 = 0x2;
 +pub(crate) const BIT_RF_SDM_RSTB: u32 = 0x4;
 +pub(crate) const BIT_RF_TYPE_ID: u32 = 0x8000000;
++pub(crate) const BIT_ROM_DLEN: u32 = 0x80000;
++pub(crate) const BIT_ROM_PGE: u32 = 0x70000;
 +pub(crate) const BIT_RPWM_TOGGLE: u32 = 0x80;
 +pub(crate) const BIT_RSTB_3WIRE: u32 = 0x100;
 +pub(crate) const BIT_RST_TRXDMA_INTF: u32 = 0x100000;
++pub(crate) const BIT_RXBB_DFIR_EN: u32 = 0x80000;
 +pub(crate) const BIT_RXPSF_CCKCHKEN: u32 = 0x100;
 +pub(crate) const BIT_RXPSF_CCKRST: u32 = 0x40;
 +pub(crate) const BIT_RXPSF_CONT_ERRCHKEN: u32 = 0x10;
@@ -2614,7 +3038,13 @@ index 0000000..6d5f424
 +pub(crate) const BIT_SDIO_INT: u32 = 0x40000;
 +pub(crate) const BIT_SEL_PATH: u32 = 0x6;
 +pub(crate) const BIT_SHIFT_EF_ADDR: u32 = 0x8;
++pub(crate) const BIT_SHIFT_EPQ: u32 = 0x10;
++pub(crate) const BIT_SHIFT_HPQ: u32 = 0x0;
++pub(crate) const BIT_SHIFT_LPQ: u32 = 0x8;
 +pub(crate) const BIT_SHIFT_MAC_CLK_SEL: u32 = 0x14;
++pub(crate) const BIT_SHIFT_NPQ: u32 = 0x0;
++pub(crate) const BIT_SHIFT_PUBQ: u32 = 0x10;
++pub(crate) const BIT_SHIFT_ROM_PGE: u32 = 0x10;
 +pub(crate) const BIT_SHIFT_R_MU_RL: u32 = 0xc;
 +pub(crate) const BIT_SHIFT_TXDMA_BEQ_MAP: u32 = 0x8;
 +pub(crate) const BIT_SHIFT_TXDMA_BKQ_MAP: u32 = 0xa;
@@ -2629,12 +3059,17 @@ index 0000000..6d5f424
 +pub(crate) const BIT_USB_SUS_DIS: u32 = 0x100;
 +pub(crate) const BIT_USE_NDPA_PARAMETER: u32 = 0x40000000;
 +pub(crate) const BIT_VHT_DACK: u32 = 0x4000000;
++pub(crate) const BIT_WAKEPAD_EN: u32 = 0x8;
++pub(crate) const BIT_WINTINI_RDY: u32 = 0x40;
 +pub(crate) const BIT_WLMCU_IOIF: u32 = 0x1;
 +pub(crate) const BIT_WLRF1_BBRF_EN: u32 = 0x7000000;
 +pub(crate) const BIT_WLRFE_4_5_EN: u32 = 0x4;
 +pub(crate) const BIT_WL_PLATFORM_RST: u32 = 0x10000;
 +pub(crate) const BIT_WL_RST: u32 = 0x10000;
 +pub(crate) const BIT_WMAC_TXMU_ACKPOLICY_EN: u32 = 0x40;
++pub(crate) const BIT_XTA0: u32 = 0x10000000;
++pub(crate) const BIT_XTA1: u32 = 0x20000000;
++pub(crate) const BIT_XTAL_GMP_BIT4: u32 = 0x10000000;
 +pub(crate) const BTG_CCA: u32 = 0xe;
 +pub(crate) const BTG_LNA: u32 = 0xfc84;
 +pub(crate) const BTI_PAGE_OVF: u32 = 0x4;
@@ -2663,21 +3098,31 @@ index 0000000..6d5f424
 +pub(crate) const DESC_RATE54M: u32 = 0xb;
 +pub(crate) const DESC_RATE6M: u32 = 0x4;
 +pub(crate) const DESC_RATEMCS7: u32 = 0x13;
++pub(crate) const DIS_3WIRE: u32 = 0xccf000c0;
 +pub(crate) const DIS_DPD_MASK: u32 = 0x3ff;
 +pub(crate) const DIS_DPD_RATEALL: u32 = 0x3ff;
++pub(crate) const DLFW_PAGE_SIZE_LEGACY: u32 = 0x1000;
 +pub(crate) const DPDT_CTRL_PIN: u32 = 0x77;
++pub(crate) const EFUSE_ACCESS_OFF: u32 = 0x0;
++pub(crate) const EFUSE_ACCESS_ON: u32 = 0x69;
 +pub(crate) const EFUSE_READ_FAIL: u32 = 0xff;
++pub(crate) const EN_3WIRE: u32 = 0xccc000c0;
++pub(crate) const EN_IQK: u32 = 0x808000;
 +pub(crate) const FAST_EDCA_BE_TH: u32 = 0x6;
 +pub(crate) const FAST_EDCA_BK_TH: u32 = 0x6;
 +pub(crate) const FAST_EDCA_VI_TH: u32 = 0x6;
 +pub(crate) const FAST_EDCA_VO_TH: u32 = 0x6;
++pub(crate) const FREQ_CH13: u32 = 0xfccd;
++pub(crate) const FREQ_CH14: u32 = 0xff9a;
 +pub(crate) const FW_HDR_CHKSUM_SIZE: u32 = 0x8;
 +pub(crate) const FW_HDR_SIZE: u32 = 0x40;
 +pub(crate) const FW_KEY_MASK: u32 = 0xffffff00;
 +pub(crate) const FW_READY: u32 = 0xc078;
++pub(crate) const FW_READY_LEGACY: u32 = 0xc6;
 +pub(crate) const FW_READY_MASK: u32 = 0xcfff;
 +pub(crate) const FW_RF_1T1R: u32 = 0x4;
 +pub(crate) const FW_RF_2T2R: u32 = 0x2;
++pub(crate) const FW_START_ADDR_LEGACY: u32 = 0x1000;
 +pub(crate) const H2C_CMD_BT_WIFI_CONTROL: u32 = 0x69;
 +pub(crate) const H2C_CMD_COEX_TDMA_TYPE: u32 = 0x60;
 +pub(crate) const H2C_CMD_DEFAULT_PORT: u32 = 0x2c;
@@ -2704,6 +3149,11 @@ index 0000000..6d5f424
 +pub(crate) const IMR_VIDOK: u32 = 0x8;
 +pub(crate) const IMR_VODOK: u32 = 0x4;
 +pub(crate) const INTF_PCIE: u32 = 0x1;
++pub(crate) const IQK_NR: u32 = 0x8;
++pub(crate) const LDO_SEL: u32 = 0xc3;
++pub(crate) const LSSI_READ_ADDR_MASK: u32 = 0x7f800000;
++pub(crate) const LSSI_READ_DATA_MASK: u32 = 0xfffff;
++pub(crate) const LSSI_READ_EDGE_MASK: u32 = 0x80000000;
 +pub(crate) const LTECOEX_ACCESS_CTRL: u32 = 0x1700;
 +pub(crate) const LTECOEX_READY: u32 = 0x20000000;
 +pub(crate) const LTECOEX_READ_DATA: u32 = 0x1708;
@@ -2718,6 +3168,7 @@ index 0000000..6d5f424
 +pub(crate) const MASKBYTE0: u32 = 0xff;
 +pub(crate) const MASKBYTE1: u32 = 0xff00;
 +pub(crate) const MASKBYTE2: u32 = 0xff0000;
++pub(crate) const MASKH4BITS: u32 = 0xf0000000;
 +pub(crate) const MASKHWORD: u32 = 0xffff0000;
 +pub(crate) const MASKLWORD: u32 = 0xffff;
 +pub(crate) const OCPBASE_DMEM_88XX: u32 = 0x200000;
@@ -2744,6 +3195,7 @@ index 0000000..6d5f424
 +pub(crate) const PPG_THERMAL_A: u32 = 0x1ef;
 +pub(crate) const PPG_THERMAL_B: u32 = 0x1b0;
 +pub(crate) const PTA_CTRL_PIN: u32 = 0x66;
++pub(crate) const REG_2ND_CCA_CTRL: u32 = 0x976;
 +pub(crate) const REG_3WIRE: u32 = 0x180c;
 +pub(crate) const REG_3WIRE2: u32 = 0x410c;
 +pub(crate) const REG_ACBB0: u32 = 0x948;
@@ -2755,12 +3207,17 @@ index 0000000..6d5f424
 +pub(crate) const REG_ADCCLK: u32 = 0x8ac;
 +pub(crate) const REG_ADCINI: u32 = 0xa04;
 +pub(crate) const REG_AFE_CTRL1: u32 = 0x24;
++pub(crate) const REG_AFE_CTRL3: u32 = 0x2c;
++pub(crate) const REG_AFE_CTRL_4: u32 = 0x78;
 +pub(crate) const REG_AFE_PLL_CTRL: u32 = 0x28;
 +pub(crate) const REG_AFE_XTAL_CTRL: u32 = 0x24;
 +pub(crate) const REG_AGCSWSH: u32 = 0xc44;
 +pub(crate) const REG_AGCTR_A: u32 = 0xc08;
 +pub(crate) const REG_AGCTR_B: u32 = 0xe08;
++pub(crate) const REG_AGGR_BREAK_TIME: u32 = 0x51a;
++pub(crate) const REG_AMPDU_MAX_TIME: u32 = 0x456;
 +pub(crate) const REG_AMPDU_MAX_TIME_V1: u32 = 0x455;
++pub(crate) const REG_ANALOG_P4: u32 = 0x88c;
 +pub(crate) const REG_ANAPAR_A: u32 = 0x1830;
 +pub(crate) const REG_ANAPAR_B: u32 = 0x4130;
 +pub(crate) const REG_ANAPAR_XTAL_0: u32 = 0x1040;
@@ -2775,16 +3232,25 @@ index 0000000..6d5f424
 +pub(crate) const REG_ARFRH1_V1: u32 = 0x450;
 +pub(crate) const REG_ARFRH4: u32 = 0x4a0;
 +pub(crate) const REG_ARFRH5: u32 = 0x4a8;
++pub(crate) const REG_ATIMWND: u32 = 0x55a;
++pub(crate) const REG_AUTO_LLT: u32 = 0x224;
 +pub(crate) const REG_AUTO_LLT_V1: u32 = 0x208;
++pub(crate) const REG_A_RXIQI: u32 = 0xc14;
 +pub(crate) const REG_BAR_MODE_CTRL: u32 = 0x4cc;
 +pub(crate) const REG_BBPSF_CTRL: u32 = 0x6dc;
++pub(crate) const REG_BBRX_DFIR: u32 = 0x954;
++pub(crate) const REG_BB_PWR_SAV1_11N: u32 = 0x874;
++pub(crate) const REG_BB_RX_PATH_11N: u32 = 0xc04;
++pub(crate) const REG_BB_SEL_BTG: u32 = 0x948;
 +pub(crate) const REG_BCNDMATIM: u32 = 0x559;
 +pub(crate) const REG_BCNQ1_BDNY_V1: u32 = 0x456;
++pub(crate) const REG_BCNQ_BDNY: u32 = 0x424;
 +pub(crate) const REG_BCNQ_BDNY_V1: u32 = 0x424;
 +pub(crate) const REG_BCN_CTRL: u32 = 0x550;
 +pub(crate) const REG_BCN_CTRL_CLINT0: u32 = 0x551;
 +pub(crate) const REG_BCN_MAX_ERR: u32 = 0x55d;
 +pub(crate) const REG_BGCTRL: u32 = 0x1a14;
++pub(crate) const REG_BTG_SEL: u32 = 0x67;
 +pub(crate) const REG_BT_COEX_BRK_TABLE: u32 = 0x6c8;
 +pub(crate) const REG_BT_COEX_TABLE0: u32 = 0x6c0;
 +pub(crate) const REG_BT_COEX_TABLE1: u32 = 0x6c4;
@@ -2799,6 +3265,7 @@ index 0000000..6d5f424
 +pub(crate) const REG_CCASEL: u32 = 0x82c;
 +pub(crate) const REG_CCK0_FAREPORT: u32 = 0xa2c;
 +pub(crate) const REG_CCKTXONLY: u32 = 0x1a80;
++pub(crate) const REG_CCK_ANT_SEL_11N: u32 = 0xa04;
 +pub(crate) const REG_CCK_CHECK: u32 = 0x454;
 +pub(crate) const REG_CCK_SOURCE: u32 = 0x1abc;
 +pub(crate) const REG_CDDTXP: u32 = 0x93c;
@@ -2808,6 +3275,7 @@ index 0000000..6d5f424
 +pub(crate) const REG_CR: u32 = 0x100;
 +pub(crate) const REG_CR_EXT: u32 = 0x1100;
 +pub(crate) const REG_CTRL_TYPE: u32 = 0x67;
++pub(crate) const REG_CTX: u32 = 0xd03;
 +pub(crate) const REG_DARFRC: u32 = 0x430;
 +pub(crate) const REG_DARFRCH: u32 = 0x434;
 +pub(crate) const REG_DATA_SC: u32 = 0x483;
@@ -2822,10 +3290,12 @@ index 0000000..6d5f424
 +pub(crate) const REG_DPD_CTL1_S0: u32 = 0x1b08;
 +pub(crate) const REG_DRVERLYINT: u32 = 0x558;
 +pub(crate) const REG_DUMMY_PAGE4_V1: u32 = 0x4fc;
++pub(crate) const REG_DWBCN0_CTRL: u32 = 0x208;
 +pub(crate) const REG_EDCA_BE_PARAM: u32 = 0x508;
 +pub(crate) const REG_EDCA_BK_PARAM: u32 = 0x50c;
 +pub(crate) const REG_EDCA_VI_PARAM: u32 = 0x504;
 +pub(crate) const REG_EDCA_VO_PARAM: u32 = 0x500;
++pub(crate) const REG_EFUSE_ACCESS: u32 = 0xcf;
 +pub(crate) const REG_EFUSE_CTRL: u32 = 0x30;
 +pub(crate) const REG_EIFS: u32 = 0x642;
 +pub(crate) const REG_ENCCK: u32 = 0x1c3c;
@@ -2839,9 +3309,13 @@ index 0000000..6d5f424
 +pub(crate) const REG_FIFOPAGE_INFO_3: u32 = 0x238;
 +pub(crate) const REG_FIFOPAGE_INFO_4: u32 = 0x23c;
 +pub(crate) const REG_FIFOPAGE_INFO_5: u32 = 0x240;
++pub(crate) const REG_FPGA0_IQK_11N: u32 = 0xe28;
++pub(crate) const REG_FPGA0_RFMOD: u32 = 0x800;
++pub(crate) const REG_FPGA1_RFMOD: u32 = 0x900;
 +pub(crate) const REG_FWHW_TXQ_CTRL: u32 = 0x420;
 +pub(crate) const REG_FW_DBG7: u32 = 0x10fc;
 +pub(crate) const REG_GENERAL_OPTION: u32 = 0x1664;
++pub(crate) const REG_GPIO_INTM: u32 = 0x48;
 +pub(crate) const REG_GPIO_MUXCFG: u32 = 0x40;
 +pub(crate) const REG_H2CQ_CSR: u32 = 0x1330;
 +pub(crate) const REG_H2C_HEAD: u32 = 0x244;
@@ -2851,6 +3325,7 @@ index 0000000..6d5f424
 +pub(crate) const REG_H2C_READ_ADDR: u32 = 0x24c;
 +pub(crate) const REG_H2C_TAIL: u32 = 0x248;
 +pub(crate) const REG_HCI_OPT_CTRL: u32 = 0x74;
++pub(crate) const REG_HIQ_NO_LMT_EN: u32 = 0x5a7;
 +pub(crate) const REG_HMEBOX0: u32 = 0x1d0;
 +pub(crate) const REG_HMEBOX0_EX: u32 = 0x1f0;
 +pub(crate) const REG_HMEBOX1: u32 = 0x1d4;
@@ -2861,24 +3336,55 @@ index 0000000..6d5f424
 +pub(crate) const REG_HMEBOX3_EX: u32 = 0x1fc;
 +pub(crate) const REG_HMETFR: u32 = 0x1cc;
 +pub(crate) const REG_HTSTFWT: u32 = 0x800;
++pub(crate) const REG_HWSEQ_CTRL: u32 = 0x423;
 +pub(crate) const REG_INIRTS_RATE_SEL: u32 = 0x480;
 +pub(crate) const REG_INT_MIG: u32 = 0x304;
 +pub(crate) const REG_IQKSTAT: u32 = 0x1b10;
++pub(crate) const REG_IQK_AGC_PTS_11N: u32 = 0xe48;
++pub(crate) const REG_IQK_AGC_RSP_11N: u32 = 0xe4c;
++pub(crate) const REG_IQK_RES_RX: u32 = 0xea4;
++pub(crate) const REG_IQK_RES_RY: u32 = 0xeac;
++pub(crate) const REG_IQK_RES_TX: u32 = 0xe94;
++pub(crate) const REG_IQK_RES_TY: u32 = 0xe9c;
 +pub(crate) const REG_L1WT: u32 = 0x83c;
 +pub(crate) const REG_LDO_EFUSE_CTRL: u32 = 0x34;
++pub(crate) const REG_LDO_SWR_CTRL: u32 = 0x7c;
++pub(crate) const REG_LEDCFG2: u32 = 0x4e;
 +pub(crate) const REG_LED_CFG: u32 = 0x4c;
 +pub(crate) const REG_LIFETIME_EN: u32 = 0x426;
++pub(crate) const REG_LTECOEX_CTRL: u32 = 0x7c0;
++pub(crate) const REG_LTECOEX_PATH_CONTROL: u32 = 0x70;
++pub(crate) const REG_LTECOEX_READ_DATA: u32 = 0x7c8;
++pub(crate) const REG_LTECOEX_WRITE_DATA: u32 = 0x7c4;
++pub(crate) const REG_LTR_ACTIVE_LATENCY: u32 = 0x79c;
++pub(crate) const REG_LTR_CTRL_BASIC: u32 = 0x7a4;
++pub(crate) const REG_LTR_IDLE_LATENCY: u32 = 0x798;
++pub(crate) const REG_MAC_SPEC_SIFS: u32 = 0x63a;
 +pub(crate) const REG_MAR: u32 = 0x620;
++pub(crate) const REG_MAX_AGGR_NUM: u32 = 0x4ca;
 +pub(crate) const REG_MCUFW_CTRL: u32 = 0x80;
++pub(crate) const REG_MCUTST_1: u32 = 0x1c0;
 +pub(crate) const REG_MCU_TST_CFG: u32 = 0x84;
 +pub(crate) const REG_MDIO_V1: u32 = 0x3f4;
++pub(crate) const REG_MGQ_BDNY: u32 = 0x425;
 +pub(crate) const REG_MISC_CTRL: u32 = 0x577;
 +pub(crate) const REG_MRC: u32 = 0x850;
 +pub(crate) const REG_MRCM: u32 = 0xc38;
 +pub(crate) const REG_MU_TX_CTL: u32 = 0x14c0;
 +pub(crate) const REG_NAV_CTRL: u32 = 0x650;
++pub(crate) const REG_NAV_PROT_LEN: u32 = 0x546;
 +pub(crate) const REG_NCTL0: u32 = 0x1b00;
 +pub(crate) const REG_NDPA_OPT_CTRL: u32 = 0x45f;
++pub(crate) const REG_OFDM0_RXDSP: u32 = 0xc40;
++pub(crate) const REG_OFDM0_XAAGC1: u32 = 0xc50;
++pub(crate) const REG_OFDM0_XBAGC1: u32 = 0xc58;
++pub(crate) const REG_OFDM1_CFOTRK: u32 = 0xd2c;
++pub(crate) const REG_OFDM1_CSI1: u32 = 0xd40;
++pub(crate) const REG_OFDM1_CSI2: u32 = 0xd44;
++pub(crate) const REG_OFDM1_CSI3: u32 = 0xd48;
++pub(crate) const REG_OFDM1_CSI4: u32 = 0xd4c;
++pub(crate) const REG_OFDM_0_ECCA_THRESHOLD: u32 = 0xc4c;
++pub(crate) const REG_OFDM_0_XA_TX_IQ_IMBALANCE: u32 = 0xc80;
 +pub(crate) const REG_ORITXCODE: u32 = 0x1800;
 +pub(crate) const REG_ORITXCODE2: u32 = 0x4100;
 +pub(crate) const REG_PAD_CTRL1: u32 = 0x64;
@@ -2887,6 +3393,8 @@ index 0000000..6d5f424
 +pub(crate) const REG_PIFS: u32 = 0x512;
 +pub(crate) const REG_PRECNT_CTRL: u32 = 0x4e5;
 +pub(crate) const REG_PROT_MODE_CTRL: u32 = 0x4c8;
++pub(crate) const REG_PSDFN: u32 = 0x808;
++pub(crate) const REG_PSDRPT: u32 = 0x8b4;
 +pub(crate) const REG_PT_CHSMO: u32 = 0xcbc;
 +pub(crate) const REG_QUEUE_CTRL: u32 = 0x4c6;
 +pub(crate) const REG_RARFRCH: u32 = 0x43c;
@@ -2895,6 +3403,7 @@ index 0000000..6d5f424
 +pub(crate) const REG_RD_NAV_NXT: u32 = 0x544;
 +pub(crate) const REG_RESP_SIFS_CCK: u32 = 0x63c;
 +pub(crate) const REG_RESP_SIFS_OFDM: u32 = 0x63e;
++pub(crate) const REG_RETRY_LIMIT: u32 = 0x42a;
 +pub(crate) const REG_RFECTL: u32 = 0xcb8;
 +pub(crate) const REG_RFEINV: u32 = 0xcbc;
 +pub(crate) const REG_RFESEL0: u32 = 0xcb0;
@@ -2906,7 +3415,9 @@ index 0000000..6d5f424
 +pub(crate) const REG_RFE_INV8: u32 = 0xcbd;
 +pub(crate) const REG_RF_CTRL: u32 = 0x1f;
 +pub(crate) const REG_RPT_CIP: u32 = 0x2d9c;
++pub(crate) const REG_RQPN: u32 = 0x200;
 +pub(crate) const REG_RQPN_CTRL_2: u32 = 0x22c;
++pub(crate) const REG_RQPN_NPQ: u32 = 0x214;
 +pub(crate) const REG_RRSR: u32 = 0x440;
 +pub(crate) const REG_RSTB: u32 = 0x1c90;
 +pub(crate) const REG_RSV_CTRL: u32 = 0x1c;
@@ -2917,25 +3428,34 @@ index 0000000..6d5f424
 +pub(crate) const REG_RXDESC: u32 = 0xa2c;
 +pub(crate) const REG_RXFF_BNDY: u32 = 0x11c;
 +pub(crate) const REG_RXFLTMAP0: u32 = 0x6a0;
++pub(crate) const REG_RXFLTMAP1: u32 = 0x6a2;
 +pub(crate) const REG_RXFLTMAP2: u32 = 0x6a4;
 +pub(crate) const REG_RXFNCTL: u32 = 0x1d30;
 +pub(crate) const REG_RXIGI: u32 = 0x1d70;
 +pub(crate) const REG_RXIGI_A: u32 = 0xc50;
 +pub(crate) const REG_RXIGI_B: u32 = 0xe50;
++pub(crate) const REG_RXIQK_11N: u32 = 0xe44;
++pub(crate) const REG_RXIQK_MATRIX_LSB_11N: u32 = 0xca0;
++pub(crate) const REG_RXIQK_PI_A_11N: u32 = 0xe3c;
++pub(crate) const REG_RXIQK_TONE_A_11N: u32 = 0xe34;
++pub(crate) const REG_RXIQ_AB_S0: u32 = 0xcd8;
 +pub(crate) const REG_RXPSEL: u32 = 0x808;
 +pub(crate) const REG_RXPSF_CTRL: u32 = 0x1610;
 +pub(crate) const REG_RXPSF_TYPE_CTRL: u32 = 0x1614;
 +pub(crate) const REG_RXTSF_OFFSET_CCK: u32 = 0x55e;
 +pub(crate) const REG_RX_DRVINFO_SZ: u32 = 0x60f;
++pub(crate) const REG_RX_IQK_TONE_B: u32 = 0xe54;
 +pub(crate) const REG_RX_PKT_LIMIT: u32 = 0x60c;
 +pub(crate) const REG_SBD: u32 = 0x88c;
 +pub(crate) const REG_SCOTRK: u32 = 0xc30;
 +pub(crate) const REG_SIFS: u32 = 0x514;
++pub(crate) const REG_SINGLE_AMPDU_CTRL: u32 = 0x4c7;
 +pub(crate) const REG_SLOT: u32 = 0x51b;
 +pub(crate) const REG_SND_PTCL_CTRL: u32 = 0x718;
 +pub(crate) const REG_SPEC_SIFS: u32 = 0x428;
 +pub(crate) const REG_SW_AMPDU_BURST_MODE_CTRL: u32 = 0x4bc;
 +pub(crate) const REG_SYS_CFG1: u32 = 0xf0;
++pub(crate) const REG_SYS_CLKR: u32 = 0x8;
 +pub(crate) const REG_SYS_CLK_CTRL: u32 = 0x8;
 +pub(crate) const REG_SYS_CTRL: u32 = 0x0;
 +pub(crate) const REG_SYS_FUNC_EN: u32 = 0x2;
@@ -2944,6 +3464,7 @@ index 0000000..6d5f424
 +pub(crate) const REG_TBTT_PROHIBIT: u32 = 0x540;
 +pub(crate) const REG_TCR: u32 = 0x604;
 +pub(crate) const REG_TIMER0_SRC_SEL: u32 = 0x5b4;
++pub(crate) const REG_TRMUX_11N: u32 = 0xc08;
 +pub(crate) const REG_TRSW: u32 = 0xca0;
 +pub(crate) const REG_TRXFF_BNDY: u32 = 0x114;
 +pub(crate) const REG_TXBF_CTRL: u32 = 0x42c;
@@ -2963,6 +3484,12 @@ index 0000000..6d5f424
 +pub(crate) const REG_TXF6: u32 = 0x1aac;
 +pub(crate) const REG_TXF7: u32 = 0x1ab0;
 +pub(crate) const REG_TXFILTER: u32 = 0xaac;
++pub(crate) const REG_TXIQK_11N: u32 = 0xe40;
++pub(crate) const REG_TXIQK_MATRIXA_LSB2_11N: u32 = 0xc94;
++pub(crate) const REG_TXIQK_PI_A_11N: u32 = 0xe38;
++pub(crate) const REG_TXIQK_TONE_A_11N: u32 = 0xe30;
++pub(crate) const REG_TXIQ_AB_S0: u32 = 0xcd0;
++pub(crate) const REG_TXIQ_CD_S0: u32 = 0xcd4;
 +pub(crate) const REG_TXLGMAP: u32 = 0x1e2c;
 +pub(crate) const REG_TXPAUSE: u32 = 0x522;
 +pub(crate) const REG_TXPSEL: u32 = 0x80c;
@@ -2971,17 +3498,20 @@ index 0000000..6d5f424
 +pub(crate) const REG_TXSF2: u32 = 0xa24;
 +pub(crate) const REG_TXSF6: u32 = 0xa28;
 +pub(crate) const REG_TX_HANG_CTRL: u32 = 0x45e;
++pub(crate) const REG_TX_IQK_TONE_B: u32 = 0xe50;
 +pub(crate) const REG_TX_PTCL_CTRL: u32 = 0x520;
 +pub(crate) const REG_USTIME_EDCA: u32 = 0x638;
 +pub(crate) const REG_USTIME_TSF: u32 = 0x55c;
 +pub(crate) const REG_WIFI_BT_INFO: u32 = 0xaa;
 +pub(crate) const REG_WLRF1: u32 = 0xec;
++pub(crate) const REG_WMAC_LBK_BF_HD: u32 = 0x45d;
 +pub(crate) const REG_WMAC_MU_BF_CTL: u32 = 0x1680;
 +pub(crate) const REG_WMAC_MU_BF_OPTION: u32 = 0x167c;
 +pub(crate) const REG_WMAC_OPTION_FUNCTION: u32 = 0x7d0;
 +pub(crate) const REG_WMAC_OPTION_FUNCTION_1: u32 = 0x7d4;
 +pub(crate) const REG_WMAC_TRXPTCL_CTL: u32 = 0x668;
 +pub(crate) const REG_WMAC_TRXPTCL_CTL_H: u32 = 0x66c;
++pub(crate) const REPORT_BUF: u32 = 0x80;
 +pub(crate) const RF18_BAND_2G: u32 = 0x0;
 +pub(crate) const RF18_BAND_5G: u32 = 0x10100;
 +pub(crate) const RF18_BAND_MASK: u32 = 0x10300;
@@ -2991,9 +3521,14 @@ index 0000000..6d5f424
 +pub(crate) const RF18_RFSI_GE: u32 = 0x20000;
 +pub(crate) const RF18_RFSI_GT: u32 = 0x40000;
 +pub(crate) const RF18_RFSI_MASK: u32 = 0x60000;
++pub(crate) const RFCFGCH_BW_20M: u32 = 0xc00;
++pub(crate) const RFCFGCH_BW_MASK: u32 = 0xc00;
++pub(crate) const RFCFGCH_CHANNEL_MASK: u32 = 0xff;
 +pub(crate) const RFREG_MASK: u32 = 0xfffff;
++pub(crate) const RF_BSPAD: u32 = 0x54;
 +pub(crate) const RF_CFGCH: u32 = 0x18;
 +pub(crate) const RF_DTXLOK: u32 = 0x8;
++pub(crate) const RF_GAINTX: u32 = 0x56;
 +pub(crate) const RF_LUTDBG: u32 = 0xdf;
 +pub(crate) const RF_LUTWA: u32 = 0x33;
 +pub(crate) const RF_LUTWD0: u32 = 0x3f;
@@ -3001,12 +3536,20 @@ index 0000000..6d5f424
 +pub(crate) const RF_LUTWE: u32 = 0xef;
 +pub(crate) const RF_LUTWE2: u32 = 0xee;
 +pub(crate) const RF_MALSEL: u32 = 0xbe;
++pub(crate) const RF_MODE: u32 = 0x0;
 +pub(crate) const RF_MODOPT: u32 = 0x1;
 +pub(crate) const RF_PA: u32 = 0x60;
 +pub(crate) const RF_PABIAS_2G_MASK: u32 = 0xf000;
 +pub(crate) const RF_PABIAS_5G_MASK: u32 = 0xf0000;
++pub(crate) const RF_RXIQGEN: u32 = 0x8d;
 +pub(crate) const RF_THEMAL_MASK: u32 = 0xf0000;
++pub(crate) const RF_TRXIQ: u32 = 0x66;
++pub(crate) const RF_TXADBG: u32 = 0xde;
++pub(crate) const RF_TXATANK: u32 = 0x64;
++pub(crate) const RF_WLINT: u32 = 0x1;
++pub(crate) const RF_WLSEL: u32 = 0x2;
 +pub(crate) const RF_XTALX2: u32 = 0xb8;
++pub(crate) const RST_IQK: u32 = 0x0;
 +pub(crate) const RSVD_PG_CPU_INSTRUCTION_NUM: u32 = 0x0;
 +pub(crate) const RSVD_PG_FW_TXBUF_NUM: u32 = 0x4;
 +pub(crate) const RSVD_PG_H2CQ_NUM: u32 = 0x8;
@@ -3091,7 +3634,11 @@ index 0000000..6d5f424
 +pub(crate) const RTW_SEC_TX_DEC_EN: u32 = 0x4;
 +pub(crate) const RTW_SEC_TX_UNI_USE_DK: u32 = 0x1;
 +pub(crate) const RTW_SEC_WRITE_REG: u32 = 0x674;
++pub(crate) const RTW_WCPU_8051: u32 = 0x1;
 +pub(crate) const RX_TAG_MAX: u32 = 0x2000;
++pub(crate) const SPS_SEL: u32 = 0x83;
++pub(crate) const SPUR_THRES: u32 = 0x16;
++pub(crate) const START_PSD: u32 = 0x400000;
 +pub(crate) const TRX_BD_HW_IDX_MASK: u32 = 0xfff0000;
 +pub(crate) const TRX_BD_IDX_MASK: u32 = 0xfff;
 +pub(crate) const TX_DESC_QSEL_BEACON: u32 = 0x10;
@@ -3122,12 +3669,837 @@ index 0000000..6d5f424
 +pub(crate) const WLAN_SIFS_CFG: u32 = 0x10100e0a;
 +pub(crate) const WLAN_SLOT_TIME: u32 = 0x9;
 +pub(crate) const WLAN_TBTT_TIME: u32 = 0x6404;
++pub(crate) const WLAN_TXQ_RPT_EN: u32 = 0x1f;
 +pub(crate) const WLAN_TX_FUNC_CFG1: u32 = 0x30;
 +pub(crate) const WLAN_TX_FUNC_CFG2: u32 = 0x30;
 +pub(crate) const WLAN_VI_TXOP_LIMIT: u32 = 0x3bc;
 +pub(crate) const WLAN_VO_TXOP_LIMIT: u32 = 0x186;
 +pub(crate) const WLG_CCA: u32 = 0x12;
 +pub(crate) const WLG_LNA: u32 = 0x7532;
+diff --git a/kernel/comps/rtw88/src/rtw8723d.rs b/kernel/comps/rtw88/src/rtw8723d.rs
+new file mode 100644
+index 0000000..0f14f95
+--- /dev/null
++++ b/kernel/comps/rtw88/src/rtw8723d.rs
+@@ -0,0 +1,818 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! What is the RTL8723D's own (Linux's `rtw8723d.c`, and `rtw8723x.c` it
++//! shares with the RTL8703B): an 802.11n chip with an 8051 CPU, one path
++//! at 2.4 GHz and Bluetooth on the same antenna. Its efuse, MAC and PHY
++//! settings, the channel (the RF's two paths, the spur notch of channels
++//! 13 and 14, the CCK filter), the TX power in the per-rate registers of
++//! the 11n chips, the IQ calibration the driver runs itself (Linux's
++//! `rtw8723d_phy_calibration`, through the RF's S1 and S0 sides), and the
++//! antenna's selection for the BT coexistence.
++
++use crate::{
++    hw::{Hw, RATE_SECTIONS, RfeTables},
++    regs::*,
++};
++
++// ---- `rtw8723d.c`'s MAC timing. ----
++
++const SLOT_TIME: u8 = 0x09;
++const RETRY_LIMIT: u16 = 0x3030;
++const BAR_MODE: u32 = 0x0201_ffff;
++/// The TBTT's setup and hold fields, and the hold while beacons stop.
++const TBTT_MASK: u32 = (0xfff << 8) | 0xff;
++const TBTT_STOP_BCN: u32 = 0x04 | (0x64 << 8);
++const PIFS_TIME: u8 = 0;
++const AGG_BREAK_TIME: u8 = 0x16;
++const NAV_PROT_LEN: u16 = 0x0040;
++const SPEC_SIFS: u16 = 0x100a;
++const RX_PKT_LIMIT: u8 = 0x17;
++const MAX_AGG_NR: u8 = 0x0a;
++const AMPDU_MAX_TIME: u8 = 0x1c;
++const ANT_SEL: u8 = 0x82;
++const LTR_IDLE_LATENCY: u32 = 0x9003_9003;
++const LTR_ACTIVE_LATENCY: u32 = 0x883c_883c;
++const LTR_CTRL1: u32 = 0xcb00_4010;
++const LTR_CTRL2: u32 = 0x0123_3425;
++
++// ---- `rtw8723x.c`'s TX and RX settings. ----
++
++/// `BIT_CFENDFORM`, `BIT_WMAC_TCR_ERR0`, `BIT_WMAC_TCR_ERR1`.
++const TCR_CFG: u32 = (1 << 9) | (1 << 12) | (1 << 13);
++const RX_FILTER0: u16 = 0xffff;
++const RX_FILTER1: u16 = 0x0400;
++const RX_FILTER2: u16 = 0xffff;
++const RCR_CFG: u32 = 0x7000_60ce;
++
++/// The TX power indexes for an efuse without them
++/// (`rtw8723x_txpwr_idx_table`, path A's CCK and 40 MHz bases and its HT
++/// difference).
++const TXPWR_DEFAULT: [u8; 12] = [0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x2d, 0x02];
++
++/// Each rate's TX power register and byte (`rtw8723x_txagc`): CCK, OFDM,
++/// MCS 0 to 7.
++const TXAGC: [(u32, u32); 20] = [
++    (0xe08, 0x0000_ff00),
++    (0x86c, 0x0000_ff00),
++    (0x86c, 0x00ff_0000),
++    (0x86c, 0xff00_0000),
++    (0xe00, 0x0000_00ff),
++    (0xe00, 0x0000_ff00),
++    (0xe00, 0x00ff_0000),
++    (0xe00, 0xff00_0000),
++    (0xe04, 0x0000_00ff),
++    (0xe04, 0x0000_ff00),
++    (0xe04, 0x00ff_0000),
++    (0xe04, 0xff00_0000),
++    (0xe10, 0x0000_00ff),
++    (0xe10, 0x0000_ff00),
++    (0xe10, 0x00ff_0000),
++    (0xe10, 0xff00_0000),
++    (0xe14, 0x0000_00ff),
++    (0xe14, 0x0000_ff00),
++    (0xe14, 0x00ff_0000),
++    (0xe14, 0xff00_0000),
++];
++
++/// The CCK filter of channels 1 to 13 and of channel 14 (`cck_dfir_cfg`).
++const CCK_DFIR: [[(u32, u32); 3]; 2] = [
++    [(0xa24, 0x64b8_0c1c), (0xa28, 0x0000_8810), (0xaac, 0x0123_5667)],
++    [(0xa24, 0x0000_b81c), (0xa28, 0x0000_0000), (0xaac, 0x0000_3667)],
++];
++
++// ---- The IQ calibration (`rtw8723x_common`, `rtw8723d.c`). ----
++
++/// The registers saved before the calibration and put back after it.
++const IQK_ADDA: [u32; 16] = [0x85c, 0xe6c, 0xe70, 0xe74, 0xe78, 0xe7c, 0xe80, 0xe84, 0xe88, 0xe8c, 0xed0, 0xed4, 0xed8, 0xedc, 0xee0, 0xeec];
++const IQK_MAC8: [u32; 3] = [0x522, 0x550, 0x551];
++const IQK_MAC32: [u32; 1] = [0x40];
++const IQK_BB: [u32; 9] = [0xc04, 0xc08, 0x874, 0xb68, 0xb6c, 0x870, 0x860, 0x864, 0xa04];
++/// The ADDA registers' value while calibrating, and the GNT the LTE
++/// window holds then (`ADDA_ON_VAL_8723D`, `IQK_LTE_WRITE_VAL_8723D`).
++const ADDA_ON: u32 = 0x03c0_0016;
++const IQK_LTE_WRITE: u32 = 0x0000_ff00;
++/// The results' order (`enum rtw8723x_iqk_result`): each side's TX X and
++/// Y, then its RX X and Y; S1 first.
++const IQK_NR: usize = 8;
++const IQK_SX_NR: usize = 4;
++const S1_TX_X: usize = 0;
++const S1_RX_X: usize = 2;
++const S0_TX_X: usize = 4;
++const S0_RX_X: usize = 6;
++/// Three rounds and the hybrid of two (`enum rtw8723x_iqk_round`).
++const ROUNDS: usize = 3;
++const ROUND_HYBRID: usize = 3;
++/// `rtw8723x.h`'s limits.
++const PATH_RETRY: usize = 2;
++const TOLERANCE: u32 = 5;
++const TX_X_ERR: u32 = 0x142;
++const TX_Y_ERR: u32 = 0x42;
++const RX_X_UPPER: u32 = 0x11a;
++const RX_X_LOWER: u32 = 0xe6;
++const RX_Y_LIMIT: u32 = 0x1a;
++const TX_OK: u8 = 1 << 0;
++const RX_OK: u8 = 1 << 1;
++
++/// A side's calibration settings (`struct rtw_8723d_iqk_cfg`).
++struct IqkSide {
++    bb_sel_btg: u32,
++    lutwe: u32,
++    txiqk_pi: u32,
++    padlut: u32,
++    gaintx: u32,
++    bspad: u32,
++    wlint: u32,
++    wlsel: u32,
++    iqkpts: u32,
++}
++
++/// S1 and S0 (`iqk_tx_cfg`).
++const IQK_SIDES: [IqkSide; 2] = [
++    IqkSide { bb_sel_btg: 0x9900_0000, lutwe: RF_LUTWE, txiqk_pi: 0x8214_019f, padlut: RF_LUTDBG, gaintx: RF_GAINTX, bspad: RF_BSPAD, wlint: 0xe0d, wlsel: 0x60d, iqkpts: 0xfa00_0000 },
++    IqkSide { bb_sel_btg: 0x9900_0280, lutwe: RF_LUTWE2, txiqk_pi: 0x8214_018a, padlut: RF_TXADBG, gaintx: RF_TRXIQ, bspad: RF_TXATANK, wlint: 0xe6d, wlsel: 0x66d, iqkpts: 0xf900_0000 },
++];
++
++/// What the calibration saves (`struct rtw8723x_iqk_backup_regs`).
++struct IqkBackup {
++    adda: [u32; 16],
++    mac8: [u8; 3],
++    mac32: [u32; 1],
++    bb: [u32; 9],
++    lte_path: u32,
++    lte_gnt: u32,
++    bb_sel_btg: u32,
++    btg_sel: u8,
++    igia: u32,
++    igib: u32,
++}
++
++/// `iqkxy_to_s32`: a 10-bit result, signed.
++fn iqk_signed(value: i32) -> i32 {
++    (value << 22) >> 22
++}
++
++/// `iqk_mult`: two Q10.8 values' product in Q10.8, and its bit below.
++fn iqk_mult(x: i32, y: i32) -> (i32, i32) {
++    let product = x.wrapping_mul(y);
++    (product >> 8, (product >> 7) & 1)
++}
++
++/// `__rtw8723x_iqk_similarity_cmp`: whether rounds `c1` and `c2` agree;
++/// the hybrid takes what they agree on.
++fn iqk_similar(result: &mut [[i32; IQK_NR]; ROUNDS + 1], c1: usize, c2: usize) -> bool {
++    let mut bitmap = 0u32;
++    let mut candidate = [None::<usize>; 2];
++    for i in 0..IQK_NR {
++        let diff = (iqk_signed(result[c1][i]) - iqk_signed(result[c2][i])).unsigned_abs();
++        if diff <= TOLERANCE {
++            continue;
++        }
++        if (i == S1_RX_X || i == S0_RX_X) && bitmap == 0 {
++            if result[c1][i] + result[c1][i + 1] == 0 {
++                candidate[i / IQK_SX_NR] = Some(c2);
++            } else if result[c2][i] + result[c2][i + 1] == 0 {
++                candidate[i / IQK_SX_NR] = Some(c1);
++            } else {
++                bitmap |= 1 << i;
++            }
++        } else {
++            bitmap |= 1 << i;
++        }
++    }
++    if bitmap == 0 {
++        let mut similar = true;
++        for (side, chosen) in candidate.iter().enumerate() {
++            let Some(chosen) = *chosen else { continue };
++            for j in side * IQK_SX_NR..side * IQK_SX_NR + 2 {
++                result[ROUND_HYBRID][j] = result[chosen][j];
++            }
++            similar = false;
++        }
++        return similar;
++    }
++    for i in 0..IQK_NR {
++        let pair = i & !1;
++        if bitmap & (0b11 << pair) != 0 {
++            continue;
++        }
++        result[ROUND_HYBRID][i] = result[c1][i];
++    }
++    false
++}
++
++impl Hw {
++    /// `rtw8723x_read_efuse` (`struct rtw8723x_efuse`, the PCIe card's MAC
++    /// address at 0xd0) and its fixes of an efuse left empty.
++    pub(crate) fn efuse_8723d(&mut self, map: &[u8]) {
++        let mac_at = self.spec.mac_offset;
++        let e = &mut self.efuse;
++        for (path, table) in e.txpwr.iter_mut().enumerate() {
++            let at = 0x10 + 42 * path;
++            table.copy_from_slice(&map[at..at + 42]);
++        }
++        if e.txpwr[0][..TXPWR_DEFAULT.len()].iter().all(|&byte| byte == 0xff) {
++            e.txpwr[0][..TXPWR_DEFAULT.len()].copy_from_slice(&TXPWR_DEFAULT);
++        }
++        e.afe = map[0x04];
++        e.rfe_option = 0;
++        e.crystal_cap = if map[0xb9] == 0xff { 0x20 } else { map[0xb9] };
++        // No board options: the low bits only (a BT-coexistence board).
++        e.rf_board_option = if map[0xc1] == 0xff { 0x3f } else { map[0xc1] };
++        // No antenna setting: shared, on RF path A.
++        e.bt_setting = if map[0xc3] == 0xff { 0xff & !(1 << 6) } else { map[0xc3] };
++        e.tx_bb_swing_2g = if map[0xc6] == 0xff { 0 } else { map[0xc6] };
++        e.address.copy_from_slice(&map[mac_at..mac_at + 6]);
++        e.share_ant = e.bt_setting & 1 != 0;
++        e.btcoex = e.rf_board_option & 0xe0 == 0x20;
++    }
++
++    /// `rtw8723x_efuse_grant`.
++    pub(crate) fn efuse_grant_8723x(&self, on: bool) {
++        let c = &self.chip;
++        if on {
++            c.w8(REG_EFUSE_ACCESS, EFUSE_ACCESS_ON as u8);
++            c.set16(REG_SYS_FUNC_EN, BIT_FEN_ELDR);
++            c.set16(REG_SYS_CLKR, BIT_LOADER_CLK_EN | BIT_ANA8M);
++        } else {
++            c.w8(REG_EFUSE_ACCESS, EFUSE_ACCESS_OFF as u8);
++        }
++    }
++
++    /// `rtw8723x_mac_init`.
++    pub(crate) fn mac_init_8723x(&self) {
++        let c = &self.chip;
++        c.w32(REG_TCR, TCR_CFG);
++        c.w16(REG_RXFLTMAP0, RX_FILTER0);
++        c.w16(REG_RXFLTMAP1, RX_FILTER1);
++        c.w16(REG_RXFLTMAP2, RX_FILTER2);
++        c.w32(REG_RCR, RCR_CFG);
++        c.w32(REG_INT_MIG, 0);
++        c.w32(REG_MCUTST_1, 0);
++        c.w8(REG_MISC_CTRL, BIT_DIS_SECOND_CCA as u8);
++        c.w8(REG_2ND_CCA_CTRL, 0);
++    }
++
++    /// `rtw8723x_mac_postinit`: the TX reports on.
++    pub(crate) fn mac_postinit_8723x(&self) {
++        self.chip.w8(REG_FWHW_TXQ_CTRL + 1, WLAN_TXQ_RPT_EN as u8);
++    }
++
++    /// `rtw8723d_phy_set_param`.
++    pub(crate) fn phy_set_param_8723d(&mut self) {
++        let c = &self.chip;
++        // The BB and RF on.
++        c.set16(REG_SYS_FUNC_EN, BIT_FEN_EN_25_1 | BIT_FEN_BB_GLB_RST | BIT_FEN_BB_RSTB);
++        c.set8(REG_RF_CTRL, BIT_RF_EN | BIT_RF_RSTB | BIT_RF_SDM_RSTB);
++        c.w8(REG_AFE_CTRL1 + 1, 0x80);
++        self.load_tables();
++        let c = &self.chip;
++        c.clr32(REG_RCR, BIT_RCR_ADF);
++        c.set8(REG_HIQ_NO_LMT_EN, BIT_HIQ_NO_LMT_EN_ROOT);
++        c.set16(REG_AFE_CTRL_4, BIT_CK320M_AFE_EN | BIT_EN_SYN);
++        let crystal = (self.efuse.crystal_cap & 0x3f) as u32;
++        c.w32_mask(REG_AFE_CTRL3, BIT_MASK_XTAL, crystal | (crystal << 6));
++        c.set32(REG_FPGA0_RFMOD, BIT_CCKEN | BIT_OFDMEN);
++        if self.efuse.afe >> 4 == 14 {
++            c.set32(REG_AFE_CTRL3, BIT_XTAL_GMP_BIT4);
++            c.clr32(REG_AFE_CTRL1, BITS_PLL);
++            c.set32(REG_LDO_SWR_CTRL, BIT_XTA1);
++            c.clr32(REG_LDO_SWR_CTRL, BIT_XTA0);
++        }
++        c.w8(REG_SLOT, SLOT_TIME);
++        c.w8(REG_FWHW_TXQ_CTRL + 1, WLAN_TXQ_RPT_EN as u8);
++        c.w16(REG_RETRY_LIMIT, RETRY_LIMIT);
++        c.w32(REG_BAR_MODE_CTRL, BAR_MODE);
++        c.w8(REG_ATIMWND, 0x2);
++        c.w8(REG_BCN_CTRL, (BIT_DIS_TSF_UDT | BIT_EN_BCN_FUNCTION | BIT_EN_TXBCN_RPT) as u8);
++        // Linux writes the low byte of the TBTT's fields.
++        let tbtt = (c.r32(REG_TBTT_PROHIBIT) & !TBTT_MASK) | TBTT_STOP_BCN;
++        c.w8(REG_TBTT_PROHIBIT, tbtt as u8);
++        c.w8(REG_PIFS, PIFS_TIME);
++        c.w8(REG_AGGR_BREAK_TIME, AGG_BREAK_TIME);
++        c.w16(REG_NAV_PROT_LEN, NAV_PROT_LEN);
++        c.w16(REG_MAC_SPEC_SIFS, SPEC_SIFS);
++        c.w16(REG_SIFS, SPEC_SIFS);
++        c.w16(REG_SIFS + 2, SPEC_SIFS);
++        c.w8(REG_SINGLE_AMPDU_CTRL, BIT_EN_SINGLE_APMDU as u8);
++        c.w8(REG_RX_PKT_LIMIT, RX_PKT_LIMIT);
++        c.w8(REG_MAX_AGGR_NUM, MAX_AGG_NR);
++        c.w8(REG_AMPDU_MAX_TIME, AMPDU_MAX_TIME);
++        c.w8(REG_LEDCFG2, ANT_SEL);
++        c.w32(REG_LTR_IDLE_LATENCY, LTR_IDLE_LATENCY);
++        c.w32(REG_LTR_ACTIVE_LATENCY, LTR_ACTIVE_LATENCY);
++        c.w32(REG_LTR_CTRL_BASIC, LTR_CTRL1);
++        c.w32(REG_LTR_CTRL_BASIC + 4, LTR_CTRL2);
++        c.set16(REG_TXDMA_OFFSET_CHK, BIT_DROP_DATA_EN);
++        self.lck_8723x();
++        let c = &self.chip;
++        c.w32_mask(REG_OFDM0_XAAGC1, MASKBYTE0, 0x50);
++        c.w32_mask(REG_OFDM0_XAAGC1, MASKBYTE0, 0x20);
++    }
++
++    /// `rtw8723x_lck`: the LC tank's calibration, TX paused.
++    fn lck_8723x(&self) {
++        let c = &self.chip;
++        let context = c.r8(REG_CTX);
++        let busy = context as u32 & BIT_MASK_CTX_TYPE != 0;
++        if busy {
++            c.w8(REG_CTX, context & !(BIT_MASK_CTX_TYPE as u8));
++        } else {
++            c.w8(REG_TXPAUSE, 0xff);
++        }
++        let lc = self.read_rf(RF_CFGCH, RFREG_MASK);
++        self.write_rf(RF_CFGCH, RFREG_MASK, lc | BIT_LCK);
++        // Done when the bit clears: 10 ms steps, a second at most.
++        let mut done = false;
++        for _ in 0..100 {
++            if self.read_rf(RF_CFGCH, BIT_LCK) != 1 {
++                done = true;
++                break;
++            }
++            crate::sleep_ms(10);
++        }
++        if !done {
++            ostd::warn!("{}: the LC calibration did not finish", self.chip.name);
++        }
++        self.write_rf(RF_CFGCH, RFREG_MASK, lc);
++        let c = &self.chip;
++        if busy {
++            c.w8(REG_CTX, context);
++        } else {
++            c.w8(REG_TXPAUSE, 0x00);
++        }
++    }
++
++    /// `query_phy_status`: CCK and OFDM both by path A's power.
++    pub(crate) fn phy_signal_8723d(&self, status: &[u8]) -> Option<i32> {
++        match status[0] & 0xf {
++            0 => Some(status[1] as i32 - 97),
++            1 => Some(status[1] as i32 - 110),
++            _ => None,
++        }
++    }
++
++    // ---- The channel. ----
++
++    /// `rtw8723d_set_channel` at 20 MHz: the RF, the MAC, the BB.
++    pub(crate) fn set_channel_8723d(&mut self, channel: u8) {
++        // The channel on both RF paths, 20 MHz on path A's.
++        let mut a = self.read_rf_path(0, RF_CFGCH, RFREG_MASK);
++        let mut b = self.read_rf_path(1, RF_CFGCH, RFREG_MASK);
++        a = (a & !RFCFGCH_CHANNEL_MASK) | (channel as u32 & RFCFGCH_CHANNEL_MASK);
++        b = (b & !RFCFGCH_CHANNEL_MASK) | (channel as u32 & RFCFGCH_CHANNEL_MASK);
++        a = (a & !RFCFGCH_BW_MASK) | RFCFGCH_BW_20M;
++        self.write_rf_path(0, RF_CFGCH, RFREG_MASK, a);
++        self.write_rf_path(1, RF_CFGCH, RFREG_MASK, b);
++        self.spur_cal_8723d(channel);
++        self.set_channel_mac(channel);
++        let c = &self.chip;
++        for (register, value) in CCK_DFIR[if channel <= 13 { 0 } else { 1 }] {
++            c.w32(register, value);
++        }
++        c.w32_mask(REG_FPGA0_RFMOD, BIT_MASK_RFMOD, 0x0);
++        c.w32_mask(REG_FPGA1_RFMOD, BIT_MASK_RFMOD, 0x0);
++        c.w32_mask(REG_BBRX_DFIR, BIT_RXBB_DFIR_EN, 1);
++        c.w32_mask(REG_BBRX_DFIR, BIT_MASK_RXBB_DFIR, 0xa);
++    }
++
++    /// `rtw8723d_spur_cal`: on channels 13 and 14, a notch where the PSD
++    /// finds the spur.
++    fn spur_cal_8723d(&self, channel: u8) {
++        let notch = channel >= 13 && self.spur_over_8723d(channel);
++        self.notch_8723d(channel, notch);
++    }
++
++    /// `rtw8723d_check_spur_ov_thres`.
++    fn spur_over_8723d(&self, channel: u8) -> bool {
++        let freq = match channel {
++            13 => FREQ_CH13,
++            14 => FREQ_CH14,
++            _ => return false,
++        };
++        let c = &self.chip;
++        c.w32(REG_ANALOG_P4, DIS_3WIRE);
++        c.w32(REG_PSDFN, freq);
++        c.w32(REG_PSDFN, START_PSD | freq);
++        crate::sleep_ms(30);
++        let over = c.r32(REG_PSDRPT) >= SPUR_THRES;
++        c.w32(REG_PSDFN, freq);
++        c.w32(REG_ANALOG_P4, EN_3WIRE);
++        over
++    }
++
++    /// `rtw8723d_cfg_notch`.
++    fn notch_8723d(&self, channel: u8, notch: bool) {
++        let c = &self.chip;
++        let (dsp, csi) = match (notch, channel) {
++            (true, 13) => (0xb, [0x0400_0000, 0, 0, 0]),
++            (true, 14) => (0x5, [0, 0, 0, 0x0008_0000]),
++            _ => {
++                c.w32_mask(REG_OFDM0_RXDSP, BIT_MASK_RXDSP, 0x1f);
++                c.w32_mask(REG_OFDM0_RXDSP, BIT_EN_RXDSP, 0x0);
++                for register in [REG_OFDM1_CSI1, REG_OFDM1_CSI2, REG_OFDM1_CSI3, REG_OFDM1_CSI4] {
++                    c.w32(register, 0);
++                }
++                c.w32_mask(REG_OFDM1_CFOTRK, BIT_EN_CFOTRK, 0x0);
++                return;
++            }
++        };
++        c.w32_mask(REG_OFDM0_RXDSP, BIT_MASK_RXDSP, dsp);
++        c.w32_mask(REG_OFDM0_RXDSP, BIT_EN_RXDSP, 0x1);
++        for (register, value) in [REG_OFDM1_CSI1, REG_OFDM1_CSI2, REG_OFDM1_CSI3, REG_OFDM1_CSI4].into_iter().zip(csi) {
++            c.w32(register, value);
++        }
++        c.w32_mask(REG_OFDM1_CFOTRK, BIT_EN_CFOTRK, 0x1);
++    }
++
++    /// `rtw8723x_set_tx_power_index`: CCK, OFDM and one stream's MCS, each
++    /// rate's index in its byte.
++    pub(crate) fn set_tx_power_8723d(&self, tables: &RfeTables, channel: u8) {
++        for path in 0..self.paths() {
++            for (section, rates) in RATE_SECTIONS.into_iter().take(3) {
++                for rate in rates {
++                    let index = self.power_index(tables, path, channel, rate, section);
++                    let (register, mask) = TXAGC[rate as usize];
++                    self.chip.w32_mask(register, mask, index as u32);
++                }
++            }
++        }
++    }
++
++    // ---- The IQ calibration (`rtw8723d_phy_calibration`). ----
++
++    pub(crate) fn do_iqk_8723d(&mut self) {
++        let mut result = [[0i32; IQK_NR]; ROUNDS + 1];
++        let backup = self.iqk_backup();
++        let mut chosen = None;
++        'rounds: for round in 0..ROUNDS {
++            self.iqk_config_path_ctrl();
++            self.iqk_config_lte_path_gnt(IQK_LTE_WRITE);
++            self.iqk_one_round(&mut result, round, &backup);
++            if round > 0 {
++                self.iqk_restore_regs(&backup);
++            }
++            self.iqk_restore_lte_path_gnt(&backup);
++            self.chip.w8(REG_BTG_SEL, backup.btg_sel);
++            for earlier in 0..round {
++                if iqk_similar(&mut result, earlier, round) {
++                    chosen = Some(earlier);
++                    break 'rounds;
++                }
++            }
++        }
++        if chosen.is_none() && result[ROUND_HYBRID].iter().sum::<i32>() != 0 {
++            chosen = Some(ROUND_HYBRID);
++        }
++        match chosen {
++            Some(round) => {
++                let values = result[round];
++                self.iqk_fill_s1(&values);
++                self.iqk_fill_s0(&values);
++            }
++            None => ostd::warn!("{}: the IQ calibration failed", self.chip.name),
++        }
++        self.chip.w32(REG_BB_SEL_BTG, backup.bb_sel_btg);
++    }
++
++    /// `rtw8723x_iqk_backup_path_ctrl`, `_backup_lte_path_gnt` and
++    /// `_backup_regs`.
++    fn iqk_backup(&self) -> IqkBackup {
++        let c = &self.chip;
++        let btg_sel = c.r8(REG_BTG_SEL);
++        let lte_path = c.r32(REG_LTECOEX_PATH_CONTROL);
++        c.w32(REG_LTECOEX_CTRL, 0x800f_0038);
++        crate::delay_ms(1);
++        let lte_gnt = c.r32(REG_LTECOEX_READ_DATA);
++        IqkBackup {
++            adda: IQK_ADDA.map(|register| c.r32(register)),
++            mac8: IQK_MAC8.map(|register| c.r8(register)),
++            mac32: IQK_MAC32.map(|register| c.r32(register)),
++            bb: IQK_BB.map(|register| c.r32(register)),
++            lte_path,
++            lte_gnt,
++            bb_sel_btg: c.r32(REG_BB_SEL_BTG),
++            btg_sel,
++            igia: c.r32_mask(REG_OFDM0_XAAGC1, MASKBYTE0),
++            igib: c.r32_mask(REG_OFDM0_XBAGC1, MASKBYTE0),
++        }
++    }
++
++    /// `rtw8723x_iqk_restore_regs`.
++    fn iqk_restore_regs(&self, backup: &IqkBackup) {
++        let c = &self.chip;
++        for (register, value) in IQK_ADDA.into_iter().zip(backup.adda) {
++            c.w32(register, value);
++        }
++        for (register, value) in IQK_MAC8.into_iter().zip(backup.mac8) {
++            c.w8(register, value);
++        }
++        for (register, value) in IQK_MAC32.into_iter().zip(backup.mac32) {
++            c.w32(register, value);
++        }
++        for (register, value) in IQK_BB.into_iter().zip(backup.bb) {
++            c.w32(register, value);
++        }
++        c.w32_mask(REG_OFDM0_XAAGC1, MASKBYTE0, 0x50);
++        c.w32_mask(REG_OFDM0_XAAGC1, MASKBYTE0, backup.igia);
++        c.w32_mask(REG_OFDM0_XBAGC1, MASKBYTE0, 0x50);
++        c.w32_mask(REG_OFDM0_XBAGC1, MASKBYTE0, backup.igib);
++        c.w32(REG_TXIQK_TONE_A_11N, 0x0100_8c00);
++        c.w32(REG_RXIQK_TONE_A_11N, 0x0100_8c00);
++    }
++
++    /// `rtw8723x_iqk_config_path_ctrl`: the antenna to WLAN's path.
++    fn iqk_config_path_ctrl(&self) {
++        self.chip.w32_mask(REG_PAD_CTRL1, BIT_BT_BTG_SEL, 0x1);
++    }
++
++    /// `rtw8723x_iqk_config_lte_path_gnt`.
++    fn iqk_config_lte_path_gnt(&self, value: u32) {
++        let c = &self.chip;
++        c.w32(REG_LTECOEX_WRITE_DATA, value);
++        c.w32(REG_LTECOEX_CTRL, 0xc002_0038);
++        c.w32_mask(REG_LTECOEX_PATH_CONTROL, BIT_LTE_MUX_CTRL_PATH, 0x1);
++    }
++
++    /// `rtw8723x_iqk_restore_lte_path_gnt`.
++    fn iqk_restore_lte_path_gnt(&self, backup: &IqkBackup) {
++        let c = &self.chip;
++        c.w32(REG_LTECOEX_WRITE_DATA, backup.lte_gnt);
++        c.w32(REG_LTECOEX_CTRL, 0xc00f_0038);
++        c.w32(REG_LTECOEX_PATH_CONTROL, backup.lte_path);
++    }
++
++    /// `rtw8723x_iqk_path_adda_on`.
++    fn iqk_adda_on(&self) {
++        for register in IQK_ADDA {
++            self.chip.w32(register, ADDA_ON);
++        }
++    }
++
++    fn iqk_mode(&self, on: bool) {
++        self.chip.w32_mask(REG_FPGA0_IQK_11N, BIT_MASK_IQK_MOD, if on { EN_IQK } else { RST_IQK });
++    }
++
++    /// `rtw8723d_iqk_one_shot`: LOK and IQK started, then done.
++    fn iqk_one_shot(&self, tx: bool, side: &IqkSide) {
++        let c = &self.chip;
++        self.iqk_mode(true);
++        self.iqk_config_lte_path_gnt(IQK_LTE_WRITE);
++        c.w32(REG_LTECOEX_CTRL, 0x800f_0054);
++        crate::delay_ms(1);
++        c.w32(REG_IQK_AGC_PTS_11N, if tx { side.iqkpts } else { 0xf900_0000 });
++        c.w32(REG_IQK_AGC_PTS_11N, 0xf800_0000);
++        if !c.ready(REG_IQK_RES_RY, BIT_IQK_DONE, 1) {
++            ostd::warn!("{}: an IQ calibration step did not finish", c.name);
++        }
++    }
++
++    /// `rtw8723d_iqk_check_tx_failed`.
++    fn iqk_tx_ok(&self) -> u8 {
++        let c = &self.chip;
++        let failed = c.r32_mask(REG_IQK_RES_RY, BIT_IQK_TX_FAIL) != 0;
++        let (x, y) = (c.r32_mask(REG_IQK_RES_TX, BIT_MASK_RES_TX), c.r32_mask(REG_IQK_RES_TY, BIT_MASK_RES_TY));
++        if !failed && x != TX_X_ERR && y != TX_Y_ERR { TX_OK } else { 0 }
++    }
++
++    /// `rtw8723d_iqk_check_rx_failed`.
++    fn iqk_rx_ok(&self) -> u8 {
++        let c = &self.chip;
++        let failed = c.r32_mask(REG_IQK_RES_RY, BIT_IQK_RX_FAIL) != 0;
++        let x = c.r32_mask(REG_IQK_RES_RX, BIT_MASK_RES_RX);
++        let y = iqk_signed(c.r32_mask(REG_IQK_RES_RY, BIT_MASK_RES_RY) as i32).unsigned_abs();
++        if !failed && x < RX_X_UPPER && x > RX_X_LOWER && y < RX_Y_LIMIT { RX_OK } else { 0 }
++    }
++
++    /// `rtw8723d_iqk_txrx_path_post`: IQK mode left.
++    fn iqk_side_post(&self, side: &IqkSide, backup: &IqkBackup) {
++        self.iqk_restore_lte_path_gnt(backup);
++        self.chip.w32(REG_BB_SEL_BTG, backup.bb_sel_btg);
++        self.iqk_mode(false);
++        crate::delay_ms(1);
++        self.write_rf(side.padlut, 0x800, 0x0);
++        self.write_rf(RF_WLINT, 1 << 0, 0x0);
++        self.write_rf(RF_WLSEL, 1 << 0, 0x0);
++    }
++
++    /// The RF's LUT for an IQK mode: `lutwa`, `lutwd1`, `lutwd0`.
++    fn iqk_lut(&self, side: &IqkSide, lut: [u32; 3]) {
++        self.write_rf(side.lutwe, RFREG_MASK, 0x80000);
++        self.write_rf(RF_LUTWA, RFREG_MASK, lut[0]);
++        self.write_rf(RF_LUTWD1, RFREG_MASK, lut[1]);
++        self.write_rf(RF_LUTWD0, RFREG_MASK, lut[2]);
++        self.write_rf(side.lutwe, RFREG_MASK, 0x00000);
++    }
++
++    /// `rtw8723d_iqk_tx_path`.
++    fn iqk_tx_side(&self, side: &IqkSide, backup: &IqkBackup) -> u8 {
++        let c = &self.chip;
++        c.w32(REG_BB_SEL_BTG, side.bb_sel_btg);
++        self.iqk_mode(false);
++        crate::delay_ms(1);
++        self.iqk_lut(side, [0x00004, 0x0005d, 0xbffe0]);
++        let c = &self.chip;
++        c.w32(REG_TXIQK_TONE_A_11N, 0x0800_8c0c);
++        c.w32(REG_RXIQK_TONE_A_11N, 0x3800_8c1c);
++        c.w32(REG_TXIQK_PI_A_11N, side.txiqk_pi);
++        c.w32(REG_RXIQK_PI_A_11N, 0x2816_0200);
++        c.w32(REG_TXIQK_11N, 0x0100_7c00);
++        c.w32(REG_RXIQK_11N, 0x0100_4800);
++        c.w32(REG_IQK_AGC_RSP_11N, 0x0046_2911);
++        // PA and PAD, then the 8723D's LOK.
++        self.write_rf(side.padlut, 0x800, 0x1);
++        self.write_rf(side.gaintx, 0x600, 0x0);
++        self.write_rf(side.gaintx, 0x1e0, 0x3);
++        self.write_rf(RF_RXIQGEN, 0x1f, 0xf);
++        self.write_rf(side.lutwe, 0x10, 0x1);
++        self.write_rf(side.bspad, 0x1, 0x1);
++        self.write_rf(RF_WLINT, RFREG_MASK, side.wlint);
++        self.write_rf(RF_WLSEL, RFREG_MASK, side.wlsel);
++        self.iqk_one_shot(true, side);
++        let status = self.iqk_tx_ok();
++        self.iqk_side_post(side, backup);
++        status
++    }
++
++    /// `rtw8723d_iqk_rx_path`: its first step a TX IQK, whose result the
++    /// second step's TX takes.
++    fn iqk_rx_side(&self, side: &IqkSide, backup: &IqkBackup) -> u8 {
++        let c = &self.chip;
++        c.w32(REG_BB_SEL_BTG, side.bb_sel_btg);
++        self.iqk_mode(false);
++        c.w32(REG_TXIQK_11N, 0x0100_7c00);
++        c.w32(REG_RXIQK_11N, 0x0100_4800);
++        c.w32(REG_TXIQK_TONE_A_11N, 0x1800_8c1c);
++        c.w32(REG_RXIQK_TONE_A_11N, 0x3800_8c1c);
++        c.w32(REG_TX_IQK_TONE_B, 0x3800_8c1c);
++        c.w32(REG_RX_IQK_TONE_B, 0x3800_8c1c);
++        c.w32(REG_TXIQK_PI_A_11N, 0x8216_0000);
++        c.w32(REG_RXIQK_PI_A_11N, 0x2816_0000);
++        c.w32(REG_IQK_AGC_RSP_11N, 0x0046_a911);
++        self.iqk_lut(side, [0x00006, 0x0005f, 0xa7ffb]);
++        self.write_rf(side.padlut, 0x800, 0x1);
++        self.write_rf(side.gaintx, 0x600, 0x0);
++        self.write_rf(RF_WLINT, RFREG_MASK, side.wlint);
++        self.write_rf(RF_WLSEL, RFREG_MASK, side.wlsel);
++        self.iqk_one_shot(false, side);
++        let mut status = self.iqk_tx_ok();
++        if status != 0 {
++            let c = &self.chip;
++            let (x, y) = (c.r32_mask(REG_IQK_RES_TX, BIT_MASK_RES_TX), c.r32_mask(REG_IQK_RES_TY, BIT_MASK_RES_TY));
++            c.w32(REG_TXIQK_11N, 0x8000_7c00 | (x << 16) | y);
++            c.w32(REG_RXIQK_11N, 0x0100_4800);
++            c.w32(REG_TXIQK_TONE_A_11N, 0x3800_8c1c);
++            c.w32(REG_RXIQK_TONE_A_11N, 0x1800_8c1c);
++            c.w32(REG_TX_IQK_TONE_B, 0x3800_8c1c);
++            c.w32(REG_RX_IQK_TONE_B, 0x3800_8c1c);
++            c.w32(REG_TXIQK_PI_A_11N, 0x8217_0000);
++            c.w32(REG_RXIQK_PI_A_11N, 0x2817_1400);
++            c.w32(REG_IQK_AGC_RSP_11N, 0x0046_a8d1);
++            self.iqk_mode(false);
++            crate::delay_ms(1);
++            self.write_rf(side.lutwe, 0x80000, 0x1);
++            self.write_rf(RF_LUTWA, RFREG_MASK, 0x00007);
++            self.write_rf(RF_LUTWD1, RFREG_MASK, 0x0005f);
++            self.write_rf(RF_LUTWD0, RFREG_MASK, 0xb3fdb);
++            self.write_rf(side.lutwe, RFREG_MASK, 0x00000);
++            self.iqk_one_shot(false, side);
++            status |= self.iqk_rx_ok();
++        }
++        self.iqk_side_post(side, backup);
++        status
++    }
++
++    /// `rtw8723d_iqk_rf_standby`.
++    fn iqk_rf_standby(&self, path: usize) {
++        self.iqk_mode(false);
++        crate::delay_ms(1);
++        self.write_rf_path(path, RF_MODE, RFREG_MASK, 0x10000);
++        self.iqk_mode(true);
++    }
++
++    /// `rtw8723d_iqk_precfg_path`: the other side's RF path in standby.
++    fn iqk_precfg_side(&self, s0: bool) {
++        if s0 {
++            self.iqk_rf_standby(0);
++            self.iqk_adda_on();
++        }
++        self.iqk_mode(true);
++        self.chip.w32(REG_TXIQK_11N, 0x0100_7c00);
++        self.chip.w32(REG_RXIQK_11N, 0x0100_4800);
++        if !s0 {
++            self.iqk_rf_standby(1);
++            self.iqk_adda_on();
++        }
++    }
++
++    /// `rtw8723d_iqk_one_round`: S1, then S0, each its TX and its RX.
++    fn iqk_one_round(&self, result: &mut [[i32; IQK_NR]; ROUNDS + 1], round: usize, backup: &IqkBackup) {
++        self.iqk_adda_on();
++        let c = &self.chip;
++        c.w8(REG_TXPAUSE, 0xff);
++        c.w32_mask(REG_CCK_ANT_SEL_11N, 0x0f00_0000, 0xf);
++        c.w32(REG_BB_RX_PATH_11N, 0x03a0_5611);
++        c.w32(REG_TRMUX_11N, 0x0008_00e4);
++        c.w32(REG_BB_PWR_SAV1_11N, 0x2520_4200);
++        for (index, side) in IQK_SIDES.iter().enumerate() {
++            let s0 = index == 1;
++            let tx_at = if s0 { S0_TX_X } else { S1_TX_X };
++            let rx_at = tx_at + 2;
++            self.iqk_precfg_side(s0);
++            for _ in 0..PATH_RETRY {
++                if self.iqk_tx_side(side, backup) == TX_OK {
++                    result[round][tx_at] = self.chip.r32_mask(REG_IQK_RES_TX, BIT_MASK_RES_TX) as i32;
++                    result[round][tx_at + 1] = self.chip.r32_mask(REG_IQK_RES_TY, BIT_MASK_RES_TY) as i32;
++                    break;
++                }
++                result[round][tx_at] = 0x100;
++                result[round][tx_at + 1] = 0;
++            }
++            for _ in 0..PATH_RETRY {
++                if self.iqk_rx_side(side, backup) == TX_OK | RX_OK {
++                    result[round][rx_at] = self.chip.r32_mask(REG_IQK_RES_RX, BIT_MASK_RES_RX) as i32;
++                    result[round][rx_at + 1] = self.chip.r32_mask(REG_IQK_RES_RY, BIT_MASK_RES_RY) as i32;
++                    break;
++                }
++                result[round][rx_at] = 0x100;
++                result[round][rx_at + 1] = 0;
++            }
++        }
++        self.iqk_mode(false);
++        crate::delay_ms(1);
++    }
++
++    /// `rtw8723d_iqk_fill_s1_matrix`.
++    fn iqk_fill_s1(&self, result: &[i32; IQK_NR]) {
++        if result[S1_TX_X] == 0 {
++            return;
++        }
++        let c = &self.chip;
++        let old = c.r32_mask(REG_OFDM_0_XA_TX_IQ_IMBALANCE, BIT_MASK_TXIQ_ELM_D) as i32;
++        let (a, a_ext) = iqk_mult(iqk_signed(result[S1_TX_X]), old);
++        c.w32_mask(REG_OFDM_0_XA_TX_IQ_IMBALANCE, BIT_MASK_TXIQ_ELM_A, a as u32);
++        c.w32_mask(REG_OFDM_0_ECCA_THRESHOLD, BIT_MASK_OFDM0_EXT_A, a_ext as u32);
++        let (cc, c_ext) = iqk_mult(iqk_signed(result[S1_TX_X + 1]), old);
++        c.w32_mask(REG_TXIQK_MATRIXA_LSB2_11N, MASKH4BITS, ((cc as u32) & 0x3c0) >> 6);
++        c.w32_mask(REG_OFDM_0_XA_TX_IQ_IMBALANCE, BIT_MASK_TXIQ_ELM_C, (cc as u32) & 0x3f);
++        c.w32_mask(REG_OFDM_0_ECCA_THRESHOLD, BIT_MASK_OFDM0_EXT_C, c_ext as u32);
++        if result[S1_RX_X] == 0 {
++            return;
++        }
++        let y = result[S1_RX_X + 1] as u32;
++        c.w32_mask(REG_A_RXIQI, BIT_MASK_RXIQ_S1_X, result[S1_RX_X] as u32);
++        c.w32_mask(REG_A_RXIQI, BIT_MASK_RXIQ_S1_Y1, y & 0x3f);
++        c.w32_mask(REG_RXIQK_MATRIX_LSB_11N, BIT_MASK_RXIQ_S1_Y2, (y >> 6) & 0xf);
++    }
++
++    /// `rtw8723d_iqk_fill_s0_matrix`.
++    fn iqk_fill_s0(&self, result: &[i32; IQK_NR]) {
++        if result[S0_TX_X] == 0 {
++            return;
++        }
++        let c = &self.chip;
++        let old = c.r32_mask(REG_TXIQ_CD_S0, BIT_MASK_TXIQ_D_S0) as i32;
++        let (a, a_ext) = iqk_mult(iqk_signed(result[S0_TX_X]), old);
++        c.w32_mask(REG_TXIQ_AB_S0, BIT_MASK_TXIQ_A_S0, a as u32);
++        c.w32_mask(REG_TXIQ_AB_S0, BIT_MASK_TXIQ_A_EXT_S0, a_ext as u32);
++        let (cc, c_ext) = iqk_mult(iqk_signed(result[S0_TX_X + 1]), old);
++        c.w32_mask(REG_TXIQ_CD_S0, BIT_MASK_TXIQ_C_S0, cc as u32);
++        c.w32_mask(REG_TXIQ_CD_S0, BIT_MASK_TXIQ_C_EXT_S0, c_ext as u32);
++        if result[S0_RX_X] == 0 {
++            return;
++        }
++        c.w32_mask(REG_RXIQ_AB_S0, BIT_MASK_RXIQ_X_S0, result[S0_RX_X] as u32);
++        c.w32_mask(REG_RXIQ_AB_S0, BIT_MASK_RXIQ_Y_S0, result[S0_RX_X + 1] as u32);
++    }
++
++    // ---- BT coexistence. ----
++
++    /// `rtw8723d_coex_cfg_gnt_debug`: the GNT debug pins off.
++    pub(crate) fn coex_gnt_debug_8723d(&self) {
++        let c = &self.chip;
++        c.w8_mask(REG_LEDCFG2, 1 << 6, 0);
++        c.w8_mask(REG_PAD_CTRL1 + 3, 1 << 0, 0);
++        c.w8_mask(REG_GPIO_INTM + 2, 1 << 4, 0);
++        c.w8_mask(REG_GPIO_MUXCFG + 2, 1 << 1, 0);
++        c.w8_mask(REG_PAD_CTRL1 + 3, 1 << 1, 0);
++        c.w8_mask(REG_PAD_CTRL1 + 2, 1 << 7, 0);
++        c.w8_mask(REG_SYS_CLKR + 1, 1 << 1, 0);
++        c.w8_mask(REG_SYS_SDIO_CTRL + 3, 1 << 3, 0);
++    }
++
++    /// `rtw8723d_coex_cfg_rfe_type`: the antenna, main or aux, shared or
++    /// not; the LTE coexistence off on the WLAN side.
++    pub(crate) fn coex_rfe_type_8723d(&self) {
++        let aux = self.efuse.bt_setting & (1 << 6) != 0;
++        let select = match (self.efuse.share_ant, aux) {
++            (true, true) => 0x80,
++            (true, false) => 0x200,
++            (false, true) => 0x280,
++            (false, false) => 0x0,
++        };
++        let c = &self.chip;
++        c.w16(REG_BB_SEL_BTG, select);
++        c.ltecoex_write_mask(LTE_COEX_CTRL as u16, BIT_LTE_COEX_EN, 0);
++        c.ltecoex_write_mask(LTE_WL_TRX_CTRL as u16, MASKLWORD, 0xffff);
++        c.ltecoex_write_mask(LTE_BT_TRX_CTRL as u16, MASKLWORD, 0xffff);
++    }
++}
 diff --git a/kernel/comps/rtw88/src/rtw8821c.rs b/kernel/comps/rtw88/src/rtw8821c.rs
 new file mode 100644
 index 0000000..89f9c1f
@@ -4670,10 +6042,10 @@ index 0000000..6b3053c
 +}
 diff --git a/kernel/comps/rtw88/src/sta.rs b/kernel/comps/rtw88/src/sta.rs
 new file mode 100644
-index 0000000..12febc7
+index 0000000..d256d71
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/sta.rs
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,592 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The station as mac80211 runs it over rtw88: a software scan (the
@@ -4825,7 +6197,7 @@ index 0000000..12febc7
 +        }
 +        let mut channels: Vec<u8> = request.freqs.iter().filter_map(|&freq| wifi::channel_of(freq)).filter(|&channel| self.supports(channel)).collect();
 +        if channels.is_empty() {
-+            channels = (1..=13).chain(CHANNELS_5GHZ.iter().map(|&channel| channel as u8)).collect();
++            channels = (1..=13).chain(CHANNELS_5GHZ.iter().map(|&channel| channel as u8)).filter(|&channel| self.supports(channel)).collect();
 +        }
 +        self.hw.set_rcr(true);
 +        self.scan = Some(Scan { channels, next: 0, ssids: request.ssids.clone(), elements: request.elements.clone(), deadline: 0, home: false, aborted: false });
@@ -4833,8 +6205,10 @@ index 0000000..12febc7
 +        Ok(())
 +    }
 +
++    /// The channels offered: 2.4 GHz's, and 5 GHz's on the chips that have
++    /// the band.
 +    fn supports(&self, channel: u8) -> bool {
-+        (1..=13).contains(&channel) || CHANNELS_5GHZ.contains(&(channel as u16))
++        (1..=13).contains(&channel) || (self.hw.spec.band_5g && CHANNELS_5GHZ.contains(&(channel as u16)))
 +    }
 +
 +    pub(crate) fn abort_scan(&mut self) {
@@ -5064,7 +6438,7 @@ index 0000000..12febc7
 +        let basic = self.network.as_ref().map_or(0, |network| network.basic);
 +        let rate = if basic == 0 { lowest } else { lowest + basic.trailing_zeros() as u8 };
 +        let info = TxInfo {
-+            offset: crate::pci::TX_DESC as u8,
++            offset: self.hw.pci.tx_desc() as u8,
 +            bmc: frame[4] & 1 != 0,
 +            ls: true,
 +            dis_qselseq: true,
@@ -5120,7 +6494,7 @@ index 0000000..12febc7
 +        // The rate adaptation's set (`update_ra`).
 +        let rate_id = self.rate_id;
 +        let info = TxInfo {
-+            offset: crate::pci::TX_DESC as u8,
++            offset: self.hw.pci.tx_desc() as u8,
 +            bmc: frame[4] & 1 != 0,
 +            ls: true,
 +            mac_id: MAC_ID,
@@ -5234,7 +6608,7 @@ index 0000000..12febc7
 +        if self.hw.paths() > 1 {
 +            mcs[1] = 0xff;
 +        }
-+        let ht = HtCap { info: HT_INFO, ampdu_factor: 3, ampdu_density: 4, mcs };
++        let ht = HtCap { info: HT_INFO, ampdu_factor: 3, ampdu_density: self.hw.spec.ampdu_density, mcs };
 +        let band = |id: BandId| {
 +            let channels: Vec<Channel> = match id {
 +                BandId::Ghz2 => (1..=13u8).map(|channel| Channel::new(channel_freq(channel))).collect(),
@@ -5250,10 +6624,14 @@ index 0000000..12febc7
 +            };
 +            Band { id, channels, ht: Some(ht.clone()), vht: None, he: None }
 +        };
++        let mut bands = vec![band(BandId::Ghz2)];
++        if self.hw.spec.band_5g {
++            bands.push(band(BandId::Ghz5));
++        }
 +        Info {
 +            driver: String::from("rtw88"),
 +            address: self.address,
-+            bands: vec![band(BandId::Ghz2), band(BandId::Ghz5)],
++            bands,
 +            ciphers: vec![radio::CIPHER_CCMP],
 +            max_scan_ssids: 4,
 +            max_scan_ie_len: 512,
@@ -5262,10 +6640,10 @@ index 0000000..12febc7
 +}
 diff --git a/kernel/comps/rtw88/src/tables.rs b/kernel/comps/rtw88/src/tables.rs
 new file mode 100644
-index 0000000..35d4df3
+index 0000000..00602f8
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/tables.rs
-@@ -0,0 +1,18967 @@
+@@ -0,0 +1,19348 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright(c) 2018-2019 Realtek Corporation
 +
@@ -24230,6 +25608,387 @@ index 0000000..35d4df3
 +        4 => Some(RfeTables { offset_2g: &TXPWR_OFFSET_2G_8822C_PG0, offset_5g: &TXPWR_OFFSET_5G_8822C_PG0, limit_2g: &TXPWR_LIMIT_2G_8822C_PG0_LMT0, limit_5g: &TXPWR_LIMIT_5G_8822C_PG0_LMT0, agc_btg: None }),
 +        5 => Some(RfeTables { offset_2g: &TXPWR_OFFSET_2G_8822C_PG0, offset_5g: &TXPWR_OFFSET_5G_8822C_PG0, limit_2g: &TXPWR_LIMIT_2G_8822C_PG0_LMT5, limit_5g: &TXPWR_LIMIT_5G_8822C_PG0_LMT5, agc_btg: None }),
 +        6 => Some(RfeTables { offset_2g: &TXPWR_OFFSET_2G_8822C_PG0, offset_5g: &TXPWR_OFFSET_5G_8822C_PG0, limit_2g: &TXPWR_LIMIT_2G_8822C_PG0_LMT0, limit_5g: &TXPWR_LIMIT_5G_8822C_PG0_LMT0, agc_btg: None }),
++        _ => None,
++    }
++}
++
++static TRANS_CARDDIS_TO_CARDEMU_8723D: [PwrCmd; 8] = [
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x88, value: 0x00 },
++    PwrCmd { offset: 0x0086, cut_mask: 0xff, intf_mask: 0x01, base: 3, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x0086, cut_mask: 0xff, intf_mask: 0x01, base: 3, cmd: 2, mask: 0x02, value: 0x02 },
++    PwrCmd { offset: 0x004a, cut_mask: 0xff, intf_mask: 0x02, base: 0, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x18, value: 0x00 },
++    PwrCmd { offset: 0x0023, cut_mask: 0xff, intf_mask: 0x01, base: 0, cmd: 1, mask: 0x10, value: 0x00 },
++    PwrCmd { offset: 0x0301, cut_mask: 0xff, intf_mask: 0x04, base: 0, cmd: 1, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++static TRANS_CARDEMU_TO_ACT_8723D: [PwrCmd; 26] = [
++    PwrCmd { offset: 0x0020, cut_mask: 0xff, intf_mask: 0x03, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0001, cut_mask: 0xff, intf_mask: 0x03, base: 0, cmd: 3, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0000, cut_mask: 0xff, intf_mask: 0x03, base: 0, cmd: 1, mask: 0x20, value: 0x00 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x1c, value: 0x00 },
++    PwrCmd { offset: 0x0075, cut_mask: 0xff, intf_mask: 0x04, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0006, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0x02, value: 0x02 },
++    PwrCmd { offset: 0x0075, cut_mask: 0xff, intf_mask: 0x04, base: 0, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x0006, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0x03, value: 0x00 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x80, value: 0x00 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x18, value: 0x00 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x0010, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x40, value: 0x40 },
++    PwrCmd { offset: 0x0049, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x02 },
++    PwrCmd { offset: 0x0063, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x02 },
++    PwrCmd { offset: 0x0062, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x00 },
++    PwrCmd { offset: 0x0058, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x005a, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x02 },
++    PwrCmd { offset: 0x0068, cut_mask: 0x01, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x08, value: 0x08 },
++    PwrCmd { offset: 0x0069, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x40, value: 0x40 },
++    PwrCmd { offset: 0x001f, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x0077, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x001f, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x07 },
++    PwrCmd { offset: 0x0077, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x07 },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++pub(crate) static CARD_ENABLE_FLOW_8723D: [&[PwrCmd]; 2] = [&TRANS_CARDDIS_TO_CARDEMU_8723D, &TRANS_CARDEMU_TO_ACT_8723D];
++
++static TRANS_ACT_TO_LPS_8723D: [PwrCmd; 14] = [
++    PwrCmd { offset: 0x0301, cut_mask: 0xff, intf_mask: 0x04, base: 0, cmd: 1, mask: 0xff, value: 0xff },
++    PwrCmd { offset: 0x0522, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0xff },
++    PwrCmd { offset: 0x05f8, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x05f9, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x05fa, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x05fb, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x0002, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x0002, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 3, mask: 0x00, value: 0x00 },
++    PwrCmd { offset: 0x0002, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x00 },
++    PwrCmd { offset: 0x0100, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x03 },
++    PwrCmd { offset: 0x0101, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x00 },
++    PwrCmd { offset: 0x0093, cut_mask: 0xff, intf_mask: 0x01, base: 0, cmd: 1, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0x0553, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x20, value: 0x20 },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++static TRANS_ACT_TO_PRE_CARDDIS_8723D: [PwrCmd; 3] = [
++    PwrCmd { offset: 0x0003, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x04, value: 0x00 },
++    PwrCmd { offset: 0x0080, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x00 },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++static TRANS_ACT_TO_CARDEMU_8723D: [PwrCmd; 9] = [
++    PwrCmd { offset: 0x0002, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x0049, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x00 },
++    PwrCmd { offset: 0x0006, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x02, value: 0x02 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 2, mask: 0x02, value: 0x00 },
++    PwrCmd { offset: 0x0010, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x40, value: 0x00 },
++    PwrCmd { offset: 0x0000, cut_mask: 0xff, intf_mask: 0x03, base: 0, cmd: 1, mask: 0x20, value: 0x20 },
++    PwrCmd { offset: 0x0020, cut_mask: 0xff, intf_mask: 0x03, base: 0, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++static TRANS_CARDEMU_TO_CARDDIS_8723D: [PwrCmd; 9] = [
++    PwrCmd { offset: 0x0007, cut_mask: 0xff, intf_mask: 0x01, base: 0, cmd: 1, mask: 0xff, value: 0x20 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x03, base: 0, cmd: 1, mask: 0x18, value: 0x08 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x04, base: 0, cmd: 1, mask: 0x04, value: 0x04 },
++    PwrCmd { offset: 0x0005, cut_mask: 0xff, intf_mask: 0x04, base: 0, cmd: 1, mask: 0x18, value: 0x18 },
++    PwrCmd { offset: 0x004a, cut_mask: 0xff, intf_mask: 0x02, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0023, cut_mask: 0xff, intf_mask: 0x01, base: 0, cmd: 1, mask: 0x10, value: 0x10 },
++    PwrCmd { offset: 0x0086, cut_mask: 0xff, intf_mask: 0x01, base: 3, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x0086, cut_mask: 0xff, intf_mask: 0x01, base: 3, cmd: 2, mask: 0x02, value: 0x00 },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++static TRANS_ACT_TO_POST_CARDDIS_8723D: [PwrCmd; 4] = [
++    PwrCmd { offset: 0x001d, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x00 },
++    PwrCmd { offset: 0x001d, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0x01, value: 0x01 },
++    PwrCmd { offset: 0x001c, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 1, mask: 0xff, value: 0x0e },
++    PwrCmd { offset: 0xffff, cut_mask: 0xff, intf_mask: 0x0f, base: 0, cmd: 4, mask: 0x00, value: 0x00 },
++];
++pub(crate) static CARD_DISABLE_FLOW_8723D: [&[PwrCmd]; 5] = [&TRANS_ACT_TO_LPS_8723D, &TRANS_ACT_TO_PRE_CARDDIS_8723D, &TRANS_ACT_TO_CARDEMU_8723D, &TRANS_CARDEMU_TO_CARDDIS_8723D, &TRANS_ACT_TO_POST_CARDDIS_8723D];
++
++pub(crate) static PCIE_GEN1_8723D: [IntfPara; 3] = [
++    IntfPara { offset: 0x0008, value: 0x4a22, ip_sel: 0, cut_mask: 0xffff },
++    IntfPara { offset: 0x0009, value: 0x1000, ip_sel: 0, cut_mask: 0xfffc },
++    IntfPara { offset: 0xffff, value: 0x0000, ip_sel: 0, cut_mask: 0xffff },
++];
++pub(crate) static PCIE_GEN2_8723D: [IntfPara; 0] = [];
++
++pub(crate) static MAC_8723D: [u32; 226] = [
++    0x00000020, 0x00000013, 0x0000002f, 0x00000010, 0x00000077, 0x00000007, 0x00000421, 0x0000000f,
++    0x00000428, 0x0000000a, 0x00000429, 0x00000010, 0x00000430, 0x00000000, 0x00000431, 0x00000000,
++    0x00000432, 0x00000000, 0x00000433, 0x00000001, 0x00000434, 0x00000002, 0x00000435, 0x00000003,
++    0x00000436, 0x00000005, 0x00000437, 0x00000007, 0x00000438, 0x00000000, 0x00000439, 0x00000000,
++    0x0000043a, 0x00000000, 0x0000043b, 0x00000001, 0x0000043c, 0x00000002, 0x0000043d, 0x00000003,
++    0x0000043e, 0x00000005, 0x0000043f, 0x00000007, 0x00000440, 0x0000005d, 0x00000441, 0x00000001,
++    0x00000442, 0x00000000, 0x00000444, 0x00000010, 0x00000445, 0x00000000, 0x00000446, 0x00000000,
++    0x00000447, 0x00000000, 0x00000448, 0x00000000, 0x00000449, 0x000000f0, 0x0000044a, 0x0000000f,
++    0x0000044b, 0x0000003e, 0x0000044c, 0x00000010, 0x0000044d, 0x00000000, 0x0000044e, 0x00000000,
++    0x0000044f, 0x00000000, 0x00000450, 0x00000000, 0x00000451, 0x000000f0, 0x00000452, 0x0000000f,
++    0x00000453, 0x00000000, 0x00000456, 0x0000005e, 0x00000460, 0x00000066, 0x00000461, 0x00000066,
++    0x000004c8, 0x000000ff, 0x000004c9, 0x00000008, 0x000004cc, 0x000000ff, 0x000004cd, 0x000000ff,
++    0x000004ce, 0x00000001, 0x00000500, 0x00000026, 0x00000501, 0x000000a2, 0x00000502, 0x0000002f,
++    0x00000503, 0x00000000, 0x00000504, 0x00000028, 0x00000505, 0x000000a3, 0x00000506, 0x0000005e,
++    0x00000507, 0x00000000, 0x00000508, 0x0000002b, 0x00000509, 0x000000a4, 0x0000050a, 0x0000005e,
++    0x0000050b, 0x00000000, 0x0000050c, 0x0000004f, 0x0000050d, 0x000000a4, 0x0000050e, 0x00000000,
++    0x0000050f, 0x00000000, 0x00000512, 0x0000001c, 0x00000514, 0x0000000a, 0x00000516, 0x0000000a,
++    0x00000525, 0x0000004f, 0x00000550, 0x00000010, 0x00000551, 0x00000010, 0x00000559, 0x00000002,
++    0x0000055c, 0x00000028, 0x0000055d, 0x000000ff, 0x00000605, 0x00000030, 0x00000608, 0x0000000e,
++    0x00000609, 0x0000002a, 0x00000620, 0x000000ff, 0x00000621, 0x000000ff, 0x00000622, 0x000000ff,
++    0x00000623, 0x000000ff, 0x00000624, 0x000000ff, 0x00000625, 0x000000ff, 0x00000626, 0x000000ff,
++    0x00000627, 0x000000ff, 0x00000638, 0x00000028, 0x0000063c, 0x0000000a, 0x0000063d, 0x0000000a,
++    0x0000063e, 0x0000000c, 0x0000063f, 0x0000000c, 0x00000640, 0x00000040, 0x00000642, 0x00000040,
++    0x00000643, 0x00000000, 0x00000652, 0x000000c8, 0x0000066a, 0x000000b0, 0x0000066e, 0x00000005,
++    0x00000700, 0x00000021, 0x00000701, 0x00000043, 0x00000702, 0x00000065, 0x00000703, 0x00000087,
++    0x00000708, 0x00000021, 0x00000709, 0x00000043, 0x0000070a, 0x00000065, 0x0000070b, 0x00000087,
++    0x00000765, 0x00000018, 0x0000076e, 0x00000004, 0x000007c0, 0x00000038, 0x000007c2, 0x0000000f,
++    0x000007c3, 0x000000c0, 0x00000073, 0x00000004, 0x000007c4, 0x00000077, 0x0000007c, 0x00000003,
++    0x00000016, 0x000000b3,
++];
++
++pub(crate) static BB_8723D: [u32; 446] = [
++    0x00000800, 0x80046c00, 0x00000804, 0x00000003, 0x00000808, 0x0000fc00, 0x0000080c, 0x0000000a,
++    0x00000810, 0x10001331, 0x00000814, 0x020c3d10, 0x00000818, 0x00200385, 0x0000081c, 0x00000000,
++    0x00000820, 0x01000100, 0x00000824, 0x00390204, 0x00000828, 0x00000000, 0x0000082c, 0x00000000,
++    0x00000830, 0x00000000, 0x00000834, 0x00000000, 0x00000838, 0x00000000, 0x0000083c, 0x00000000,
++    0x00000840, 0x00010000, 0x00000844, 0x00000000, 0x00000848, 0x00000000, 0x0000084c, 0x00000000,
++    0x00000850, 0x00000000, 0x00000854, 0x00000000, 0x00000858, 0x569a11a9, 0x0000085c, 0x01000014,
++    0x00000860, 0x66f60110, 0x00000864, 0x461f0641, 0x00000868, 0x00000000, 0x0000086c, 0x27272700,
++    0x00000870, 0x07000460, 0x00000874, 0x25004000, 0x00000878, 0x00000808, 0x0000087c, 0x004f0201,
++    0x00000880, 0xb2002e12, 0x00000884, 0x00000007, 0x00000888, 0x00000000, 0x0000088c, 0xccc000c0,
++    0x00000890, 0x00000800, 0x00000894, 0xfffffffe, 0x00000898, 0x40302010, 0x0000089c, 0x00706050,
++    0x00000900, 0x00000000, 0x00000904, 0x00000023, 0x00000908, 0x00000000, 0x0000090c, 0x81121111,
++    0x00000910, 0x00000402, 0x00000914, 0x00000300, 0x00000920, 0x18c6318c, 0x00000924, 0x0000018c,
++    0x00000948, 0x99000000, 0x0000094c, 0x00000010, 0x00000950, 0x00003800, 0x00000954, 0x5a380000,
++    0x00000958, 0x4bc6d87a, 0x0000095c, 0x04eb9b79, 0x0000096c, 0x00000003, 0x00000970, 0x00000000,
++    0x00000974, 0x00000000, 0x00000978, 0x00000000, 0x0000097c, 0x13000000, 0x00000980, 0x00000000,
++    0x00000a00, 0x00d046c8, 0x00000a04, 0x80ff800c, 0x00000a08, 0x8c838300, 0x00000a0c, 0x2e20100f,
++    0x00000a10, 0x9500bb78, 0x00000a14, 0x1114d028, 0x00000a18, 0x00881117, 0x00000a1c, 0x89140f00,
++    0x00000a20, 0xe82c0001, 0x00000a24, 0x64b80c1c, 0x00000a28, 0x00008810, 0x00000a2c, 0x00d30000,
++    0x00000a70, 0x101fbf00, 0x00000a74, 0x00000007, 0x00000a78, 0x00008900, 0x00000a7c, 0x225b0606,
++    0x00000a80, 0x2180fa74, 0x00000a84, 0x00200000, 0x00000a88, 0x040c0000, 0x00000a8c, 0x12345678,
++    0x00000a90, 0xabcdef00, 0x00000a94, 0x001b1b89, 0x00000a98, 0x00000000, 0x00000a9c, 0x00020000,
++    0x00000aa0, 0x00000000, 0x00000aa4, 0x0000000c, 0x00000aa8, 0xca100008, 0x00000aac, 0x01235667,
++    0x00000ab0, 0x00000000, 0x00000ab4, 0x20201402, 0x00000b2c, 0x00000000, 0x00000c00, 0x48071d40,
++    0x00000c04, 0x03a05611, 0x00000c08, 0x000000e4, 0x00000c0c, 0x6c6c6c6c, 0x00000c10, 0x28800000,
++    0x00000c14, 0x40000100, 0x00000c18, 0x08800000, 0x00000c1c, 0x40000100, 0x00000c20, 0x00000000,
++    0x00000c24, 0x00000000, 0x00000c28, 0x00000000, 0x00000c2c, 0x00000000, 0x00000c30, 0x69e9ac48,
++    0x00000c34, 0x31000040, 0x00000c38, 0x21688080, 0x00000c3c, 0x000016d4, 0x00000c40, 0x1f78403f,
++    0x00000c44, 0x00010036, 0x00000c48, 0xec020107, 0x00000c4c, 0x007f037f, 0x00000c50, 0x69553420,
++    0x00000c54, 0x43bc0094, 0x00000c58, 0x00015969, 0x00000c5c, 0x00310492, 0x00000c60, 0x00280a00,
++    0x00000c64, 0x7112848b, 0x00000c68, 0x47c074ff, 0x00000c6c, 0x00000036, 0x00000c70, 0x2c7f000d,
++    0x00000c74, 0x020600db, 0x00000c78, 0x0000001f, 0x00000c7c, 0x00b91612, 0x00000c80, 0x390000e4,
++    0x00000c84, 0x21f60000, 0x00000c88, 0x40000100, 0x00000c8c, 0x20200000, 0x00000c90, 0x00091521,
++    0x00000c94, 0x00000000, 0x00000c98, 0x00121820, 0x00000c9c, 0x00007f7f, 0x00000ca0, 0x00012000,
++    0x00000ca4, 0x800000a0, 0x00000ca8, 0x84e6c606, 0x00000cac, 0x00000060, 0x00000cb0, 0x00000000,
++    0x00000cb4, 0x00000000, 0x00000cb8, 0x00000000, 0x00000cbc, 0x28000000, 0x00000cc0, 0x0010a3d0,
++    0x00000cc4, 0x00000f7d, 0x00000cc8, 0x000442d6, 0x00000ccc, 0x00000000, 0x00000cd0, 0x000001c8,
++    0x00000cd4, 0x001c8000, 0x00000cd8, 0x00000100, 0x00000cdc, 0x40100000, 0x00000ce0, 0x00222220,
++    0x00000ce4, 0x20000000, 0x00000ce8, 0x37644302, 0x00000cec, 0x2f97d40c, 0x00000d00, 0x00030740,
++    0x00000d04, 0x40020401, 0x00000d08, 0x0000907f, 0x00000d0c, 0x20010201, 0x00000d10, 0xa0633333,
++    0x00000d14, 0x3333bc53, 0x00000d18, 0x7a8f5b6f, 0x00000d2c, 0xcc979975, 0x00000d30, 0x00000000,
++    0x00000d34, 0x40608000, 0x00000d38, 0x88000000, 0x00000d3c, 0xc0127343, 0x00000d40, 0x00000000,
++    0x00000d44, 0x00000000, 0x00000d48, 0x00000000, 0x00000d4c, 0x00000000, 0x00000d50, 0x00000038,
++    0x00000d54, 0x00000000, 0x00000d58, 0x00000282, 0x00000d5c, 0x30032064, 0x00000d60, 0x4653de68,
++    0x00000d64, 0x04518a3c, 0x00000d68, 0x00002101, 0x00000e00, 0x2d2d2d2d, 0x00000e04, 0x2d2d2d2d,
++    0x00000e08, 0x0390272d, 0x00000e10, 0x2d2d2d2d, 0x00000e14, 0x2d2d2d2d, 0x00000e18, 0x2d2d2d2d,
++    0x00000e1c, 0x2d2d2d2d, 0x00000e28, 0x00000000, 0x00000e30, 0x1000dc1f, 0x00000e34, 0x10008c1f,
++    0x00000e38, 0x02140102, 0x00000e3c, 0x681604c2, 0x00000e40, 0x01007c00, 0x00000e44, 0x01004800,
++    0x00000e48, 0xfb000000, 0x00000e4c, 0x000028d1, 0x00000e50, 0x1000dc1f, 0x00000e54, 0x10008c1f,
++    0x00000e58, 0x02140102, 0x00000e5c, 0x28160d05, 0x00000e60, 0x00000008, 0x00000e68, 0x001b25a4,
++    0x00000e6c, 0x01c00014, 0x00000e70, 0x01c00016, 0x00000e74, 0x02000014, 0x00000e78, 0x02000014,
++    0x00000e7c, 0x02000014, 0x00000e80, 0x02000014, 0x00000e84, 0x01c00014, 0x00000e88, 0x02000014,
++    0x00000e8c, 0x01c00014, 0x00000ed0, 0x01c00014, 0x00000ed4, 0x01c00014, 0x00000ed8, 0x01c00014,
++    0x00000edc, 0x00000014, 0x00000ee0, 0x00000014, 0x00000ee8, 0x21555448, 0x00000eec, 0x03c00014,
++    0x00000f14, 0x00000003, 0x00000f00, 0x00100300, 0x00000f08, 0x0000800b, 0x00000f0c, 0x0000f007,
++    0x00000f10, 0x0000a487, 0x00000f1c, 0x80000064, 0x00000f38, 0x00030155, 0x00000f3c, 0x0000003a,
++    0x00000f4c, 0x13000000, 0x00000f50, 0x00000000, 0x00000f18, 0x00000000,
++];
++
++pub(crate) static AGC_8723D: [u32; 772] = [
++    0x00000c78, 0xfe000101, 0x00000c78, 0xfd010101, 0x00000c78, 0xfc020101, 0x00000c78, 0xfb030101,
++    0x00000c78, 0xfa040101, 0x00000c78, 0xf9050101, 0x00000c78, 0xf8060101, 0x00000c78, 0xf7070101,
++    0x00000c78, 0xf6080101, 0x00000c78, 0xf5090101, 0x00000c78, 0xf40a0101, 0x00000c78, 0xf30b0101,
++    0x00000c78, 0xf20c0101, 0x00000c78, 0xf10d0101, 0x00000c78, 0xf00e0101, 0x00000c78, 0xef0f0101,
++    0x00000c78, 0xee100101, 0x00000c78, 0xed110101, 0x00000c78, 0xec120101, 0x00000c78, 0xeb130101,
++    0x00000c78, 0xea140101, 0x00000c78, 0xe9150101, 0x00000c78, 0xe8160101, 0x00000c78, 0xe7170101,
++    0x00000c78, 0xe6180101, 0x00000c78, 0xe5190101, 0x00000c78, 0xe41a0101, 0x00000c78, 0xe31b0101,
++    0x00000c78, 0xe21c0101, 0x00000c78, 0xe11d0101, 0x00000c78, 0xe01e0101, 0x00000c78, 0x861f0101,
++    0x00000c78, 0x85200101, 0x00000c78, 0x84210101, 0x00000c78, 0x83220101, 0x00000c78, 0x82230101,
++    0x00000c78, 0x81240101, 0x00000c78, 0x80250101, 0x00000c78, 0x44260101, 0x00000c78, 0x43270101,
++    0x00000c78, 0x42280101, 0x00000c78, 0x41290101, 0x00000c78, 0x402a0101, 0x00000c78, 0x022b0101,
++    0x00000c78, 0x012c0101, 0x00000c78, 0x002d0101, 0x00000c78, 0xc52e0001, 0x00000c78, 0xc42f0001,
++    0x00000c78, 0xc3300001, 0x00000c78, 0xc2310001, 0x00000c78, 0xc1320001, 0x00000c78, 0xc0330001,
++    0x00000c78, 0x04340001, 0x00000c78, 0x03350001, 0x00000c78, 0x02360001, 0x00000c78, 0x01370001,
++    0x00000c78, 0x00380001, 0x00000c78, 0x00390001, 0x00000c78, 0x003a0001, 0x00000c78, 0x003b0001,
++    0x00000c78, 0x003c0001, 0x00000c78, 0x003d0001, 0x00000c78, 0x003e0001, 0x00000c78, 0x003f0001,
++    0x00000c78, 0x6f002001, 0x00000c78, 0x6f012001, 0x00000c78, 0x6f022001, 0x00000c78, 0x6f032001,
++    0x00000c78, 0x6f042001, 0x00000c78, 0x6f052001, 0x00000c78, 0x6f062001, 0x00000c78, 0x6f072001,
++    0x00000c78, 0x6f082001, 0x00000c78, 0x6f092001, 0x00000c78, 0x6f0a2001, 0x00000c78, 0x6f0b2001,
++    0x00000c78, 0x6f0c2001, 0x00000c78, 0x6f0d2001, 0x00000c78, 0x6f0e2001, 0x00000c78, 0x6f0f2001,
++    0x00000c78, 0x6f102001, 0x00000c78, 0x6f112001, 0x00000c78, 0x6f122001, 0x00000c78, 0x6f132001,
++    0x00000c78, 0x6f142001, 0x00000c78, 0x6f152001, 0x00000c78, 0x6f162001, 0x00000c78, 0x6f172001,
++    0x00000c78, 0x6f182001, 0x00000c78, 0x6f192001, 0x00000c78, 0x6f1a2001, 0x00000c78, 0x6f1b2001,
++    0x00000c78, 0x6f1c2001, 0x00000c78, 0x6f1d2001, 0x00000c78, 0x6f1e2001, 0x00000c78, 0x6f1f2001,
++    0x00000c78, 0x6f202001, 0x00000c78, 0x6f212001, 0x00000c78, 0x6f222001, 0x00000c78, 0x6f232001,
++    0x00000c78, 0x6e242001, 0x00000c78, 0x6d252001, 0x00000c78, 0x6c262001, 0x00000c78, 0x6b272001,
++    0x00000c78, 0x6a282001, 0x00000c78, 0x69292001, 0x00000c78, 0x4b2a2001, 0x00000c78, 0x4a2b2001,
++    0x00000c78, 0x492c2001, 0x00000c78, 0x482d2001, 0x00000c78, 0x472e2001, 0x00000c78, 0x462f2001,
++    0x00000c78, 0x45302001, 0x00000c78, 0x44312001, 0x00000c78, 0x43322001, 0x00000c78, 0x42332001,
++    0x00000c78, 0x41342001, 0x00000c78, 0x40352001, 0x00000c78, 0x02362001, 0x00000c78, 0x01372001,
++    0x00000c78, 0x00382001, 0x00000c78, 0x00392001, 0x00000c78, 0x003a2001, 0x00000c78, 0x003b2001,
++    0x00000c78, 0x003c2001, 0x00000c78, 0x003d2001, 0x00000c78, 0x003e2001, 0x00000c78, 0x003f2001,
++    0x00000c78, 0x7f003101, 0x00000c78, 0x7f013101, 0x00000c78, 0x7f023101, 0x00000c78, 0x7f033101,
++    0x00000c78, 0x7f043101, 0x00000c78, 0x7f053101, 0x00000c78, 0x7f063101, 0x00000c78, 0x7f073101,
++    0x00000c78, 0x7e083101, 0x00000c78, 0x7d093101, 0x00000c78, 0x7c0a3101, 0x00000c78, 0x7b0b3101,
++    0x00000c78, 0x7a0c3101, 0x00000c78, 0x790d3101, 0x00000c78, 0x780e3101, 0x00000c78, 0x770f3101,
++    0x00000c78, 0x76103101, 0x00000c78, 0x75113101, 0x00000c78, 0x74123101, 0x00000c78, 0x73133101,
++    0x00000c78, 0x72143101, 0x00000c78, 0x71153101, 0x00000c78, 0x70163101, 0x00000c78, 0x6f173101,
++    0x00000c78, 0x6e183101, 0x00000c78, 0x6d193101, 0x00000c78, 0x6c1a3101, 0x00000c78, 0x6b1b3101,
++    0x00000c78, 0x6a1c3101, 0x00000c78, 0x691d3101, 0x00000c78, 0x681e3101, 0x00000c78, 0x4b1f3101,
++    0x00000c78, 0x4a203101, 0x00000c78, 0x49213101, 0x00000c78, 0x48223101, 0x00000c78, 0x47233101,
++    0x00000c78, 0x46243101, 0x00000c78, 0x45253101, 0x00000c78, 0x44263101, 0x00000c78, 0x43273101,
++    0x00000c78, 0x42283101, 0x00000c78, 0x41293101, 0x00000c78, 0x402a3101, 0x00000c78, 0x022b3101,
++    0x00000c78, 0x012c3101, 0x00000c78, 0x002d3101, 0x00000c78, 0x002e3101, 0x00000c78, 0x002f3101,
++    0x00000c78, 0x00303101, 0x00000c78, 0x00313101, 0x00000c78, 0x00323101, 0x00000c78, 0x00333101,
++    0x00000c78, 0x00343101, 0x00000c78, 0x00353101, 0x00000c78, 0x00363101, 0x00000c78, 0x00373101,
++    0x00000c78, 0x00383101, 0x00000c78, 0x00393101, 0x00000c78, 0x003a3101, 0x00000c78, 0x003b3101,
++    0x00000c78, 0x003c3101, 0x00000c78, 0x003d3101, 0x00000c78, 0x003e3101, 0x00000c78, 0x003f3101,
++    0x00000c78, 0xfe403101, 0x00000c78, 0xfd413101, 0x00000c78, 0xfc423101, 0x00000c78, 0xfb433101,
++    0x00000c78, 0xfa443101, 0x00000c78, 0xf9453101, 0x00000c78, 0xf8463101, 0x00000c78, 0xf7473101,
++    0x00000c78, 0xf6483101, 0x00000c78, 0xf5493101, 0x00000c78, 0xf44a3101, 0x00000c78, 0xf34b3101,
++    0x00000c78, 0xf24c3101, 0x00000c78, 0xf14d3101, 0x00000c78, 0xf04e3101, 0x00000c78, 0xef4f3101,
++    0x00000c78, 0xee503101, 0x00000c78, 0xed513101, 0x00000c78, 0xec523101, 0x00000c78, 0xeb533101,
++    0x00000c78, 0xea543101, 0x00000c78, 0xe9553101, 0x00000c78, 0xe8563101, 0x00000c78, 0xe7573101,
++    0x00000c78, 0xe6583101, 0x00000c78, 0xe5593101, 0x00000c78, 0xe45a3101, 0x00000c78, 0xe35b3101,
++    0x00000c78, 0xe25c3101, 0x00000c78, 0xe15d3101, 0x00000c78, 0xe05e3101, 0x00000c78, 0x865f3101,
++    0x00000c78, 0x85603101, 0x00000c78, 0x84613101, 0x00000c78, 0x83623101, 0x00000c78, 0x82633101,
++    0x00000c78, 0x81643101, 0x00000c78, 0x80653101, 0x00000c78, 0x80663101, 0x00000c78, 0x80673101,
++    0x00000c78, 0x80683101, 0x00000c78, 0x80693101, 0x00000c78, 0x806a3101, 0x00000c78, 0x806b3101,
++    0x00000c78, 0x806c3101, 0x00000c78, 0x806d3101, 0x00000c78, 0x806e3101, 0x00000c78, 0x806f3101,
++    0x00000c78, 0x80703101, 0x00000c78, 0x80713101, 0x00000c78, 0x80723101, 0x00000c78, 0x80733101,
++    0x00000c78, 0x80743101, 0x00000c78, 0x80753101, 0x00000c78, 0x80763101, 0x00000c78, 0x80773101,
++    0x00000c78, 0x80783101, 0x00000c78, 0x80793101, 0x00000c78, 0x807a3101, 0x00000c78, 0x807b3101,
++    0x00000c78, 0x807c3101, 0x00000c78, 0x807d3101, 0x00000c78, 0x807e3101, 0x00000c78, 0x807f3101,
++    0x00000c78, 0xef402001, 0x00000c78, 0xef412001, 0x00000c78, 0xef422001, 0x00000c78, 0xef432001,
++    0x00000c78, 0xef442001, 0x00000c78, 0xef452001, 0x00000c78, 0xef462001, 0x00000c78, 0xef472001,
++    0x00000c78, 0xef482001, 0x00000c78, 0xef492001, 0x00000c78, 0xef4a2001, 0x00000c78, 0xef4b2001,
++    0x00000c78, 0xef4c2001, 0x00000c78, 0xef4d2001, 0x00000c78, 0xef4e2001, 0x00000c78, 0xef4f2001,
++    0x00000c78, 0xef502001, 0x00000c78, 0xef512001, 0x00000c78, 0xef522001, 0x00000c78, 0xef532001,
++    0x00000c78, 0xef542001, 0x00000c78, 0xef552001, 0x00000c78, 0xef562001, 0x00000c78, 0xef572001,
++    0x00000c78, 0xef582001, 0x00000c78, 0xef592001, 0x00000c78, 0xef5a2001, 0x00000c78, 0xef5b2001,
++    0x00000c78, 0xef5c2001, 0x00000c78, 0xef5d2001, 0x00000c78, 0xef5e2001, 0x00000c78, 0xef5f2001,
++    0x00000c78, 0xef602001, 0x00000c78, 0xee612001, 0x00000c78, 0xed622001, 0x00000c78, 0xec632001,
++    0x00000c78, 0xeb642001, 0x00000c78, 0xea652001, 0x00000c78, 0xe9662001, 0x00000c78, 0xe8672001,
++    0x00000c78, 0xcb682001, 0x00000c78, 0xca692001, 0x00000c78, 0xc96a2001, 0x00000c78, 0xc86b2001,
++    0x00000c78, 0xc76c2001, 0x00000c78, 0xc66d2001, 0x00000c78, 0xc56e2001, 0x00000c78, 0xc46f2001,
++    0x00000c78, 0xc3702001, 0x00000c78, 0xc2712001, 0x00000c78, 0xc1722001, 0x00000c78, 0xc0732001,
++    0x00000c78, 0x82742001, 0x00000c78, 0x81752001, 0x00000c78, 0x80762001, 0x00000c78, 0x80772001,
++    0x00000c78, 0x80782001, 0x00000c78, 0x80792001, 0x00000c78, 0x807a2001, 0x00000c78, 0x807b2001,
++    0x00000c78, 0x807c2001, 0x00000c78, 0x807d2001, 0x00000c78, 0x807e2001, 0x00000c78, 0x807f2001,
++    0x00000c78, 0xfa001101, 0x00000c78, 0xf9011101, 0x00000c78, 0xf8021101, 0x00000c78, 0xf7031101,
++    0x00000c78, 0xf6041101, 0x00000c78, 0xf5051101, 0x00000c78, 0xf4061101, 0x00000c78, 0xd7071101,
++    0x00000c78, 0xd6081101, 0x00000c78, 0xd5091101, 0x00000c78, 0xd40a1101, 0x00000c78, 0x970b1101,
++    0x00000c78, 0x960c1101, 0x00000c78, 0x950d1101, 0x00000c78, 0x940e1101, 0x00000c78, 0x930f1101,
++    0x00000c78, 0x92101101, 0x00000c78, 0x91111101, 0x00000c78, 0x90121101, 0x00000c78, 0x8f131101,
++    0x00000c78, 0x8e141101, 0x00000c78, 0x8d151101, 0x00000c78, 0x8c161101, 0x00000c78, 0x8b171101,
++    0x00000c78, 0x8a181101, 0x00000c78, 0x89191101, 0x00000c78, 0x881a1101, 0x00000c78, 0x871b1101,
++    0x00000c78, 0x861c1101, 0x00000c78, 0x851d1101, 0x00000c78, 0x841e1101, 0x00000c78, 0x831f1101,
++    0x00000c78, 0x82201101, 0x00000c78, 0x81211101, 0x00000c78, 0x80221101, 0x00000c78, 0x43231101,
++    0x00000c78, 0x42241101, 0x00000c78, 0x41251101, 0x00000c78, 0x04261101, 0x00000c78, 0x03271101,
++    0x00000c78, 0x02281101, 0x00000c78, 0x01291101, 0x00000c78, 0x002a1101, 0x00000c78, 0xc42b1001,
++    0x00000c78, 0xc32c1001, 0x00000c78, 0xc22d1001, 0x00000c78, 0xc12e1001, 0x00000c78, 0xc02f1001,
++    0x00000c78, 0x85301001, 0x00000c78, 0x84311001, 0x00000c78, 0x83321001, 0x00000c78, 0x82331001,
++    0x00000c78, 0x81341001, 0x00000c78, 0x80351001, 0x00000c78, 0x05361001, 0x00000c78, 0x04371001,
++    0x00000c78, 0x03381001, 0x00000c78, 0x02391001, 0x00000c78, 0x013a1001, 0x00000c78, 0x003b1001,
++    0x00000c78, 0x003c1001, 0x00000c78, 0x003d1001, 0x00000c78, 0x003e1001, 0x00000c78, 0x003f1001,
++    0x00000c50, 0x69553422, 0x00000c50, 0x69553420,
++];
++
++pub(crate) static RF_A_8723D: [u32; 360] = [
++    0x00000050, 0x0001c000, 0x00000049, 0x0004aa00, 0x00000000, 0x00010000, 0x000000b1, 0x00054573,
++    0x000000b4, 0x000508ab, 0x000000b7, 0x00014787, 0x000000b8, 0x000064cb, 0x0000001b, 0x00073a40,
++    0x00000051, 0x00038caf, 0x00000052, 0x000fcca3, 0x00000053, 0x00090f38, 0x00000054, 0x00011083,
++    0x00000057, 0x000d0000, 0x0000008d, 0x00000a1a, 0x00000082, 0x00082aac, 0x0000008e, 0x00076940,
++    0x0000008f, 0x00088400, 0x00000061, 0x00038caf, 0x00000062, 0x000fcca3, 0x00000063, 0x00090f38,
++    0x00000064, 0x00011083, 0x00000067, 0x000d0000, 0x00000092, 0x00082aac, 0x000000ef, 0x00000400,
++    0x00000030, 0x000008ca, 0x00000030, 0x000018ca, 0x00000030, 0x000028ca, 0x00000030, 0x000038ca,
++    0x000000ef, 0x00000000, 0x000000ee, 0x00000400, 0x00000030, 0x000008ca, 0x00000030, 0x000018ca,
++    0x00000030, 0x000028ca, 0x00000030, 0x000038ca, 0x000000ee, 0x00000000, 0x000000ef, 0x00000100,
++    0x00000033, 0x00000000, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000001, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000002, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000003, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000004, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000005, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000006, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000007, 0x0000003f, 0x0000cca3,
++    0x000000ef, 0x00000000, 0x000000ee, 0x00000100, 0x00000033, 0x00000000, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000001, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000002, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000003, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000004, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000005, 0x0000003f, 0x0000cca3, 0x00000033, 0x00000006, 0x0000003f, 0x0000cca3,
++    0x00000033, 0x00000007, 0x0000003f, 0x0000cca3, 0x000000ee, 0x00000000, 0x000000ef, 0x00000800,
++    0x00000030, 0x0000002d, 0x00000030, 0x0000122c, 0x00000030, 0x0000222f, 0x00000030, 0x0000326c,
++    0x00000030, 0x0000466b, 0x00000030, 0x0000566e, 0x00000030, 0x000066eb, 0x00000030, 0x000077ec,
++    0x00000030, 0x000087ef, 0x00000030, 0x000097f2, 0x00000030, 0x0000a7f5, 0x000000ef, 0x00000000,
++    0x000000ee, 0x00000800, 0x00000030, 0x00000001, 0x00000030, 0x00001011, 0x00000030, 0x00002011,
++    0x00000030, 0x00003013, 0x00000030, 0x00004033, 0x00000030, 0x00005033, 0x00000030, 0x00006037,
++    0x00000030, 0x0000703f, 0x00000030, 0x0000803f, 0x00000030, 0x0000903f, 0x00000030, 0x0000a03f,
++    0x000000ee, 0x00000000, 0x00000082, 0x00083b8c, 0x000000ed, 0x00000008, 0x00000030, 0x000030f6,
++    0x00000030, 0x00002004, 0x00000030, 0x000010f6, 0x00000030, 0x000000f6, 0x000000ed, 0x00000000,
++    0x00000092, 0x00083b8c, 0x000000ec, 0x00000008, 0x00000030, 0x000030f6, 0x00000030, 0x00002004,
++    0x00000030, 0x000010f6, 0x00000030, 0x000000f6, 0x000000ec, 0x00000000, 0x000000ef, 0x00010000,
++    0x00000030, 0x0001c11c, 0x00000030, 0x000181f4, 0x00000030, 0x00014108, 0x00000030, 0x000101e4,
++    0x00000030, 0x0000c11c, 0x00000030, 0x000081f4, 0x00000030, 0x00004108, 0x00000030, 0x000001e4,
++    0x000000ef, 0x00000000, 0x000000ee, 0x00010000, 0x00000030, 0x0001c11c, 0x00000030, 0x000181f4,
++    0x00000030, 0x00014108, 0x00000030, 0x000101e4, 0x00000030, 0x0000c11c, 0x00000030, 0x000081f4,
++    0x00000030, 0x00004108, 0x00000030, 0x000001e4, 0x000000ee, 0x00000000, 0x000000ef, 0x00080000,
++    0x00000033, 0x00000007, 0x0000003e, 0x0000005f, 0x0000003f, 0x000b3fdb, 0x00000033, 0x00000004,
++    0x0000003e, 0x0000005d, 0x0000003f, 0x000bffe0, 0x00000033, 0x00000005, 0x0000003e, 0x0000005d,
++    0x0000003f, 0x000fbfce, 0x00000033, 0x00000006, 0x0000003e, 0x0000005f, 0x0000003f, 0x000a7ffb,
++    0x000000ef, 0x00000000, 0x000000ee, 0x00000002, 0x00000030, 0x00000001, 0x00000030, 0x00002001,
++    0x00000030, 0x00004001, 0x00000030, 0x00007001, 0x00000030, 0x00006001, 0x00000030, 0x00020001,
++    0x00000030, 0x00022001, 0x00000030, 0x00024001, 0x00000030, 0x00027001, 0x00000030, 0x00026001,
++    0x00000030, 0x00034001, 0x00000030, 0x00037001, 0x00000030, 0x00036001, 0x00000030, 0x00008000,
++    0x00000030, 0x0000a000, 0x00000030, 0x0000c000, 0x83000100, 0x00000000, 0x40000000, 0x00000000,
++    0x00000030, 0x0000e024, 0xa0000000, 0x00000000, 0x00000030, 0x0000e000, 0xb0000000, 0x00000000,
++    0x00000030, 0x0001c000, 0x00000030, 0x0001e000, 0x000000ee, 0x00000000, 0x000000ee, 0x00020000,
++    0x000000ef, 0x00020000, 0x00000030, 0x00000f75, 0x00000030, 0x00002f55, 0x00000030, 0x00003f75,
++    0x000000ee, 0x00000000, 0x000000ef, 0x00000000, 0x00000018, 0x00008401, 0x00000ffe, 0x00000000,
++];
++
++static TXPWR_OFFSET_2G_8723D_PG: [[i8; 84]; 2] = [
++    [0, 0, 0, 0, 6, 6, 6, 4, 4, 2, 2, 0, 8, 6, 6, 4, 4, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++];
++static TXPWR_OFFSET_5G_8723D_PG: [[i8; 84]; 2] = [
++    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++];
++static TXPWR_LIMIT_2G_8723D_PG_LMT: [[i8; 14]; 10] = [
++    [-2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -2, -15, -2],
++    [-2, 0, 2, 2, 2, 2, 2, 2, 2, 0, -2, -4, -14, 35],
++    [-2, 0, 4, 4, 4, 4, 4, 4, 4, 0, -2, -3, -13, 37],
++    [28, 28, 30, 30, 30, 30, 30, 30, 28, 28, 28, 30, 30, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++];
++static TXPWR_LIMIT_5G_8723D_PG_LMT: [[i8; 49]; 10] = [
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++    [63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63],
++];
++
++/// The RFE types Linux supports for the RTL8723D (`rtw8723d_rfe_defs`).
++pub(crate) static RFE_8723D: [u8; 1] = [0];
++
++/// The TX power tables and the BT-shared AGC table of an RFE type.
++pub(crate) fn rfe_8723d(rfe: u8) -> Option<RfeTables> {
++    match rfe {
++        0 => Some(RfeTables { offset_2g: &TXPWR_OFFSET_2G_8723D_PG, offset_5g: &TXPWR_OFFSET_5G_8723D_PG, limit_2g: &TXPWR_LIMIT_2G_8723D_PG_LMT, limit_5g: &TXPWR_LIMIT_5G_8723D_PG_LMT, agc_btg: None }),
 +        _ => None,
 +    }
 +}
