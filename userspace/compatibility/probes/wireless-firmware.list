@@ -62,7 +62,8 @@ intel/iwlwifi/iwlwifi-sc-a0-*-10[01].ucode
 intel/iwlwifi/iwlwifi-sc-a0-*-c10[1-3].ucode
 
 # MediaTek Wi-Fi (kernel/comps/mt7921): the patch and the RAM code of the
-# MT7921 (and its AMD RZ608/RZ616 names), the MT7920 (1a) and the MT7922.
+# MT7921 (and its AMD RZ608/RZ616 names, and the MT7921AU USB adapters),
+# the MT7920 (1a) and the MT7922.
 licence LICENCE.mediatek 018qiwzkha4qr6md3kism2fm88knlxg55igy8ncqi1adf1k3y3d9
 mediatek/WIFI_MT7961_patch_mcu_1_2_hdr.bin
 mediatek/WIFI_RAM_CODE_MT7961_1.bin
@@ -70,21 +71,25 @@ mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin
 mediatek/WIFI_RAM_CODE_MT7961_1a.bin
 mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin
 mediatek/WIFI_RAM_CODE_MT7922_1.bin
-# The MT7925 (Wi-Fi 7, the connac3 commands).
+# The MT7925 (Wi-Fi 7, the connac3 commands; the MT7925U adapters too).
 mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin
 mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin
 
 # Realtek Wi-Fi (kernel/comps/rtw88): the RTL8821CE's, RTL8822BE's,
-# RTL8822CE's and RTL8723DE's firmware (its licence is the Realtek one
-# under Bluetooth below).
+# RTL8822CE's and RTL8723DE's firmware, the same on their USB adapters, and
+# the RTL8812AU's and the RTL8821AU's (the RTL8811AU runs the latter) for
+# their 8051 CPU (its licence is the Realtek one under Bluetooth below).
 rtw88/rtw8821c_fw.bin
 rtw88/rtw8822b_fw.bin
 rtw88/rtw8822c_fw.bin
 rtw88/rtw8723d_fw.bin
+rtw88/rtw8812a_fw.bin
+rtw88/rtw8821a_fw.bin
 
 # Realtek 802.11ax and 802.11be Wi-Fi (kernel/comps/rtw89): each chip's
 # newest firmware format the driver reads (the BB tables, TX power and, on
-# the RTL8922A, its baseband MCU's firmware are elements in the same file).
+# the RTL8922A, its baseband MCU's firmware are elements in the same file);
+# the RTL8851BU, RTL8852AU, RTL8852BU and RTL8852CU adapters run the same.
 rtw89/rtw8852a_fw-1.bin
 rtw89/rtw8852b_fw-2.bin
 rtw89/rtw8852bt_fw.bin

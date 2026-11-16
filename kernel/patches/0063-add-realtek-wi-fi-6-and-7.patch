@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 967c83e..e4b4f37 100644
+index 189e22e..b0338ec 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -508,6 +508,20 @@ dependencies = [
+@@ -509,6 +509,21 @@ dependencies = [
   "ostd",
  ]
  
@@ -15,6 +15,7 @@ index 967c83e..e4b4f37 100644
 + "aster-firmware",
 + "aster-linuxkpi",
 + "aster-pci",
++ "aster-usb",
 + "aster-wlan",
 + "component",
 + "ostd",
@@ -23,7 +24,7 @@ index 967c83e..e4b4f37 100644
  [[package]]
  name = "aster-simpledrm"
  version = "0.1.0"
-@@ -681,6 +695,7 @@ dependencies = [
+@@ -682,6 +697,7 @@ dependencies = [
   "aster-iwlwifi",
   "aster-mt7921",
   "aster-rtw88",
@@ -85,10 +86,10 @@ index 1243db4..93fbc16 100644
  [target.x86_64-unknown-none.dependencies]
 diff --git a/kernel/comps/rtw89/Cargo.toml b/kernel/comps/rtw89/Cargo.toml
 new file mode 100644
-index 0000000..99bb180
+index 0000000..a3ff9a0
 --- /dev/null
 +++ b/kernel/comps/rtw89/Cargo.toml
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +[package]
 +name = "aster-rtw89"
 +version = "0.1.0"
@@ -100,6 +101,7 @@ index 0000000..99bb180
 +aster-firmware.workspace = true
 +aster-linuxkpi.workspace = true
 +aster-pci.workspace = true
++aster-usb.workspace = true
 +aster-wlan.workspace = true
 +component.workspace = true
 +ostd.workspace = true
@@ -158,7 +160,7 @@ index 0000000..88090f7
 +the image ships beside the files.
 diff --git a/kernel/comps/rtw89/src/be.rs b/kernel/comps/rtw89/src/be.rs
 new file mode 100644
-index 0000000..14d3d00
+index 0000000..261bb7b
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/be.rs
 @@ -0,0 +1,889 @@
@@ -593,7 +595,7 @@ index 0000000..14d3d00
 +    counters.0 = counters.0.wrapping_add(1);
 +    hal.w8_mask(R_BE_UDM1 + 1, B_BE_UDM1_HALMAC_H2C_DEQ_CNT_MASK >> 8, counters.0 as u32);
 +    hal.w8(R_BE_H2CREG_CTRL, B_AX_H2CREG_TRIGGER as u8);
-+    hal.poll8(R_BE_C2HREG_CTRL, |value| value != 0, 1, RTW89_C2H_TIMEOUT as u64).map_err(|_| String::from("no register answer from the firmware"))?;
++    hal.poll8(R_BE_C2HREG_CTRL, |value| value != 0, 1, hal.c2h_wait()).map_err(|_| String::from("no register answer from the firmware"))?;
 +    let answer = [R_BE_C2HREG_DATA0, R_BE_C2HREG_DATA1, R_BE_C2HREG_DATA2, R_BE_C2HREG_DATA3].map(|reg| hal.r32(reg));
 +    hal.w8(R_BE_C2HREG_CTRL, 0);
 +    counters.1 = counters.1.wrapping_add(1);
@@ -1279,7 +1281,7 @@ index 0000000..f0fcd01
 +}
 diff --git a/kernel/comps/rtw89/src/fw.rs b/kernel/comps/rtw89/src/fw.rs
 new file mode 100644
-index 0000000..fba93bc
+index 0000000..1fb1f46
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/fw.rs
 @@ -0,0 +1,696 @@
@@ -1302,7 +1304,7 @@ index 0000000..fba93bc
 +
 +use crate::{
 +    hal::{ChipId, Hal, field, get},
-+    pci::Pci,
++    hci::Hci,
 +    regs::*,
 +};
 +
@@ -1720,7 +1722,7 @@ index 0000000..fba93bc
 +    }
 +
 +    /// `__rtw89_fw_download` on the 802.11ax chips.
-+    pub(crate) fn download(&self, hal: &Hal, pci: &mut Pci, h2c: &mut H2c, secure: &Secure) -> Result<(), String> {
++    pub(crate) fn download(&self, hal: &Hal, pci: &mut Hci, h2c: &mut H2c, secure: &Secure) -> Result<(), String> {
 +        if hal.chip.be {
 +            return self.download_be(hal, pci, h2c, secure);
 +        }
@@ -1762,10 +1764,10 @@ index 0000000..fba93bc
 +        hal.w16_mask(R_AX_BOOT_REASON, B_AX_BOOT_REASON_MASK, 0);
 +        hal.set32(R_AX_PLATFORM_ENABLE, B_AX_WCPU_EN);
 +        // The H2C path, then the header (its part size set).
-+        if hal.poll8(R_AX_WCPU_FW_CTRL, |value| value as u32 & B_AX_H2C_PATH_RDY != 0, 1, 400_000).is_err() {
++        if hal.poll8(R_AX_WCPU_FW_CTRL, |value| value as u32 & B_AX_H2C_PATH_RDY != 0, 1, hal.fwdl_wait()).is_err() {
 +            return Err(String::from("the H2C path did not get ready"));
 +        }
-+        self.send_suit(hal, pci, h2c, fw, hdr_len, &sections, || hal.poll8(R_AX_WCPU_FW_CTRL, |value| value as u32 & B_AX_FWDL_PATH_RDY != 0, 1, 400_000).is_ok())?;
++        self.send_suit(hal, pci, h2c, fw, hdr_len, &sections, || hal.poll8(R_AX_WCPU_FW_CTRL, |value| value as u32 & B_AX_FWDL_PATH_RDY != 0, 1, hal.fwdl_wait()).is_ok())?;
 +        crate::delay_ms(5);
 +        h2c.reset();
 +        match hal.poll8(R_AX_WCPU_FW_CTRL, |value| get(B_AX_WCPU_FWDL_STS_MASK, value as u32) as u8 == FWDL_INIT_RDY, 1, 400_000) {
@@ -1783,7 +1785,7 @@ index 0000000..fba93bc
 +    /// out) and its sections (`rtw89_fw_download_hdr`, `_main`); the
 +    /// download's path ready after the header.
 +    #[allow(clippy::too_many_arguments)]
-+    fn send_suit(&self, hal: &Hal, pci: &mut Pci, h2c: &mut H2c, fw: &[u8], hdr_len: usize, sections: &[Section], header_taken: impl Fn() -> bool) -> Result<(), String> {
++    fn send_suit(&self, hal: &Hal, pci: &mut Hci, h2c: &mut H2c, fw: &[u8], hdr_len: usize, sections: &[Section], header_taken: impl Fn() -> bool) -> Result<(), String> {
 +        let mut header = fw[..hdr_len].to_vec();
 +        let v1 = get(FW_HDR_W3_HDR_VER, get_le32(fw, 12)) == 1;
 +        let w7 = get_le32(&header, 28);
@@ -1843,7 +1845,7 @@ index 0000000..fba93bc
 +    /// WLAN CPU's and baseband MCU's download on, each firmware (the
 +    /// normal one with the RTL8922A's secure-boot memory set), then the
 +    /// firmware's start awaited.
-+    fn download_be(&self, hal: &Hal, pci: &mut Pci, h2c: &mut H2c, secure: &Secure) -> Result<(), String> {
++    fn download_be(&self, hal: &Hal, pci: &mut Hci, h2c: &mut H2c, secure: &Secure) -> Result<(), String> {
 +        crate::be::disable_cpu(hal);
 +        crate::be::enable_wcpu(hal, true);
 +        let normal = self.data();
@@ -1981,21 +1983,22 @@ index 0000000..fba93bc
 +}
 diff --git a/kernel/comps/rtw89/src/hal.rs b/kernel/comps/rtw89/src/hal.rs
 new file mode 100644
-index 0000000..bab18cb
+index 0000000..8f475fd
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/hal.rs
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,926 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chips this driver knows (Linux's `struct rtw89_chip_info`, the
 +//! parts it uses) and the register access everything else goes through:
 +//! the MAC's registers, the baseband's (`rtw89_phy_*`, past `cr_base`),
 +//! the RF's (directly or through the serial interface, `rtw89_*_rf*`)
-+//! and the crystal's (`rtw89_mac_*_xtal_si`).
++//! and the crystal's (`rtw89_mac_*_xtal_si`); in BAR 2 on PCIe, through
++//! vendor requests on USB ([`crate::usb::UsbRegs`]).
 +
 +use aster_linuxkpi::{delay::read_poll_timeout, io::Mmio};
 +
-+use crate::regs::*;
++use crate::{regs::*, usb::UsbRegs};
 +
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub(crate) enum ChipId {
@@ -2052,8 +2055,39 @@ index 0000000..bab18cb
 +    pub(crate) public: (u16, u16, u16, u16),
 +}
 +
++/// `struct rtw89_hfc_prec_cfg`: the pages a channel's, the H2C's and the
++/// WP channels' frames cost, and their full conditions.
++pub(crate) type HfcPrec = (u16, u16, u16, u16, u8, u8, u8, u8);
++
 +/// `rtw89_mac_size.hfc_preccfg_pcie`.
-+pub(crate) const HFC_PREC_PCIE: (u16, u16, u16, u16, u8, u8, u8, u8) = (2, 40, 0, 0, 1, 0, 0, 0);
++pub(crate) const HFC_PREC_PCIE: HfcPrec = (2, 40, 0, 0, 1, 0, 0, 0);
++
++/// Where the registers are and what moves the frames (`rtw89_hci_type`,
++/// and `rtw89_hci_dle_type`: the USB adapters' quotas by the link's
++/// speed).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Bus {
++    Pcie,
++    Usb2,
++    Usb3,
++}
++
++/// A chip on USB (Linux's `rtw89_usb_info` and the chip's USB tables):
++/// its quotas on a USB 2 and a USB 3 link, its host flow control, where
++/// the eFuse keeps the adapter's MAC address, its USB registers (the
++/// RTL8852C's are `_V1`), the bulk OUT endpoint of each DMA channel, and
++/// whether the access categories share channels (`rtw89_core_get_ch_dma_v2`:
++/// the dual-band chips' adapters use ACH0 and ACH2 only).
++pub(crate) struct UsbSpec {
++    pub(crate) scc_usb2: DleMem,
++    pub(crate) scc_usb3: DleMem,
++    pub(crate) hfc: Hfc,
++    pub(crate) prec: HfcPrec,
++    pub(crate) efuse_mac: usize,
++    pub(crate) v1: bool,
++    pub(crate) bulkout_id: [u8; 13],
++    pub(crate) ch_dma_v2: bool,
++}
 +
 +pub(crate) struct Chip {
 +    pub(crate) id: ChipId,
@@ -2085,6 +2119,8 @@ index 0000000..bab18cb
 +    pub(crate) be: bool,
 +    /// The 6 GHz band (`support_bands`): the RTL8852C and RTL8922A.
 +    pub(crate) band_6: bool,
++    /// The chip's USB adapters (`rtw88xxu.c`), if Linux has them.
++    pub(crate) usb: Option<&'static UsbSpec>,
 +}
 +
 +const fn dle(page: u32, linked: u32, unlinked: u32) -> DleSize {
@@ -2140,6 +2176,30 @@ index 0000000..bab18cb
 +const PLE_QT57: PleQuota = ple([147, 0, 16, 20, 13, 13, 178, 0, 32, 14, 8, 0]);
 +const PLE_QT58: PleQuota = ple([147, 0, 16, 20, 157, 13, 229, 0, 172, 14, 24, 0]);
 +const PLE_QT59: PleQuota = ple([147, 0, 32, 20, 1860, 13, 2025, 0, 1879, 14, 24, 0]);
++/// The USB adapters' (`rtw89_mac_size`).
++const WDE_SIZE1: DleSize = dle(64, 768, 0);
++const WDE_SIZE17: DleSize = dle(64, 354, 30);
++const WDE_SIZE30: DleSize = dle(64, 220, 36);
++const WDE_SIZE31: DleSize = dle(64, 384, 0);
++const PLE_SIZE1: DleSize = dle(128, 3184, 16);
++const PLE_SIZE17: DleSize = dle(128, 3368, 24);
++const PLE_SIZE27: DleSize = dle(128, 1396, 12);
++const PLE_SIZE31: DleSize = dle(128, 1392, 16);
++const PLE_SIZE34: DleSize = dle(128, 3374, 18);
++const WDE_QT1: WdeQuota = wde(512, 196, 0, 60);
++const WDE_QT16: WdeQuota = wde(344, 2, 0, 8);
++const WDE_QT30: WdeQuota = wde(210, 2, 0, 8);
++const WDE_QT31: WdeQuota = wde(338, 6, 0, 40);
++const PLE_QT25: PleQuota = ple([1536, 0, 16, 48, 13, 13, 360, 0, 32, 40, 8, 0]);
++const PLE_QT26: PleQuota = ple([2654, 0, 1134, 48, 64, 13, 1478, 0, 64, 128, 120, 0]);
++const PLE_QT27: PleQuota = ple([1040, 0, 16, 48, 13, 13, 178, 0, 32, 14, 8, 0]);
++const PLE_QT28: PleQuota = ple([1040, 0, 32, 48, 43, 13, 208, 0, 62, 14, 24, 0]);
++const PLE_QT42: PleQuota = ple([1068, 0, 16, 48, 4, 13, 178, 0, 16, 1, 8, 16]);
++const PLE_QT43: PleQuota = ple([3068, 0, 32, 48, 4, 13, 178, 0, 16, 1, 8, 16]);
++const PLE_QT61: PleQuota = ple([858, 0, 16, 48, 4, 13, 370, 0, 32, 14, 8, 0]);
++const PLE_QT62: PleQuota = ple([858, 0, 32, 48, 37, 13, 403, 0, 65, 14, 24, 0]);
++const PLE_QT78: PleQuota = ple([1560, 0, 16, 48, 13, 13, 390, 0, 32, 38, 8, 16]);
++const PLE_QT79: PleQuota = ple([1560, 0, 32, 48, 1253, 13, 1630, 0, 1272, 38, 120, 1256]);
 +
 +const fn mem(wde: DleSize, ple: DleSize, wde_min: WdeQuota, wde_max: WdeQuota, ple_min: PleQuota, ple_max: PleQuota) -> DleMem {
 +    DleMem { wde, ple, wde_min, wde_max, ple_min, ple_max, ple_h2d: (0, 0) }
@@ -2157,6 +2217,88 @@ index 0000000..bab18cb
 +
 +/// The ACH4-7 and CH10-11 channels the single-band chips lack.
 +const SINGLE_BAND_DMA: u32 = (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 10) | (1 << 11);
++
++/// Each DMA channel's bulk OUT endpoint (`bulkout_id`, by `RTW89_DMA_*`):
++/// the single-band chips' four access categories on 3 to 6, the
++/// dual-band chips' bands' (ACH0, ACH2, ACH4 and ACH6) on 3, 5, 4 and 6;
++/// management on 0 and 1, the firmware's commands on 2.
++const BULKOUT_SINGLE: [u8; 13] = [3, 4, 5, 6, 0, 0, 0, 0, 0, 1, 0, 0, 2];
++const BULKOUT_DUAL: [u8; 13] = [3, 0, 5, 0, 4, 0, 6, 0, 0, 0, 1, 1, 2];
++/// `rtw89_usb_info.usb*`'s eFuse offset of the MAC address (`u.mac_addr`).
++const EFUSE_MAC_ADDR_USB: usize = 0x488;
++const EFUSE_MAC_ADDR_USB_8852A: usize = 0x438;
++
++/// The single-band chips' host flow control on USB (`rtw8852b_hfc_*_usb`,
++/// `rtw8851b_hfc_*_usb`).
++const HFC_USB_SINGLE: Hfc = Hfc {
++    channels: [
++        (18, 210, G0), (18, 210, G0), (18, 210, G0), (18, 210, G0),
++        (0, 0, G0), (0, 0, G0), (0, 0, G0), (0, 0, G0),
++        (18, 210, G0), (18, 210, G0), (0, 0, G0), (0, 0, G0),
++    ],
++    public: (210, 0, 210, 0),
++};
++
++/// `rtw8852b_dle_mem_usb3` (on both speeds) and the RTL8851B's on USB 3.
++const SCC_USB_885XB: DleMem = mem(WDE_SIZE30, PLE_SIZE31, WDE_QT30, WDE_QT30, PLE_QT27, PLE_QT28);
++
++static USB_8852A: UsbSpec = UsbSpec {
++    scc_usb2: mem(WDE_SIZE1, PLE_SIZE1, WDE_QT1, WDE_QT1, PLE_QT25, PLE_QT26),
++    scc_usb3: mem(WDE_SIZE1, PLE_SIZE1, WDE_QT1, WDE_QT1, PLE_QT25, PLE_QT26),
++    hfc: Hfc {
++        channels: [
++            (22, 402, G0), (0, 0, G0), (22, 402, G0), (0, 0, G0),
++            (22, 402, G0), (0, 0, G0), (22, 402, G0), (0, 0, G0),
++            (22, 402, G0), (0, 0, G0), (22, 402, G0), (0, 0, G0),
++        ],
++        public: (512, 0, 512, 104),
++    },
++    prec: (11, 32, 76, 25, 1, 1, 1, 1),
++    efuse_mac: EFUSE_MAC_ADDR_USB_8852A,
++    v1: false,
++    bulkout_id: BULKOUT_DUAL,
++    ch_dma_v2: true,
++};
++
++static USB_8852B: UsbSpec = UsbSpec {
++    scc_usb2: SCC_USB_885XB,
++    scc_usb3: SCC_USB_885XB,
++    hfc: HFC_USB_SINGLE,
++    prec: (9, 32, 64, 24, 1, 1, 1, 1),
++    efuse_mac: EFUSE_MAC_ADDR_USB,
++    v1: false,
++    bulkout_id: BULKOUT_SINGLE,
++    ch_dma_v2: false,
++};
++
++static USB_8851B: UsbSpec = UsbSpec {
++    scc_usb2: mem(WDE_SIZE30, PLE_SIZE27, WDE_QT30, WDE_QT30, PLE_QT61, PLE_QT62),
++    scc_usb3: SCC_USB_885XB,
++    hfc: HFC_USB_SINGLE,
++    prec: (9, 32, 64, 24, 1, 1, 1, 1),
++    efuse_mac: EFUSE_MAC_ADDR_USB,
++    v1: false,
++    bulkout_id: BULKOUT_SINGLE,
++    ch_dma_v2: false,
++};
++
++static USB_8852C: UsbSpec = UsbSpec {
++    scc_usb2: mem(WDE_SIZE31, PLE_SIZE34, WDE_QT31, WDE_QT31, PLE_QT78, PLE_QT79),
++    scc_usb3: mem(WDE_SIZE17, PLE_SIZE17, WDE_QT16, WDE_QT16, PLE_QT42, PLE_QT43),
++    hfc: Hfc {
++        channels: [
++            (18, 344, G0), (0, 0, G0), (18, 344, G0), (0, 0, G0),
++            (18, 344, G0), (0, 0, G0), (18, 344, G0), (0, 0, G0),
++            (18, 344, G0), (0, 0, G0), (18, 344, G0), (0, 0, G0),
++        ],
++        public: (344, 0, 344, 0),
++    },
++    prec: (9, 32, 146, 146, 1, 1, 1, 1),
++    efuse_mac: EFUSE_MAC_ADDR_USB,
++    v1: true,
++    bulkout_id: BULKOUT_DUAL,
++    ch_dma_v2: true,
++};
 +
 +pub(crate) static RTL8852A: Chip = Chip {
 +    id: ChipId::Rtl8852a,
@@ -2186,6 +2328,7 @@ index 0000000..bab18cb
 +    v1: false,
 +    be: false,
 +    band_6: false,
++    usb: Some(&USB_8852A),
 +};
 +
 +pub(crate) static RTL8852B: Chip = Chip {
@@ -2216,6 +2359,7 @@ index 0000000..bab18cb
 +    v1: false,
 +    be: false,
 +    band_6: false,
++    usb: Some(&USB_8852B),
 +};
 +
 +pub(crate) static RTL8852BT: Chip = Chip {
@@ -2246,6 +2390,7 @@ index 0000000..bab18cb
 +    v1: false,
 +    be: false,
 +    band_6: false,
++    usb: None,
 +};
 +
 +pub(crate) static RTL8851B: Chip = Chip {
@@ -2276,6 +2421,7 @@ index 0000000..bab18cb
 +    v1: false,
 +    be: false,
 +    band_6: false,
++    usb: Some(&USB_8851B),
 +};
 +
 +pub(crate) static RTL8852C: Chip = Chip {
@@ -2306,6 +2452,7 @@ index 0000000..bab18cb
 +    v1: true,
 +    be: false,
 +    band_6: true,
++    usb: Some(&USB_8852C),
 +};
 +
 +pub(crate) static RTL8922A: Chip = Chip {
@@ -2336,6 +2483,7 @@ index 0000000..bab18cb
 +    v1: false,
 +    be: true,
 +    band_6: true,
++    usb: None,
 +};
 +
 +/// The PHY's registers are past this in BAR 2 (`rtw89_phy_gen_ax.cr_base`,
@@ -2360,8 +2508,15 @@ index 0000000..bab18cb
 +    if mask == 0 { 0 } else { mask.trailing_zeros() }
 +}
 +
++/// The registers' way: BAR 2, or USB vendor requests.
++pub(crate) enum Io {
++    Mmio(Mmio),
++    Usb(UsbRegs),
++}
++
 +pub(crate) struct Hal {
-+    mmio: Mmio,
++    io: Io,
++    pub(crate) bus: Bus,
 +    pub(crate) chip: &'static Chip,
 +    /// The chip's cut (`hal.cv`) and its analog part's (`hal.acv`).
 +    pub(crate) cv: u8,
@@ -2383,7 +2538,58 @@ index 0000000..bab18cb
 +
 +impl Hal {
 +    pub(crate) fn new(mmio: Mmio, chip: &'static Chip) -> Self {
-+        Self { mmio, chip, cv: 0, acv: 0, aid: 0, rfe_type: 0, xtal_cap: 0, efuse_valid: false, secure_boot: false, mss_idx: 0, no_eht: false, no_mcs_12_13: false }
++        Self::with(Io::Mmio(mmio), Bus::Pcie, chip)
++    }
++
++    /// A USB adapter's chip; `bus` says the link's speed.
++    pub(crate) fn new_usb(regs: UsbRegs, chip: &'static Chip, bus: Bus) -> Self {
++        Self::with(Io::Usb(regs), bus, chip)
++    }
++
++    fn with(io: Io, bus: Bus, chip: &'static Chip) -> Self {
++        Self { io, bus, chip, cv: 0, acv: 0, aid: 0, rfe_type: 0, xtal_cap: 0, efuse_valid: false, secure_boot: false, mss_idx: 0, no_eht: false, no_mcs_12_13: false }
++    }
++
++    /// On USB rather than PCIe.
++    pub(crate) fn usb(&self) -> bool {
++        self.bus != Bus::Pcie
++    }
++
++    /// The chip's USB tables, on USB.
++    pub(crate) fn usb_spec(&self) -> Option<&'static UsbSpec> {
++        if self.usb() { self.chip.usb } else { None }
++    }
++
++    /// The quotas of the normal mode (`RTW89_QTA_SCC`) on this bus.
++    pub(crate) fn scc(&self) -> &'static DleMem {
++        match (self.bus, self.chip.usb) {
++            (Bus::Usb2, Some(usb)) => &usb.scc_usb2,
++            (Bus::Usb3, Some(usb)) => &usb.scc_usb3,
++            _ => &self.chip.scc,
++        }
++    }
++
++    /// The host's flow control on this bus: the channels' and public
++    /// pages, their costs, and whether frames are counted as they are
++    /// stored (USB's `RTW89_HCIFC_STF`) or by their WD pages (`_POH`).
++    pub(crate) fn hfc(&self) -> (&'static Hfc, HfcPrec, bool) {
++        match self.usb_spec() {
++            Some(usb) => (&usb.hfc, usb.prec, true),
++            None => (&self.chip.hfc, HFC_PREC_PCIE, false),
++        }
++    }
++
++    /// How many times a poll of the firmware's download path reads its
++    /// register (`FWDL_WAIT_CNT`, `_USB`: a read over USB takes far
++    /// longer).
++    pub(crate) fn fwdl_wait(&self) -> u64 {
++        if self.usb() { FWDL_WAIT_CNT_USB as u64 } else { FWDL_WAIT_CNT as u64 }
++    }
++
++    /// The same for the firmware's register answers (`RTW89_C2H_TIMEOUT`,
++    /// `_USB`).
++    pub(crate) fn c2h_wait(&self) -> u64 {
++        if self.usb() { RTW89_C2H_TIMEOUT_USB as u64 } else { RTW89_C2H_TIMEOUT as u64 }
 +    }
 +
 +    pub(crate) fn id(&self) -> ChipId {
@@ -2402,27 +2608,45 @@ index 0000000..bab18cb
 +    // ---- The MAC. ----
 +
 +    pub(crate) fn r8(&self, addr: u32) -> u8 {
-+        self.mmio.ioread8(addr as usize)
++        match &self.io {
++            Io::Mmio(mmio) => mmio.ioread8(addr as usize),
++            Io::Usb(usb) => usb.read(addr, 1) as u8,
++        }
 +    }
 +
 +    pub(crate) fn r16(&self, addr: u32) -> u16 {
-+        self.mmio.ioread16(addr as usize)
++        match &self.io {
++            Io::Mmio(mmio) => mmio.ioread16(addr as usize),
++            Io::Usb(usb) => usb.read(addr, 2) as u16,
++        }
 +    }
 +
 +    pub(crate) fn r32(&self, addr: u32) -> u32 {
-+        self.mmio.ioread32(addr as usize)
++        match &self.io {
++            Io::Mmio(mmio) => mmio.ioread32(addr as usize),
++            Io::Usb(usb) => usb.read(addr, 4),
++        }
 +    }
 +
 +    pub(crate) fn w8(&self, addr: u32, value: u8) {
-+        self.mmio.iowrite8(addr as usize, value);
++        match &self.io {
++            Io::Mmio(mmio) => mmio.iowrite8(addr as usize, value),
++            Io::Usb(usb) => usb.write(addr, value as u32, 1),
++        }
 +    }
 +
 +    pub(crate) fn w16(&self, addr: u32, value: u16) {
-+        self.mmio.iowrite16(addr as usize, value);
++        match &self.io {
++            Io::Mmio(mmio) => mmio.iowrite16(addr as usize, value),
++            Io::Usb(usb) => usb.write(addr, value as u32, 2),
++        }
 +    }
 +
 +    pub(crate) fn w32(&self, addr: u32, value: u32) {
-+        self.mmio.iowrite32(addr as usize, value);
++        match &self.io {
++            Io::Mmio(mmio) => mmio.iowrite32(addr as usize, value),
++            Io::Usb(usb) => usb.write(addr, value, 4),
++        }
 +    }
 +
 +    pub(crate) fn r32_mask(&self, addr: u32, mask: u32) -> u32 {
@@ -2480,8 +2704,23 @@ index 0000000..bab18cb
 +    }
 +
 +    pub(crate) fn present(&self) -> bool {
++        if !self.alive() {
++            return false;
++        }
 +        let value = self.r32(R_AX_SYS_CFG1);
-+        value != u32::MAX && value != 0xeaea_eaea && value != 0xdead_beef
++        value != u32::MAX && value != 0xeaea_eaea && value != RTW89_R32_DEAD
++    }
++
++    /// Still there: the PCIe card answers; the USB adapter was not
++    /// unplugged (checked without a request: the task asks every 5 ms).
++    pub(crate) fn alive(&self) -> bool {
++        match &self.io {
++            Io::Mmio(_) => {
++                let value = self.r32(R_AX_SYS_CFG1);
++                value != u32::MAX && value != 0xeaea_eaea && value != RTW89_R32_DEAD
++            }
++            Io::Usb(usb) => !usb.gone(),
++        }
 +    }
 +
 +    // ---- The baseband. ----
@@ -2674,12 +2913,133 @@ index 0000000..bab18cb
 +pub(crate) fn get(mask: u32, value: u32) -> u32 {
 +    (value & mask) >> shift_of(mask)
 +}
+diff --git a/kernel/comps/rtw89/src/hci.rs b/kernel/comps/rtw89/src/hci.rs
+new file mode 100644
+index 0000000..29943fb
+--- /dev/null
++++ b/kernel/comps/rtw89/src/hci.rs
+@@ -0,0 +1,115 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The bus a chip is on (Linux's `rtw89_hci_ops`): PCIe ([`crate::pci`])
++//! or USB ([`crate::usb`]), behind the same operations.
++
++use alloc::vec::Vec;
++
++use crate::{
++    hal::Hal,
++    pci::{Pci, TXCH_ACH0, TXCH_CH8, TxDesc},
++    regs::*,
++    usb::Usb,
++};
++
++pub(crate) enum Hci {
++    Pci(Pci),
++    Usb(Usb),
++}
++
++impl Hci {
++    pub(crate) fn send_h2c(&mut self, hal: &Hal, h2c: &[u8], fwdl: bool) -> Result<(), &'static str> {
++        match self {
++            Self::Pci(pci) => pci.send_h2c(hal, h2c, fwdl),
++            Self::Usb(usb) => usb.send_h2c(hal, h2c, fwdl),
++        }
++    }
++
++    pub(crate) fn mac_pre_init(&mut self, hal: &Hal) -> Result<(), &'static str> {
++        match self {
++            Self::Pci(pci) => pci.mac_pre_init(hal),
++            Self::Usb(usb) => {
++                // `rtw89_usb_ops_mac_pre_init` leaves the BE chips alone.
++                if !hal.chip.be {
++                    usb.mac_pre_init(hal);
++                }
++                Ok(())
++            }
++        }
++    }
++
++    pub(crate) fn mac_post_init(&self, hal: &Hal) {
++        match self {
++            Self::Pci(pci) => pci.mac_post_init(hal),
++            Self::Usb(usb) => usb.mac_post_init(hal),
++        }
++    }
++
++    pub(crate) fn enable_interrupts(&mut self, hal: &Hal) {
++        if let Self::Pci(pci) = self {
++            pci.enable_interrupts(hal);
++        }
++    }
++
++    pub(crate) fn disable_interrupts(&self, hal: &Hal) {
++        if let Self::Pci(pci) = self {
++            pci.disable_interrupts(hal);
++        }
++    }
++
++    /// The PCIe interrupts acknowledged; whether the firmware halted (USB
++    /// has no interrupts).
++    pub(crate) fn acknowledge(&self, hal: &Hal) -> bool {
++        match self {
++            Self::Pci(pci) => pci.acknowledge(hal),
++            Self::Usb(_) => false,
++        }
++    }
++
++    pub(crate) fn send_frame(&mut self, hal: &Hal, desc: &TxDesc, frame: &[u8]) -> Result<(), &'static str> {
++        match self {
++            Self::Pci(pci) => pci.send_frame(hal, desc, frame),
++            Self::Usb(usb) => usb.send_frame(hal, desc, frame),
++        }
++    }
++
++    pub(crate) fn receive(&mut self, hal: &Hal) -> Vec<Vec<u8>> {
++        match self {
++            Self::Pci(pci) => pci.receive(hal),
++            Self::Usb(usb) => usb.receive(hal),
++        }
++    }
++
++    /// Whether the firmware's command went out (USB sends them at once).
++    pub(crate) fn h2c_idle(&mut self, hal: &Hal) -> bool {
++        match self {
++            Self::Pci(pci) => pci.h2c_idle(hal),
++            Self::Usb(_) => true,
++        }
++    }
++
++    /// Ends what the bus has pending (USB's transfers).
++    pub(crate) fn stop(&mut self) {
++        if let Self::Usb(usb) = self {
++            usb.stop();
++        }
++    }
++}
++
++/// A frame's DMA channel (`rtw89_chip_get_ch_dma`): an access category's
++/// own, or on the dual-band chips' USB adapters (`rtw89_core_get_ch_dma_v2`)
++/// ACH0 for best effort and voice, ACH2 for background and video;
++/// management on CH8.
++pub(crate) fn ch_dma(hal: &Hal, qsel: u32) -> usize {
++    let v2 = hal.usb_spec().is_some_and(|usb| usb.ch_dma_v2);
++    match qsel {
++        RTW89_TX_QSEL_B0_MGMT | RTW89_TX_QSEL_B0_HI => TXCH_CH8,
++        RTW89_TX_QSEL_BK_0 if v2 => TXCH_ACH0 + 2,
++        RTW89_TX_QSEL_VI_0 if v2 => TXCH_ACH0 + 2,
++        RTW89_TX_QSEL_VO_0 if v2 => TXCH_ACH0,
++        RTW89_TX_QSEL_BK_0 => TXCH_ACH0 + 1,
++        RTW89_TX_QSEL_VI_0 => TXCH_ACH0 + 2,
++        RTW89_TX_QSEL_VO_0 => TXCH_ACH0 + 3,
++        _ => TXCH_ACH0,
++    }
++}
 diff --git a/kernel/comps/rtw89/src/lib.rs b/kernel/comps/rtw89/src/lib.rs
 new file mode 100644
-index 0000000..a65acc7
+index 0000000..8d295bd
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/lib.rs
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,453 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Realtek's 802.11ax and 802.11be Wi-Fi on PCIe, as Linux's rtw89 runs
@@ -2688,7 +3048,8 @@ index 0000000..a65acc7
 +//! RTL8852CE (10ec:c852) and the 802.11be RTL8922AE (10ec:8922, its VS
 +//! variant 10ec:892b): another MAC ([`be`]), PCIe and descriptor
 +//! generation, H2C commands of their own, the firmware's calibrations
-+//! ([`rtw8922a`]).
++//! ([`rtw8922a`]). The RTL8851BU, RTL8852AU, RTL8852BU and RTL8852CU USB
++//! adapters run the same chips through [`usb`] ([`hci`] picks the bus).
 +//!
 +//! The chip ([`hal`], [`pci`]) is brought up as Linux's `rtw89_core_start`
 +//! does: power ([`mac`]), the eFuse, the firmware ([`fw`]: linux-firmware's
@@ -2709,7 +3070,8 @@ index 0000000..a65acc7
 +//! firmware calibrates, its TSSI too. The RTL8852CE runs 6 GHz, the
 +//! RTL8922AE 6 GHz and EHT; block-ack sessions and power save on all.
 +//! Not yet: the TSSI's alignment measured with the baseband's own packets
-+//! (the tables' defaults stand in), the RTL8922AE's second band.
++//! (the tables' defaults stand in), the RTL8922AE's second band, the
++//! RTL8922AU adapters and switching USB 2 adapters to USB 3.
 +//! `dmesg | grep rtw89` says how far a card gets; `rtw89.off` leaves the
 +//! cards alone.
 +
@@ -2729,6 +3091,7 @@ index 0000000..a65acc7
 +mod coex;
 +mod fw;
 +mod hal;
++mod hci;
 +mod mac;
 +mod pci;
 +mod phy;
@@ -2744,9 +3107,10 @@ index 0000000..a65acc7
 +mod rtw88xx;
 +mod rtw8922a;
 +mod sta;
++mod usb;
 +
-+use alloc::{sync::Arc, vec::Vec};
-+use core::sync::atomic::{AtomicBool, Ordering};
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 +
 +pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms, udelay as delay_us};
 +use aster_linuxkpi::{
@@ -2764,9 +3128,11 @@ index 0000000..a65acc7
 +
 +use crate::{
 +    fw::Firmware,
-+    hal::{Chip, Hal},
++    hal::{Bus, Chip, Hal},
++    hci::Hci,
 +    pci::Pci,
 +    sta::Rtw89,
++    usb::{Usb, UsbRegs},
 +};
 +
 +/// The cards' tasks sleep here: woken by their interrupt, and by the timer
@@ -2799,6 +3165,67 @@ index 0000000..a65acc7
 +    chip_of(vendor, device).is_some()
 +}
 +
++/// The USB adapters (`rtw_8851bu_id_table`, `rtw_8852au_id_table`,
++/// `rtw_8852bu_id_table`, `rtw_8852cu_id_table`), their vendor-specific
++/// interface.
++fn usb_chip_of(vendor: u16, product: u16) -> Option<&'static Chip> {
++    const REALTEK: u16 = 0x0bda;
++    match (vendor, product) {
++        (REALTEK, 0xb831 | 0xb851) | (0x2001, 0x332a) | (0x2c4e, 0x0128) | (0x3625, 0x010b) | (0x7392, 0xe611) => Some(&hal::RTL8851B),
++        (REALTEK, 0x8832 | 0x885a | 0x885c)
++        | (0x0411, 0x0312)
++        | (0x056e, 0x4020)
++        | (0x0b05, 0x1997)
++        | (0x2001, 0x3321 | 0x3323 | 0x332c)
++        | (0x2357, 0x013f | 0x0140 | 0x0141)
++        | (0x3625, 0x010d | 0x010f) => Some(&hal::RTL8852A),
++        (REALTEK, 0xb832 | 0xb83a | 0xb852 | 0xb85a | 0xa85b)
++        | (0x0586, 0x3428)
++        | (0x0b05, 0x1a62 | 0x1cb6)
++        | (0x0db0, 0x6931 | 0xf0c8)
++        | (0x2001, 0x3327)
++        | (0x3574, 0x6121)
++        | (0x35bc, 0x0100 | 0x0108)
++        | (0x7392, 0x6822) => Some(&hal::RTL8852B),
++        (REALTEK, 0xc832 | 0xc85a | 0xc85d)
++        | (0x0411, 0x03a6)
++        | (0x056e, 0x4024)
++        | (0x0db0, 0x991d)
++        | (0x28de, 0x2432)
++        | (0x2c7c, 0x8206)
++        | (0x35b2, 0x0502)
++        | (0x35bc, 0x0101 | 0x0102)
++        | (0x37ad, 0x0103) => Some(&hal::RTL8852C),
++        _ => None,
++    }
++}
++
++/// The USB adapters' driver, for aster-usb.
++struct UsbDriver;
++
++impl aster_usb::driver::UsbDriver for UsbDriver {
++    fn name(&self) -> &'static str {
++        "rtw89_usb"
++    }
++
++    fn matches(&self, info: &aster_usb::driver::InterfaceInfo) -> bool {
++        info.class == 0xff && usb_chip_of(info.vendor, info.product).is_some()
++    }
++
++    fn probe(&self, interface: aster_usb::driver::UsbInterface) {
++        run_usb(interface);
++    }
++}
++
++static USB_ADAPTERS: AtomicUsize = AtomicUsize::new(0);
++static TIMER_STARTED: AtomicBool = AtomicBool::new(false);
++
++fn start_timer_once() {
++    if !TIMER_STARTED.swap(true, Ordering::AcqRel) {
++        WAKER.start_timer();
++    }
++}
++
 +static DISABLED: AtomicBool = AtomicBool::new(false);
 +aster_cmdline::define_flag_param!("rtw89.off", DISABLED);
 +/// `rtw89.nocal`: no calibration of the channel on the host (the AX chips'
@@ -2808,9 +3235,13 @@ index 0000000..a65acc7
 +
 +#[init_component]
 +fn init() -> Result<(), ComponentInitError> {
-+    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
-+        WAKER.start_timer();
++    if DISABLED.load(Ordering::Relaxed) {
++        return Ok(());
 +    }
++    if DEVICES.register(claims) {
++        start_timer_once();
++    }
++    aster_usb::driver::register_driver(Arc::new(UsbDriver));
 +    Ok(())
 +}
 +
@@ -2984,10 +3415,18 @@ index 0000000..a65acc7
 +            return;
 +        }
 +    };
-+    let mut state = Rtw89::new(hal, pci, firmware, secure, efuse);
++    let state = Rtw89::new(hal, Hci::Pci(pci), firmware, secure, efuse);
++    serve(state, &name);
++    drop((vectors, device));
++}
++
++/// The chip up, the station registered, then what the chip says until it
++/// is gone.
++fn serve(mut state: Rtw89, name: &str) {
 +    if let Err(error) = state.bring_up() {
 +        ostd::warn!("{}: {}", name, error);
 +        mac::power_off(&state.hal);
++        state.hci.stop();
 +        return;
 +    }
 +    let info = state.info();
@@ -3000,17 +3439,66 @@ index 0000000..a65acc7
 +        let mut state = card.state.lock();
 +        state.poll();
 +        if state.dead {
++            state.hci.stop();
 +            break;
 +        }
 +    }
-+    drop((vectors, device));
++}
++
++/// A USB adapter's task (`rtw89_usb_probe`): the registers through vendor
++/// requests, the quotas of the link's speed, the reads waiting, then the
++/// chip up as on PCIe.
++fn run_usb(interface: aster_usb::driver::UsbInterface) {
++    let (vendor, product) = (interface.info.vendor, interface.info.product);
++    let Some(chip) = usb_chip_of(vendor, product) else { return };
++    let Some(spec) = chip.usb else { return };
++    let index = USB_ADAPTERS.fetch_add(1, Ordering::Relaxed);
++    let name: String = format!("rtw89_usb {} ({:04x}:{:04x})", index, vendor, product);
++    start_timer_once();
++    let interface = Arc::new(interface);
++    let bus = if interface.speed >= 4 { Bus::Usb3 } else { Bus::Usb2 };
++    let mut hal = Hal::new_usb(UsbRegs::new(interface.clone()), chip, bus);
++    if !hal.present() {
++        ostd::warn!("{}: the adapter does not answer", name);
++        return;
++    }
++    hal.read_chip_version();
++    let model = chip.name.strip_suffix('E').unwrap_or(chip.name);
++    ostd::notice!("{}: Realtek {}U on USB (speed {}), cut {}", name, model, interface.speed, hal.cv);
++    if let Err(error) = mac::power_on(&mut hal) {
++        ostd::warn!("{}: power on: {}", name, error);
++        return;
++    }
++    let (efuse, secure) = match mac::read_efuse(&mut hal) {
++        Ok(read) => read,
++        Err(error) => {
++            ostd::warn!("{}: eFuse: {}", name, error);
++            return;
++        }
++    };
++    let firmware = match Firmware::load(&hal).and_then(|fw| fw.check_elements(&hal).map(|()| fw)) {
++        Ok(firmware) => firmware,
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    };
++    let mut usb = match Usb::new(interface.clone(), spec, Arc::new(|| WAKER.wake())) {
++        Ok(usb) => usb,
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    };
++    usb.start_rx();
++    serve(Rtw89::new(hal, Hci::Usb(usb), firmware, secure, efuse), &name);
 +}
 diff --git a/kernel/comps/rtw89/src/mac.rs b/kernel/comps/rtw89/src/mac.rs
 new file mode 100644
-index 0000000..c65b063
+index 0000000..8f8ee84
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/mac.rs
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,973 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The MAC of the 802.11ax chips as Linux's rtw89 `mac.c` brings it up:
@@ -3024,7 +3512,7 @@ index 0000000..c65b063
 +
 +use crate::{
 +    fw::{Secure, secure_from_efuse},
-+    hal::{ChipId, DleMem, HFC_PREC_PCIE, Hal, field, get},
++    hal::{ChipId, DleMem, Hal, field, get},
 +    regs::*,
 +};
 +
@@ -3094,7 +3582,8 @@ index 0000000..c65b063
 +const PHYCAP_AX_PA_BIAS_TRIM: [u32; 2] = [0x5de, 0x5db];
 +
 +/// Logical eFuse offsets (`struct rtw8852bx_efuse` and the others'): the
-+/// same on every 802.11ax chip on PCIe.
++/// same on every 802.11ax chip on PCIe (the USB adapters' MAC address is
++/// the chip's [`crate::hal::UsbSpec::efuse_mac`]).
 +const EFUSE_MAC_ADDR_PCIE: usize = 0x400;
 +const EFUSE_RFE_TYPE: usize = 0x2ca;
 +const EFUSE_XTAL_K: usize = 0x2b9;
@@ -3109,35 +3598,54 @@ index 0000000..c65b063
 +    hal.write_xtal_si(offset as u8, value as u8, mask as u8).map_err(|()| format!("the crystal's register {offset:#x}"))
 +}
 +
-+/// The steps of `rtw89_mac_pwr_seq` for the RTL8852A (its PCIe and common
-+/// ones): address, cuts (a bit each), poll or write, mask, value.
-+const RTL8852A_PWR_ON: &[(u32, u8, bool, u8, u8)] = &[
-+    (0x00c6, 1 << 1, false, 1 << 6, 1 << 6),
-+    (0x0005, 0xff, false, (1 << 4) | (1 << 3), 0),
-+    (0x0005, 0xff, false, 1 << 7, 0),
-+    (0x0005, 0xff, false, 1 << 2, 0),
-+    (0x0006, 0xff, true, 1 << 1, 1 << 1),
-+    (0x0006, 0xff, false, 1 << 0, 1 << 0),
-+    (0x0005, 0xff, false, 1 << 0, 1 << 0),
-+    (0x0005, 0xff, true, 1 << 0, 0),
-+    (0x0088, 0xff, false, 1 << 0, 1 << 0),
-+    (0x0088, 0xff, false, 1 << 0, 0),
-+    (0x0088, 0xff, false, 1 << 0, 1 << 0),
-+    (0x0088, 0xff, false, 1 << 0, 0),
-+    (0x0088, 0xff, false, 1 << 0, 1 << 0),
-+    (0x0083, 0xff, false, 1 << 6, 0),
-+    (0x0080, 0xff, false, 1 << 5, 1 << 5),
-+    (0x0024, 0xff, false, 0x1f, 0),
-+    (0x02a0, 0xff, false, 1 << 1, 1 << 1),
-+    (0x02a2, 0xff, false, 0xe0, 0),
-+    (0x0071, 0xff, false, 1 << 4, 0),
-+    (0x0010, 1 << 0, false, 1 << 2, 1 << 2),
-+    (0x02a0, 1 << 0, false, 0xc0, 0),
++/// The steps of `rtw89_mac_pwr_seq` for the RTL8852A (its PCIe, USB and
++/// common ones): address, cuts (a bit each), interfaces
++/// (`PWR_INTF_MSK_*`), poll or write, mask, value.
++const RTL8852A_PWR_ON: &[(u32, u8, u8, bool, u8, u8)] = &[
++    (0x00c6, 1 << 1, PCIE, false, 1 << 6, 1 << 6),
++    (0x0005, 0xff, ALL, false, (1 << 4) | (1 << 3), 0),
++    (0x0005, 0xff, ALL, false, 1 << 7, 0),
++    (0x0005, 0xff, ALL, false, 1 << 2, 0),
++    (0x0006, 0xff, ALL, true, 1 << 1, 1 << 1),
++    (0x0006, 0xff, ALL, false, 1 << 0, 1 << 0),
++    (0x0005, 0xff, ALL, false, 1 << 0, 1 << 0),
++    (0x0005, 0xff, ALL, true, 1 << 0, 0),
++    (0x106d, (1 << 1) | (1 << 2), USB, false, 1 << 6, 0),
++    (0x0088, 0xff, ALL, false, 1 << 0, 1 << 0),
++    (0x0088, 0xff, ALL, false, 1 << 0, 0),
++    (0x0088, 0xff, ALL, false, 1 << 0, 1 << 0),
++    (0x0088, 0xff, ALL, false, 1 << 0, 0),
++    (0x0088, 0xff, ALL, false, 1 << 0, 1 << 0),
++    (0x0083, 0xff, ALL, false, 1 << 6, 0),
++    (0x0080, 0xff, ALL, false, 1 << 5, 1 << 5),
++    (0x0024, 0xff, ALL, false, 0x1f, 0),
++    (0x02a0, 0xff, ALL, false, 1 << 1, 1 << 1),
++    (0x02a2, 0xff, ALL, false, 0xe0, 0),
++    (0x0071, 0xff, PCIE, false, 1 << 4, 0),
++    (0x0010, 1 << 0, PCIE, false, 1 << 2, 1 << 2),
++    (0x02a0, 1 << 0, ALL, false, 0xc0, 0),
 +];
++const PCIE: u8 = PWR_INTF_MSK_PCIE as u8;
++const USB: u8 = PWR_INTF_MSK_USB as u8;
++const ALL: u8 = PWR_INTF_MSK_ALL as u8;
++
++/// `rtw89_mac_power_switch_boot_mode`: a USB adapter that came up in its
++/// boot mode (as a mass-storage device with the driver for another
++/// system) leaves it.
++fn leave_boot_mode(hal: &Hal) {
++    if !hal.usb() || hal.r32_mask(R_AX_GPIO_MUXCFG, B_AX_BOOT_MODE) == 0 {
++        return;
++    }
++    hal.clr32(R_AX_SYS_PW_CTRL, B_AX_APFN_ONMAC);
++    hal.clr32(R_AX_SYS_STATUS1, B_AX_AUTO_WLPON);
++    hal.clr32(R_AX_GPIO_MUXCFG, B_AX_BOOT_MODE);
++    hal.clr32(R_AX_RSV_CTRL, B_AX_R_DIS_PRST);
++}
 +
 +/// `rtw89_mac_pwr_on`: each chip's power-on (`pwr_on_func`, or the
 +/// RTL8852A's sequence).
 +pub(crate) fn power_on(hal: &mut Hal) -> Result<(), String> {
++    leave_boot_mode(hal);
 +    if hal.chip.be {
 +        // `rtw89_mac_pwr_on`: off and on again if it fails.
 +        if crate::be::power_on(hal).is_ok() {
@@ -3152,8 +3660,9 @@ index 0000000..c65b063
 +    }
 +    let id = hal.id();
 +    if id == ChipId::Rtl8852a {
-+        for &(addr, cuts, is_poll, mask, value) in RTL8852A_PWR_ON {
-+            if cuts != 0xff && cuts & (1 << hal.cv) == 0 {
++        let intf = if hal.usb() { USB } else { PCIE };
++        for &(addr, cuts, intfs, is_poll, mask, value) in RTL8852A_PWR_ON {
++            if (cuts != 0xff && cuts & (1 << hal.cv) == 0) || intfs & intf == 0 {
 +                continue;
 +            }
 +            if is_poll {
@@ -3177,7 +3686,7 @@ index 0000000..c65b063
 +        ChipId::Rtl8852b => hal.w16(R_AX_SPS_ANA_ON_CTRL2, RTL8852B_DEFAULT_SPS_ANA as u16),
 +        ChipId::Rtl8852bt => hal.set32(R_AX_LDO_AON_CTRL0, B_AX_PD_REGU_L),
 +        ChipId::Rtl8852c => {
-+            if get(B_AX_PAD_HCI_SEL_V2_MASK, hal.r32(R_AX_SYS_STATUS1)) == MAC_AX_HCI_SEL_PCIE_USB {
++            if hal.usb() || get(B_AX_PAD_HCI_SEL_V2_MASK, hal.r32(R_AX_SYS_STATUS1)) == MAC_AX_HCI_SEL_PCIE_USB {
 +                hal.set32(R_AX_LDO_AON_CTRL0, B_AX_PD_REGU_L);
 +            }
 +        }
@@ -3215,7 +3724,10 @@ index 0000000..c65b063
 +            hal.clr8(R_AX_PLATFORM_ENABLE, B_AX_PLATFORM_EN);
 +        }
 +    }
-+    hal.clr32(R_AX_SYS_SDIO_CTRL, B_AX_PCIE_CALIB_EN_V1);
++    let pcie = !hal.usb();
++    if pcie {
++        hal.clr32(R_AX_SYS_SDIO_CTRL, B_AX_PCIE_CALIB_EN_V1);
++    }
 +    if id == ChipId::Rtl8852c {
 +        hal.clr32(R_AX_SYS_ISO_CTRL_EXTEND, B_AX_CMAC1_FEN);
 +        hal.set32(R_AX_SYS_ISO_CTRL_EXTEND, B_AX_R_SYM_ISO_CMAC12PP);
@@ -3251,7 +3763,9 @@ index 0000000..c65b063
 +    hal.clr32(R_AX_PMC_DBG_CTRL2, B_AX_SYSON_DIS_PMCR_AX_WRMSK);
 +    match id {
 +        ChipId::Rtl8851b => {
-+            hal.set32(R_AX_GPIO0_16_EECS_EESK_LED1_PULL_LOW_EN, B_AX_GPIO10_PULL_LOW_EN | B_AX_GPIO16_PULL_LOW_EN_V1);
++            if pcie {
++                hal.set32(R_AX_GPIO0_16_EECS_EESK_LED1_PULL_LOW_EN, B_AX_GPIO10_PULL_LOW_EN | B_AX_GPIO16_PULL_LOW_EN_V1);
++            }
 +            if hal.cv == CHIP_CAV as u8
 +                && let Ok(cv) = efuse_version(hal)
 +            {
@@ -3263,11 +3777,11 @@ index 0000000..c65b063
 +                hal.set32(R_AX_SPSANA_ON_CTRL1, B_AX_FPWMDELAY);
 +            }
 +        }
-+        ChipId::Rtl8852c => hal.set32(R_AX_GPIO0_15_EECS_EESK_LED1_PULL_LOW_EN, B_AX_EECS_PULL_LOW_EN | B_AX_EESK_PULL_LOW_EN | B_AX_LED1_PULL_LOW_EN),
++        ChipId::Rtl8852c if pcie => hal.set32(R_AX_GPIO0_15_EECS_EESK_LED1_PULL_LOW_EN, B_AX_EECS_PULL_LOW_EN | B_AX_EESK_PULL_LOW_EN | B_AX_LED1_PULL_LOW_EN),
 +        ChipId::Rtl8852b | ChipId::Rtl8852bt if hal.efuse_valid => {
 +            hal.w32_mask(R_AX_SPS_DIG_ON_CTRL0, B_AX_VOL_L1_MASK, 0x9);
 +            hal.w32_mask(R_AX_SPS_DIG_ON_CTRL0, B_AX_VREFPFM_L_MASK, 0xa);
-+            if id == ChipId::Rtl8852b && hal.cv == CHIP_CBV as u8 {
++            if id == ChipId::Rtl8852b && hal.cv == CHIP_CBV as u8 && pcie {
 +                hal.set32(R_AX_PMC_DBG_CTRL2, B_AX_SYSON_DIS_PMCR_AX_WRMSK);
 +                hal.w16_mask(R_AX_HCI_LDO_CTRL, B_AX_R_AX_VADJ_MASK, 0xa);
 +                hal.clr32(R_AX_PMC_DBG_CTRL2, B_AX_SYSON_DIS_PMCR_AX_WRMSK);
@@ -3302,8 +3816,15 @@ index 0000000..c65b063
 +    hal.clr8(R_AX_SYS_FUNC_EN, B_AX_FEN_BB_GLB_RSTN | B_AX_FEN_BBRSTB);
 +    hal.set32(R_AX_SYS_PW_CTRL, B_AX_APFM_OFFMAC);
 +    let _ = hal.poll32(R_AX_SYS_PW_CTRL, |value| value & B_AX_APFM_OFFMAC == 0, 1000, 20_000);
-+    hal.w32(R_AX_WLLPS_CTRL, SW_LPS_OPTION);
-+    hal.set32(R_AX_SYS_PW_CTRL, B_AX_APFM_SWLPS);
++    if hal.usb() {
++        // The USB adapters stay in their suspend state machine.
++        hal.clr32(R_AX_SYS_PW_CTRL, B_AX_SOP_EDSWR);
++        let value = hal.r32(R_AX_SYS_PW_CTRL);
++        hal.w32(R_AX_SYS_PW_CTRL, (value & !B_AX_AFSM_PCIE_SUS_EN) | B_AX_AFSM_WLSUS_EN);
++    } else {
++        hal.w32(R_AX_WLLPS_CTRL, SW_LPS_OPTION);
++        hal.set32(R_AX_SYS_PW_CTRL, B_AX_APFM_SWLPS);
++    }
 +}
 +
 +// ---- The eFuse. ----
@@ -3421,7 +3942,8 @@ index 0000000..c65b063
 +        logical(&dav, chip.dav_logical_efuse as usize, 4, &mut log[start..]);
 +    }
 +    let mut efuse = Efuse::default();
-+    efuse.address.copy_from_slice(&log[EFUSE_MAC_ADDR_PCIE..EFUSE_MAC_ADDR_PCIE + 6]);
++    let mac = hal.usb_spec().map_or(EFUSE_MAC_ADDR_PCIE, |usb| usb.efuse_mac);
++    efuse.address.copy_from_slice(&log[mac..mac + 6]);
 +    efuse.rfe_type = log[EFUSE_RFE_TYPE];
 +    efuse.xtal_cap = log[EFUSE_XTAL_K];
 +    efuse.country = [log[EFUSE_COUNTRY], log[EFUSE_COUNTRY + 1]];
@@ -3546,7 +4068,8 @@ index 0000000..c65b063
 +/// DMA channel's pages, the public pages, then flow control on.
 +fn hfc_init(hal: &Hal, download: bool) -> Result<(), String> {
 +    check_dmac(hal)?;
-+    let (ch011, h2c, wp07, wp811, ch011_full, h2c_full, wp07_full, wp811_full) = HFC_PREC_PCIE;
++    let (hfc, prec, stf) = hal.hfc();
++    let (ch011, h2c, wp07, wp811, ch011_full, h2c_full, wp07_full, wp811_full) = prec;
 +    let page = (R_AX_HCI_FC_CTRL, R_AX_CH_PAGE_CTRL, R_AX_ACH0_PAGE_CTRL, R_AX_PUB_PAGE_CTRL1, R_AX_PUB_PAGE_CTRL2, R_AX_WP_PAGE_CTRL1, R_AX_WP_PAGE_CTRL2);
 +    let (fc_ctrl, ch_page, ach_page, pub1, pub2, wp1, wp2) = page;
 +    hal.clr32(fc_ctrl, B_AX_HCI_FC_EN | B_AX_HCI_FC_CH12_EN);
@@ -3556,7 +4079,6 @@ index 0000000..c65b063
 +        hal.set32(fc_ctrl, B_AX_HCI_FC_CH12_EN);
 +        return Ok(());
 +    }
-+    let hfc = &hal.chip.hfc;
 +    for (channel, &(min, max, group)) in hfc.channels.iter().enumerate() {
 +        if hal.chip.dma_ch_mask & (1 << channel) != 0 {
 +            continue;
@@ -3572,7 +4094,7 @@ index 0000000..c65b063
 +    hal.w32(wp1, field(B_AX_PREC_PAGE_WP_CH07_MASK, wp07 as u32) | field(B_AX_PREC_PAGE_WP_CH811_MASK, wp811 as u32));
 +    let mut ctrl = hal.r32(fc_ctrl);
 +    let replace = |value: u32, mask: u32, new: u32| (value & !mask) | field(mask, new);
-+    ctrl = replace(ctrl, B_AX_HCI_FC_MODE_MASK, RTW89_HCIFC_POH);
++    ctrl = replace(ctrl, B_AX_HCI_FC_MODE_MASK, if stf { RTW89_HCIFC_STF } else { RTW89_HCIFC_POH });
 +    ctrl = replace(ctrl, B_AX_HCI_FC_WD_FULL_COND_MASK, ch011_full as u32);
 +    ctrl = replace(ctrl, B_AX_HCI_FC_CH12_FULL_COND_MASK, h2c_full as u32);
 +    ctrl = replace(ctrl, B_AX_HCI_FC_WP_CH07_FULL_COND_MASK, wp07_full as u32);
@@ -3595,13 +4117,13 @@ index 0000000..c65b063
 +    hal.w32(R_AX_DMAC_CLK_EN, clk);
 +    if id == ChipId::Rtl8852c {
 +        let mut value = hal.r32(R_AX_HAXI_INIT_CFG1) & !(B_AX_DMA_MODE_MASK | B_AX_STOP_AXI_MST);
-+        value |= B_AX_TXHCI_EN_V1 | B_AX_RXHCI_EN_V1 | field(B_AX_DMA_MODE_MASK, DMA_MOD_PCIE_1B);
++        value |= B_AX_TXHCI_EN_V1 | B_AX_RXHCI_EN_V1 | field(B_AX_DMA_MODE_MASK, if hal.usb() { DMA_MOD_USB } else { DMA_MOD_PCIE_1B });
 +        hal.w32(R_AX_HAXI_INIT_CFG1, value);
 +        hal.clr32(R_AX_HAXI_DMA_STOP1, B_AX_STOP_ACH0 | B_AX_STOP_ACH1 | B_AX_STOP_ACH3 | B_AX_STOP_ACH4 | B_AX_STOP_ACH5 | B_AX_STOP_ACH6 | B_AX_STOP_ACH7 | B_AX_STOP_CH8 | B_AX_STOP_CH9 | B_AX_STOP_CH12 | B_AX_STOP_ACH2);
 +        hal.clr32(R_AX_HAXI_DMA_STOP2, B_AX_STOP_CH10 | B_AX_STOP_CH11);
 +        hal.set32(R_AX_PLATFORM_ENABLE, B_AX_AXIDMA_EN);
 +    }
-+    dle_init(hal, &hal.chip.dlfw, Some(hal.chip.scc.wde_min.wcpu))?;
++    dle_init(hal, &hal.chip.dlfw, Some(hal.scc().wde_min.wcpu))?;
 +    hfc_init(hal, true)
 +}
 +
@@ -3631,7 +4153,7 @@ index 0000000..c65b063
 +pub(crate) fn trx_init(hal: &Hal, rx_filter: u32) -> Result<(), String> {
 +    let id = hal.id();
 +    let xb = hal.is_885xb();
-+    let scc = &hal.chip.scc;
++    let scc = hal.scc();
 +    dle_init(hal, scc, None)?;
 +    // `preload_init_set_ax` (the RTL8852C only).
 +    if id == ChipId::Rtl8852c {
@@ -3661,7 +4183,7 @@ index 0000000..c65b063
 +    if id == ChipId::Rtl8852c {
 +        sec |= B_AX_UC_MGNT_DEC;
 +    }
-+    if matches!(id, ChipId::Rtl8852a | ChipId::Rtl8852b | ChipId::Rtl8851b) {
++    if matches!(id, ChipId::Rtl8852a | ChipId::Rtl8852b | ChipId::Rtl8851b) || (id == ChipId::Rtl8852c && hal.usb()) {
 +        sec &= !B_AX_TX_PARTIAL_MODE;
 +    }
 +    hal.w32(R_AX_SEC_ENG_CTRL, sec);
@@ -3670,9 +4192,15 @@ index 0000000..c65b063
 +        hal.w32_mask(R_AX_SEC_DEBUG1, B_AX_TX_TIMEOUT_SEL_MASK, AX_TX_TO_VAL);
 +    }
 +    cmac_init(hal, rx_filter, scc)?;
-+    // `set_host_rpr_ax` for PCIe: release reports to the host.
-+    hal.w32_mask(R_AX_WDRLS_CFG, B_AX_WDRLS_MODE_MASK, RTW89_RPR_MODE_POH);
-+    hal.set32(R_AX_RLSRPT0_CFG0, B_AX_RLSRPT0_FLTR_MAP_MASK);
++    // `set_host_rpr_ax`: release reports to the host on PCIe; USB's
++    // frames are done once stored (`RTW89_RPR_MODE_STF`).
++    if hal.usb() {
++        hal.w32_mask(R_AX_WDRLS_CFG, B_AX_WDRLS_MODE_MASK, RTW89_RPR_MODE_STF);
++        hal.clr32(R_AX_RLSRPT0_CFG0, B_AX_RLSRPT0_FLTR_MAP_MASK);
++    } else {
++        hal.w32_mask(R_AX_WDRLS_CFG, B_AX_WDRLS_MODE_MASK, RTW89_RPR_MODE_POH);
++        hal.set32(R_AX_RLSRPT0_CFG0, B_AX_RLSRPT0_FLTR_MAP_MASK);
++    }
 +    hal.w32_mask(R_AX_RLSRPT0_CFG1, B_AX_RLSRPT0_AGGNUM_MASK, 30);
 +    hal.w32_mask(R_AX_RLSRPT0_CFG1, B_AX_RLSRPT0_TO_MASK, 255);
 +    if id == ChipId::Rtl8852c {
@@ -3776,14 +4304,16 @@ index 0000000..c65b063
 +    if id == ChipId::Rtl8852a || xb {
 +        hal.w32_mask(R_AX_PTCL_RRSR1, B_AX_RRSR_RATE_EN_MASK, RRSR_OFDM_CCK_EN);
 +    }
-+    // `ptcl_init_ax`.
-+    let mut sifs_set = hal.r32(R_AX_SIFS_SETTING);
-+    sifs_set = (sifs_set & !B_AX_HW_CTS2SELF_PKT_LEN_TH_MASK) | field(B_AX_HW_CTS2SELF_PKT_LEN_TH_MASK, S_AX_CTS2S_TH_1K);
-+    sifs_set = (sifs_set & !B_AX_HW_CTS2SELF_PKT_LEN_TH_TWW_MASK) | field(B_AX_HW_CTS2SELF_PKT_LEN_TH_TWW_MASK, S_AX_CTS2S_TH_SEC_256B);
-+    hal.w32(R_AX_SIFS_SETTING, sifs_set | B_AX_HW_CTS2SELF_EN);
-+    let mut fsm = hal.r32(R_AX_PTCL_FSM_MON);
-+    fsm = (fsm & !B_AX_PTCL_TX_ARB_TO_THR_MASK) | field(B_AX_PTCL_TX_ARB_TO_THR_MASK, S_AX_PTCL_TO_2MS);
-+    hal.w32(R_AX_PTCL_FSM_MON, fsm & !B_AX_PTCL_TX_ARB_TO_MODE);
++    // `ptcl_init_ax`: CTS-to-self and the TX arbiter's timeout on PCIe.
++    if !hal.usb() {
++        let mut sifs_set = hal.r32(R_AX_SIFS_SETTING);
++        sifs_set = (sifs_set & !B_AX_HW_CTS2SELF_PKT_LEN_TH_MASK) | field(B_AX_HW_CTS2SELF_PKT_LEN_TH_MASK, S_AX_CTS2S_TH_1K);
++        sifs_set = (sifs_set & !B_AX_HW_CTS2SELF_PKT_LEN_TH_TWW_MASK) | field(B_AX_HW_CTS2SELF_PKT_LEN_TH_TWW_MASK, S_AX_CTS2S_TH_SEC_256B);
++        hal.w32(R_AX_SIFS_SETTING, sifs_set | B_AX_HW_CTS2SELF_EN);
++        let mut fsm = hal.r32(R_AX_PTCL_FSM_MON);
++        fsm = (fsm & !B_AX_PTCL_TX_ARB_TO_THR_MASK) | field(B_AX_PTCL_TX_ARB_TO_THR_MASK, S_AX_PTCL_TO_2MS);
++        hal.w32(R_AX_PTCL_FSM_MON, fsm & !B_AX_PTCL_TX_ARB_TO_MODE);
++    }
 +    hal.set8(R_AX_PTCL_COMMON_SETTING_0, B_AX_CMAC_TX_MODE_0 | B_AX_CMAC_TX_MODE_1);
 +    hal.clr8(R_AX_PTCL_COMMON_SETTING_0, B_AX_PTCL_TRIGGER_SS_EN_0 | B_AX_PTCL_TRIGGER_SS_EN_1 | B_AX_PTCL_TRIGGER_SS_EN_UL);
 +    hal.w8_mask(R_AX_PTCLRPT_FULL_HDL, B_AX_SPE_RPT_PATH_MASK, FWD_TO_WLCPU);
@@ -3944,10 +4474,10 @@ index 0000000..c65b063
 +}
 diff --git a/kernel/comps/rtw89/src/pci.rs b/kernel/comps/rtw89/src/pci.rs
 new file mode 100644
-index 0000000..ac3bff8
+index 0000000..37f1148
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/pci.rs
-@@ -0,0 +1,1153 @@
+@@ -0,0 +1,1176 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The PCIe side as Linux's rtw89 `pci.c` runs it on the 802.11ax chips:
@@ -4823,21 +5353,7 @@ index 0000000..ac3bff8
 +            return Err("an H2C too long");
 +        }
 +        let mut buffer = vec![0u8; desc_size + h2c.len()];
-+        if hal.chip.be {
-+            // `rtw89_core_fill_txdesc_fwcmd_v2`.
-+            let kind = if fwdl { RTW89_CORE_RX_TYPE_FWDL } else { RTW89_CORE_RX_TYPE_H2C };
-+            let word = field(BE_RXD_RPKT_LEN_MASK, h2c.len() as u32) | field(BE_RXD_RPKT_TYPE_MASK, kind);
-+            buffer[0..4].copy_from_slice(&word.to_le_bytes());
-+        } else if hal.chip.v1 {
-+            let kind = if fwdl { RTW89_CORE_RX_TYPE_FWDL } else { RTW89_CORE_RX_TYPE_H2C };
-+            let word = field(AX_RXD_RPKT_LEN_MASK, h2c.len() as u32) | field(AX_RXD_RPKT_TYPE_MASK, kind);
-+            buffer[0..4].copy_from_slice(&word.to_le_bytes());
-+        } else {
-+            let word0 = field(RTW89_TXWD_BODY0_CHANNEL_DMA, RTW89_DMA_H2C) | field(RTW89_TXWD_BODY0_FW_DL, fwdl as u32);
-+            let word2 = field(RTW89_TXWD_BODY2_TXPKT_SIZE, h2c.len() as u32);
-+            buffer[0..4].copy_from_slice(&word0.to_le_bytes());
-+            buffer[8..12].copy_from_slice(&word2.to_le_bytes());
-+        }
++        h2c_desc(hal, h2c.len(), fwdl, &mut buffer[..desc_size]);
 +        buffer[desc_size..].copy_from_slice(h2c);
 +        let slot = ring.wp;
 +        ring.pages.write_bytes(slot * PAGE_SIZE, &buffer).map_err(|_| "H2C buffer")?;
@@ -4860,7 +5376,6 @@ index 0000000..ac3bff8
 +        if frame.len() > TX_FRAME_MAX {
 +            return Err("a frame too long");
 +        }
-+        let body = hal.chip.txwd_body;
 +        let v1 = hal.chip.v1;
 +        let ring = self.tx.get_mut(desc.channel).and_then(Option::as_mut).ok_or("no such TX channel")?;
 +        Self::reclaim(hal, ring);
@@ -4872,46 +5387,16 @@ index 0000000..ac3bff8
 +        ring.busy[page] = crate::now_ms().max(1);
 +        let base = ring.pages.daddr() + page * PAGE_SIZE;
 +        let frame_dma = (base + WD_PAGE) as u64;
-+        let mut wd = [0u8; WD_PAGE];
++        let (mut wd, body_info) = txwd(hal, desc, frame.len());
 +        if hal.chip.be {
-+            let length = Self::wd_be(&mut wd, desc, frame.len(), page, frame_dma);
++            let length = Self::wp_be(&mut wd, body_info, frame.len(), page, frame_dma);
 +            let offset = page * PAGE_SIZE;
 +            ring.pages.write_bytes(offset + WD_PAGE, frame).map_err(|_| "TX buffer")?;
 +            ring.pages.write_bytes(offset, &wd[..length]).map_err(|_| "WD page")?;
 +            return Self::kick(hal, ring, length, base as u64).map_err(|()| "TX ring");
 +        }
-+        let mut words = [0u32; 8];
-+        let wp_offset = 0u32;
-+        words[0] = if v1 { field(RTW89_TXWD_BODY0_WP_OFFSET_V1, wp_offset) } else { field(RTW89_TXWD_BODY0_WP_OFFSET, wp_offset) }
-+            | RTW89_TXWD_BODY0_WD_INFO_EN
-+            | field(RTW89_TXWD_BODY0_CHANNEL_DMA, desc.channel as u32)
-+            | field(RTW89_TXWD_BODY0_HDR_LLC_LEN, desc.hdr_llc_len)
-+            | RTW89_TXWD_BODY0_WD_PAGE;
-+        if desc.hw_seq && !v1 {
-+            words[0] |= field(RTW89_TXWD_BODY0_HW_SSN_SEL, RTW89_MGMT_HW_SSN_SEL) | field(RTW89_TXWD_BODY0_HW_SSN_MODE, RTW89_MGMT_HW_SEQ_MODE);
-+        }
-+        words[2] = field(RTW89_TXWD_BODY2_TID_INDICATE, desc.tid_indicate as u32) | field(RTW89_TXWD_BODY2_QSEL, desc.qsel) | field(RTW89_TXWD_BODY2_TXPKT_SIZE, frame.len() as u32) | field(RTW89_TXWD_BODY2_MACID, desc.mac_id);
-+        words[3] = field(RTW89_TXWD_BODY3_SW_SEQ, desc.seq) | field(RTW89_TXWD_BODY3_AGG_EN, desc.agg_en as u32);
-+        if v1 {
-+            words[1] = field(RTW89_TXWD_BODY1_ADDR_INFO_NUM, 1) | field(RTW89_TXWD_BODY1_SEC_KEYID, desc.key_id) | field(RTW89_TXWD_BODY1_SEC_TYPE, desc.sec_type);
-+            words[7] = field(RTW89_TXWD_BODY7_USE_RATE_V1, desc.use_rate as u32) | field(RTW89_TXWD_BODY7_DATA_RATE, desc.rate);
-+        }
-+        for (index, word) in words.iter().take(body / 4).enumerate() {
-+            wd[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-+        }
-+        // The WD info.
-+        let mut info = [0u32; 6];
-+        info[0] = if v1 { 0 } else { field(RTW89_TXWD_INFO0_USE_RATE, desc.use_rate as u32) | field(RTW89_TXWD_INFO0_DATA_RATE, desc.rate) } | field(RTW89_TXWD_INFO0_DISDATAFB, desc.use_rate as u32);
-+        let sec = desc.sec_type != 0;
-+        info[2] = if v1 { field(RTW89_TXWD_INFO2_FORCE_KEY_EN, sec as u32) } else { field(RTW89_TXWD_INFO2_SEC_TYPE, desc.sec_type) | field(RTW89_TXWD_INFO2_SEC_HW_ENC, sec as u32) } | field(RTW89_TXWD_INFO2_SEC_CAM_IDX, desc.sec_cam);
-+        info[4] = field(RTW89_TXWD_INFO4_RTS_EN, !desc.bmc as u32) | field(RTW89_TXWD_INFO4_HW_RTS_EN, 1);
-+        info[1] |= field(RTW89_TXWD_INFO1_MAX_AGGNUM, desc.ampdu_num);
-+        info[2] |= field(RTW89_TXWD_INFO2_AMPDU_DENSITY, desc.ampdu_density);
-+        for (index, word) in info.iter().enumerate() {
-+            wd[body + index * 4..body + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-+        }
 +        // The WP info, then the address.
-+        let wp = body + 24;
++        let wp = body_info;
 +        wd[wp..wp + 2].copy_from_slice(&(page as u16 | TXWP_VALID).to_le_bytes());
 +        let addr = wp + 8;
 +        let length = if v1 {
@@ -4935,31 +5420,9 @@ index 0000000..ac3bff8
 +        Self::kick(hal, ring, length, base as u64).map_err(|()| "TX ring")
 +    }
 +
-+    /// A BE chip's WD page (`rtw89_core_fill_txdesc_v2`, the WP info,
-+    /// `rtw89_pci_fill_txaddr_info_v1`); its length.
-+    fn wd_be(wd: &mut [u8; WD_PAGE], desc: &TxDesc, len: usize, page: usize, frame_dma: u64) -> usize {
-+        let sec = desc.sec_type != 0;
-+        let pn = desc.pn.unwrap_or(0).to_le_bytes();
-+        let mut body = [0u32; 8];
-+        body[0] = field(BE_TXD_BODY0_WP_OFFSET_V1, desc.wp_offset) | BE_TXD_BODY0_WDINFO_EN | field(BE_TXD_BODY0_CH_DMA, desc.channel as u32) | field(BE_TXD_BODY0_HDR_LLC_LEN, desc.hdr_llc_len) | BE_TXD_BODY0_WD_PAGE;
-+        body[1] = field(BE_TXD_BODY1_ADDR_INFO_NUM, 1) | field(BE_TXD_BODY1_SEC_KEYID, desc.key_id) | field(BE_TXD_BODY1_SEC_TYPE, desc.sec_type);
-+        body[2] = field(BE_TXD_BODY2_TID_IND, desc.tid_indicate as u32) | field(BE_TXD_BODY2_QSEL, desc.qsel) | field(BE_TXD_BODY2_TXPKTSIZE, len as u32) | field(BE_TXD_BODY2_MACID, desc.mac_id) | field(BE_TXD_BODY2_AGG_EN, desc.agg_en as u32);
-+        // Management frames' sequence numbers are the hardware's own.
-+        body[3] = field(BE_TXD_BODY3_WIFI_SEQ, desc.seq) | field(BE_TXD_BODY3_IS_MLD_SW_EN, desc.hw_seq as u32);
-+        if sec && desc.pn.is_some() {
-+            body[4] = field(BE_TXD_BODY4_SEC_IV_L0, pn[0] as u32) | field(BE_TXD_BODY4_SEC_IV_L1, pn[1] as u32);
-+            body[5] = field(BE_TXD_BODY5_SEC_IV_H2, pn[2] as u32) | field(BE_TXD_BODY5_SEC_IV_H3, pn[3] as u32) | field(BE_TXD_BODY5_SEC_IV_H4, pn[4] as u32) | field(BE_TXD_BODY5_SEC_IV_H5, pn[5] as u32);
-+        }
-+        body[7] = field(BE_TXD_BODY7_USERATE_SEL, desc.use_rate as u32) | field(BE_TXD_BODY7_DATARATE, desc.rate);
-+        let mut info = [0u32; 8];
-+        info[0] = field(BE_TXD_INFO0_DISDATAFB, desc.use_rate as u32);
-+        info[1] = field(BE_TXD_INFO1_DATA_RTY_LOWEST_RATE, desc.lowest_rate) | field(BE_TXD_INFO1_MAX_AGG_NUM, desc.ampdu_num);
-+        info[2] = field(BE_TXD_INFO2_FORCE_KEY_EN, sec as u32) | field(BE_TXD_INFO2_SEC_CAM_IDX, desc.sec_cam) | field(BE_TXD_INFO2_AMPDU_DENSITY, desc.ampdu_density);
-+        info[4] = field(BE_TXD_INFO4_RTS_EN, !desc.bmc as u32) | field(BE_TXD_INFO4_HW_RTS_EN, 1);
-+        for (index, word) in body.iter().chain(info.iter()).enumerate() {
-+            wd[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-+        }
-+        let wp = 64;
++    /// A BE chip's WP info and address after the body and info
++    /// (`rtw89_pci_fill_txaddr_info_v1`); the WD's length.
++    fn wp_be(wd: &mut [u8; WD_PAGE], wp: usize, len: usize, page: usize, frame_dma: u64) -> usize {
 +        wd[wp..wp + 2].copy_from_slice(&(page as u16 | TXWP_VALID).to_le_bytes());
 +        let addr = wp + 8;
 +        let opt = (len as u16 & 0x7ff) | (1 << 15) | ((((frame_dma >> 32) as u16) & 0xf) << 11);
@@ -5096,6 +5559,96 @@ index 0000000..ac3bff8
 +    }
 +}
 +
++/// `rtw89_core_fill_txdesc` (and the RTL8852C's `_v1`, the BE chips' `_v2`):
++/// a frame's TX descriptor, its body and its WD info; their length.
++pub(crate) fn txwd(hal: &Hal, desc: &TxDesc, len: usize) -> ([u8; WD_PAGE], usize) {
++    let mut wd = [0u8; WD_PAGE];
++    // The frame's address entries (`addr_info_nr`): one on PCIe, none on
++    // USB (the frame follows the descriptor).
++    let addr_info = !hal.usb() as u32;
++    if hal.chip.be {
++        txwd_be(&mut wd, desc, len, addr_info);
++        return (wd, 64);
++    }
++    let body = hal.chip.txwd_body;
++    let v1 = hal.chip.v1;
++    let mut words = [0u32; 8];
++    let wp_offset = 0u32;
++    words[0] = if v1 { field(RTW89_TXWD_BODY0_WP_OFFSET_V1, wp_offset) } else { field(RTW89_TXWD_BODY0_WP_OFFSET, wp_offset) }
++        | RTW89_TXWD_BODY0_WD_INFO_EN
++        | field(RTW89_TXWD_BODY0_CHANNEL_DMA, desc.channel as u32)
++        | field(RTW89_TXWD_BODY0_HDR_LLC_LEN, desc.hdr_llc_len)
++        | RTW89_TXWD_BODY0_WD_PAGE;
++    if desc.hw_seq && !v1 {
++        words[0] |= field(RTW89_TXWD_BODY0_HW_SSN_SEL, RTW89_MGMT_HW_SSN_SEL) | field(RTW89_TXWD_BODY0_HW_SSN_MODE, RTW89_MGMT_HW_SEQ_MODE);
++    }
++    words[2] = field(RTW89_TXWD_BODY2_TID_INDICATE, desc.tid_indicate as u32) | field(RTW89_TXWD_BODY2_QSEL, desc.qsel) | field(RTW89_TXWD_BODY2_TXPKT_SIZE, len as u32) | field(RTW89_TXWD_BODY2_MACID, desc.mac_id);
++    words[3] = field(RTW89_TXWD_BODY3_SW_SEQ, desc.seq) | field(RTW89_TXWD_BODY3_AGG_EN, desc.agg_en as u32);
++    if v1 {
++        words[1] = field(RTW89_TXWD_BODY1_ADDR_INFO_NUM, addr_info) | field(RTW89_TXWD_BODY1_SEC_KEYID, desc.key_id) | field(RTW89_TXWD_BODY1_SEC_TYPE, desc.sec_type);
++        words[7] = field(RTW89_TXWD_BODY7_USE_RATE_V1, desc.use_rate as u32) | field(RTW89_TXWD_BODY7_DATA_RATE, desc.rate);
++    }
++    for (index, word) in words.iter().take(body / 4).enumerate() {
++        wd[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
++    }
++    // The WD info.
++    let mut info = [0u32; 6];
++    info[0] = if v1 { 0 } else { field(RTW89_TXWD_INFO0_USE_RATE, desc.use_rate as u32) | field(RTW89_TXWD_INFO0_DATA_RATE, desc.rate) } | field(RTW89_TXWD_INFO0_DISDATAFB, desc.use_rate as u32);
++    let sec = desc.sec_type != 0;
++    info[2] = if v1 { field(RTW89_TXWD_INFO2_FORCE_KEY_EN, sec as u32) } else { field(RTW89_TXWD_INFO2_SEC_TYPE, desc.sec_type) | field(RTW89_TXWD_INFO2_SEC_HW_ENC, sec as u32) } | field(RTW89_TXWD_INFO2_SEC_CAM_IDX, desc.sec_cam);
++    info[4] = field(RTW89_TXWD_INFO4_RTS_EN, !desc.bmc as u32) | field(RTW89_TXWD_INFO4_HW_RTS_EN, 1);
++    info[1] |= field(RTW89_TXWD_INFO1_MAX_AGGNUM, desc.ampdu_num);
++    info[2] |= field(RTW89_TXWD_INFO2_AMPDU_DENSITY, desc.ampdu_density);
++    for (index, word) in info.iter().enumerate() {
++        wd[body + index * 4..body + index * 4 + 4].copy_from_slice(&word.to_le_bytes());
++    }
++    (wd, body + 24)
++}
++
++/// `rtw89_core_fill_txdesc_v2`: the BE chips' body and info (eight words
++/// each).
++fn txwd_be(wd: &mut [u8; WD_PAGE], desc: &TxDesc, len: usize, addr_info: u32) {
++    let sec = desc.sec_type != 0;
++    let pn = desc.pn.unwrap_or(0).to_le_bytes();
++    let mut body = [0u32; 8];
++    body[0] = field(BE_TXD_BODY0_WP_OFFSET_V1, desc.wp_offset) | BE_TXD_BODY0_WDINFO_EN | field(BE_TXD_BODY0_CH_DMA, desc.channel as u32) | field(BE_TXD_BODY0_HDR_LLC_LEN, desc.hdr_llc_len) | BE_TXD_BODY0_WD_PAGE;
++    body[1] = field(BE_TXD_BODY1_ADDR_INFO_NUM, addr_info) | field(BE_TXD_BODY1_SEC_KEYID, desc.key_id) | field(BE_TXD_BODY1_SEC_TYPE, desc.sec_type);
++    body[2] = field(BE_TXD_BODY2_TID_IND, desc.tid_indicate as u32) | field(BE_TXD_BODY2_QSEL, desc.qsel) | field(BE_TXD_BODY2_TXPKTSIZE, len as u32) | field(BE_TXD_BODY2_MACID, desc.mac_id) | field(BE_TXD_BODY2_AGG_EN, desc.agg_en as u32);
++    // Management frames' sequence numbers are the hardware's own.
++    body[3] = field(BE_TXD_BODY3_WIFI_SEQ, desc.seq) | field(BE_TXD_BODY3_IS_MLD_SW_EN, desc.hw_seq as u32);
++    if sec && desc.pn.is_some() {
++        body[4] = field(BE_TXD_BODY4_SEC_IV_L0, pn[0] as u32) | field(BE_TXD_BODY4_SEC_IV_L1, pn[1] as u32);
++        body[5] = field(BE_TXD_BODY5_SEC_IV_H2, pn[2] as u32) | field(BE_TXD_BODY5_SEC_IV_H3, pn[3] as u32) | field(BE_TXD_BODY5_SEC_IV_H4, pn[4] as u32) | field(BE_TXD_BODY5_SEC_IV_H5, pn[5] as u32);
++    }
++    body[7] = field(BE_TXD_BODY7_USERATE_SEL, desc.use_rate as u32) | field(BE_TXD_BODY7_DATARATE, desc.rate);
++    let mut info = [0u32; 8];
++    info[0] = field(BE_TXD_INFO0_DISDATAFB, desc.use_rate as u32);
++    info[1] = field(BE_TXD_INFO1_DATA_RTY_LOWEST_RATE, desc.lowest_rate) | field(BE_TXD_INFO1_MAX_AGG_NUM, desc.ampdu_num);
++    info[2] = field(BE_TXD_INFO2_FORCE_KEY_EN, sec as u32) | field(BE_TXD_INFO2_SEC_CAM_IDX, desc.sec_cam) | field(BE_TXD_INFO2_AMPDU_DENSITY, desc.ampdu_density);
++    info[4] = field(BE_TXD_INFO4_RTS_EN, !desc.bmc as u32) | field(BE_TXD_INFO4_HW_RTS_EN, 1);
++    for (index, word) in body.iter().chain(info.iter()).enumerate() {
++        wd[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
++    }
++}
++
++/// `rtw89_core_fill_txdesc_fwcmd` (and `_v1`, `_v2`): a firmware command's
++/// descriptor for `len` bytes.
++pub(crate) fn h2c_desc(hal: &Hal, len: usize, fwdl: bool, out: &mut [u8]) {
++    let kind = if fwdl { RTW89_CORE_RX_TYPE_FWDL } else { RTW89_CORE_RX_TYPE_H2C };
++    if hal.chip.be {
++        let word = field(BE_RXD_RPKT_LEN_MASK, len as u32) | field(BE_RXD_RPKT_TYPE_MASK, kind);
++        out[0..4].copy_from_slice(&word.to_le_bytes());
++    } else if hal.chip.v1 {
++        let word = field(AX_RXD_RPKT_LEN_MASK, len as u32) | field(AX_RXD_RPKT_TYPE_MASK, kind);
++        out[0..4].copy_from_slice(&word.to_le_bytes());
++    } else {
++        let word0 = field(RTW89_TXWD_BODY0_CHANNEL_DMA, RTW89_DMA_H2C) | field(RTW89_TXWD_BODY0_FW_DL, fwdl as u32);
++        let word2 = field(RTW89_TXWD_BODY2_TXPKT_SIZE, len as u32);
++        out[0..4].copy_from_slice(&word0.to_le_bytes());
++        out[8..12].copy_from_slice(&word2.to_le_bytes());
++    }
++}
++
 +/// The RX BD's length field, for tests of descriptors.
 +#[allow(dead_code)]
 +pub(crate) fn bd_length(bd: &[u8]) -> u16 {
@@ -5103,7 +5656,7 @@ index 0000000..ac3bff8
 +}
 diff --git a/kernel/comps/rtw89/src/phy.rs b/kernel/comps/rtw89/src/phy.rs
 new file mode 100644
-index 0000000..7f01574
+index 0000000..0d0b620
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/phy.rs
 @@ -0,0 +1,436 @@
@@ -5121,7 +5674,7 @@ index 0000000..7f01574
 +use crate::{
 +    fw::{Firmware, H2c, Table},
 +    hal::{ChipId, Hal, RFREG_MASK, field},
-+    pci::Pci,
++    hci::Hci,
 +    regs::*,
 +};
 +
@@ -5255,7 +5808,7 @@ index 0000000..7f01574
 +
 +/// `rtw89_phy_init_rf_reg`: each path's table (written, and the values
 +/// past 0x100 handed to the firmware, `rtw89_fw_h2c_rf_reg`).
-+pub(crate) fn init_rf(hal: &Hal, fw: &Firmware, pci: &mut Pci, h2c: &mut H2c) {
++pub(crate) fn init_rf(hal: &Hal, fw: &Firmware, pci: &mut Hci, h2c: &mut H2c) {
 +    for path in 0..hal.chip.rf_paths {
 +        let Some(table) = &fw.elements.radio[path as usize] else { continue };
 +        let mut stored: Vec<u32> = Vec::new();
@@ -5292,7 +5845,7 @@ index 0000000..7f01574
 +}
 +
 +/// Lets the H2C ring drain (commands are taken in order).
-+pub(crate) fn wait_h2c(hal: &Hal, pci: &mut Pci) {
++pub(crate) fn wait_h2c(hal: &Hal, pci: &mut Hci) {
 +    let deadline = crate::now_ms() + 100;
 +    while !pci.h2c_idle(hal) && crate::now_ms() < deadline {
 +        crate::delay_us(20);
@@ -5545,10 +6098,10 @@ index 0000000..7f01574
 +}
 diff --git a/kernel/comps/rtw89/src/regs.rs b/kernel/comps/rtw89/src/regs.rs
 new file mode 100644
-index 0000000..7c11135
+index 0000000..917a923
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/regs.rs
-@@ -0,0 +1,3390 @@
+@@ -0,0 +1,3451 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright(c) 2019-2024 Realtek Corporation
 +
@@ -5765,6 +6318,7 @@ index 0000000..7c11135
 +pub(crate) const B_AX_APP_PLCP_HDR_RPT: u32 = 0x8;
 +pub(crate) const B_AX_ASFF_FULL_NO_STK: u32 = 0x2;
 +pub(crate) const B_AX_AUTOLOAD_SUS: u32 = 0x20;
++pub(crate) const B_AX_AUTO_WLPON: u32 = 0x400;
 +pub(crate) const B_AX_AXIDMA_CLK_EN: u32 = 0x200;
 +pub(crate) const B_AX_AXIDMA_EN: u32 = 0x8;
 +pub(crate) const B_AX_A_A1_MATCH: u32 = 0x2;
@@ -5785,6 +6339,7 @@ index 0000000..7c11135
 +pub(crate) const B_AX_BCN_SPACE_MASK: u32 = 0xffff;
 +pub(crate) const B_AX_BC_DEC: u32 = 0x4;
 +pub(crate) const B_AX_BG_CLR_ASYNC_M3: u32 = 0x10;
++pub(crate) const B_AX_BOOT_MODE: u32 = 0x80000;
 +pub(crate) const B_AX_BOOT_REASON_MASK: u32 = 0x7;
 +pub(crate) const B_AX_BRK_SETUP: u32 = 0x10000;
 +pub(crate) const B_AX_BTCCA_BRK_TXOP_EN: u32 = 0x200;
@@ -5824,6 +6379,7 @@ index 0000000..7c11135
 +pub(crate) const B_AX_CLR_RPQ_IDX: u32 = 0x2;
 +pub(crate) const B_AX_CLR_RXQ_IDX: u32 = 0x1;
 +pub(crate) const B_AX_CMAC1_FEN: u32 = 0x40000000;
++pub(crate) const B_AX_CMAC_ALLCKEN: u32 = 0xffffffff;
 +pub(crate) const B_AX_CMAC_CKEN: u32 = 0x40000000;
 +pub(crate) const B_AX_CMAC_CRPRT: u32 = 0x80000000;
 +pub(crate) const B_AX_CMAC_DMA_CKEN: u32 = 0x10;
@@ -5872,6 +6428,7 @@ index 0000000..7c11135
 +pub(crate) const B_AX_EN_CHKDSC_NO_RX_STUCK: u32 = 0x100000;
 +pub(crate) const B_AX_EN_STUCK_DBG: u32 = 0x1;
 +pub(crate) const B_AX_EN_WLON: u32 = 0x10000;
++pub(crate) const B_AX_EP_IDX: u32 = 0xf;
 +pub(crate) const B_AX_FEN_BBRSTB: u32 = 0x1;
 +pub(crate) const B_AX_FEN_BB_GLB_RSTN: u32 = 0x2;
 +pub(crate) const B_AX_FORCE_CMACREG_GCKEN: u32 = 0x8000;
@@ -5901,6 +6458,8 @@ index 0000000..7c11135
 +pub(crate) const B_AX_HCI_FC_WD_FULL_COND_MASK: u32 = 0x30;
 +pub(crate) const B_AX_HCI_FC_WP_CH07_FULL_COND_MASK: u32 = 0xc0;
 +pub(crate) const B_AX_HCI_FC_WP_CH811_FULL_COND_MASK: u32 = 0x300;
++pub(crate) const B_AX_HCI_RXDMA_EN: u32 = 0x2;
++pub(crate) const B_AX_HCI_TXDMA_EN: u32 = 0x1;
 +pub(crate) const B_AX_HE_SIGB_CRC_CHK: u32 = 0x40;
 +pub(crate) const B_AX_HOST_ADDR_INFO_8B_SEL: u32 = 0x1;
 +pub(crate) const B_AX_HS0ISR_IND_INT_EN: u32 = 0x1000000;
@@ -6029,6 +6588,11 @@ index 0000000..7c11135
 +pub(crate) const B_AX_RST_BDRAM: u32 = 0x8;
 +pub(crate) const B_AX_RTK_BT_ENABLE: u32 = 0x1;
 +pub(crate) const B_AX_RTS_LIMIT_IN_OFDM6: u32 = 0x2;
++pub(crate) const B_AX_RXAGG_0_BUF_SZ_1K: u32 = 0xff;
++pub(crate) const B_AX_RXAGG_0_BUF_SZ_4K: u32 = 0xff;
++pub(crate) const B_AX_RXAGG_0_EN: u32 = 0x80000000;
++pub(crate) const B_AX_RXAGG_0_NUM_TH: u32 = 0xff0000;
++pub(crate) const B_AX_RXAGG_0_TIME_32US_TH: u32 = 0xff00;
 +pub(crate) const B_AX_RXBD_MODE: u32 = 0x40000;
 +pub(crate) const B_AX_RXBD_MODE_V1: u32 = 0x4000;
 +pub(crate) const B_AX_RXDMA_INT_EN: u32 = 0x1;
@@ -6046,12 +6610,14 @@ index 0000000..7c11135
 +pub(crate) const B_AX_RX_MPDU_MAX_LEN_MASK: u32 = 0x3f0000;
 +pub(crate) const B_AX_RX_TRUNC_MODE: u32 = 0x10;
 +pub(crate) const B_AX_R_AX_VADJ_MASK: u32 = 0xf;
++pub(crate) const B_AX_R_DIS_PRST: u32 = 0x40;
 +pub(crate) const B_AX_R_SYM_ISO_CMAC12PP: u32 = 0x20;
 +pub(crate) const B_AX_R_SYM_WLCMAC1_P1_PC_EN: u32 = 0x2;
 +pub(crate) const B_AX_R_SYM_WLCMAC1_P2_PC_EN: u32 = 0x4;
 +pub(crate) const B_AX_R_SYM_WLCMAC1_P3_PC_EN: u32 = 0x8;
 +pub(crate) const B_AX_R_SYM_WLCMAC1_P4_PC_EN: u32 = 0x10;
 +pub(crate) const B_AX_R_SYM_WLCMAC1_PC_EN: u32 = 0x1;
++pub(crate) const B_AX_R_USBIO_MODE: u32 = 0x10;
 +pub(crate) const B_AX_S0_LDO_VSEL_F_MASK: u32 = 0x600000;
 +pub(crate) const B_AX_S1_LDO_VSEL_F_MASK: u32 = 0x3000000;
 +pub(crate) const B_AX_SAMPLE_CLK_MASK: u32 = 0xff;
@@ -6070,9 +6636,11 @@ index 0000000..7c11135
 +pub(crate) const B_AX_SIFS_CHK_EDCCA: u32 = 0x100000;
 +pub(crate) const B_AX_SIFS_MACTXEN_T1_MASK: u32 = 0x7f;
 +pub(crate) const B_AX_SIGA_CRC_CHK: u32 = 0x8;
++pub(crate) const B_AX_SOP_EDSWR: u32 = 0x10000000;
 +pub(crate) const B_AX_SPE_RPT_PATH_MASK: u32 = 0x30;
 +pub(crate) const B_AX_SR_EN: u32 = 0x1;
 +pub(crate) const B_AX_SSN_SEL: u32 = 0x4;
++pub(crate) const B_AX_SSPHY_LFPS_FILTER: u32 = 0x80000000;
 +pub(crate) const B_AX_SS_DEST_QUEUE_MASK: u32 = 0x3f00;
 +pub(crate) const B_AX_SS_EN: u32 = 0x1;
 +pub(crate) const B_AX_SS_INIT_DONE_1: u32 = 0x80000000;
@@ -6136,6 +6704,8 @@ index 0000000..7c11135
 +pub(crate) const B_AX_UC_MGNT_DEC: u32 = 0x10;
 +pub(crate) const B_AX_UPD_HGQMD: u32 = 0x2;
 +pub(crate) const B_AX_UPD_TIMIE: u32 = 0x1;
++pub(crate) const B_AX_USBRX_RST: u32 = 0x200;
++pub(crate) const B_AX_USBTX_RST: u32 = 0x100;
 +pub(crate) const B_AX_VHT_MU_SIGB_CRC_CHK: u32 = 0x20;
 +pub(crate) const B_AX_VHT_SU_SIGB_CRC_CHK: u32 = 0x10;
 +pub(crate) const B_AX_VOL_L1_MASK: u32 = 0xf;
@@ -7248,6 +7818,7 @@ index 0000000..7c11135
 +pub(crate) const DMA_BUSY1_CHECK_BE: u32 = 0x7fff;
 +pub(crate) const DMA_BUSY1_CHECK_V1: u32 = 0x70f00;
 +pub(crate) const DMA_MOD_PCIE_1B: u32 = 0x0;
++pub(crate) const DMA_MOD_USB: u32 = 0x2;
 +pub(crate) const EFUSE_HDR_OFFSET_MASK: u32 = 0x1fff0;
 +pub(crate) const EFUSE_HDR_PAGE_MASK: u32 = 0xe0000;
 +pub(crate) const EFUSE_HDR_WORD_EN_MASK: u32 = 0xf;
@@ -7257,6 +7828,8 @@ index 0000000..7c11135
 +pub(crate) const EF_FV_OFSET_BE_V1: u32 = 0x17ca;
 +pub(crate) const FULL_BIT_MASK: u32 = 0xff;
 +pub(crate) const FWCMD_TYPE_H2C: u32 = 0x0;
++pub(crate) const FWDL_WAIT_CNT: u32 = 0x61a80;
++pub(crate) const FWDL_WAIT_CNT_USB: u32 = 0xc80;
 +pub(crate) const FWD_TO_WLCPU: u32 = 0x1;
 +pub(crate) const FWSECTION_HDR_V1_W1_CHECKSUM: u32 = 0x10000000;
 +pub(crate) const FWSECTION_HDR_V1_W1_SECTIONTYPE: u32 = 0xf000000;
@@ -7352,6 +7925,7 @@ index 0000000..7c11135
 +pub(crate) const MAC_AX_TX_BURST_2048B: u32 = 0x7;
 +pub(crate) const MAC_AX_TX_BURST_V1_256B: u32 = 0x2;
 +pub(crate) const MAC_AX_WD_DMA_INTVL_256NS: u32 = 0x1;
++pub(crate) const MAC_REG_POOL_COUNT: u32 = 0xa;
 +pub(crate) const MANUAL_LVL_MASK: u32 = 0x1e0;
 +pub(crate) const MDIO_PG0_G1: u32 = 0x0;
 +pub(crate) const MDIO_PG0_G2: u32 = 0x2;
@@ -7359,6 +7933,7 @@ index 0000000..7c11135
 +pub(crate) const MDIO_PG1_G2: u32 = 0x3;
 +pub(crate) const MPDU_INFO_B1_OFST: u32 = 0x12;
 +pub(crate) const NAV_25MS: u32 = 0xc4;
++pub(crate) const NUMP: u32 = 0x1;
 +pub(crate) const OFFSET_CAL_MASK: u32 = 0xf0;
 +pub(crate) const OFFSET_CAL_MODE: u32 = 0x2000;
 +pub(crate) const OOBS_LEVEL_MASK: u32 = 0x1f00;
@@ -7377,6 +7952,9 @@ index 0000000..7c11135
 +pub(crate) const PRELD_MISCQ_ENT_NUM_8922A: u32 = 0x2;
 +pub(crate) const PRELD_NEXT_MIN_SIZE: u32 = 0xff;
 +pub(crate) const PRELD_NEXT_WND: u32 = 0x1;
++pub(crate) const PWR_INTF_MSK_ALL: u32 = 0x7;
++pub(crate) const PWR_INTF_MSK_PCIE: u32 = 0x4;
++pub(crate) const PWR_INTF_MSK_USB: u32 = 0x2;
 +pub(crate) const RAC_ANA03: u32 = 0x3;
 +pub(crate) const RAC_ANA09: u32 = 0x9;
 +pub(crate) const RAC_ANA0B: u32 = 0xb;
@@ -7639,6 +8217,7 @@ index 0000000..7c11135
 +pub(crate) const RTW89_C2HREG_PHYCAP_W1_PROT: u32 = 0xff00;
 +pub(crate) const RTW89_C2HREG_PHYCAP_W1_PROT_11BE: u32 = 0x4;
 +pub(crate) const RTW89_C2H_TIMEOUT: u32 = 0xf4240;
++pub(crate) const RTW89_C2H_TIMEOUT_USB: u32 = 0xfa0;
 +pub(crate) const RTW89_CHIP_BE: u32 = 0x1;
 +pub(crate) const RTW89_CORE_RX_TYPE_C2H: u32 = 0xa;
 +pub(crate) const RTW89_CORE_RX_TYPE_FWDL: u32 = 0xe;
@@ -7737,11 +8316,13 @@ index 0000000..7c11135
 +pub(crate) const RTW89_H2C_ROLE_MAINTAIN_W0_UPD_MODE: u32 = 0x1c00;
 +pub(crate) const RTW89_H2C_ROLE_MAINTAIN_W0_WIFI_ROLE: u32 = 0x1e000;
 +pub(crate) const RTW89_HCIFC_POH: u32 = 0x0;
++pub(crate) const RTW89_HCIFC_STF: u32 = 0x1;
 +pub(crate) const RTW89_HW_RATE_CCK1: u32 = 0x0;
 +pub(crate) const RTW89_LAST_RPWM_ACTIVE: u32 = 0x6;
 +pub(crate) const RTW89_LAST_RPWM_PS: u32 = 0x0;
 +pub(crate) const RTW89_MAC_AX_PS_MODE_ACTIVE: u32 = 0x0;
 +pub(crate) const RTW89_MAC_AX_PS_MODE_LEGACY: u32 = 0x1;
++pub(crate) const RTW89_MAX_BULKOUT_NUM: u32 = 0x7;
 +pub(crate) const RTW89_MGMT_HW_SEQ_MODE: u32 = 0x1;
 +pub(crate) const RTW89_MGMT_HW_SSN_SEL: u32 = 0x1;
 +pub(crate) const RTW89_NET_TYPE_AP_MODE: u32 = 0x3;
@@ -7769,12 +8350,15 @@ index 0000000..7c11135
 +pub(crate) const RTW89_PPDU_MAC_RX_CNT_SIZE_V1: u32 = 0x80;
 +pub(crate) const RTW89_PPE_BW_NUM: u32 = 0x5;
 +pub(crate) const RTW89_PRPT_DEST_HOST: u32 = 0x1;
++pub(crate) const RTW89_QTA_SCC: u32 = 0x0;
++pub(crate) const RTW89_R32_DEAD: u32 = 0xdeadbeef;
 +pub(crate) const RTW89_RF_ADDR_ADSEL_MASK: u32 = 0x10000;
 +pub(crate) const RTW89_ROLE_CREATE: u32 = 0x0;
 +pub(crate) const RTW89_ROLE_INFO_CHANGE: u32 = 0x3;
 +pub(crate) const RTW89_ROLE_REMOVE: u32 = 0x1;
 +pub(crate) const RTW89_ROLE_TYPE_CHANGE: u32 = 0x2;
 +pub(crate) const RTW89_RPR_MODE_POH: u32 = 0x0;
++pub(crate) const RTW89_RPR_MODE_STF: u32 = 0x1;
 +pub(crate) const RTW89_RXINFO_W0_INVALID_V1: u32 = 0x8000000;
 +pub(crate) const RTW89_RXINFO_W0_PLCP_LEN_V1: u32 = 0xff0000;
 +pub(crate) const RTW89_RXINFO_W0_RX_CNT_VLD: u32 = 0x20000000;
@@ -7798,6 +8382,7 @@ index 0000000..7c11135
 +pub(crate) const RTW89_TXWD_BODY0_HDR_LLC_LEN: u32 = 0xf800;
 +pub(crate) const RTW89_TXWD_BODY0_HW_SSN_MODE: u32 = 0x3;
 +pub(crate) const RTW89_TXWD_BODY0_HW_SSN_SEL: u32 = 0xc;
++pub(crate) const RTW89_TXWD_BODY0_STF_MODE: u32 = 0x400;
 +pub(crate) const RTW89_TXWD_BODY0_WD_INFO_EN: u32 = 0x400000;
 +pub(crate) const RTW89_TXWD_BODY0_WD_PAGE: u32 = 0x80;
 +pub(crate) const RTW89_TXWD_BODY0_WP_OFFSET: u32 = 0xff000000;
@@ -7824,11 +8409,18 @@ index 0000000..7c11135
 +pub(crate) const RTW89_TXWD_INFO2_SEC_TYPE: u32 = 0x1e00;
 +pub(crate) const RTW89_TXWD_INFO4_HW_RTS_EN: u32 = 0x80000000;
 +pub(crate) const RTW89_TXWD_INFO4_RTS_EN: u32 = 0x8000000;
++pub(crate) const RTW89_TX_QSEL_B0_HI: u32 = 0x11;
 +pub(crate) const RTW89_TX_QSEL_B0_MGMT: u32 = 0x12;
 +pub(crate) const RTW89_TX_QSEL_BE_0: u32 = 0x0;
 +pub(crate) const RTW89_TX_QSEL_BK_0: u32 = 0x1;
 +pub(crate) const RTW89_TX_QSEL_VI_0: u32 = 0x2;
 +pub(crate) const RTW89_TX_QSEL_VO_0: u32 = 0x3;
++pub(crate) const RTW89_USB_MAX_TX_URBS_PER_CH: u32 = 0x80;
++pub(crate) const RTW89_USB_MOD512_PADDING: u32 = 0x4;
++pub(crate) const RTW89_USB_RECVBUF_SZ: u32 = 0x5000;
++pub(crate) const RTW89_USB_RXCB_NUM: u32 = 0x8;
++pub(crate) const RTW89_USB_VENQT: u32 = 0x5;
++pub(crate) const RTW89_USB_VENQT_WRITE: u32 = 0x40;
 +pub(crate) const RTW89_WIFI_ROLE_AP: u32 = 0x2;
 +pub(crate) const RTW89_WIFI_ROLE_STATION: u32 = 0x1;
 +pub(crate) const RX_FLTR_FRAME_ACCEPT_BE: u32 = 0xffff;
@@ -7957,6 +8549,8 @@ index 0000000..7c11135
 +pub(crate) const R_AX_CH_PAGE_CTRL: u32 = 0x8a04;
 +pub(crate) const R_AX_CK_EN: u32 = 0xc004;
 +pub(crate) const R_AX_CMAC_FUNC_EN: u32 = 0xc000;
++pub(crate) const R_AX_CMAC_REG_END: u32 = 0xffff;
++pub(crate) const R_AX_CMAC_REG_START: u32 = 0xc000;
 +pub(crate) const R_AX_CSR_MODE: u32 = 0xda40;
 +pub(crate) const R_AX_CTN_TXEN: u32 = 0xc348;
 +pub(crate) const R_AX_CTRL_FLTR: u32 = 0xce24;
@@ -7989,6 +8583,8 @@ index 0000000..7c11135
 +pub(crate) const R_AX_HAXI_INIT_CFG1: u32 = 0x1000;
 +pub(crate) const R_AX_HCI_BG_CTRL: u32 = 0x78;
 +pub(crate) const R_AX_HCI_FC_CTRL: u32 = 0x8a00;
++pub(crate) const R_AX_HCI_FUNC_EN: u32 = 0x8380;
++pub(crate) const R_AX_HCI_FUNC_EN_V1: u32 = 0x7880;
 +pub(crate) const R_AX_HCI_LDO_CTRL: u32 = 0x7a;
 +pub(crate) const R_AX_HCI_OPT_CTRL: u32 = 0x74;
 +pub(crate) const R_AX_HIMR0: u32 = 0x1a0;
@@ -8116,10 +8712,15 @@ index 0000000..7c11135
 +pub(crate) const R_AX_RPQ_RXBD_NUM: u32 = 0x1022;
 +pub(crate) const R_AX_RPQ_RXBD_NUM_V1: u32 = 0x1212;
 +pub(crate) const R_AX_RSP_CHK_SIG: u32 = 0xcc00;
++pub(crate) const R_AX_RSV_CTRL: u32 = 0x1c;
 +pub(crate) const R_AX_RTK_MODE_CFG_V1: u32 = 0xda04;
++pub(crate) const R_AX_RXAGG_0: u32 = 0x8900;
++pub(crate) const R_AX_RXAGG_0_V1: u32 = 0x6000;
++pub(crate) const R_AX_RXAGG_1_V1: u32 = 0x6004;
 +pub(crate) const R_AX_RXBD_RWPTR_CLR: u32 = 0x1018;
 +pub(crate) const R_AX_RXBD_RWPTR_CLR_V1: u32 = 0x1200;
 +pub(crate) const R_AX_RXDMA_CTRL_0: u32 = 0xc804;
++pub(crate) const R_AX_RXDMA_SETTING: u32 = 0x8908;
 +pub(crate) const R_AX_RXQ_RXBD_DESA_L: u32 = 0x1100;
 +pub(crate) const R_AX_RXQ_RXBD_DESA_L_V1: u32 = 0x1220;
 +pub(crate) const R_AX_RXQ_RXBD_IDX: u32 = 0x1050;
@@ -8170,6 +8771,16 @@ index 0000000..7c11135
 +pub(crate) const R_AX_TX_SUB_CARRIER_VALUE: u32 = 0xc088;
 +pub(crate) const R_AX_UDM1: u32 = 0x1f4;
 +pub(crate) const R_AX_UDM2: u32 = 0x1f8;
++pub(crate) const R_AX_USB3_MAC_NPI_CONFIG_INTF_0: u32 = 0x1114;
++pub(crate) const R_AX_USB3_MAC_NPI_CONFIG_INTF_0_V1: u32 = 0x5114;
++pub(crate) const R_AX_USB_ENDPOINT_0: u32 = 0x1060;
++pub(crate) const R_AX_USB_ENDPOINT_0_V1: u32 = 0x5060;
++pub(crate) const R_AX_USB_ENDPOINT_2: u32 = 0x1068;
++pub(crate) const R_AX_USB_ENDPOINT_2_V1: u32 = 0x5068;
++pub(crate) const R_AX_USB_HOST_REQUEST_2: u32 = 0x1078;
++pub(crate) const R_AX_USB_HOST_REQUEST_2_V1: u32 = 0x5078;
++pub(crate) const R_AX_USB_WLAN0_1: u32 = 0x1174;
++pub(crate) const R_AX_USB_WLAN0_1_V1: u32 = 0x5174;
 +pub(crate) const R_AX_WCPU_FW_CTRL: u32 = 0x1e0;
 +pub(crate) const R_AX_WDE_INI_STATUS: u32 = 0x8d00;
 +pub(crate) const R_AX_WDE_PKTBUF_CFG: u32 = 0x8c08;
@@ -8888,6 +9499,9 @@ index 0000000..7c11135
 +pub(crate) const TXBD_HW_IDX_MASK: u32 = 0xfff0000;
 +pub(crate) const TXDFIFO_HIGH_MCS_THRE: u32 = 0x7;
 +pub(crate) const TXDFIFO_LOW_MCS_THRE: u32 = 0x7;
++pub(crate) const USB11_BULKSIZE: u32 = 0x2;
++pub(crate) const USB2_BULKSIZE: u32 = 0x1;
++pub(crate) const USB3_BULKSIZE: u32 = 0x0;
 +pub(crate) const WDE_MGN_INI_RDY: u32 = 0x3;
 +pub(crate) const WDRLS_DEST_QID_POH: u32 = 0x1;
 +pub(crate) const WDT_CTRL_ALL_DIS: u32 = 0x0;
@@ -18801,10 +19415,10 @@ index 0000000..9490a19
 +}
 diff --git a/kernel/comps/rtw89/src/sta.rs b/kernel/comps/rtw89/src/sta.rs
 new file mode 100644
-index 0000000..8eb445b
+index 0000000..ced3fb3
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/sta.rs
-@@ -0,0 +1,2461 @@
+@@ -0,0 +1,2457 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface as mac80211 runs it over rtw89 on the 802.11ax chips: the
@@ -18841,7 +19455,8 @@ index 0000000..8eb445b
 +    fw::{Firmware, H2c, Secure, TxPowerTrack, words},
 +    hal::{ChipId, Hal, field, get},
 +    mac::{self, Efuse, Tssi},
-+    pci::{Pci, TX_FRAME_MAX, TXCH_ACH0, TXCH_CH8, TxDesc},
++    hci::{self, Hci},
++    pci::{TX_FRAME_MAX, TxDesc},
 +    phy,
 +    regs::*,
 +    rtw8851b_rfk, rtw8852a_rfk, rtw8852b, rtw8852b_rfk, rtw8852bt_rfk, rtw8852c_rfk, rtw88xx,
@@ -19004,6 +19619,11 @@ index 0000000..8eb445b
 +        crc_err: w3 & BE_RXD_CRC32_ERR != 0,
 +        offset: shift + drv_info + phy_rpt + hdr_cnv + rxd_len,
 +    })
++}
++
++/// A packet's length from its RX descriptor on (USB's aggregates).
++pub(crate) fn rx_packet_len(be: bool, data: &[u8]) -> Option<usize> {
++    rx_desc(be, data).map(|desc| desc.offset + desc.pkt_size)
 +}
 +
 +/// Where a report's entries start after its RX descriptor (for the
@@ -19217,7 +19837,7 @@ index 0000000..8eb445b
 +
 +pub(crate) struct Rtw89 {
 +    pub(crate) hal: Hal,
-+    pci: Pci,
++    pub(crate) hci: Hci,
 +    fw: Firmware,
 +    h2c: H2c,
 +    secure: Secure,
@@ -19376,12 +19996,12 @@ index 0000000..8eb445b
 +}
 +
 +impl Rtw89 {
-+    pub(crate) fn new(hal: Hal, pci: Pci, fw: Firmware, secure: Secure, efuse: Efuse) -> Self {
++    pub(crate) fn new(hal: Hal, hci: Hci, fw: Firmware, secure: Secure, efuse: Efuse) -> Self {
 +        let address = efuse.address;
 +        let host_rfk = HostRfk::of(hal.id());
 +        Self {
 +            hal,
-+            pci,
++            hci,
 +            fw,
 +            h2c: H2c::new(),
 +            secure,
@@ -19420,7 +20040,7 @@ index 0000000..8eb445b
 +        let packet = self.h2c.packet(cat, class, func, rack, dack, payload);
 +        let deadline = crate::now_ms() + 200;
 +        loop {
-+            match self.pci.send_h2c(&self.hal, &packet, false) {
++            match self.hci.send_h2c(&self.hal, &packet, false) {
 +                Ok(()) => return Ok(()),
 +                Err(error) if crate::now_ms() >= deadline => return Err(String::from(error)),
 +                Err(_) => crate::delay_us(50),
@@ -19437,10 +20057,10 @@ index 0000000..8eb445b
 +        // `rtw89_mac_partial_init`: the DMA's TX and RX, the download's
 +        // memory, the rings, the firmware.
 +        mac::dmac_pre_init(&self.hal)?;
-+        self.pci.mac_pre_init(&self.hal).map_err(String::from)?;
++        self.hci.mac_pre_init(&self.hal).map_err(String::from)?;
 +        let mut tries = 0;
 +        loop {
-+            match self.fw.download(&self.hal, &mut self.pci, &mut self.h2c, &self.secure) {
++            match self.fw.download(&self.hal, &mut self.hci, &mut self.h2c, &self.secure) {
 +                Ok(()) => break,
 +                Err(error) if tries >= 4 => return Err(error),
 +                Err(_) => tries += 1,
@@ -19451,13 +20071,13 @@ index 0000000..8eb445b
 +        mac::enable_bb_rf(&self.hal)?;
 +        mac::sys_init(&self.hal);
 +        mac::trx_init(&self.hal, DEFAULT_AX_RX_FLTR)?;
-+        self.pci.mac_post_init(&self.hal);
++        self.hci.mac_post_init(&self.hal);
 +        // `rtw89_fw_h2c_set_ofld_cfg`.
 +        self.h2c_send(H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, H2C_FUNC_OFLD_CFG, false, true, &[0x09, 0, 0, 0, 0x5e, 0, 0, 0])?;
 +        // The PHY: tables, then the dynamic part (`rtw89_phy_dm_init`).
 +        phy::init_bb(&self.hal, &self.fw);
 +        self.bb_reset();
-+        phy::init_rf(&self.hal, &self.fw, &mut self.pci, &mut self.h2c);
++        phy::init_rf(&self.hal, &self.fw, &mut self.hci, &mut self.h2c);
 +        self.btc_init();
 +        self.bb_sethw();
 +        phy::init_nctl(&self.hal, &self.fw);
@@ -19467,7 +20087,7 @@ index 0000000..8eb445b
 +        rtw8852b_rfk::power_trim(&self.hal, &self.efuse, self.hal.chip.rf_paths);
 +        self.cfg_txrx_path(true);
 +        ppdu_status(&self.hal, true);
-+        self.pci.enable_interrupts(&self.hal);
++        self.hci.enable_interrupts(&self.hal);
 +        // The interface (`rtw89_mac_vif_init`).
 +        mac::port_update(&self.hal, RTW89_NET_TYPE_NO_LINK, 100, 1);
 +        mac::tables_init(&self.hal, MAC_ID);
@@ -19484,7 +20104,7 @@ index 0000000..8eb445b
 +    fn download(&mut self) -> Result<(), String> {
 +        let mut tries = 0;
 +        loop {
-+            match self.fw.download(&self.hal, &mut self.pci, &mut self.h2c, &self.secure) {
++            match self.fw.download(&self.hal, &mut self.hci, &mut self.h2c, &self.secure) {
 +                Ok(()) => break,
 +                Err(error) if tries >= 4 => return Err(error),
 +                Err(_) => tries += 1,
@@ -19502,7 +20122,7 @@ index 0000000..8eb445b
 +    fn bring_up_be(&mut self) -> Result<(), String> {
 +        rtw8922a::bb_preinit(&self.hal);
 +        be::dmac_pre_init(&self.hal)?;
-+        self.pci.mac_pre_init(&self.hal).map_err(String::from)?;
++        self.hci.mac_pre_init(&self.hal).map_err(String::from)?;
 +        be::fwdl_preconfig(&self.hal);
 +        self.download()?;
 +        self.features = Features::of(self.fw.version);
@@ -19528,13 +20148,13 @@ index 0000000..8eb445b
 +            let w0 = field(RTW89_H2C_BA_CAM_INIT_USERS_MASK, users) | field(RTW89_H2C_BA_CAM_INIT_OFFSET_MASK, offset) | field(RTW89_H2C_BA_CAM_INIT_BAND_SEL, band);
 +            self.h2c_send(H2C_CAT_MAC, H2C_CL_BA_CAM, H2C_FUNC_MAC_BA_CAM_INIT, false, true, &words(&[w0]))?;
 +        }
-+        self.pci.mac_post_init(&self.hal);
++        self.hci.mac_post_init(&self.hal);
 +        self.h2c_send(H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, H2C_FUNC_OFLD_CFG, false, true, &[0x09, 0, 0, 0, 0x5e, 0, 0, 0])?;
 +        rtw8922a::reset_bb_rf(&self.hal);
 +        phy::init_bb(&self.hal, &self.fw);
 +        self.bb_gain = rtw8922a::bb_gain(&self.hal, &self.fw);
 +        rtw8922a::bb_postinit(&self.hal);
-+        phy::init_rf(&self.hal, &self.fw, &mut self.pci, &mut self.h2c);
++        phy::init_rf(&self.hal, &self.fw, &mut self.hci, &mut self.h2c);
 +        rtw8922a::btc_init(&self.hal);
 +        // `rtw89_phy_dm_init`.
 +        rtw8922a::bb_sethw(&self.hal, 0);
@@ -19549,7 +20169,7 @@ index 0000000..8eb445b
 +        self.hal.w32_mask(R_BE_RCR, B_BE_PHY_RPT_SZ_MASK, MAC_AX_PHY_RPT_SIZE_8);
 +        self.hal.w32_mask(R_BE_RCR, B_BE_HDR_CNV_SZ_MASK, MAC_AX_HDR_CNV_SIZE_0);
 +        self.hal.w32_mask(R_BE_DRV_INFO_OPTION, B_BE_DRV_INFO_PHYRPT_EN, 1);
-+        self.pci.enable_interrupts(&self.hal);
++        self.hci.enable_interrupts(&self.hal);
 +        mac::port_update(&self.hal, RTW89_NET_TYPE_NO_LINK, 100, 1);
 +        self.macid_pause(false)?;
 +        self.role_maintain(RTW89_ROLE_CREATE)?;
@@ -20707,12 +21327,7 @@ index 0000000..8eb445b
 +                6 | 7 => RTW89_TX_QSEL_VO_0,
 +                _ => RTW89_TX_QSEL_BE_0,
 +            };
-+            desc.channel = match desc.qsel {
-+                RTW89_TX_QSEL_BK_0 => TXCH_ACH0 + 1,
-+                RTW89_TX_QSEL_VI_0 => TXCH_ACH0 + 2,
-+                RTW89_TX_QSEL_VO_0 => TXCH_ACH0 + 3,
-+                _ => TXCH_ACH0,
-+            };
++            desc.channel = hci::ch_dma(&self.hal, desc.qsel);
 +            desc.tid_indicate = matches!(tid, 2 | 3 | 5 | 7);
 +            if desc.bmc || !self.associated {
 +                desc.use_rate = true;
@@ -20720,7 +21335,7 @@ index 0000000..8eb445b
 +            }
 +        } else {
 +            desc.qsel = RTW89_TX_QSEL_B0_MGMT;
-+            desc.channel = TXCH_CH8;
++            desc.channel = hci::ch_dma(&self.hal, desc.qsel);
 +            desc.use_rate = true;
 +            desc.rate = self.lowest_rate();
 +            desc.hw_seq = true;
@@ -20728,7 +21343,7 @@ index 0000000..8eb445b
 +        if frame.len() > TX_FRAME_MAX {
 +            return Err(radio::Error::Invalid);
 +        }
-+        self.pci.send_frame(&self.hal, &desc, &frame).map_err(|_| radio::Error::Busy)
++        self.hci.send_frame(&self.hal, &desc, &frame).map_err(|_| radio::Error::Busy)
 +    }
 +
 +    fn lowest_rate(&self) -> u32 {
@@ -20930,12 +21545,7 @@ index 0000000..8eb445b
 +            6 | 7 => RTW89_TX_QSEL_VO_0,
 +            _ => RTW89_TX_QSEL_BE_0,
 +        };
-+        desc.channel = match desc.qsel {
-+            RTW89_TX_QSEL_BK_0 => TXCH_ACH0 + 1,
-+            RTW89_TX_QSEL_VI_0 => TXCH_ACH0 + 2,
-+            RTW89_TX_QSEL_VO_0 => TXCH_ACH0 + 3,
-+            _ => TXCH_ACH0,
-+        };
++        desc.channel = hci::ch_dma(&self.hal, desc.qsel);
 +        desc.tid_indicate = matches!(tid, 2 | 3 | 5 | 7);
 +        desc.lowest_rate = lowest;
 +        if multicast {
@@ -20945,7 +21555,7 @@ index 0000000..8eb445b
 +        if frame.len() > TX_FRAME_MAX {
 +            return Err(radio::Error::Invalid);
 +        }
-+        self.pci.send_frame(&self.hal, &desc, &frame).map_err(|_| radio::Error::Busy)
++        self.hci.send_frame(&self.hal, &desc, &frame).map_err(|_| radio::Error::Busy)
 +    }
 +
 +    // ---- What the chip says. ----
@@ -20954,17 +21564,17 @@ index 0000000..8eb445b
 +        if self.dead {
 +            return;
 +        }
-+        if !self.hal.present() {
++        if !self.hal.alive() {
 +            ostd::warn!("rtw89: the card is gone");
 +            self.died();
 +            return;
 +        }
-+        if self.pci.acknowledge(&self.hal) {
++        if self.hci.acknowledge(&self.hal) {
 +            ostd::warn!("rtw89: the firmware halted ({:#x}); the card stays off until the next boot", self.hal.r32(R_AX_HALT_C2H));
 +            self.died();
 +            return;
 +        }
-+        for packet in self.pci.receive(&self.hal) {
++        for packet in self.hci.receive(&self.hal) {
 +            self.handle(&packet);
 +        }
 +        self.flush_held(None, None);
@@ -21071,7 +21681,7 @@ index 0000000..8eb445b
 +
 +    fn died(&mut self) {
 +        self.dead = true;
-+        self.pci.disable_interrupts(&self.hal);
++        self.hci.disable_interrupts(&self.hal);
 +        if let Some(device) = &self.device {
 +            if self.scan.take().is_some() {
 +                device.scan_done(true);
@@ -21265,6 +21875,306 @@ index 0000000..8eb445b
 +    }
 +    let raw = get(RTW89_PHY_STS_HDR_W0_RSSI_AVG, hdr) as i32;
 +    Some(((raw >> 1) - 110).clamp(-110, -1) as i8)
++}
+diff --git a/kernel/comps/rtw89/src/usb.rs b/kernel/comps/rtw89/src/usb.rs
+new file mode 100644
+index 0000000..dfeafdb
+--- /dev/null
++++ b/kernel/comps/rtw89/src/usb.rs
+@@ -0,0 +1,294 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The USB side as Linux's rtw89 `usb.c` runs the 802.11ax adapters: the
++//! registers through vendor requests (`RTW89_USB_VENQT`, the address's
++//! third byte in the index; the CMAC's read again while they say
++//! `0xdeadbeef`, its clocks forced on), each DMA channel's frames on the
++//! bulk OUT endpoint `bulkout_id` names (the TX descriptor's body and
++//! info, the store-and-forward bit set, then the frame), the firmware's
++//! commands on theirs (padded off a multiple of 512 bytes), and frames
++//! and events received in aggregates on the bulk IN endpoint, eight reads
++//! always waiting.
++
++use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++
++use aster_usb::driver::{Notify, Transfer, UsbInterface};
++
++use crate::{
++    hal::{Hal, UsbSpec, field},
++    pci::{self, TxDesc},
++    regs::*,
++};
++
++const READ_TIMEOUT_MS: u32 = 500;
++const WRITE_TIMEOUT_MS: u32 = 500;
++/// The attempts of a vendor request, and the failures in a row after which
++/// the adapter counts as unplugged.
++const ATTEMPTS: usize = 10;
++const ERRORS_UNPLUGGED: u32 = 4;
++/// How long a failed read waits to be submitted again.
++const RX_RETRY_MS: u64 = 50;
++/// The RX aggregates' alignment (`rx_agg_alignment`).
++const RX_AGG_ALIGN: usize = 8;
++
++/// The chip's registers over USB.
++pub(crate) struct UsbRegs {
++    interface: Arc<UsbInterface>,
++    errors: AtomicU32,
++    unplugged: AtomicBool,
++}
++
++impl UsbRegs {
++    pub(crate) fn new(interface: Arc<UsbInterface>) -> Self {
++        Self { interface, errors: AtomicU32::new(0), unplugged: AtomicBool::new(false) }
++    }
++
++    pub(crate) fn gone(&self) -> bool {
++        self.unplugged.load(Ordering::Relaxed) || self.interface.is_gone()
++    }
++
++    /// One vendor request, tried again as `rtw89_usb_vendorreq` does; the
++    /// adapter counts as unplugged after failures in a row.
++    fn request(&self, addr: u32, read: Option<usize>, data: &[u8]) -> Option<Vec<u8>> {
++        if self.gone() {
++            return None;
++        }
++        let value = addr as u16;
++        let index = ((addr >> 16) & 0xff) as u16;
++        for _ in 0..ATTEMPTS {
++            let result = match read {
++                Some(len) => self.interface.control_in(RTW89_USB_VENQT_WRITE as u8, RTW89_USB_VENQT as u8, value, index, len, READ_TIMEOUT_MS).ok().filter(|reply| reply.len() >= len),
++                None => self.interface.control_out(RTW89_USB_VENQT_WRITE as u8, RTW89_USB_VENQT as u8, value, index, data, WRITE_TIMEOUT_MS).ok().map(|()| Vec::new()),
++            };
++            if let Some(reply) = result {
++                self.errors.store(0, Ordering::Relaxed);
++                return Some(reply);
++            }
++            if self.interface.is_gone() || self.errors.fetch_add(1, Ordering::Relaxed) + 1 > ERRORS_UNPLUGGED {
++                if !self.unplugged.swap(true, Ordering::Relaxed) {
++                    ostd::warn!("rtw89: the USB adapter stopped answering");
++                }
++                return None;
++            }
++        }
++        None
++    }
++
++    fn read_raw(&self, addr: u32, len: usize) -> u32 {
++        match self.request(addr, Some(len), &[]) {
++            Some(reply) => {
++                let mut bytes = [0u8; 4];
++                bytes[..len].copy_from_slice(&reply[..len]);
++                u32::from_le_bytes(bytes)
++            }
++            None => u32::MAX >> (32 - 8 * len as u32),
++        }
++    }
++
++    /// `rtw89_usb_ops_read*`: the CMAC's registers 32 bits at a time
++    /// (`rtw89_usb_read_cmac`), read again while its clock is off.
++    pub(crate) fn read(&self, addr: u32, len: usize) -> u32 {
++        if !(R_AX_CMAC_REG_START..=R_AX_CMAC_REG_END).contains(&addr) {
++            return self.read_raw(addr, len);
++        }
++        let aligned = addr & !3;
++        let mut value = self.read_raw(aligned, 4);
++        let mut count = 0;
++        while value == RTW89_R32_DEAD && !self.gone() {
++            if count >= MAC_REG_POOL_COUNT {
++                break;
++            }
++            count += 1;
++            self.write(R_AX_CK_EN, B_AX_CMAC_ALLCKEN, 4);
++            value = self.read_raw(aligned, 4);
++        }
++        value >> ((addr & 3) * 8)
++    }
++
++    pub(crate) fn write(&self, addr: u32, value: u32, len: usize) {
++        let _ = self.request(addr, None, &value.to_le_bytes()[..len]);
++    }
++}
++
++/// The USB side of a chip.
++pub(crate) struct Usb {
++    interface: Arc<UsbInterface>,
++    spec: &'static UsbSpec,
++    bulk_in: u8,
++    bulk_out: Vec<u8>,
++    rx: VecDeque<Transfer>,
++    tx: VecDeque<Transfer>,
++    receiving: bool,
++    rx_retry_at: u64,
++    notify: Notify,
++    pub(crate) speed: u32,
++}
++
++impl Usb {
++    /// `rtw89_usb_parse`: the first bulk IN endpoint and the bulk OUT ones
++    /// in order.
++    pub(crate) fn new(interface: Arc<UsbInterface>, spec: &'static UsbSpec, notify: Notify) -> Result<Self, String> {
++        let mut bulk_in = None;
++        let mut bulk_out = Vec::new();
++        for endpoint in interface.endpoints.iter().filter(|endpoint| !endpoint.interrupt) {
++            if endpoint.is_in() {
++                bulk_in.get_or_insert(endpoint.address);
++            } else {
++                bulk_out.push(endpoint.address);
++            }
++        }
++        let bulk_in = bulk_in.ok_or_else(|| String::from("no bulk IN endpoint"))?;
++        if bulk_out.is_empty() || bulk_out.len() > RTW89_MAX_BULKOUT_NUM as usize {
++            return Err(format!("{} bulk OUT endpoints", bulk_out.len()));
++        }
++        let speed = interface.speed;
++        Ok(Self { interface, spec, bulk_in, bulk_out, rx: VecDeque::new(), tx: VecDeque::new(), receiving: false, rx_retry_at: 0, notify, speed })
++    }
++
++    /// A DMA channel's endpoint; an adapter with fewer endpoints than the
++    /// table names sends on its last.
++    fn endpoint(&self, channel: usize) -> u8 {
++        let id = self.spec.bulkout_id.get(channel).copied().unwrap_or(0) as usize;
++        self.bulk_out.get(id).or(self.bulk_out.last()).copied().unwrap_or(0)
++    }
++
++    /// The reads that wait for frames (`rtw89_usb_start_rx`).
++    pub(crate) fn start_rx(&mut self) {
++        self.receiving = true;
++        self.top_up();
++    }
++
++    fn top_up(&mut self) {
++        if !self.receiving || crate::now_ms() < self.rx_retry_at || self.interface.is_gone() {
++            return;
++        }
++        while self.rx.len() < RTW89_USB_RXCB_NUM as usize {
++            match self.interface.submit_read(self.bulk_in, RTW89_USB_RECVBUF_SZ as usize, Some(self.notify.clone())) {
++                Ok(transfer) => self.rx.push_back(transfer),
++                Err(_) => break,
++            }
++        }
++    }
++
++    /// `rtw89_usb_ops_mac_pre_init`: the USB I/O mode, the USB DMA's resets
++    /// let go, the HCI's DMA off and on (Realtek's fix for a hang).
++    pub(crate) fn mac_pre_init(&self, hal: &Hal) {
++        let v1 = self.spec.v1;
++        hal.set32(if v1 { R_AX_USB_HOST_REQUEST_2_V1 } else { R_AX_USB_HOST_REQUEST_2 }, B_AX_R_USBIO_MODE);
++        hal.clr32(if v1 { R_AX_USB_WLAN0_1_V1 } else { R_AX_USB_WLAN0_1 }, B_AX_USBRX_RST | B_AX_USBTX_RST);
++        let func_en = if v1 { R_AX_HCI_FUNC_EN_V1 } else { R_AX_HCI_FUNC_EN };
++        let value = hal.r32(func_en) & !(B_AX_HCI_RXDMA_EN | B_AX_HCI_TXDMA_EN);
++        hal.w32(func_en, value);
++        hal.w32(func_en, value | B_AX_HCI_RXDMA_EN | B_AX_HCI_TXDMA_EN);
++    }
++
++    /// `rtw89_usb_ops_mac_post_init`: the USB 3 PHY's LFPS filter off, the
++    /// RX DMA's bulk size by the link's speed, one packet per transfer on
++    /// each endpoint, then RX aggregation (`rtw89_usb_rx_agg_cfg`): up to
++    /// 20 KiB, flushed after 32 × 32 µs.
++    pub(crate) fn mac_post_init(&self, hal: &Hal) {
++        let v1 = self.spec.v1;
++        hal.clr32(if v1 { R_AX_USB3_MAC_NPI_CONFIG_INTF_0_V1 } else { R_AX_USB3_MAC_NPI_CONFIG_INTF_0 }, B_AX_SSPHY_LFPS_FILTER);
++        let bulk = match self.speed {
++            4.. => USB3_BULKSIZE,
++            3 => USB2_BULKSIZE,
++            _ => USB11_BULKSIZE,
++        };
++        hal.w8(R_AX_RXDMA_SETTING, bulk as u8);
++        let (endpoint_0, endpoint_2) = if v1 { (R_AX_USB_ENDPOINT_0_V1, R_AX_USB_ENDPOINT_2_V1) } else { (R_AX_USB_ENDPOINT_0, R_AX_USB_ENDPOINT_2) };
++        for ep in (5..=12).filter(|&ep| ep != 8) {
++            hal.w8_mask(endpoint_0, B_AX_EP_IDX, ep);
++            hal.w8(endpoint_2 + 1, NUMP as u8);
++        }
++        if v1 {
++            hal.w32(R_AX_RXAGG_0_V1, B_AX_RXAGG_0_EN | field(B_AX_RXAGG_0_NUM_TH, 255) | field(B_AX_RXAGG_0_TIME_32US_TH, 32) | field(B_AX_RXAGG_0_BUF_SZ_1K, 20));
++            hal.w32(R_AX_RXAGG_1_V1, 0x1f);
++        } else {
++            hal.w32(R_AX_RXAGG_0, B_AX_RXAGG_0_EN | field(B_AX_RXAGG_0_NUM_TH, 0) | field(B_AX_RXAGG_0_TIME_32US_TH, 32) | field(B_AX_RXAGG_0_BUF_SZ_4K, 5));
++        }
++    }
++
++    /// Forgets the TX transfers that ended.
++    fn reap(&mut self) {
++        while self.tx.front().is_some_and(|transfer| transfer.result().is_some()) {
++            self.tx.pop_front();
++        }
++    }
++
++    /// A firmware command (`rtw89_usb_tx_write_fwcmd`): its descriptor and
++    /// the command, four bytes more when they would fill 512-byte packets
++    /// exactly; sent and waited for (the driver checks its effect next).
++    pub(crate) fn send_h2c(&mut self, hal: &Hal, h2c: &[u8], fwdl: bool) -> Result<(), &'static str> {
++        let desc_size = hal.chip.h2c_desc;
++        let mut size = h2c.len();
++        if (size + desc_size).is_multiple_of(512) {
++            size += RTW89_USB_MOD512_PADDING as usize;
++        }
++        let mut packet = vec![0u8; desc_size + size];
++        pci::h2c_desc(hal, size, fwdl, &mut packet[..desc_size]);
++        packet[desc_size..desc_size + h2c.len()].copy_from_slice(h2c);
++        let endpoint = self.endpoint(RTW89_DMA_H2C as usize);
++        self.interface.write(endpoint, &packet, true, WRITE_TIMEOUT_MS).map(|_| ()).map_err(|_| "the H2C's transfer failed")
++    }
++
++    /// A frame (`rtw89_usb_ops_tx_write`): the TX descriptor's body and info
++    /// with `STF_MODE`, then the frame, on its channel's endpoint; `Err`
++    /// when the channel has as many transfers in flight as Linux allows.
++    pub(crate) fn send_frame(&mut self, hal: &Hal, desc: &TxDesc, frame: &[u8]) -> Result<(), &'static str> {
++        self.reap();
++        if self.tx.len() >= RTW89_USB_MAX_TX_URBS_PER_CH as usize {
++            return Err("too many frames in flight");
++        }
++        let (mut wd, length) = pci::txwd(hal, desc, frame.len());
++        let word0 = u32::from_le_bytes([wd[0], wd[1], wd[2], wd[3]]) | RTW89_TXWD_BODY0_STF_MODE;
++        wd[0..4].copy_from_slice(&word0.to_le_bytes());
++        let mut packet = Vec::with_capacity(length + frame.len());
++        packet.extend_from_slice(&wd[..length]);
++        packet.extend_from_slice(frame);
++        let endpoint = self.endpoint(desc.channel);
++        let transfer = self.interface.submit_write(endpoint, &packet, true, Some(self.notify.clone())).map_err(|_| "the frame's transfer failed")?;
++        self.tx.push_back(transfer);
++        Ok(())
++    }
++
++    /// What the reads brought (`rtw89_usb_rx_handler`): each aggregate's
++    /// packets, each from its RX descriptor on, the next at the following
++    /// eight-byte boundary; each read that ended is submitted again.
++    pub(crate) fn receive(&mut self, hal: &Hal) -> Vec<Vec<u8>> {
++        let mut out = Vec::new();
++        while self.rx.front().is_some_and(|transfer| transfer.result().is_some()) {
++            let Some(transfer) = self.rx.pop_front() else { break };
++            let Some((status, _)) = transfer.result() else { break };
++            if status >= 0 {
++                split(hal.chip.be, &transfer.data(), &mut out);
++            } else {
++                self.rx_retry_at = crate::now_ms() + RX_RETRY_MS;
++            }
++        }
++        self.reap();
++        self.top_up();
++        out
++    }
++
++    /// Cancels what is pending (`rtw89_usb_cancel_rx_bufs`, `_tx_bufs`).
++    pub(crate) fn stop(&mut self) {
++        self.receiving = false;
++        for transfer in self.rx.drain(..).chain(self.tx.drain(..)) {
++            transfer.cancel();
++        }
++    }
++}
++
++/// An aggregate's packets.
++fn split(be: bool, buffer: &[u8], out: &mut Vec<Vec<u8>>) {
++    let mut at = 0;
++    while at < buffer.len() {
++        let Some(length) = crate::sta::rx_packet_len(be, &buffer[at..]) else { break };
++        if length == 0 || at + length > buffer.len() {
++            break;
++        }
++        out.push(buffer[at..at + length].to_vec());
++        at += length.next_multiple_of(RX_AGG_ALIGN);
++    }
 +}
 diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
 index f5f0007..693b66a 100644

@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 0ac8474..797a933 100644
+index 0ac8474..ed3b245 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -399,6 +399,20 @@ dependencies = [
+@@ -399,6 +399,21 @@ dependencies = [
   "zerocopy",
  ]
  
@@ -15,6 +15,7 @@ index 0ac8474..797a933 100644
 + "aster-firmware",
 + "aster-linuxkpi",
 + "aster-pci",
++ "aster-usb",
 + "aster-wlan",
 + "component",
 + "ostd",
@@ -23,7 +24,7 @@ index 0ac8474..797a933 100644
  [[package]]
  name = "aster-network"
  version = "0.1.0"
-@@ -635,6 +649,7 @@ dependencies = [
+@@ -635,6 +650,7 @@ dependencies = [
   "aster-firmware",
   "aster-i8042",
   "aster-iwlwifi",
@@ -85,10 +86,10 @@ index 87e07b4..634794b 100644
  [target.x86_64-unknown-none.dependencies]
 diff --git a/kernel/comps/mt7921/Cargo.toml b/kernel/comps/mt7921/Cargo.toml
 new file mode 100644
-index 0000000..b38d8c6
+index 0000000..b0225ed
 --- /dev/null
 +++ b/kernel/comps/mt7921/Cargo.toml
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +[package]
 +name = "aster-mt7921"
 +version = "0.1.0"
@@ -100,6 +101,7 @@ index 0000000..b38d8c6
 +aster-firmware.workspace = true
 +aster-linuxkpi.workspace = true
 +aster-pci.workspace = true
++aster-usb.workspace = true
 +aster-wlan.workspace = true
 +component.workspace = true
 +ostd.workspace = true
@@ -138,10 +140,10 @@ index 0000000..eb3e371
 +ships beside the files.
 diff --git a/kernel/comps/mt7921/src/hw.rs b/kernel/comps/mt7921/src/hw.rs
 new file mode 100644
-index 0000000..d2afdac
+index 0000000..a22ce9b
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/hw.rs
-@@ -0,0 +1,957 @@
+@@ -0,0 +1,1190 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip as Linux's mt76 drives it over PCIe (`mt7921/pci.c`,
@@ -149,8 +151,11 @@ index 0000000..d2afdac
 +//! addresses through the bus windows, the WFDMA rings, the MCU's messages
 +//! and the firmware's download (ROM patch, then RAM). The MT7925 has its
 +//! own windows, rings, reset register, MAC addresses and a longer MCU event
-+//! header; the rest is the same.
++//! header; the rest is the same. The USB adapters (`mt792x_usb.c`) reach
++//! the registers by the chip's own addresses and send the MCU's messages
++//! on bulk endpoints ([`crate::usb`]).
 +
++use crate::usb::{EP_IN_CMD_RESP, EP_IN_PKT_RX, EP_OUT_AC_BE, EP_OUT_INBAND_CMD, UsbBus};
 +use alloc::{format, string::String, vec, vec::Vec};
 +use core::cell::Cell;
 +
@@ -352,8 +357,56 @@ index 0000000..d2afdac
 +    }
 +}
 +
++/// The registers' way: BAR 0 through the windows, or USB vendor requests
++/// by the chip's own addresses ([`crate::usb`]).
++enum Io {
++    Mmio(BarAccess),
++    Usb(UsbBus),
++}
++
++/// The USB adapters' registers (`mt792x_regs.h`): the USB DMA's settings,
++/// the firmware download's queue select, the WFDMA's and the DMA
++/// scheduler's chip addresses, the USB block's endpoint reset options, the
++/// Wi-Fi subsystem's reset and its done flags.
++const UDMA_TX_QSEL: u32 = 0x7400_0008;
++const FW_DL_EN: u32 = 1 << 3;
++const UDMA_WLCFG_0: u32 = 0x7400_0018;
++const UDMA_WLCFG_1: u32 = 0x7400_000c;
++const WL_RX_AGG_PKT_LMT: u32 = 0xff;
++const WL_RX_AGG_TO: u32 = 0xff;
++const WL_RX_AGG_LMT: u32 = 0xff00;
++const WL_RX_MPSZ_PAD0: u32 = 1 << 18;
++const WL_RX_FLUSH: u32 = 1 << 19;
++const TICK_1US_EN: u32 = 1 << 20;
++const WL_RX_EN: u32 = 1 << 22;
++const WL_TX_EN: u32 = 1 << 23;
++const UDMA_CONN_INFRA_STATUS: u32 = 0x7400_0a20;
++const UDMA_CONN_WFSYS_INIT_DONE: u32 = 1 << 22;
++const UDMA_CONN_INFRA_STATUS_SEL: u32 = 0x7400_0a24;
++const SSUSB_EPCTL_CSR_EP_RST_OPT: u32 = 0x7401_1890;
++const UWFDMA0_GLO_CFG: u32 = 0x7c02_4208;
++const UWFDMA0_TX_RING_EXT_CTRL: u32 = 0x7c02_4600;
++const GLO_FW_DWLD_BYPASS_DMASHDL: u32 = 1 << 9;
++const DMASHDL_PAGE: u32 = 0x7c02_600c;
++const DMASHDL_GROUP_SEQ_ORDER: u32 = 1 << 16;
++const DMASHDL_REFILL: u32 = 0x7c02_6010;
++const DMASHDL_PKT_MAX_SIZE: u32 = 0x7c02_601c;
++const DMASHDL_GROUP_QUOTA: u32 = 0x7c02_6020;
++const DMASHDL_Q_MAP: u32 = 0x7c02_6060;
++const DMASHDL_SCHED_SET: u32 = 0x7c02_6070;
++const WFDMA_HOST_CONFIG: u32 = 0x7c02_7030;
++const WFDMA_HOST_CONFIG_USB_RXEVT_EP4_EN: u32 = 1 << 6;
++const CBTOP_RGU_WF_SUBSYS_RST: u32 = 0x7000_2600;
++const CBTOP_RGU_WF_SUBSYS_RST_7925: u32 = 0x7002_8600;
++const WFSYS_INIT_DONE_ADDR_7925: u32 = 0x184c_1604;
++const WFSYS_INIT_DONE_7925: u32 = 0x0000_1d1e;
++/// `MT792x_WFSYS_INIT_RETRY_COUNT`.
++const WFSYS_INIT_RETRY: usize = 2;
++const TOP_MISC2_FW_PWR_ON: u32 = 1 << 0;
++const TOP_MISC2_FW_N9_RDY: u32 = 0x3;
++
 +pub(crate) struct Chip {
-+    mmio: BarAccess,
++    io: Io,
 +    pub(crate) name: String,
 +    pub(crate) chip_id: u32,
 +    pub(crate) rev: u32,
@@ -375,8 +428,17 @@ index 0000000..d2afdac
 +
 +impl Chip {
 +    pub(crate) fn new(mmio: BarAccess, name: String, mt7925: bool) -> Self {
++        Self::with(Io::Mmio(mmio), name, mt7925)
++    }
++
++    /// A USB adapter's chip.
++    pub(crate) fn new_usb(bus: UsbBus, name: String, mt7925: bool) -> Self {
++        Self::with(Io::Usb(bus), name, mt7925)
++    }
++
++    fn with(io: Io, name: String, mt7925: bool) -> Self {
 +        Self {
-+            mmio,
++            io,
 +            name,
 +            chip_id: 0,
 +            rev: 0,
@@ -562,19 +624,63 @@ index 0000000..d2afdac
 +    }
 +
 +    fn raw_read(&self, offset: u32) -> u32 {
-+        self.mmio.read_once::<u32>(offset as usize).unwrap_or(u32::MAX)
++        match &self.io {
++            Io::Mmio(mmio) => mmio.read_once::<u32>(offset as usize).unwrap_or(u32::MAX),
++            Io::Usb(_) => u32::MAX,
++        }
 +    }
 +
 +    fn raw_write(&self, offset: u32, value: u32) {
-+        let _ = self.mmio.write_once::<u32>(offset as usize, value);
++        if let Io::Mmio(mmio) = &self.io {
++            let _ = mmio.write_once::<u32>(offset as usize, value);
++        }
 +    }
 +
 +    pub(crate) fn rr(&self, addr: u32) -> u32 {
-+        self.raw_read(self.map(addr))
++        match &self.io {
++            Io::Mmio(_) => self.raw_read(self.map(addr)),
++            Io::Usb(usb) => usb.rr(addr),
++        }
 +    }
 +
 +    pub(crate) fn wr(&self, addr: u32, value: u32) {
-+        self.raw_write(self.map(addr), value);
++        match &self.io {
++            Io::Mmio(_) => self.raw_write(self.map(addr), value),
++            Io::Usb(usb) => usb.wr(addr, value),
++        }
++    }
++
++    /// On USB rather than PCIe.
++    pub(crate) fn usb(&self) -> bool {
++        matches!(self.io, Io::Usb(_))
++    }
++
++    /// The USB adapter was unplugged.
++    pub(crate) fn gone(&self) -> bool {
++        match &self.io {
++            Io::Usb(usb) => usb.gone(),
++            Io::Mmio(_) => false,
++        }
++    }
++
++    /// Ends the USB transfers pending.
++    pub(crate) fn stop(&mut self) {
++        if let Io::Usb(usb) = &mut self.io {
++            usb.stop();
++        }
++    }
++
++    fn uhw_rr(&self, addr: u32) -> u32 {
++        match &self.io {
++            Io::Usb(usb) => usb.uhw_rr(addr),
++            Io::Mmio(_) => u32::MAX,
++        }
++    }
++
++    fn uhw_wr(&self, addr: u32, value: u32) {
++        if let Io::Usb(usb) = &self.io {
++            usb.uhw_wr(addr, value);
++        }
 +    }
 +
 +    fn set(&self, addr: u32, bits: u32) {
@@ -604,6 +710,9 @@ index 0000000..d2afdac
 +    /// `mt792xe_mcu_fw_pmctrl`, `__mt792xe_mcu_drv_pmctrl`), the chip's
 +    /// identity, and the Wi-Fi system's reset.
 +    pub(crate) fn start(&mut self) -> Result<(), String> {
++        if self.usb() {
++            return self.start_usb();
++        }
 +        for _ in 0..10 {
 +            self.wr(CONN_ON_LPCTL, 1);
 +            if self.poll(CONN_ON_LPCTL, 4, 4, 50) {
@@ -641,6 +750,100 @@ index 0000000..d2afdac
 +        self.wr(HOST_INT_ENA, 0);
 +        self.wr(PCIE_MAC_INT_ENABLE, 0xff);
 +        self.dma_init()
++    }
++
++    /// A USB adapter's start (`mt7921u_probe`, `mt7925u_probe`): its
++    /// identity, the Wi-Fi system reset if a firmware already runs, the
++    /// MCU's power, the USB DMA (`mt792xu_dma_init`), then the reads.
++    fn start_usb(&mut self) -> Result<(), String> {
++        self.chip_id = self.rr(HW_CHIPID) & 0xffff;
++        self.rev = self.rr(HW_REV) & 0xff;
++        if self.chip_id == 0xffff {
++            return Err(String::from("the adapter does not answer"));
++        }
++        if self.rr(CONN_ON_MISC) & TOP_MISC2_FW_N9_RDY != 0 {
++            self.wfsys_reset_usb()?;
++        }
++        let powered = matches!(&self.io, Io::Usb(usb) if usb.power_on());
++        if !powered || !self.poll(CONN_ON_MISC, TOP_MISC2_FW_PWR_ON, TOP_MISC2_FW_PWR_ON, 500) {
++            return Err(String::from("the MCU did not power on"));
++        }
++        self.dma_init_usb()?;
++        if let Io::Usb(usb) = &mut self.io {
++            usb.start_rx();
++        }
++        Ok(())
++    }
++
++    /// `mt792xu_epctl_rst_opt`: the bulk endpoints' reset options (OUT 4-9,
++    /// IN 4-5, the interrupt one) off.
++    fn epctl_rst_opt(&self) {
++        let value = self.uhw_rr(SSUSB_EPCTL_CSR_EP_RST_OPT) & !((0x3f << 4) | (0x7 << 20));
++        self.uhw_wr(SSUSB_EPCTL_CSR_EP_RST_OPT, value);
++    }
++
++    /// `mt792xu_wfsys_reset`: the Wi-Fi subsystem's whole path reset, then
++    /// its init awaited (the MT7925's by its own flags).
++    fn wfsys_reset_usb(&self) -> Result<(), String> {
++        self.epctl_rst_opt();
++        let (reset, done, mask, value) = if self.mt7925 {
++            (CBTOP_RGU_WF_SUBSYS_RST_7925, WFSYS_INIT_DONE_ADDR_7925, u32::MAX, WFSYS_INIT_DONE_7925)
++        } else {
++            (CBTOP_RGU_WF_SUBSYS_RST, UDMA_CONN_INFRA_STATUS, UDMA_CONN_WFSYS_INIT_DONE, UDMA_CONN_WFSYS_INIT_DONE)
++        };
++        self.uhw_wr(reset, self.uhw_rr(reset) | 1);
++        if self.mt7925 {
++            crate::delay_ms(20);
++        } else {
++            aster_linuxkpi::delay::udelay(20);
++        }
++        self.uhw_wr(reset, self.uhw_rr(reset) & !1);
++        if !self.mt7925 {
++            self.uhw_wr(UDMA_CONN_INFRA_STATUS_SEL, 0);
++        }
++        for _ in 0..WFSYS_INIT_RETRY {
++            if self.uhw_rr(done) & mask == value {
++                return Ok(());
++            }
++            crate::delay_ms(100);
++        }
++        Err(String::from("the Wi-Fi system did not come out of reset"))
++    }
++
++    /// `mt792xu_dma_init` (`mt792xu_wfdma_init`, `_dma_rx_evt_ep4`): the
++    /// WFDMA's prefetch and modes, the DMA scheduler's quotas and queues,
++    /// the USB DMA on without RX aggregation, events on their endpoint.
++    fn dma_init_usb(&self) -> Result<(), String> {
++        let rmw = |addr: u32, mask: u32, value: u32| self.wr(addr, (self.rr(addr) & !mask) | value);
++        for (ring, base) in [(0u32, 0x080u32), (1, 0x0c0), (2, 0x100), (3, 0x140), (4, 0x180), (16, 0x280), (17, 0x2c0)] {
++            rmw(UWFDMA0_TX_RING_EXT_CTRL + ring * 4, 0xffff_00ff, (base << 16) | 4);
++        }
++        self.clear(UWFDMA0_GLO_CFG, GLO_OMIT_RX_INFO);
++        self.set(UWFDMA0_GLO_CFG, GLO_OMIT_TX_INFO | GLO_OMIT_RX_INFO_PFET2 | GLO_FW_DWLD_BYPASS_DMASHDL | GLO_TX_DMA_EN | GLO_RX_DMA_EN);
++        rmw(DMASHDL_REFILL, 0xffff_0000, 0xffe0_0000);
++        self.clear(DMASHDL_PAGE, DMASHDL_GROUP_SEQ_ORDER);
++        rmw(DMASHDL_PKT_MAX_SIZE, 0x0fff_0fff, 1);
++        for group in 0..16u32 {
++            self.wr(DMASHDL_GROUP_QUOTA + group * 4, if group < 5 { 0x3 | (0xfff << 16) } else { 0 });
++        }
++        for (index, value) in [0x3201_3201u32, 0x3201_3201, 0x5555_5444, 0x5555_5444].into_iter().enumerate() {
++            self.wr(DMASHDL_Q_MAP + index as u32 * 4, value);
++        }
++        self.wr(DMASHDL_SCHED_SET, 0x7654_0132);
++        self.wr(DMASHDL_SCHED_SET + 4, 0xfedc_ba98);
++        self.set(WFDMA_DUMMY_CR, 1 << 1);
++        self.clear(UDMA_WLCFG_0, WL_RX_FLUSH);
++        self.set(UDMA_WLCFG_0, WL_RX_EN | WL_TX_EN | WL_RX_MPSZ_PAD0 | TICK_1US_EN);
++        self.clear(UDMA_WLCFG_0, WL_RX_AGG_TO | WL_RX_AGG_LMT);
++        self.clear(UDMA_WLCFG_1, WL_RX_AGG_PKT_LMT);
++        if !self.poll(UWFDMA0_GLO_CFG, GLO_RX_DMA_BUSY, 0, 1000) {
++            return Err(String::from("the USB's RX DMA did not go idle"));
++        }
++        self.clear(UWFDMA0_GLO_CFG, GLO_RX_DMA_EN);
++        self.set(WFDMA_HOST_CONFIG, WFDMA_HOST_CONFIG_USB_RXEVT_EP4_EN);
++        self.set(UWFDMA0_GLO_CFG, GLO_RX_DMA_EN);
++        self.epctl_rst_opt();
++        Ok(())
 +    }
 +
 +    fn new_ring(&self, regs: u32, size: usize, rx: bool) -> Result<Ring, String> {
@@ -745,6 +948,11 @@ index 0000000..d2afdac
 +    /// Before the firmware's download (`__mt7921_init_hardware`,
 +    /// `mt7921e_mcu_init`): its normal mode, and no L0s on the link.
 +    pub(crate) fn before_firmware(&self) {
++        if self.usb() {
++            // The data endpoint carries the firmware (`mt7921u_mcu_init`).
++            self.set(UDMA_TX_QSEL, FW_DL_EN);
++            return;
++        }
 +        if !self.mt7925 {
 +            self.wr(SWDEF_MODE, SWDEF_NORMAL_MODE);
 +        }
@@ -874,8 +1082,24 @@ index 0000000..d2afdac
 +        self.ring_send(TXQ_DATA, txwi)
 +    }
 +
++    /// A frame (its TXD first) on a USB endpoint (`usb::EP_OUT_*`).
++    pub(crate) fn usb_send(&mut self, endpoint: usize, bytes: &[u8]) -> Result<(), ()> {
++        match &mut self.io {
++            Io::Usb(usb) => usb.send(endpoint, bytes),
++            Io::Mmio(_) => Err(()),
++        }
++    }
++
 +    /// The packets the chip wrote to an RX ring since the last call.
 +    pub(crate) fn ring_receive(&mut self, which: u32) -> Vec<Vec<u8>> {
++        if let Io::Usb(usb) = &mut self.io {
++            // Frames on the first IN endpoint, events on the second.
++            return match which {
++                RXQ_DATA => usb.receive(EP_IN_PKT_RX),
++                RXQ_MCU => usb.receive(EP_IN_CMD_RESP),
++                _ => Vec::new(),
++            };
++        }
 +        let mut out = Vec::new();
 +        let ring = match which {
 +            RXQ_MCU => self.rx_mcu.as_mut(),
@@ -951,10 +1175,14 @@ index 0000000..d2afdac
 +            }
 +        }
 +        out.extend_from_slice(payload);
-+        if !self.ring_wait(TXQ_MCU) {
-+            return Err(format!("the MCU's command ring is full ({cmd:?})"));
++        if let Io::Usb(usb) = &self.io {
++            usb.send_sync(EP_OUT_INBAND_CMD, &out).map_err(|error| format!("command {cmd:?}: {error}"))?;
++        } else {
++            if !self.ring_wait(TXQ_MCU) {
++                return Err(format!("the MCU's command ring is full ({cmd:?})"));
++            }
++            self.ring_send(TXQ_MCU, &out).map_err(|()| format!("command {cmd:?} not queued"))?;
 +        }
-+        self.ring_send(TXQ_MCU, &out).map_err(|()| format!("command {cmd:?} not queued"))?;
 +        if !wait {
 +            return Ok(Vec::new());
 +        }
@@ -996,6 +1224,10 @@ index 0000000..d2afdac
 +    /// Sends firmware bytes raw on the download ring, in pieces.
 +    fn scatter(&mut self, data: &[u8]) -> Result<(), String> {
 +        for piece in data.chunks(SCATTER) {
++            if let Io::Usb(usb) = &self.io {
++                usb.send_sync(EP_OUT_AC_BE, piece)?;
++                continue;
++            }
 +            if !self.ring_wait(TXQ_FWDL) {
 +                return Err(String::from("the firmware's download ring did not drain"));
 +            }
@@ -1096,15 +1328,18 @@ index 0000000..d2afdac
 +        if !self.poll(CONN_ON_MISC, 0x3, 0x3, 1500) {
 +            return Err(String::from("the firmware did not say it runs"));
 +        }
++        if self.usb() {
++            self.clear(UDMA_TX_QSEL, FW_DL_EN);
++        }
 +        Ok(())
 +    }
 +}
 diff --git a/kernel/comps/mt7921/src/lib.rs b/kernel/comps/mt7921/src/lib.rs
 new file mode 100644
-index 0000000..d9460e1
+index 0000000..1346368
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/lib.rs
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,475 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! MediaTek Wi-Fi: the MT7921 (AMD RZ608), MT7922 (AMD RZ616) and MT7920
@@ -1120,7 +1355,9 @@ index 0000000..d9460e1
 +//! Both run as stations or as access points (the beacon offloaded to the
 +//! firmware), with block-ack sessions and power save; 6 GHz where the
 +//! chip has it, EHT on the MT7925; TKIP for the group's key and 802.11w.
-+//! Not yet: multi-link operation, the USB adapters. The kernel's log
++//! The same chips' USB adapters (MT7921AU, MT7925U; `mt7921u`,
++//! `mt7925u`) run through [`usb`]. Not yet: multi-link operation. The
++//! kernel's log
 +//! says how far a card gets (`dmesg | grep mt7921`); `mt7921.off` leaves
 +//! the cards alone.
 +
@@ -1138,9 +1375,10 @@ index 0000000..d9460e1
 +mod hw;
 +mod mac;
 +mod mt7925;
++mod usb;
 +
-+use alloc::{string::String, sync::Arc, vec::Vec};
-+use core::sync::atomic::{AtomicBool, Ordering};
++use alloc::{format, string::String, sync::Arc, vec::Vec};
++use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 +
 +use aster_linuxkpi::{
 +    pci::{self as kpi_pci, Devices},
@@ -1185,6 +1423,42 @@ index 0000000..d9460e1
 +    is_mt7925(vendor, device) || matches!((vendor, device), (VENDOR_MEDIATEK, 0x7961 | 0x7922 | 0x0608 | 0x0616 | 0x7920) | (VENDOR_ITTIM, 0x7922))
 +}
 +
++/// The USB adapters (`mt7921u_device_table`, `mt7925u_device_table`):
++/// whether one is an MT7925.
++fn usb_kind(vendor: u16, product: u16) -> Option<bool> {
++    match (vendor, product) {
++        (0x0e8d, 0x7961) | (0x3574, 0x6211) | (0x0846, 0x9060 | 0x9065) | (0x35bc, 0x0107) => Some(false),
++        (0x0e8d, 0x7925) | (0x0846, 0x9072) => Some(true),
++        _ => None,
++    }
++}
++
++/// The USB adapters' driver, for aster-usb.
++struct UsbDriver;
++
++impl aster_usb::driver::UsbDriver for UsbDriver {
++    fn name(&self) -> &'static str {
++        "mt7921u"
++    }
++
++    fn matches(&self, info: &aster_usb::driver::InterfaceInfo) -> bool {
++        info.class == 0xff && usb_kind(info.vendor, info.product).is_some()
++    }
++
++    fn probe(&self, interface: aster_usb::driver::UsbInterface) {
++        run_usb(interface);
++    }
++}
++
++static USB_ADAPTERS: AtomicUsize = AtomicUsize::new(0);
++static TIMER_STARTED: AtomicBool = AtomicBool::new(false);
++
++fn start_timer_once() {
++    if !TIMER_STARTED.swap(true, Ordering::AcqRel) {
++        WAKER.start_timer();
++    }
++}
++
 +/// The firmware of a chip (`mt792x_patch_name`, `mt792x_ram_name`): ROM
 +/// patch, RAM code.
 +fn firmware_of(chip_id: u32, mt7925: bool) -> (&'static str, &'static str) {
@@ -1203,9 +1477,13 @@ index 0000000..d9460e1
 +
 +#[init_component]
 +fn init() -> Result<(), ComponentInitError> {
-+    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
-+        WAKER.start_timer();
++    if DISABLED.load(Ordering::Relaxed) {
++        return Ok(());
 +    }
++    if DEVICES.register(claims) {
++        start_timer_once();
++    }
++    aster_usb::driver::register_driver(Arc::new(UsbDriver));
 +    Ok(())
 +}
 +
@@ -1290,6 +1568,10 @@ index 0000000..d9460e1
 +
 +    fn poll(&mut self) {
 +        each!(self, station => station.poll())
++    }
++
++    fn stop_bus(&mut self) {
++        each!(self, station => station.chip.stop())
 +    }
 +
 +    fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
@@ -1473,10 +1755,19 @@ index 0000000..d9460e1
 +        ostd::warn!("{}: no DMA memory below 4 GiB", name);
 +        return;
 +    };
++    serve(chip, &name, mt7925, tokens);
++    // The interrupt's capability and the device stay until the task ends.
++    drop((vectors, device));
++}
++
++/// The firmware, the station registered, then what the chip says until it
++/// is gone.
++fn serve(chip: Chip, name: &String, mt7925: bool, tokens: ostd::mm::dma::DmaCoherent) {
 +    let (patch, ram) = firmware_of(chip.chip_id, mt7925);
 +    let mut state = if mt7925 { Station::Mt7925(Mt7925::new(chip, name.clone(), tokens)) } else { Station::Mt7921(Mt7921::new(chip, name.clone(), tokens)) };
 +    if let Err(error) = state.bring_up(patch, ram) {
 +        ostd::warn!("{}: {}", name, error);
++        state.stop_bus();
 +        return;
 +    }
 +    let info = state.info();
@@ -1489,18 +1780,47 @@ index 0000000..d9460e1
 +        let mut state = card.state.lock();
 +        state.poll();
 +        if state.dead() {
++            state.stop_bus();
 +            break;
 +        }
 +    }
-+    // The interrupt's capability and the device stay until the task ends.
-+    drop((vectors, device));
++}
++
++/// A USB adapter's task (`mt7921u_probe`, `mt7925u_probe`): the endpoints,
++/// the chip started over USB, then as on PCIe.
++fn run_usb(interface: aster_usb::driver::UsbInterface) {
++    let (vendor, product) = (interface.info.vendor, interface.info.product);
++    let Some(mt7925) = usb_kind(vendor, product) else { return };
++    let index = USB_ADAPTERS.fetch_add(1, Ordering::Relaxed);
++    let name = format!("mt7921u {} ({:04x}:{:04x})", index, vendor, product);
++    start_timer_once();
++    let bus = match usb::UsbBus::new(Arc::new(interface), Arc::new(|| WAKER.wake())) {
++        Ok(bus) => bus,
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    };
++    let mut chip = Chip::new_usb(bus, name.clone(), mt7925);
++    if let Err(error) = chip.start() {
++        ostd::warn!("{}: did not start: {}", name, error);
++        chip.stop();
++        return;
++    }
++    ostd::notice!("{}: MediaTek {:04x} on USB (revision {:#x})", name, chip.chip_id, chip.rev);
++    // No token buffers on USB (frames go inline); a page for the type.
++    let Some(tokens) = hw::dma32(BUFFER) else {
++        ostd::warn!("{}: no DMA memory", name);
++        return;
++    };
++    serve(chip, &name, mt7925, tokens);
 +}
 diff --git a/kernel/comps/mt7921/src/mac.rs b/kernel/comps/mt7921/src/mac.rs
 new file mode 100644
-index 0000000..b9b9ba3
+index 0000000..5d8d8d3
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mac.rs
-@@ -0,0 +1,1847 @@
+@@ -0,0 +1,1901 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface on the MediaTek firmware, as Linux's mt7921 and
@@ -1679,6 +1999,25 @@ index 0000000..b9b9ba3
 +/// (`struct bcn_content_tlv`), as firmware packets on the beacon queue.
 +const BEACON_ROOM: usize = 512;
 +const TX_TYPE_FW: u32 = 3;
++/// USB's store-and-forward frames (`MT_TX_TYPE_SF`) and their TXD
++/// (`MT_SDIO_TXD_SIZE`: the long TXD and eight words more).
++pub(crate) const TX_TYPE_SF: u32 = 1;
++pub(crate) const SDIO_TXD_SIZE: usize = 64;
++
++/// A frame's USB endpoint (`mt76u_ac_to_hwq`): data on its access
++/// category's (BE, BK, VI, VO after the command one), management on HCCA.
++pub(crate) fn usb_endpoint(data: bool, queue: u32) -> usize {
++    use crate::usb::{EP_OUT_AC_BE, EP_OUT_HCCA};
++    if !data {
++        return EP_OUT_HCCA;
++    }
++    match queue {
++        0 => EP_OUT_AC_BE + 1,
++        2 => EP_OUT_AC_BE + 2,
++        3 => EP_OUT_AC_BE + 3,
++        _ => EP_OUT_AC_BE,
++    }
++}
 +const LMAC_BCN0: u32 = 0x12;
 +const TXD3_REM_TX_COUNT: u32 = 0x1f << 11;
 +/// The interface's own MAC in the WTBL when an entry has no station.
@@ -2948,16 +3287,25 @@ index 0000000..b9b9ba3
 +        if frame.len() > BUFFER {
 +            return Err(radio::Error::Invalid);
 +        }
-+        let Some(token) = self.token() else { return Err(radio::Error::Busy) };
-+        if self.tokens.write_bytes(token * BUFFER, &frame).is_err() {
-+            self.token_busy[token] = 0;
-+            return Err(radio::Error::Memory);
-+        }
++        let usb = self.chip.usb();
++        let token = if usb {
++            0
++        } else {
++            let Some(token) = self.token() else { return Err(radio::Error::Busy) };
++            if self.tokens.write_bytes(token * BUFFER, &frame).is_err() {
++                self.token_busy[token] = 0;
++                return Err(radio::Error::Memory);
++            }
++            token
++        };
 +        // The LMAC queue: the access category of the TID (BK 0, BE 1, VI 2,
 +        // VO 3), management on ALTX0.
 +        let queue = if data { [1u32, 0, 0, 1, 2, 2, 3, 3][tid as usize] } else { LMAC_ALTX0 };
-+        let mut txd = [0u32; 8];
-+        txd[0] = ((frame.len() + TXD_SIZE) as u32 & 0xffff) | (queue << 25);
++        let mut txd = [0u32; 16];
++        // On USB the TXD is the long one and the frame follows it (store
++        // and forward, `MT_SDIO_TXD_SIZE`).
++        let (txd_size, format) = if usb { (SDIO_TXD_SIZE, TX_TYPE_SF) } else { (TXD_SIZE, 0) };
++        txd[0] = ((frame.len() + txd_size) as u32 & 0xffff) | (format << 23) | (queue << 25);
 +        txd[1] = (1 << 31) | (wcid & 0x3ff) | (HDR_FORMAT_802_11 << 16) | (((header / 2) as u32) << 11) | (tid << 20);
 +        txd[2] = (kind << 4) | subtype | if multicast { TXD2_MULTICAST } else { 0 };
 +        txd[3] = (15 << 11) | if protected { TXD3_PROTECT_FRAME } else { 0 };
@@ -2972,9 +3320,20 @@ index 0000000..b9b9ba3
 +            txd[3] |= TXD3_BA_DISABLE;
 +            txd[6] = TXD6_FIXED_BW | (rate << 16);
 +        }
++        if usb {
++            // The frame's type in word 8 (`MT_TXD8_L_TYPE`), then the frame
++            // on its access category's endpoint (management on HCCA).
++            txd[8] = (kind << 4) | subtype;
++            let mut packet = Vec::with_capacity(SDIO_TXD_SIZE + frame.len());
++            for word in txd {
++                packet.extend_from_slice(&word.to_le_bytes());
++            }
++            packet.extend_from_slice(&frame);
++            return self.chip.usb_send(usb_endpoint(data, queue), &packet).map_err(|()| radio::Error::Busy);
++        }
 +        txd[7] = (kind << 20) | (subtype << 16);
 +        let mut txwi = Vec::with_capacity(TXD_SIZE + TXP_SIZE);
-+        for word in txd {
++        for word in &txd[..8] {
 +            txwi.extend_from_slice(&word.to_le_bytes());
 +        }
 +        let mut txp = [0u8; TXP_SIZE];
@@ -3117,23 +3476,14 @@ index 0000000..b9b9ba3
 +        if self.dead {
 +            return;
 +        }
-+        let status = self.chip.rr(hw::HOST_INT_STA);
-+        if status == u32::MAX {
-+            ostd::warn!("{}: the card is gone", self.name);
-+            self.died();
-+            return;
-+        }
-+        if status != 0 {
-+            self.chip.wr(hw::HOST_INT_STA, status);
-+        }
-+        if status & hw::INT_MCU_CMD != 0 {
-+            let command = self.chip.rr(hw::MCU_CMD);
-+            self.chip.wr(hw::MCU_CMD, command);
-+            if command & MCU_CMD_STOP_DMA != 0 {
-+                ostd::warn!("{}: the firmware stopped ({:#x}); the card stays off until the next boot", self.name, command);
++        if self.chip.usb() {
++            if self.chip.gone() {
++                ostd::warn!("{}: the adapter is gone", self.name);
 +                self.died();
 +                return;
 +            }
++        } else if !self.poll_interrupts() {
++            return;
 +        }
 +        let mut packets = core::mem::take(&mut self.chip.pending);
 +        for which in [hw::RXQ_MCU, hw::RXQ_MCU_WA, hw::RXQ_DATA] {
@@ -3149,6 +3499,30 @@ index 0000000..b9b9ba3
 +                device.scan_done(true);
 +            }
 +        }
++    }
++
++    /// The PCIe interrupt causes, cleared; false when the card is gone or
++    /// its firmware stopped.
++    fn poll_interrupts(&mut self) -> bool {
++        let status = self.chip.rr(hw::HOST_INT_STA);
++        if status == u32::MAX {
++            ostd::warn!("{}: the card is gone", self.name);
++            self.died();
++            return false;
++        }
++        if status != 0 {
++            self.chip.wr(hw::HOST_INT_STA, status);
++        }
++        if status & hw::INT_MCU_CMD != 0 {
++            let command = self.chip.rr(hw::MCU_CMD);
++            self.chip.wr(hw::MCU_CMD, command);
++            if command & MCU_CMD_STOP_DMA != 0 {
++                ostd::warn!("{}: the firmware stopped ({:#x}); the card stays off until the next boot", self.name, command);
++                self.died();
++                return false;
++            }
++        }
++        true
 +    }
 +
 +    fn died(&mut self) {
@@ -3350,10 +3724,10 @@ index 0000000..b9b9ba3
 +}
 diff --git a/kernel/comps/mt7921/src/mt7925.rs b/kernel/comps/mt7921/src/mt7925.rs
 new file mode 100644
-index 0000000..183bce4
+index 0000000..5d3e71e
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mt7925.rs
-@@ -0,0 +1,1721 @@
+@@ -0,0 +1,1752 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The MT7925 (Wi-Fi 7, "connac3") as a station or an access point, as
@@ -4644,14 +5018,22 @@ index 0000000..183bce4
 +        if frame.len() > BUFFER {
 +            return Err(radio::Error::Invalid);
 +        }
-+        let Some(token) = self.token() else { return Err(radio::Error::Busy) };
-+        if self.tokens.write_bytes(token * BUFFER, &frame).is_err() {
-+            self.token_busy[token] = 0;
-+            return Err(radio::Error::Memory);
-+        }
++        let usb = self.chip.usb();
++        let token = if usb {
++            0
++        } else {
++            let Some(token) = self.token() else { return Err(radio::Error::Busy) };
++            if self.tokens.write_bytes(token * BUFFER, &frame).is_err() {
++                self.token_busy[token] = 0;
++                return Err(radio::Error::Memory);
++            }
++            token
++        };
 +        let queue = if data { [1u32, 0, 0, 1, 2, 2, 3, 3][tid as usize] } else { LMAC_ALTX0 };
-+        let mut txd = [0u32; 8];
-+        txd[0] = ((frame.len() + TXD_SIZE) as u32 & 0xffff) | (queue << 25);
++        let mut txd = [0u32; 16];
++        // On USB the TXD is the long one and the frame follows it.
++        let (txd_size, format) = if usb { (mac::SDIO_TXD_SIZE, mac::TX_TYPE_SF) } else { (TXD_SIZE, 0) };
++        txd[0] = ((frame.len() + txd_size) as u32 & 0xffff) | (format << 23) | (queue << 25);
 +        txd[1] = (wcid & 0xfff) | ((self.band_idx as u32) << 12) | (HDR_FORMAT_802_11 << 14) | (((header / 2) as u32) << 16) | (tid << 21);
 +        txd[2] = (kind << 4) | subtype;
 +        txd[3] = (15 << 11) | if protected { TXD3_PROTECT_FRAME } else { 0 } | if multicast { TXD3_BCM } else { 0 };
@@ -4667,8 +5049,16 @@ index 0000000..183bce4
 +            txd[3] |= TXD3_BA_DISABLE;
 +            txd[6] |= index << 16;
 +        }
++        if usb {
++            let mut packet = Vec::with_capacity(mac::SDIO_TXD_SIZE + frame.len());
++            for word in txd {
++                packet.extend_from_slice(&word.to_le_bytes());
++            }
++            packet.extend_from_slice(&frame);
++            return self.chip.usb_send(mac::usb_endpoint(data, queue), &packet).map_err(|()| radio::Error::Busy);
++        }
 +        let mut txwi = Vec::with_capacity(TXD_SIZE + TXP_SIZE);
-+        for word in txd {
++        for word in &txd[..8] {
 +            txwi.extend_from_slice(&word.to_le_bytes());
 +        }
 +        let mut txp = [0u8; TXP_SIZE];
@@ -4789,23 +5179,14 @@ index 0000000..183bce4
 +        if self.dead {
 +            return;
 +        }
-+        let status = self.chip.rr(hw::HOST_INT_STA);
-+        if status == u32::MAX {
-+            ostd::warn!("{}: the card is gone", self.name);
-+            self.died();
-+            return;
-+        }
-+        if status != 0 {
-+            self.chip.wr(hw::HOST_INT_STA, status);
-+        }
-+        if status & hw::INT_MCU_CMD != 0 {
-+            let command = self.chip.rr(hw::MCU_CMD);
-+            self.chip.wr(hw::MCU_CMD, command);
-+            if command & MCU_CMD_STOP_DMA != 0 {
-+                ostd::warn!("{}: the firmware stopped ({:#x}); the card stays off until the next boot", self.name, command);
++        if self.chip.usb() {
++            if self.chip.gone() {
++                ostd::warn!("{}: the adapter is gone", self.name);
 +                self.died();
 +                return;
 +            }
++        } else if !self.poll_interrupts() {
++            return;
 +        }
 +        let mut packets = core::mem::take(&mut self.chip.pending);
 +        for which in [hw::RXQ_MCU, hw::RXQ_DATA] {
@@ -4821,6 +5202,30 @@ index 0000000..183bce4
 +                device.scan_done(true);
 +            }
 +        }
++    }
++
++    /// The PCIe interrupt causes, cleared; false when the card is gone or
++    /// its firmware stopped.
++    fn poll_interrupts(&mut self) -> bool {
++        let status = self.chip.rr(hw::HOST_INT_STA);
++        if status == u32::MAX {
++            ostd::warn!("{}: the card is gone", self.name);
++            self.died();
++            return false;
++        }
++        if status != 0 {
++            self.chip.wr(hw::HOST_INT_STA, status);
++        }
++        if status & hw::INT_MCU_CMD != 0 {
++            let command = self.chip.rr(hw::MCU_CMD);
++            self.chip.wr(hw::MCU_CMD, command);
++            if command & MCU_CMD_STOP_DMA != 0 {
++                ostd::warn!("{}: the firmware stopped ({:#x}); the card stays off until the next boot", self.name, command);
++                self.died();
++                return false;
++            }
++        }
++        true
 +    }
 +
 +    fn died(&mut self) {
@@ -5072,6 +5477,225 @@ index 0000000..183bce4
 +            max_scan_ie_len: 600,
 +            ap: true,
 +            management: radio::ManagementProtection::Unicast,
++        }
++    }
++}
+diff --git a/kernel/comps/mt7921/src/usb.rs b/kernel/comps/mt7921/src/usb.rs
+new file mode 100644
+index 0000000..d9a5165
+--- /dev/null
++++ b/kernel/comps/mt7921/src/usb.rs
+@@ -0,0 +1,213 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The USB adapters as Linux's mt76 runs them (`usb.c`, `mt792x_usb.c`,
++//! `mt7921/usb.c`, `mt7925/usb.c`): the chip's registers by their own
++//! addresses through vendor requests (`MT_VEND_READ_EXT`/`_WRITE_EXT`, the
++//! address's high half in wValue), the USB block's through the UHW ones;
++//! the MCU's commands on the in-band endpoint and the firmware's pieces
++//! on the first data one, each after a four-byte length and padded to four
++//! bytes and four more; frames on their access category's endpoint
++//! (management on the HCCA one), each a 64-byte TXD of the store-and-
++//! forward kind and the frame; frames and events read from the two bulk
++//! IN endpoints, one packet a transfer.
++
++use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
++use core::cell::Cell;
++
++use aster_usb::driver::{Notify, Transfer, UsbInterface};
++
++/// `MT_USB_TYPE_VENDOR`, `MT_USB_TYPE_UHW_VENDOR` (the direction bit is
++/// the transfer's).
++const TYPE_VENDOR: u8 = 0x40 | 0x1f;
++const TYPE_UHW_VENDOR: u8 = 0x40 | 0x1e;
++/// `enum mt_vendor_req`.
++const VEND_DEV_MODE: u8 = 0x01;
++const VEND_WRITE: u8 = 0x02;
++const VEND_POWER_ON: u8 = 0x04;
++const VEND_READ_EXT: u8 = 0x63;
++const VEND_WRITE_EXT: u8 = 0x66;
++/// `MT_VEND_REQ_MAX_RETRY`, `MT_VEND_REQ_TOUT_MS`.
++const REQ_RETRY: usize = 10;
++const REQ_TIMEOUT_MS: u32 = 300;
++const BULK_TIMEOUT_MS: u32 = 1000;
++/// `enum mt76u_in_ep` and `enum mt76u_out_ep`.
++pub(crate) const EP_IN_PKT_RX: usize = 0;
++pub(crate) const EP_IN_CMD_RESP: usize = 1;
++pub(crate) const EP_OUT_INBAND_CMD: usize = 0;
++pub(crate) const EP_OUT_AC_BE: usize = 1;
++pub(crate) const EP_OUT_HCCA: usize = 5;
++/// The reads waiting on each IN endpoint, and their size (no RX
++/// aggregation: a transfer is one packet, up to an A-MSDU's).
++const RX_TRANSFERS: usize = 8;
++const RX_BUF: usize = 16384;
++const RX_RETRY_MS: u64 = 50;
++/// Frames in flight before the queues count as full.
++const TX_IN_FLIGHT: usize = 128;
++/// `MT_SDIO_HDR_SIZE`, `MT_USB_TAIL_SIZE`.
++const HDR_SIZE: usize = 4;
++const TAIL_SIZE: usize = 4;
++
++pub(crate) struct UsbBus {
++    interface: Arc<UsbInterface>,
++    in_ep: [u8; 2],
++    out_ep: [u8; 6],
++    rx: [VecDeque<Transfer>; 2],
++    tx: VecDeque<Transfer>,
++    notify: Notify,
++    receiving: bool,
++    rx_retry_at: u64,
++    removed: Cell<bool>,
++}
++
++impl UsbBus {
++    /// `mt76u_set_endpoints`: two bulk IN endpoints and six bulk OUT ones,
++    /// in their order.
++    pub(crate) fn new(interface: Arc<UsbInterface>, notify: Notify) -> Result<Self, String> {
++        let bulk = || interface.endpoints.iter().filter(|endpoint| !endpoint.interrupt);
++        let ins: Vec<u8> = bulk().filter(|endpoint| endpoint.is_in()).map(|endpoint| endpoint.address).take(2).collect();
++        let outs: Vec<u8> = bulk().filter(|endpoint| !endpoint.is_in()).map(|endpoint| endpoint.address).take(6).collect();
++        let (Ok(in_ep), Ok(out_ep)) = (<[u8; 2]>::try_from(ins.as_slice()), <[u8; 6]>::try_from(outs.as_slice())) else {
++            return Err(format!("{} bulk IN and {} bulk OUT endpoints (2 and 6 expected)", ins.len(), outs.len()));
++        };
++        Ok(Self { interface, in_ep, out_ep, rx: [VecDeque::new(), VecDeque::new()], tx: VecDeque::new(), notify, receiving: false, rx_retry_at: 0, removed: Cell::new(false) })
++    }
++
++    pub(crate) fn gone(&self) -> bool {
++        self.removed.get() || self.interface.is_gone()
++    }
++
++    /// `__mt76u_vendor_request`: tried again while it fails (`-EPROTO`
++    /// and a gone device end it).
++    fn request(&self, request: u8, request_type: u8, addr: u32, read: bool, data: &[u8]) -> Option<Vec<u8>> {
++        if self.gone() {
++            return None;
++        }
++        let (value, index) = ((addr >> 16) as u16, addr as u16);
++        for _ in 0..REQ_RETRY {
++            let result = if read {
++                self.interface.control_in(request_type, request, value, index, 4, REQ_TIMEOUT_MS).ok().filter(|reply| reply.len() >= 4)
++            } else {
++                self.interface.control_out(request_type, request, value, index, data, REQ_TIMEOUT_MS).ok().map(|()| Vec::new())
++            };
++            if result.is_some() {
++                return result;
++            }
++            if self.interface.is_gone() {
++                self.removed.set(true);
++                return None;
++            }
++            crate::delay_ms(5);
++        }
++        None
++    }
++
++    /// `mt792xu_rr`: all ones when the adapter does not answer.
++    pub(crate) fn rr(&self, addr: u32) -> u32 {
++        self.request(VEND_READ_EXT, TYPE_VENDOR, addr, true, &[]).map_or(u32::MAX, |reply| u32::from_le_bytes([reply[0], reply[1], reply[2], reply[3]]))
++    }
++
++    pub(crate) fn wr(&self, addr: u32, value: u32) {
++        let _ = self.request(VEND_WRITE_EXT, TYPE_VENDOR, addr, false, &value.to_le_bytes());
++    }
++
++    /// `mt792xu_uhw_rr`, `_wr`: the USB block's own registers.
++    pub(crate) fn uhw_rr(&self, addr: u32) -> u32 {
++        self.request(VEND_DEV_MODE, TYPE_UHW_VENDOR, addr, true, &[]).map_or(u32::MAX, |reply| u32::from_le_bytes([reply[0], reply[1], reply[2], reply[3]]))
++    }
++
++    pub(crate) fn uhw_wr(&self, addr: u32, value: u32) {
++        let _ = self.request(VEND_WRITE, TYPE_UHW_VENDOR, addr, false, &value.to_le_bytes());
++    }
++
++    /// The MCU's power (`mt792xu_mcu_power_on`'s request).
++    pub(crate) fn power_on(&self) -> bool {
++        !self.gone() && self.interface.control_out(TYPE_VENDOR, VEND_POWER_ON, 0, 1, &[], REQ_TIMEOUT_MS).is_ok()
++    }
++
++    /// A packet as the chip takes it on USB (`mt792x_skb_add_usb_sdio_hdr`
++    /// and the padding): its length, the packet, zeros to four bytes and
++    /// four more.
++    fn packet(payload: &[u8]) -> Vec<u8> {
++        let mut out = Vec::with_capacity(HDR_SIZE + payload.len() + 8);
++        out.extend_from_slice(&((payload.len() as u32) & 0xffff).to_le_bytes());
++        out.extend_from_slice(payload);
++        out.resize(out.len().next_multiple_of(4) + TAIL_SIZE, 0);
++        out
++    }
++
++    /// Sends and waits (`mt76u_bulk_msg`): the MCU's commands and the
++    /// firmware's pieces.
++    pub(crate) fn send_sync(&self, endpoint: usize, payload: &[u8]) -> Result<(), String> {
++        if self.gone() {
++            return Err(String::from("the adapter is gone"));
++        }
++        let packet = Self::packet(payload);
++        self.interface.write(self.out_ep[endpoint], &packet, false, BULK_TIMEOUT_MS).map(|_| ()).map_err(|status| format!("bulk transfer failed ({status})"))
++    }
++
++    /// A frame on its queue's endpoint; `Err` when too many are in flight.
++    pub(crate) fn send(&mut self, endpoint: usize, payload: &[u8]) -> Result<(), ()> {
++        while self.tx.front().is_some_and(|transfer| transfer.result().is_some()) {
++            self.tx.pop_front();
++        }
++        if self.tx.len() >= TX_IN_FLIGHT || self.gone() {
++            return Err(());
++        }
++        let packet = Self::packet(payload);
++        let transfer = self.interface.submit_write(self.out_ep[endpoint], &packet, false, Some(self.notify.clone())).map_err(|_| ())?;
++        self.tx.push_back(transfer);
++        Ok(())
++    }
++
++    /// The reads that wait on both IN endpoints (`mt76u_submit_rx_buffers`).
++    pub(crate) fn start_rx(&mut self) {
++        self.receiving = true;
++        for index in 0..2 {
++            self.top_up(index);
++        }
++    }
++
++    fn top_up(&mut self, index: usize) {
++        if !self.receiving || crate::now_ms() < self.rx_retry_at || self.gone() {
++            return;
++        }
++        while self.rx[index].len() < RX_TRANSFERS {
++            match self.interface.submit_read(self.in_ep[index], RX_BUF, Some(self.notify.clone())) {
++                Ok(transfer) => self.rx[index].push_back(transfer),
++                Err(_) => break,
++            }
++        }
++    }
++
++    /// The packets an IN endpoint brought (`mt76u_process_rx_entry`): each
++    /// transfer one, as long as its RXD says; the reads submitted again.
++    pub(crate) fn receive(&mut self, index: usize) -> Vec<Vec<u8>> {
++        let mut out = Vec::new();
++        while self.rx[index].front().is_some_and(|transfer| transfer.result().is_some()) {
++            let Some(transfer) = self.rx[index].pop_front() else { break };
++            let Some((status, _)) = transfer.result() else { break };
++            if status < 0 {
++                self.rx_retry_at = crate::now_ms() + RX_RETRY_MS;
++                continue;
++            }
++            let mut data = transfer.data();
++            if data.len() < 4 {
++                continue;
++            }
++            let length = (u16::from_le_bytes([data[0], data[1]]) as usize).min(data.len());
++            data.truncate(length);
++            out.push(data);
++        }
++        self.top_up(index);
++        out
++    }
++
++    /// Cancels what is pending (`mt76u_stop_rx`, `mt76u_stop_tx`).
++    pub(crate) fn stop(&mut self) {
++        self.receiving = false;
++        let [first, second] = &mut self.rx;
++        for transfer in first.drain(..).chain(second.drain(..)).chain(self.tx.drain(..)) {
++            transfer.cancel();
 +        }
 +    }
 +}
