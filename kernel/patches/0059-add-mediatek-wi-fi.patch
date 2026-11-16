@@ -1101,7 +1101,7 @@ index 0000000..d2afdac
 +}
 diff --git a/kernel/comps/mt7921/src/lib.rs b/kernel/comps/mt7921/src/lib.rs
 new file mode 100644
-index 0000000..c0fbbc5
+index 0000000..d9460e1
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/lib.rs
 @@ -0,0 +1,390 @@
@@ -1119,8 +1119,8 @@ index 0000000..c0fbbc5
 +//!
 +//! Both run as stations or as access points (the beacon offloaded to the
 +//! firmware), with block-ack sessions and power save; 6 GHz where the
-+//! chip has it, EHT on the MT7925. Not yet: multi-link operation,
-+//! management frame protection. The kernel's log
++//! chip has it, EHT on the MT7925; TKIP for the group's key and 802.11w.
++//! Not yet: multi-link operation, the USB adapters. The kernel's log
 +//! says how far a card gets (`dmesg | grep mt7921`); `mt7921.off` leaves
 +//! the cards alone.
 +
@@ -1497,10 +1497,10 @@ index 0000000..c0fbbc5
 +}
 diff --git a/kernel/comps/mt7921/src/mac.rs b/kernel/comps/mt7921/src/mac.rs
 new file mode 100644
-index 0000000..0049cd2
+index 0000000..b9b9ba3
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mac.rs
-@@ -0,0 +1,1837 @@
+@@ -0,0 +1,1847 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface on the MediaTek firmware, as Linux's mt7921 and
@@ -1655,6 +1655,7 @@ index 0000000..0049cd2
 +const PHY_TYPE_BIT_HT: u8 = 1 << 4;
 +const PHY_TYPE_BIT_VHT: u8 = 1 << 5;
 +const PHY_TYPE_BIT_HE: u8 = 1 << 6;
++const MCU_CIPHER_TKIP: u8 = 4;
 +const MCU_CIPHER_AES_CCMP: u8 = 5;
 +const MCU_CIPHER_CCMP_256: u8 = 6;
 +const MCU_CIPHER_GCMP: u8 = 7;
@@ -2827,6 +2828,8 @@ index 0000000..0049cd2
 +            radio::CIPHER_CCMP_256 => MCU_CIPHER_CCMP_256,
 +            radio::CIPHER_GCMP => MCU_CIPHER_GCMP,
 +            radio::CIPHER_GCMP_256 => MCU_CIPHER_GCMP_256,
++            // A station's group key of a mixed WPA/WPA2 network.
++            radio::CIPHER_TKIP if !key.pairwise && self.ap.is_none() => MCU_CIPHER_TKIP,
 +            _ if remove => MCU_CIPHER_AES_CCMP,
 +            _ => return Err(radio::Error::Unsupported),
 +        };
@@ -2854,6 +2857,12 @@ index 0000000..0049cd2
 +            first[2] = key.index;
 +            first[3] = key.key.len() as u8;
 +            first[4..4 + key.key.len()].copy_from_slice(&key.key);
++            if cipher == MCU_CIPHER_TKIP && key.key.len() == 32 {
++                // The receive and transmit MIC keys swapped
++                // (`mt76_connac_mcu_sta_key_tlv`).
++                first[4 + 16..4 + 24].copy_from_slice(&key.key[24..32]);
++                first[4 + 24..4 + 32].copy_from_slice(&key.key[16..24]);
++            }
 +        }
 +        value.extend_from_slice(&first);
 +        value.extend_from_slice(&[0; SEC_KEY]);
@@ -3331,19 +3340,20 @@ index 0000000..0049cd2
 +            } else {
 +                vec![band(BandId::Ghz2), band(BandId::Ghz5)]
 +            },
-+            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
++            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256, radio::CIPHER_TKIP],
 +            max_scan_ssids: 4,
 +            max_scan_ie_len: 600,
 +            ap: true,
++            management: radio::ManagementProtection::Unicast,
 +        }
 +    }
 +}
 diff --git a/kernel/comps/mt7921/src/mt7925.rs b/kernel/comps/mt7921/src/mt7925.rs
 new file mode 100644
-index 0000000..225783e
+index 0000000..183bce4
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mt7925.rs
-@@ -0,0 +1,1712 @@
+@@ -0,0 +1,1721 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The MT7925 (Wi-Fi 7, "connac3") as a station or an access point, as
@@ -3487,6 +3497,7 @@ index 0000000..225783e
 +const CMD_CBW_160MHZ: u8 = 3;
 +const CMD_CBW_320MHZ: u8 = 7;
 +/// Ciphers (`enum connac3_mcu_cipher_type`).
++const CIPHER_TKIP: u8 = 2;
 +const CIPHER_AES_CCMP: u8 = 4;
 +const CIPHER_CCMP_256: u8 = 10;
 +const CIPHER_GCMP: u8 = 11;
@@ -4504,6 +4515,8 @@ index 0000000..225783e
 +            radio::CIPHER_CCMP_256 => CIPHER_CCMP_256,
 +            radio::CIPHER_GCMP => CIPHER_GCMP,
 +            radio::CIPHER_GCMP_256 => CIPHER_GCMP_256,
++            // A station's group key of a mixed WPA/WPA2 network.
++            radio::CIPHER_TKIP if !key.pairwise && self.ap.is_none() => CIPHER_TKIP,
 +            _ if remove => CIPHER_AES_CCMP,
 +            _ => return Err(radio::Error::Unsupported),
 +        };
@@ -4539,6 +4552,11 @@ index 0000000..225783e
 +        value.extend_from_slice(&[0, cipher, key.index, key.key.len() as u8, wcid as u8, 1]);
 +        let mut material = [0u8; 32];
 +        material[..key.key.len()].copy_from_slice(&key.key);
++        if cipher == CIPHER_TKIP && key.key.len() == 32 {
++            // The receive and transmit MIC keys swapped (`mt7925_mcu_sta_key_tlv`).
++            material[16..24].copy_from_slice(&key.key[24..32]);
++            material[24..32].copy_from_slice(&key.key[16..24]);
++        }
 +        value.extend_from_slice(&material);
 +        let mut rsc = [0u8; 16];
 +        rsc[..key.seq.len().min(16)].copy_from_slice(&key.seq[..key.seq.len().min(16)]);
@@ -5049,10 +5067,11 @@ index 0000000..225783e
 +                band(BandId::Ghz5),
 +                Band { id: BandId::Ghz6, channels: chan::default_channels(BandId::Ghz6), ht: None, vht: None, he: Some(he(BandId::Ghz6)), eht: Some(eht(BandId::Ghz6)) },
 +            ],
-+            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
++            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256, radio::CIPHER_TKIP],
 +            max_scan_ssids: 10,
 +            max_scan_ie_len: 600,
 +            ap: true,
++            management: radio::ManagementProtection::Unicast,
 +        }
 +    }
 +}

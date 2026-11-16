@@ -784,7 +784,7 @@ index 027d30d..6718260
 diff --git a/kernel/comps/iwlwifi/src/lib.rs b/kernel/comps/iwlwifi/src/lib.rs
 old mode 100755
 new mode 100644
-index d00234b..e525048
+index d00234b..a88e743
 --- a/kernel/comps/iwlwifi/src/lib.rs
 +++ b/kernel/comps/iwlwifi/src/lib.rs
 @@ -1,20 +1,24 @@
@@ -916,9 +916,8 @@ index d00234b..e525048
 -        sleep();
 -    }
 -    WAITING.fetch_sub(1, Ordering::AcqRel);
-+    WAKER.msleep(ms);
- }
- 
+-}
+-
 -/// Waits about `ms` milliseconds without giving the processor away, for
 -/// the short settling times of the chip.
 -pub(crate) fn delay_ms(ms: u64) {
@@ -926,11 +925,8 @@ index d00234b..e525048
 -    while now_ms() < deadline {
 -        core::hint::spin_loop();
 -    }
-+/// The device table (`iwl_hw_card_ids`): the cards of [`ids::MACS`].
-+fn claims(vendor: u16, device: u16) -> bool {
-+    ids::mac_of(vendor, device).is_some()
- }
- 
+-}
+-
 -/// Each timer tick (1 ms).
 -fn tick() {
 -    let ticks = TICKS.fetch_add(1, Ordering::Relaxed);
@@ -959,8 +955,9 @@ index d00234b..e525048
 -#[derive(Debug)]
 -struct Driver {
 -    found: SpinLock<Vec<PciCommonDevice>>,
--}
--
++    WAKER.msleep(ms);
+ }
+ 
 -impl PciDriver for Driver {
 -    fn probe(&self, device: PciCommonDevice) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
 -        let id = *device.device_id();
@@ -970,8 +967,11 @@ index d00234b..e525048
 -        self.found.lock().push(device);
 -        Ok(Arc::new(Claimed(id)))
 -    }
--}
--
++/// The device table (`iwl_hw_card_ids`): the cards of [`ids::MACS`].
++fn claims(vendor: u16, device: u16) -> bool {
++    ids::mac_of(vendor, device).is_some()
+ }
+ 
 -/// The cards found, until their tasks start.
 -static PENDING: SpinLock<Vec<PciCommonDevice>> = SpinLock::new(Vec::new());
 -
@@ -988,15 +988,15 @@ index d00234b..e525048
  fn init() -> Result<(), ComponentInitError> {
 -    if !ENABLED.load(Ordering::Relaxed) {
 -        return Ok(());
-+    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
-+        WAKER.start_timer();
-     }
+-    }
 -    let driver = Arc::new(Driver { found: SpinLock::new(Vec::new()) });
 -    PCI_BUS.lock().register_driver(driver.clone());
 -    let cards = core::mem::take(&mut *driver.found.lock());
 -    if cards.is_empty() {
 -        return Ok(());
--    }
++    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
++        WAKER.start_timer();
+     }
 -    ostd::timer::register_callback_on_cpu(tick);
 -    *PENDING.lock() = cards;
      Ok(())
@@ -1036,7 +1036,7 @@ index d00234b..e525048
      let Some((file_name, file)) = aster_firmware::load_first(files.iter().map(String::as_str)) else {
          ostd::warn!("{}: the firmware {} is not in /lib/firmware", name, files[0]);
          return;
-@@ -237,85 +160,184 @@ fn run(index: usize, device: PciCommonDevice) {
+@@ -237,85 +160,226 @@ fn run(index: usize, device: PciCommonDevice) {
          firmware.scan_channels,
          firmware.command_version(LONG_GROUP, SCAN_REQ_UMAC)
      );
@@ -1095,6 +1095,8 @@ index d00234b..e525048
 +    let card = Arc::new(Card { mvm: Mutex::new(mvm) });
 +    let device = aster_wlan::register(info, Arc::new(IntelRadio { card: card.clone() }));
 +    card.mvm.lock().device = Some(device);
++    // Restarts this hour, and when the hour began.
++    let mut restarts = (0u32, now_ms());
      loop {
          sleep();
 -        if !proven && transport.interrupt_seen.load(Ordering::Relaxed) {
@@ -1117,7 +1119,7 @@ index d00234b..e525048
 -            return;
 +        let mut mvm = card.mvm.lock();
 +        mvm.poll();
-+        if mvm.dead {
++        if mvm.dead && !restart(&mut mvm, &firmware, &file, gen1, &prefix, &mut restarts) {
 +            break;
          }
      }
@@ -1133,9 +1135,48 @@ index d00234b..e525048
 -        let causes = transport.causes();
 -        if transport.receive().iter().any(|packet| packet.answers(sequence)) {
 -            break Ok(());
--        }
++/// Restarts a card whose firmware stopped with an error, as Linux's
++/// `iwl_mvm_nic_restart` does: the firmware loaded and configured again;
++/// the link was reported lost, and the supplicant makes it again. Three
++/// times an hour at most; then the card stays off.
++fn restart(mvm: &mut Mvm, firmware: &Firmware, file: &[u8], gen1: bool, prefix: &str, restarts: &mut (u32, u64)) -> bool {
++    const PER_HOUR: u32 = 3;
++    let now = now_ms();
++    if now.saturating_sub(restarts.1) > 3_600_000 {
++        *restarts = (0, now);
++    }
++    if restarts.0 >= PER_HOUR {
++        ostd::warn!("{}: the firmware failed {} times this hour; the card stays off", mvm.name, PER_HOUR);
++        return false;
++    }
++    restarts.0 += 1;
++    ostd::notice!("{}: restarting the firmware ({} of {} this hour)", mvm.name, restarts.0, PER_HOUR);
++    mvm.trans.stop();
++    mvm.reset(firmware);
++    let Some(alive) = start_with_retries(&mut mvm.trans, firmware, file, gen1) else { return false };
++    let alive = if gen1 {
++        if let Err(reason) = mvm.run_init_image(firmware) {
++            ostd::warn!("{}: the radio's calibration did not complete: {}", mvm.name, reason);
++            mvm.trans.stop();
++            return false;
+         }
 -        if causes.error {
 -            break Err(String::from("the firmware stopped with an error"));
++        mvm.trans.stop();
++        let Some(alive) = start_with_retries(&mut mvm.trans, firmware, file, false) else { return false };
++        alive
++    } else {
++        alive
++    };
++    if let Err(reason) = mvm.init(&alive, prefix, firmware, file) {
++        ostd::warn!("{}: the firmware did not take its configuration: {}", mvm.name, reason);
++        mvm.trans.stop();
++        return false;
++    }
++    ostd::notice!("{}: ready again", mvm.name);
++    true
++}
++
 +/// A card: its firmware's state, for its task and the Wi-Fi component.
 +struct Card {
 +    mvm: Mutex<Mvm>,
@@ -1283,7 +1324,7 @@ index d00234b..e525048
      let result = loop {
          let causes = transport.causes();
          if causes.error {
-@@ -336,7 +358,7 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
+@@ -336,7 +400,7 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
          if let Some(packet) = alive {
              let status = packet.data.get(0..2).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
              break if status == ALIVE_STATUS_OK {
@@ -1292,7 +1333,7 @@ index d00234b..e525048
              } else {
                  Err(format!("its alive status is {status:#x}"))
              };
-@@ -354,10 +376,10 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
+@@ -354,10 +418,10 @@ fn start_firmware(transport: &mut Transport, firmware: &Firmware, file: &[u8]) -
          }
          sleep();
      };
@@ -1308,10 +1349,10 @@ index d00234b..e525048
  }
 diff --git a/kernel/comps/iwlwifi/src/mvm.rs b/kernel/comps/iwlwifi/src/mvm.rs
 new file mode 100644
-index 0000000..52de1a0
+index 0000000..c156a4e
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/src/mvm.rs
-@@ -0,0 +1,2003 @@
+@@ -0,0 +1,2097 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The card as a Wi-Fi station: the commands of Linux's `iwlmvm` for
@@ -1338,15 +1379,18 @@ index 0000000..52de1a0
 +//! The AX2xx cards run 40, 80 and 160 MHz channels with HT, VHT and HE
 +//! rates (the PHY context's width, the station's, the firmware's rate
 +//! control and HE station context), on 6 GHz too where the card has it;
-+//! the BE200 adds EHT and 320 MHz; the older families stay at 20 MHz HT.
++//! the BE200 adds EHT and 320 MHz; the 7000, 8000 and 9000 families HT40
++//! and VHT to 80 MHz (the host's rate control's VHT rates).
 +//! Block-ack sessions ([`ba`]) and power save run on every family.
 +//!
 +//! The AX2xx cards also run an access point ([`ap`]): a GO MAC context,
 +//! the beacon as the firmware's template, broadcast and multicast
 +//! stations, a station and queue per client.
 +//!
-+//! Not yet: TKIP and WEP, BIP (802.11w broadcast protection), restarting
-+//! the firmware after an error.
++//! Robust management frames are protected with the pairwise key as data
++//! are; the Wi-Fi component checks the broadcast ones (BIP). A firmware
++//! that stops with an error is loaded and configured again
++//! (`crate::restart`). Not yet: TKIP and WEP.
 +
 +mod ap;
 +mod ba;
@@ -1863,6 +1907,84 @@ index 0000000..52de1a0
 +        }
 +    }
 +
++    /// Back to the state `new` makes, the transport, the name and the
++    /// Wi-Fi component's device kept: before the firmware is loaded and
++    /// configured again after an error (generated from `new`'s values).
++    pub(crate) fn reset(&mut self, firmware: &Firmware) {
++        let mac = self.trans.mac;
++        let ax210 = matches!(mac.family, Family::Ax210 | Family::Bz);
++        let (tx_ant, rx_ant) = firmware.antennas();
++        let scan_slots = (firmware.scan_channels as usize).clamp(1, SCAN_MAX_CHANNELS);
++        self.ac7000 = mac.family == Family::Ac7000;
++        self.nvm_sdp = ids::nvm_sdp(mac);
++        self.station_v7 = !firmware.has_api(gen1::API_STA_TYPE) && !firmware.has_capability(gen1::CAPA_MULTI_QUEUE_RX);
++        self.lmac_scan = !firmware.has_capability(gen1::CAPA_UMAC_SCAN);
++        self.bt_mplut = firmware.has_capability(gen1::CAPA_BT_MPLUT);
++        self.valid_channels = None;
++        self.mld = mac.family == Family::Bz;
++        self.ap = None;
++        self.rx_agreements = Vec::new();
++        self.beacon_version = if !firmware.has_capability(CAPA_CSA_AND_TBTT_OFFLOAD) {
++                6
++            } else if firmware.has_api(API_NEW_BEACON_TEMPLATE) {
++                9
++            } else {
++                7
++            };
++        self.power_save = false;
++        self.power_cmd_v2 = firmware.command_version(LONG, MAC_PM_POWER_TABLE) >= 2;
++        self.baid_cmd = mac.family == Family::Bz || firmware.has_capability(ba::CAPA_BAID_ML_SUPPORT);
++        self.baid_remove_v1 = firmware.command_version(DATA_PATH, 0x16) <= 1;
++        self.gen1 = matches!(mac.family, Family::Ac9000 | Family::Ac8000 | Family::Ac7000);
++        self.legacy_rx = matches!(mac.family, Family::Ac8000 | Family::Ac7000);
++        self.last_phy = Vec::new();
++        self.phy_db = Vec::new();
++        self.time_event = None;
++        self.authorized = false;
++        self.rates = gen1::Rates::default();
++        self.aux_queue = None;
++        self.station_queues = 0;
++        self.extra_phy_config = ids::extra_phy_config(mac);
++        self.scan_slots = scan_slots;
++        self.scan_version = firmware.command_version(LONG, SCAN_REQ_UMAC);
++        self.adaptive_dwell = firmware.has_api(gen1::API_ADAPTIVE_DWELL);
++        self.adaptive_dwell_v2 = firmware.has_api(gen1::API_ADAPTIVE_DWELL_V2);
++        self.mac = mac;
++        self.ax210 = ax210;
++        self.tx_cmd_v10 = firmware.command_version(LONG, TX_CMD) >= 10;
++        self.rx_desc_len = if ax210 { 64 } else { 48 };
++        self.uhb = firmware.has_capability(CAPA_ULTRA_HB_CHANNELS);
++        self.band_6 = ax210 && firmware.has_capability(CAPA_ULTRA_HB_CHANNELS);
++        self.eht = mac.family == Family::Bz && ids::eht_radio(self.trans.hw_rf_id, self.trans.subsystem_device);
++        self.eht_320 = mac.family == Family::Bz && ids::eht_radio(self.trans.hw_rf_id, self.trans.subsystem_device) && !ids::bw_limited(self.trans.subsystem_device);
++        self.tlc_v5 = firmware.command_version(DATA_PATH, TLC_MNG_CONFIG_CMD) == TLC_CONFIG_V5;
++        self.cdb = firmware.has_capability(CAPA_CDB_SUPPORT);
++        self.lar = firmware.has_capability(CAPA_LAR_SUPPORT);
++        self.soc_latency = firmware.has_capability(CAPA_SOC_LATENCY_SUPPORT);
++        self.tx_ant = if tx_ant == 0 { 0x3 } else { tx_ant };
++        self.rx_ant = if rx_ant == 0 { 0x3 } else { rx_ant };
++        self.address = [0; 6];
++        self.band_24 = true;
++        self.band_52 = true;
++        self.ht = true;
++        self.scan_channels = (firmware.scan_channels as usize).clamp(1, SCAN_MAX_CHANNELS);
++        self.dead = false;
++        self.mac_added = false;
++        self.phy_added = false;
++        self.binding_added = false;
++        self.station_added = false;
++        self.network = None;
++        self.associated = false;
++        self.aid = 0;
++        self.qos = false;
++        self.management_queue = None;
++        self.data_queue = None;
++        self.sequence = [0; 17];
++        self.pairwise = None;
++        self.scanning = false;
++        self.signal = None;
++    }
++
 +    // ---- Commands and what comes back. ----
 +
 +    /// Sends a command and waits for its answer, handling what else comes
@@ -1953,7 +2075,7 @@ index 0000000..52de1a0
 +            return;
 +        }
 +        self.dead = true;
-+        ostd::warn!("{}: the firmware stopped with an error; the card stays off until the next boot", self.name);
++        ostd::warn!("{}: the firmware stopped with an error", self.name);
 +        if let Some(device) = &self.device {
 +            if self.scanning {
 +                device.scan_done(true);
@@ -2166,7 +2288,8 @@ index 0000000..52de1a0
 +        let rx_streams = self.rx_ant.count_ones().clamp(1, 2) as usize;
 +        let tx_streams = self.tx_ant.count_ones().clamp(1, 2) as usize;
 +        // The AX2xx cards run 40 MHz and wider channels, VHT and HE; the
-+        // older families stay at 20 MHz HT here.
++        // first generation (7000 to 9000) HT at 40 MHz and VHT to 80 MHz,
++        // without LDPC (`iwl_init_ht_hw_capab`, `iwl_init_vht_hw_capab`).
 +        let wide = !self.gen1;
 +        let ht = self.ht.then(|| {
 +            let mut mcs = [0u8; 16];
@@ -2178,20 +2301,20 @@ index 0000000..52de1a0
 +            // Static SM power save off, short GI at 20 MHz, one receive
 +            // STBC stream; wide: LDPC, 40 MHz with its short GI, transmit
 +            // STBC with two antennas.
-+            let mut info = 0x000c | chan::HT_CAP_SGI_20 | 0x0100;
++            let mut info = 0x000c | chan::HT_CAP_SGI_20 | 0x0100 | chan::HT_CAP_SUP_WIDTH_20_40 | chan::HT_CAP_SGI_40;
 +            if wide {
-+                info |= chan::HT_CAP_LDPC | chan::HT_CAP_SUP_WIDTH_20_40 | chan::HT_CAP_SGI_40;
-+                if tx_streams >= 2 {
-+                    info |= 0x0080;
-+                }
++                info |= chan::HT_CAP_LDPC;
++            }
++            if tx_streams >= 2 {
++                info |= 0x0080;
 +            }
 +            HtCap { info, ampdu_factor: 3, ampdu_density: 5, mcs }
 +        });
 +        // MCS 0 to 9 on each stream there is, none on the others.
 +        let stream_map = |streams: usize, value: u16| -> u16 { (0..8).fold(0u16, |map, stream| map | (if stream < streams { value } else { 3 }) << (stream * 2)) };
-+        let vht = (wide && self.ht).then(|| {
++        let vht = self.ht.then(|| {
 +            let map = stream_map(rx_streams, 2);
-+            let mut info = chan::VHT_CAP_RXLDPC
++            let mut info = if wide { chan::VHT_CAP_RXLDPC } else { 0 }
 +                | chan::VHT_CAP_SGI_80
 +                | 0x0100
 +                | chan::VHT_CAP_SU_BEAMFORMEE
@@ -2199,8 +2322,10 @@ index 0000000..52de1a0
 +                | (7 << chan::VHT_CAP_MAX_AMPDU_SHIFT)
 +                | 0x1000_0000
 +                | 0x2000_0000;
-+            // 160 MHz, with its short GI.
-+            info |= 0x0000_0004 | chan::VHT_CAP_SGI_160;
++            // 160 MHz, with its short GI (the AX2xx cards').
++            if wide {
++                info |= 0x0000_0004 | chan::VHT_CAP_SGI_160;
++            }
 +            if tx_streams >= 2 {
 +                info |= chan::VHT_CAP_TXSTBC;
 +            }
@@ -2293,6 +2418,7 @@ index 0000000..52de1a0
 +            // An access point ([`ap`]): on the AX2xx firmware's API, the
 +            // MLD API, and the first generation's.
 +            ap: true,
++            management: radio::ManagementProtection::Unicast,
 +        }
 +    }
 +
@@ -2359,19 +2485,15 @@ index 0000000..52de1a0
 +    /// The PHY context on the network's channel, 20 MHz.
 +    fn phy_context(&mut self, action: u32, freq: u16) -> Result<(), String> {
 +        if self.gen1 {
-+            return self.phy_context_v1(action, freq);
++            let (width, position) = self.link_width(freq);
++            return self.phy_context_v1(action, freq, width, position);
 +        }
 +        if self.mld {
 +            return self.mld_phy_context(action, freq);
 +        }
 +        let band = phy_band(freq);
 +        let channel = channel_number(freq);
-+        let chandef = match &self.ap {
-+            Some(ap) => Some(ap.config.chandef),
-+            None => self.network.as_ref().and_then(|network| network.chandef),
-+        }
-+        .filter(|chandef| chandef.control == freq);
-+        let (width, position) = chandef.map_or((PHY_CHANNEL_MODE20, 0), |chandef| Self::phy_width(&chandef));
++        let (width, position) = self.link_width(freq);
 +        let mut out = Out::default();
 +        out.u32(0).u32(action);
 +        if self.uhb {
@@ -2384,6 +2506,21 @@ index 0000000..52de1a0
 +        out.u32(((self.rx_ant as u32) << PHY_RX_CHAIN_VALID_POS) | (chains << PHY_RX_CHAIN_CNT_POS) | (chains << PHY_RX_CHAIN_MIMO_CNT_POS));
 +        out.u32(0).u8(0).zeros(3);
 +        self.command(0, PHY_CONTEXT_CMD, &out.0).map(|_| ())
++    }
++
++    /// The PHY context's width and position for the link (or network) on
++    /// `freq`: 20 MHz without one. The first generation goes to 80 MHz.
++    fn link_width(&self, freq: u16) -> (u8, u8) {
++        let chandef = match &self.ap {
++            Some(ap) => Some(ap.config.chandef),
++            None => self.network.as_ref().and_then(|network| network.chandef),
++        }
++        .filter(|chandef| chandef.control == freq);
++        let (width, position) = chandef.map_or((PHY_CHANNEL_MODE20, 0), |chandef| Self::phy_width(&chandef));
++        if self.gen1 && width > PHY_CHANNEL_MODE80 {
++            return (PHY_CHANNEL_MODE20, 0);
++        }
++        (width, position)
 +    }
 +
 +    /// The PHY context's width code and the primary channel's position: on
@@ -2433,14 +2570,12 @@ index 0000000..52de1a0
 +            if streams >= 2 && self.rx_ant.count_ones() >= 2 && self.tx_ant.count_ones() >= 2 {
 +                flags |= STA_FLG_MIMO_EN_MIMO2;
 +            }
-+            if !self.gen1 {
-+                flags |= match network.peer.width {
-+                    Width::W160 => STA_FLG_FAT_EN_160MHZ,
-+                    Width::W80 => STA_FLG_FAT_EN_80MHZ,
-+                    Width::W40 => STA_FLG_FAT_EN_40MHZ,
-+                    _ => 0,
-+                };
-+            }
++            flags |= match network.peer.width {
++                Width::W160 | Width::W320 if !self.gen1 => STA_FLG_FAT_EN_160MHZ,
++                Width::W80 | Width::W160 | Width::W320 => STA_FLG_FAT_EN_80MHZ,
++                Width::W40 => STA_FLG_FAT_EN_40MHZ,
++                _ => 0,
++            };
 +        }
 +        let mut out = Out::default();
 +        out.u8(modify as u8).u8(0).u16(0xffff).u32(0).bytes(&network.bssid).u16(0);
@@ -4428,10 +4563,10 @@ index 0000000..7627bb3
 +}
 diff --git a/kernel/comps/iwlwifi/src/mvm/gen1.rs b/kernel/comps/iwlwifi/src/mvm/gen1.rs
 new file mode 100644
-index 0000000..9e1d6e3
+index 0000000..13b73be
 --- /dev/null
 +++ b/kernel/comps/iwlwifi/src/mvm/gen1.rs
-@@ -0,0 +1,1126 @@
+@@ -0,0 +1,1171 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The 9000 family's commands (firmware API 46), and the 8000 family's
@@ -4455,8 +4590,8 @@ index 0000000..9e1d6e3
 +use alloc::{format, string::String, vec, vec::Vec};
 +
 +use aster_wlan::{
-+    ieee80211 as wifi,
-+    radio::{self, BandId, ScanRequest},
++    chan, ieee80211 as wifi,
++    radio::{self, BandId, ScanRequest, Width},
 +};
 +
 +use super::{
@@ -4624,6 +4759,11 @@ index 0000000..9e1d6e3
 +pub(super) const RATE_CCK: u32 = 0x200;
 +const RATE_SGI: u32 = 0x2000;
 +const RATE_ANT_POS: u32 = 14;
++/// VHT rates (MCS in bits 0-3, streams less one in bits 4-5) and the
++/// channel's width in bits 11-12 (20, 40, 80 MHz).
++const RATE_VHT: u32 = 1 << 26;
++const RATE_VHT_NSS_POS: u32 = 4;
++const RATE_WIDTH_POS: u32 = 11;
 +const PLCP_1M: u32 = 10;
 +const PLCP_2M: u32 = 20;
 +const PLCP_5M: u32 = 55;
@@ -4725,9 +4865,48 @@ index 0000000..9e1d6e3
 +        let ghz2 = BandId::of(network.freq) == BandId::Ghz2;
 +        let floor = legacy(if ghz2 { PLCP_1M } else { PLCP_6M }, single);
 +        let mut rates = Rates { floor, ..Rates::default() };
++        // The link's width (to 80 MHz) and its short guard interval.
++        let (width, sgi_wide) = match network.peer.width {
++            Width::W40 => (1, network.peer.ht.is_some_and(|cap| cap.info & chan::HT_CAP_SGI_40 != 0)),
++            Width::W80 | Width::W160 | Width::W320 => {
++                (2, network.peer.vht.is_some_and(|cap| cap.info & chan::VHT_CAP_SGI_80 != 0))
++            }
++            _ => (0, network.ht_short_gi),
++        };
++        if ht && !ghz2 && let Some(vht) = network.peer.vht.filter(|_| network.ht_mcs.is_some()) {
++            // VHT: one stream's MCS 0 to its highest, then two streams' MCS
++            // 5 and up (faster than one stream's fastest), where both ends
++            // have two. MCS 9 is not at 20 MHz.
++            let sgi = if sgi_wide { RATE_SGI } else { 0 };
++            let map = u16::from_le_bytes([vht.mcs[0], vht.mcs[1]]);
++            let top_of = |stream: u32| -> Option<u32> {
++                match (map >> (2 * stream)) & 3 {
++                    3 => None,
++                    code => Some((7 + code as u32).min(if width == 0 { 8 } else { 9 })),
++                }
++            };
++            let base = RATE_VHT | sgi | (width << RATE_WIDTH_POS);
++            if let Some(top) = top_of(0) {
++                for mcs in 0..=top {
++                    rates.ladder.push(base | mcs | (single << RATE_ANT_POS));
++                    rates.mimo.push(false);
++                }
++            }
++            if both == 0x3 && network.peer.nss >= 2 && let Some(top) = top_of(1) {
++                for mcs in 5..=top {
++                    rates.ladder.push(base | mcs | (1 << RATE_VHT_NSS_POS) | (both << RATE_ANT_POS));
++                    rates.mimo.push(true);
++                }
++            }
++            if !rates.ladder.is_empty() {
++                rates.top = rates.ladder.len().min(5).saturating_sub(1);
++                rates.dirty = true;
++                return rates;
++            }
++        }
 +        match network.ht_mcs {
 +            Some(mcs) if ht => {
-+                let sgi = if network.ht_short_gi { RATE_SGI } else { 0 };
++                let sgi = (if sgi_wide { RATE_SGI } else { 0 }) | (width.min(1) << RATE_WIDTH_POS);
 +                for index in 0..8u32 {
 +                    if mcs[0] & (1 << index) != 0 {
 +                        rates.ladder.push(RATE_HT | sgi | index | (single << RATE_ANT_POS));
@@ -5257,16 +5436,17 @@ index 0000000..9e1d6e3
 +    // ---- Joining. ----
 +
 +    /// The PHY context, version 1 (`struct iwl_phy_context_cmd_v1`): the
-+    /// channel at 20 MHz, the transmit and receive chains.
-+    pub(super) fn phy_context_v1(&mut self, action: u32, freq: u16) -> Result<(), String> {
++    /// channel, its width and the primary's position, the transmit and
++    /// receive chains.
++    pub(super) fn phy_context_v1(&mut self, action: u32, freq: u16, width: u8, position: u8) -> Result<(), String> {
 +        let band = if BandId::of(freq) == BandId::Ghz2 { PHY_BAND_24 } else { PHY_BAND_5 };
 +        let channel = channel_number(freq);
 +        let mut out = Out::default();
 +        out.u32(0).u32(action).u32(0).u32(0);
 +        if self.uhb {
-+            out.u32(channel as u32).u8(band).u8(0).u8(0).u8(0);
++            out.u32(channel as u32).u8(band).u8(width).u8(position).u8(0);
 +        } else {
-+            out.u8(band).u8(channel).u8(0).u8(0);
++            out.u8(band).u8(channel).u8(width).u8(position);
 +        }
 +        let chains = self.rx_ant.count_ones().clamp(1, 2);
 +        out.u32(self.tx_ant as u32);
@@ -8744,7 +8924,7 @@ index 0000000..69c5cc1
 +}
 diff --git a/kernel/comps/wlan/src/ba.rs b/kernel/comps/wlan/src/ba.rs
 new file mode 100644
-index 0000000..203e4aa
+index 0000000..3a81041
 --- /dev/null
 +++ b/kernel/comps/wlan/src/ba.rs
 @@ -0,0 +1,602 @@
@@ -9079,7 +9259,7 @@ index 0000000..203e4aa
 +        // The network's BSSID: the access point's address, or this one's.
 +        let bssid = if self.is_ap() { self.info.address } else { *peer };
 +        let frame = wifi::action(peer, &self.info.address, &bssid, body, protect);
-+        let _ = self.radio.send_management(&frame);
++        let _ = self.transmit_management(&frame);
 +    }
 +
 +    /// A peer's offer to send aggregates: the answer.
@@ -10809,13 +10989,534 @@ index a44157b..3a5b2b0 100644
 +pub(crate) const NL80211_STA_INFO_TX_BYTES64: u32 = 24;
 +pub(crate) const NL80211_STA_INFO_TX_PACKETS: u32 = 10;
  pub(crate) const NUM_NL80211_EXT_FEATURES: u32 = 70;
+diff --git a/kernel/comps/wlan/src/crypt.rs b/kernel/comps/wlan/src/crypt.rs
+new file mode 100644
+index 0000000..afab2db
+--- /dev/null
++++ b/kernel/comps/wlan/src/crypt.rs
+@@ -0,0 +1,515 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! 802.11's ciphers where this component runs them itself: BIP, 802.11w's
++//! integrity code of broadcast management frames (CMAC and GMAC, 128 and
++//! 256 bits), and CCMP and GCMP on robust unicast management frames for
++//! radios whose chip protects data only (as Linux's mac80211 does for
++//! rtw88: `IEEE80211_KEY_FLAG_SW_MGMT_TX`). The chips run the data path;
++//! these run on the few frames they leave.
++//!
++//! References: IEEE 802.11-2020 12.5.3 (CCMP), 12.5.4 (BIP), 12.5.5
++//! (GCMP); RFC 3610 (CCM), RFC 4493 (CMAC), NIST SP 800-38D (GCM).
++
++use alloc::vec::Vec;
++
++use aes_gcm::{
++    Aes128Gcm, Aes256Gcm,
++    aead::{AeadInPlace, NewAead},
++    aes::{Aes128, Aes256, BlockEncrypt, NewBlockCipher},
++};
++
++use crate::{
++    ieee80211 as wifi,
++    radio::{
++        CIPHER_BIP_CMAC, CIPHER_BIP_GMAC, CIPHER_BIP_GMAC_256, CIPHER_CCMP, CIPHER_CCMP_256, CIPHER_GCMP,
++        CIPHER_GCMP_256,
++    },
++};
++
++/// BIP-CMAC-256 (its suite has no constant elsewhere: no radio runs it).
++pub(crate) const CIPHER_BIP_CMAC_256: u32 = 0x000f_ac0d;
++/// The ciphers of broadcast management frames this component runs.
++pub(crate) const BIP_CIPHERS: [u32; 4] = [CIPHER_BIP_CMAC, CIPHER_BIP_CMAC_256, CIPHER_BIP_GMAC, CIPHER_BIP_GMAC_256];
++/// The management MIC element (MMIE).
++const ELEMENT_MMIE: u8 = 76;
++
++pub(crate) fn is_bip(cipher: u32) -> bool {
++    BIP_CIPHERS.contains(&cipher)
++}
++
++/// AES of either size, one block at a time.
++enum Aes {
++    Bits128(Aes128),
++    Bits256(Aes256),
++}
++
++impl Aes {
++    fn new(key: &[u8]) -> Option<Self> {
++        match key.len() {
++            16 => Some(Self::Bits128(Aes128::new(key.into()))),
++            32 => Some(Self::Bits256(Aes256::new(key.into()))),
++            _ => None,
++        }
++    }
++
++    fn encrypt(&self, block: &mut [u8; 16]) {
++        let block = block.into();
++        match self {
++            Self::Bits128(cipher) => cipher.encrypt_block(block),
++            Self::Bits256(cipher) => cipher.encrypt_block(block),
++        }
++    }
++}
++
++/// AES-CMAC (RFC 4493) of `parts`, one after the other.
++fn cmac(cipher: &Aes, parts: &[&[u8]]) -> [u8; 16] {
++    let double = |block: [u8; 16]| {
++        let mut out = [0u8; 16];
++        for i in 0..16 {
++            out[i] = (block[i] << 1) | block.get(i + 1).map_or(0, |next| next >> 7);
++        }
++        if block[0] & 0x80 != 0 {
++            out[15] ^= 0x87;
++        }
++        out
++    };
++    let mut zero = [0u8; 16];
++    cipher.encrypt(&mut zero);
++    let k1 = double(zero);
++    let k2 = double(k1);
++    let total: usize = parts.iter().map(|part| part.len()).sum();
++    let mut state = [0u8; 16];
++    let mut block = [0u8; 16];
++    let mut filled = 0;
++    let mut seen = 0;
++    for byte in parts.iter().flat_map(|part| part.iter()) {
++        if filled == 16 {
++            for i in 0..16 {
++                state[i] ^= block[i];
++            }
++            cipher.encrypt(&mut state);
++            filled = 0;
++        }
++        block[filled] = *byte;
++        filled += 1;
++        seen += 1;
++    }
++    debug_assert_eq!(seen, total);
++    // The last block: whole, or padded with 10...0.
++    let subkey = if total > 0 && filled == 16 {
++        k1
++    } else {
++        block[filled] = 0x80;
++        block[filled + 1..].fill(0);
++        k2
++    };
++    for i in 0..16 {
++        state[i] ^= block[i] ^ subkey[i];
++    }
++    cipher.encrypt(&mut state);
++    state
++}
++
++/// The masked frame control and addresses BIP covers (12.5.4.4.1).
++fn bip_aad(frame: &[u8]) -> [u8; 20] {
++    let mut aad = [0u8; 20];
++    aad[0] = frame[0];
++    // Retry, Power Management and More Data off.
++    aad[1] = frame[1] & !0x38;
++    aad[2..20].copy_from_slice(&frame[4..22]);
++    aad
++}
++
++/// A group's integrity key (IGTK) and the last packet number it took.
++#[derive(Clone)]
++pub(crate) struct Igtk {
++    pub(crate) index: u8,
++    cipher: u32,
++    key: Vec<u8>,
++    last: u64,
++}
++
++impl Igtk {
++    pub(crate) fn new(index: u8, cipher: u32, key: &[u8], seq: &[u8]) -> Option<Self> {
++        let size = match cipher {
++            CIPHER_BIP_CMAC | CIPHER_BIP_GMAC => 16,
++            CIPHER_BIP_CMAC_256 | CIPHER_BIP_GMAC_256 => 32,
++            _ => return None,
++        };
++        if key.len() != size || !(4..=5).contains(&index) {
++            return None;
++        }
++        Some(Self { index, cipher, key: key.to_vec(), last: little_48(seq) })
++    }
++
++    fn mic_len(&self) -> usize {
++        if self.cipher == CIPHER_BIP_CMAC { 8 } else { 16 }
++    }
++
++    /// Whether a broadcast management frame carries this key's valid MMIE
++    /// with a packet number it has not taken yet; it is taken.
++    pub(crate) fn verify(&mut self, frame: &[u8]) -> bool {
++        let mic_len = self.mic_len();
++        let mmie_len = 2 + 2 + 6 + mic_len;
++        if frame.len() < wifi::HEADER + mmie_len || frame[1] & wifi::PROTECTED != 0 {
++            return false;
++        }
++        let mmie = &frame[frame.len() - mmie_len..];
++        if mmie[0] != ELEMENT_MMIE || mmie[1] as usize != mmie_len - 2 {
++            return false;
++        }
++        if u16::from_le_bytes([mmie[2], mmie[3]]) != u16::from(self.index) {
++            return false;
++        }
++        let ipn = little_48(&mmie[4..10]);
++        if ipn <= self.last {
++            return false;
++        }
++        let aad = bip_aad(frame);
++        // The body with the MIC field zeroed.
++        let mut body = frame[wifi::HEADER..].to_vec();
++        let mic_at = body.len() - mic_len;
++        let received = body[mic_at..].to_vec();
++        body[mic_at..].fill(0);
++        let computed: Vec<u8> = match self.cipher {
++            CIPHER_BIP_CMAC | CIPHER_BIP_CMAC_256 => {
++                let Some(cipher) = Aes::new(&self.key) else { return false };
++                cmac(&cipher, &[&aad, &body])[..mic_len].to_vec()
++            }
++            _ => {
++                // GMAC: GCM over nothing, the frame as associated data;
++                // the nonce is A2 and the IPN, most significant first.
++                let mut nonce = [0u8; 12];
++                nonce[..6].copy_from_slice(&frame[10..16]);
++                for i in 0..6 {
++                    nonce[6 + i] = mmie[9 - i];
++                }
++                let mut associated = aad.to_vec();
++                associated.extend_from_slice(&body);
++                match gcm_tag(&self.key, &nonce, &associated, &mut []) {
++                    Some(tag) => tag.to_vec(),
++                    None => return false,
++                }
++            }
++        };
++        if !equal(&computed, &received) {
++            return false;
++        }
++        self.last = ipn;
++        true
++    }
++}
++
++/// A pairwise key for robust management frames: the next packet number
++/// this side sends and the last one received.
++#[derive(Clone)]
++pub(crate) struct ManagementKey {
++    pub(crate) index: u8,
++    cipher: u32,
++    key: Vec<u8>,
++    next: u64,
++    last_received: Option<u64>,
++}
++
++impl ManagementKey {
++    pub(crate) fn new(index: u8, cipher: u32, key: &[u8]) -> Option<Self> {
++        let size = match cipher {
++            CIPHER_CCMP | CIPHER_GCMP => 16,
++            CIPHER_CCMP_256 | CIPHER_GCMP_256 => 32,
++            _ => return None,
++        };
++        (key.len() == size).then(|| Self { index, cipher, key: key.to_vec(), next: 1, last_received: None })
++    }
++
++    fn mic_len(&self) -> usize {
++        if self.cipher == CIPHER_CCMP { 8 } else { 16 }
++    }
++
++    fn gcm(&self) -> bool {
++        matches!(self.cipher, CIPHER_GCMP | CIPHER_GCMP_256)
++    }
++
++    /// Encrypts a management frame whose Protected bit is set: its body
++    /// gets the cipher's header before it and the MIC after it.
++    pub(crate) fn encrypt(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
++        if frame.len() < wifi::HEADER {
++            return None;
++        }
++        let pn = self.next;
++        self.next += 1;
++        let mut out = frame[..wifi::HEADER].to_vec();
++        out[1] |= wifi::PROTECTED;
++        out.extend_from_slice(&[
++            pn as u8,
++            (pn >> 8) as u8,
++            0,
++            0x20 | (self.index << 6),
++            (pn >> 16) as u8,
++            (pn >> 24) as u8,
++            (pn >> 32) as u8,
++            (pn >> 40) as u8,
++        ]);
++        let mut body = frame[wifi::HEADER..].to_vec();
++        let aad = management_aad(&out);
++        let nonce = self.nonce(&out, pn);
++        let tag = if self.gcm() {
++            gcm_tag(&self.key, &nonce[1..], &aad, &mut body)?.to_vec()
++        } else {
++            ccm_encrypt(&Aes::new(&self.key)?, &nonce, &aad, &mut body, self.mic_len())
++        };
++        out.extend_from_slice(&body);
++        out.extend_from_slice(&tag);
++        Some(out)
++    }
++
++    /// Decrypts a protected unicast management frame: the plain frame,
++    /// without the cipher's header and MIC but with its Protected bit (it
++    /// came protected), or none if it does not check or comes again.
++    pub(crate) fn decrypt(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
++        let mic_len = self.mic_len();
++        if frame.len() < wifi::HEADER + 8 + mic_len || frame[1] & wifi::PROTECTED == 0 {
++            return None;
++        }
++        let header = &frame[wifi::HEADER..wifi::HEADER + 8];
++        if header[3] & 0x20 == 0 || header[3] >> 6 != self.index {
++            return None;
++        }
++        let pn = u64::from(header[0])
++            | u64::from(header[1]) << 8
++            | u64::from(header[4]) << 16
++            | u64::from(header[5]) << 24
++            | u64::from(header[6]) << 32
++            | u64::from(header[7]) << 40;
++        if self.last_received.is_some_and(|last| pn <= last) {
++            return None;
++        }
++        let aad = management_aad(frame);
++        let nonce = self.nonce(frame, pn);
++        let mut body = frame[wifi::HEADER + 8..frame.len() - mic_len].to_vec();
++        let received = &frame[frame.len() - mic_len..];
++        let checks = if self.gcm() {
++            gcm_decrypt(&self.key, &nonce[1..], &aad, &mut body, received)
++        } else {
++            ccm_decrypt(&Aes::new(&self.key)?, &nonce, &aad, &mut body, received)
++        };
++        if !checks {
++            return None;
++        }
++        self.last_received = Some(pn);
++        let mut plain = frame[..wifi::HEADER].to_vec();
++        plain.extend_from_slice(&body);
++        Some(plain)
++    }
++
++    /// CCMP's nonce (flags, A2, the PN most significant first); GCMP's is
++    /// the same without the flags. The flags of a management frame have
++    /// the Management bit and priority 0.
++    fn nonce(&self, frame: &[u8], pn: u64) -> [u8; 13] {
++        let mut nonce = [0u8; 13];
++        nonce[0] = 0x10;
++        nonce[1..7].copy_from_slice(&frame[10..16]);
++        for i in 0..6 {
++            nonce[7 + i] = (pn >> (40 - 8 * i)) as u8;
++        }
++        nonce
++    }
++}
++
++/// The associated data CCMP and GCMP cover of a management frame: the
++/// frame control (its subtype kept, Retry, Power Management and More Data
++/// off, Protected on), the three addresses and the fragment number.
++fn management_aad(frame: &[u8]) -> [u8; 22] {
++    let mut aad = [0u8; 22];
++    aad[0] = frame[0];
++    aad[1] = (frame[1] & !0x38) | wifi::PROTECTED;
++    aad[2..20].copy_from_slice(&frame[4..22]);
++    aad[20] = frame[22] & 0x0f;
++    aad[21] = 0;
++    aad
++}
++
++/// CCM's CBC-MAC and counter blocks (RFC 3610) with a 13-byte nonce
++/// (L = 2): the tag of `aad` and `data`, `data` turned into what the other
++/// side gets.
++fn ccm(cipher: &Aes, nonce: &[u8; 13], aad: &[u8], data: &mut [u8], mic_len: usize, encrypting: bool) -> [u8; 16] {
++    let counter = |i: u16| {
++        let mut block = [0u8; 16];
++        block[0] = 1;
++        block[1..14].copy_from_slice(nonce);
++        block[14..16].copy_from_slice(&i.to_be_bytes());
++        cipher.encrypt(&mut block);
++        block
++    };
++    let mac_over = |plain: &[u8]| {
++        let mut mac = [0u8; 16];
++        mac[0] = 0x40 | (((mic_len as u8 - 2) / 2) << 3) | 1;
++        mac[1..14].copy_from_slice(nonce);
++        mac[14..16].copy_from_slice(&(plain.len() as u16).to_be_bytes());
++        cipher.encrypt(&mut mac);
++        let mut absorb = |chunk: &[u8]| {
++            for (i, byte) in chunk.iter().enumerate() {
++                mac[i] ^= byte;
++            }
++            cipher.encrypt(&mut mac);
++        };
++        let mut associated = Vec::with_capacity(2 + aad.len());
++        associated.extend_from_slice(&(aad.len() as u16).to_be_bytes());
++        associated.extend_from_slice(aad);
++        for chunk in associated.chunks(16) {
++            absorb(chunk);
++        }
++        for chunk in plain.chunks(16) {
++            absorb(chunk);
++        }
++        mac
++    };
++    let crypt = |data: &mut [u8]| {
++        for (index, chunk) in data.chunks_mut(16).enumerate() {
++            let stream = counter(index as u16 + 1);
++            for (byte, key) in chunk.iter_mut().zip(stream.iter()) {
++                *byte ^= key;
++            }
++        }
++    };
++    let mac = if encrypting {
++        let mac = mac_over(data);
++        crypt(data);
++        mac
++    } else {
++        crypt(data);
++        mac_over(data)
++    };
++    let first = counter(0);
++    let mut tag = [0u8; 16];
++    for i in 0..16 {
++        tag[i] = mac[i] ^ first[i];
++    }
++    tag
++}
++
++fn ccm_encrypt(cipher: &Aes, nonce: &[u8; 13], aad: &[u8], data: &mut [u8], mic_len: usize) -> Vec<u8> {
++    ccm(cipher, nonce, aad, data, mic_len, true)[..mic_len].to_vec()
++}
++
++fn ccm_decrypt(cipher: &Aes, nonce: &[u8; 13], aad: &[u8], data: &mut [u8], received: &[u8]) -> bool {
++    let tag = ccm(cipher, nonce, aad, data, received.len(), false);
++    equal(&tag[..received.len()], received)
++}
++
++/// GCM with a 12-byte nonce: `data` encrypted in place, the tag.
++fn gcm_tag(key: &[u8], nonce: &[u8], aad: &[u8], data: &mut [u8]) -> Option<[u8; 16]> {
++    let nonce: [u8; 12] = nonce.try_into().ok()?;
++    let nonce = &aes_gcm::Nonce::from(nonce);
++    let tag = match key.len() {
++        16 => Aes128Gcm::new(key.into()).encrypt_in_place_detached(nonce, aad, data).ok()?,
++        32 => Aes256Gcm::new(key.into()).encrypt_in_place_detached(nonce, aad, data).ok()?,
++        _ => return None,
++    };
++    let mut out = [0u8; 16];
++    out.copy_from_slice(&tag);
++    Some(out)
++}
++
++fn gcm_decrypt(key: &[u8], nonce: &[u8], aad: &[u8], data: &mut [u8], tag: &[u8]) -> bool {
++    if tag.len() != 16 {
++        return false;
++    }
++    let (Ok(nonce), Ok(tag)) = (<[u8; 12]>::try_from(nonce), <[u8; 16]>::try_from(tag)) else { return false };
++    let (nonce, tag) = (&aes_gcm::Nonce::from(nonce), &aes_gcm::Tag::from(tag));
++    match key.len() {
++        16 => Aes128Gcm::new(key.into()).decrypt_in_place_detached(nonce, aad, data, tag).is_ok(),
++        32 => Aes256Gcm::new(key.into()).decrypt_in_place_detached(nonce, aad, data, tag).is_ok(),
++        _ => false,
++    }
++}
++
++/// A packet number of six bytes, least significant first (as keys'
++/// sequence counters and the MMIE carry it).
++fn little_48(bytes: &[u8]) -> u64 {
++    bytes.iter().take(6).rev().fold(0, |value, byte| (value << 8) | u64::from(*byte))
++}
++
++/// Compares in constant time.
++fn equal(a: &[u8], b: &[u8]) -> bool {
++    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
++}
++
++#[cfg(ktest)]
++mod test {
++    use alloc::vec::Vec;
++
++    use ostd::prelude::*;
++
++    use super::*;
++
++    fn hex(text: &str) -> Vec<u8> {
++        let digits: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
++        digits
++            .chunks(2)
++            .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
++            .collect()
++    }
++
++    #[ktest]
++    fn cmac_rfc4493() {
++        let cipher = Aes::new(&hex("2b7e151628aed2a6abf7158809cf4f3c")).unwrap();
++        assert_eq!(cmac(&cipher, &[]).to_vec(), hex("bb1d6929e95937287fa37d129b756746"));
++        let message = hex("6bc1bee22e409f96e93d7e117393172a");
++        assert_eq!(cmac(&cipher, &[&message[..5], &message[5..]]).to_vec(), hex("070a16b46b4d4144f79bdd9dd04a287c"));
++    }
++
++    #[ktest]
++    fn ccm_rfc3610_packet_1() {
++        let cipher = Aes::new(&hex("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf")).unwrap();
++        let nonce: [u8; 13] = hex("00000003020100a0a1a2a3a4a5").try_into().unwrap();
++        let aad = hex("0001020304050607");
++        let mut data = hex("08090a0b0c0d0e0f101112131415161718191a1b1c1d1e");
++        let tag = ccm_encrypt(&cipher, &nonce, &aad, &mut data, 8);
++        assert_eq!(data, hex("588c979a61c663d2f066d0c2c0f989806d5f6b61dac384"));
++        assert_eq!(tag, hex("17e8d12cfdf926e0"));
++        assert!(ccm_decrypt(&cipher, &nonce, &aad, &mut data, &tag));
++        assert_eq!(data, hex("08090a0b0c0d0e0f101112131415161718191a1b1c1d1e"));
++    }
++
++    #[ktest]
++    fn management_round_trip() {
++        let frame = {
++            let mut frame = hex("d0400000 020304050607 0a0b0c0d0e0f 0a0b0c0d0e0f 1000");
++            frame.extend_from_slice(&[8, 4, 0x2a, 0x2b]);
++            frame
++        };
++        for (cipher, size) in [(CIPHER_CCMP, 16), (CIPHER_CCMP_256, 32), (CIPHER_GCMP, 16)] {
++            let key = alloc::vec![7u8; size];
++            let mut sender = ManagementKey::new(0, cipher, &key).unwrap();
++            let mut receiver = ManagementKey::new(0, cipher, &key).unwrap();
++            let sent = sender.encrypt(&frame).unwrap();
++            assert_eq!(receiver.decrypt(&sent).unwrap(), frame);
++            // Once only, and not altered.
++            assert!(receiver.decrypt(&sent).is_none());
++            let mut altered = sender.encrypt(&frame).unwrap();
++            let last = altered.len() - 1;
++            altered[last] ^= 1;
++            assert!(receiver.decrypt(&altered).is_none());
++        }
++    }
++
++    #[ktest]
++    fn bip_cmac_checks() {
++        // A broadcast deauthentication with an MMIE, signed here.
++        let key = hex("4ea9543e09cf2b1eca66ffc58bdecbcf");
++        let mut frame = hex("c0000000 ffffffffffff 020000000000 020000000000 0000 0200");
++        frame.extend_from_slice(&[ELEMENT_MMIE, 16, 4, 0, 5, 0, 0, 0, 0, 0]);
++        frame.extend_from_slice(&[0; 8]);
++        let cipher = Aes::new(&key).unwrap();
++        let mic = cmac(&cipher, &[&bip_aad(&frame), &frame[wifi::HEADER..]]);
++        let at = frame.len() - 8;
++        frame[at..].copy_from_slice(&mic[..8]);
++        let mut igtk = Igtk::new(4, CIPHER_BIP_CMAC, &key, &[4, 0, 0, 0, 0, 0]).unwrap();
++        assert!(igtk.verify(&frame));
++        // Replayed, or altered.
++        assert!(!igtk.verify(&frame));
++        let mut igtk = Igtk::new(4, CIPHER_BIP_CMAC, &key, &[0; 6]).unwrap();
++        frame[24] ^= 1;
++        assert!(!igtk.verify(&frame));
++    }
++}
 diff --git a/kernel/comps/wlan/src/device.rs b/kernel/comps/wlan/src/device.rs
 old mode 100755
 new mode 100644
-index c10f4e9..df40be2
+index c10f4e9..15aab52
 --- a/kernel/comps/wlan/src/device.rs
 +++ b/kernel/comps/wlan/src/device.rs
-@@ -11,15 +11,15 @@ use alloc::{
+@@ -11,15 +11,18 @@ use alloc::{
      sync::Arc,
      vec::Vec,
  };
@@ -10830,11 +11531,14 @@ index c10f4e9..df40be2
      ieee80211::{self as wifi, Address},
      netdev,
 -    radio::{self, Association, BandId, Info, Join, Key, Radio, RxInfo, ScanRequest},
-+    radio::{self, Association, BandId, Chandef, Connect, Connected, Info, Join, Key, Radio, RxInfo, ScanRequest, Width},
++    radio::{
++        self, Association, BandId, Chandef, Connect, Connected, Info, Join, Key, ManagementProtection, Radio, RxInfo,
++        ScanRequest, Width,
++    },
  };
  
  pub(crate) const ENOENT: i32 = 2;
-@@ -28,6 +28,16 @@ pub(crate) const EINVAL: i32 = 22;
+@@ -28,6 +31,16 @@ pub(crate) const EINVAL: i32 = 22;
  pub(crate) const ENOLINK: i32 = 67;
  pub(crate) const ENETDOWN: i32 = 100;
  pub(crate) const ENOTCONN: i32 = 107;
@@ -10851,7 +11555,7 @@ index c10f4e9..df40be2
  
  /// A network that is not heard for this long is forgotten.
  const BSS_EXPIRE_MS: u64 = 30_000;
-@@ -45,6 +55,13 @@ const SAE_TIMEOUT_MS: u64 = 2_000;
+@@ -45,6 +58,13 @@ const SAE_TIMEOUT_MS: u64 = 2_000;
  const AUTHENTICATED_IDLE_MS: u64 = 5_000;
  /// Frames waiting for the task, from the radio.
  const EVENT_QUEUE: usize = 256;
@@ -10865,7 +11569,7 @@ index c10f4e9..df40be2
  
  pub(crate) const ALGORITHM_OPEN: u16 = 0;
  pub(crate) const ALGORITHM_SAE: u16 = 3;
-@@ -82,13 +99,14 @@ impl Bss {
+@@ -82,13 +102,14 @@ impl Bss {
          wifi::Elements(&self.elements).get(wifi::IE_SSID).unwrap_or(&[])
      }
  
@@ -10881,7 +11585,7 @@ index c10f4e9..df40be2
          }
      }
  }
-@@ -114,6 +132,8 @@ pub(crate) struct AssocRequest {
+@@ -114,6 +135,8 @@ pub(crate) struct AssocRequest {
      pub previous: Option<Address>,
      /// The pairwise cipher cannot run under 802.11n and later (TKIP, WEP).
      pub legacy_cipher: bool,
@@ -10890,7 +11594,7 @@ index c10f4e9..df40be2
      /// Management frames are protected once the keys are in place.
      pub protect_management: bool,
      /// The frames that authenticate the link go to the supplicant's
-@@ -123,11 +143,21 @@ pub(crate) struct AssocRequest {
+@@ -123,11 +146,21 @@ pub(crate) struct AssocRequest {
      pub owner: Option<u32>,
  }
  
@@ -10912,7 +11616,7 @@ index c10f4e9..df40be2
      Associated { bss: Bss },
  }
  
-@@ -138,27 +168,50 @@ impl Link {
+@@ -138,27 +171,50 @@ impl Link {
              Link::Authenticating { bss, .. }
              | Link::Authenticated { bss, .. }
              | Link::Associating { bss, .. }
@@ -10967,7 +11671,7 @@ index c10f4e9..df40be2
  }
  
  /// What the radio's driver reports, for the task.
-@@ -170,8 +223,21 @@ enum Event {
+@@ -170,8 +226,21 @@ enum Event {
      /// A frame that authenticates the link (EAPOL), as Ethernet, and
      /// whether it came unencrypted.
      Port(Vec<u8>, bool),
@@ -10989,7 +11693,7 @@ index c10f4e9..df40be2
  }
  
  /// What a supplicant reads of the link.
-@@ -180,6 +246,7 @@ pub(crate) struct LinkInfo {
+@@ -180,6 +249,7 @@ pub(crate) struct LinkInfo {
      pub freq: u16,
      pub ssid: Vec<u8>,
      pub associated: bool,
@@ -10997,7 +11701,7 @@ index c10f4e9..df40be2
  }
  
  /// A Wi-Fi interface.
-@@ -189,10 +256,10 @@ pub struct Device {
+@@ -189,10 +259,10 @@ pub struct Device {
      /// The interface's name (`wlan0`).
      pub(crate) name: String,
      pub(crate) info: Info,
@@ -11011,7 +11715,7 @@ index c10f4e9..df40be2
      link: AtomicU8,
      bssid: SpinLock<Address, LocalIrqDisabled>,
      /// An association request is out: the access point's first data frame
-@@ -203,15 +270,35 @@ pub struct Device {
+@@ -203,15 +273,56 @@ pub struct Device {
      /// A pairwise key is in place: data that comes unencrypted is dropped.
      encrypted: AtomicBool,
      ifindex: AtomicU32,
@@ -11033,11 +11737,32 @@ index c10f4e9..df40be2
 +    /// The receive agreements (block acknowledgment), by peer and TID,
 +    /// for the data path.
 +    pub(crate) rx_ba: SpinLock<ba::RxAgreements, LocalIrqDisabled>,
++    /// This component checks broadcast management frames (BIP) for the
++    /// radio, and the keys it runs 802.11w with in software.
++    software_bip: bool,
++    soft_keys: SpinLock<SoftKeys, LocalIrqDisabled>,
++}
++
++/// The keys of 802.11w this component holds: the group's integrity key and
++/// a copy of the pairwise key for robust management frames.
++#[derive(Default)]
++struct SoftKeys {
++    igtk: Option<crate::crypt::Igtk>,
++    management: Option<crate::crypt::ManagementKey>,
  }
  
  impl Device {
      pub(crate) fn new(index: u32, name: String, info: Info, radio: Arc<dyn Radio>) -> Arc<Self> {
 +        let full_mac = radio.makes_links();
++        // A radio that protects unicast management frames, or lets this
++        // component do it, runs 802.11w with BIP from here.
++        let mut info = info;
++        let software_bip = !full_mac
++            && info.management != ManagementProtection::None
++            && !info.ciphers.contains(&radio::CIPHER_BIP_CMAC);
++        if software_bip {
++            info.ciphers.extend_from_slice(&crate::crypt::BIP_CIPHERS);
++        }
          Arc::new(Self {
              index,
              name,
@@ -11047,7 +11772,7 @@ index c10f4e9..df40be2
              state: Mutex::new(State {
                  up: false,
                  networks: BTreeMap::new(),
-@@ -222,6 +309,18 @@ impl Device {
+@@ -222,6 +333,18 @@ impl Device {
                  control_port: None,
                  owner: None,
                  protect_management: false,
@@ -11066,7 +11791,7 @@ index c10f4e9..df40be2
              }),
              events: SpinLock::new(VecDeque::new()),
              net: netdev::Shared::new(),
-@@ -231,6 +330,13 @@ impl Device {
+@@ -231,6 +354,15 @@ impl Device {
              blocked: AtomicBool::new(false),
              encrypted: AtomicBool::new(false),
              ifindex: AtomicU32::new(0),
@@ -11077,10 +11802,12 @@ index c10f4e9..df40be2
 +            isolate: AtomicBool::new(false),
 +            ap_running: AtomicBool::new(false),
 +            rx_ba: SpinLock::new(BTreeMap::new()),
++            software_bip,
++            soft_keys: SpinLock::new(SoftKeys::default()),
          })
      }
  
-@@ -254,6 +360,14 @@ impl Device {
+@@ -254,6 +386,14 @@ impl Device {
      /// A frame the radio received: management frames wait for the task,
      /// data goes on to the network stack.
      pub fn received(&self, frame: &[u8], info: RxInfo) {
@@ -11095,7 +11822,7 @@ index c10f4e9..df40be2
          if wifi::is_management(frame) {
              self.push(Event::Management(frame.to_vec(), info));
          } else if wifi::is_data(frame) {
-@@ -278,10 +392,25 @@ impl Device {
+@@ -278,10 +418,25 @@ impl Device {
          if transmitter != *self.bssid.lock() {
              return;
          }
@@ -11121,7 +11848,7 @@ index c10f4e9..df40be2
          let security = if protected { info.security_header as usize } else { 0 };
          for ethernet in wifi::ethernet_from_data(frame, &self.info.address, security) {
              self.received_ethernet(ethernet, protected);
-@@ -291,6 +420,10 @@ impl Device {
+@@ -291,6 +446,10 @@ impl Device {
      /// A frame from the network, already as Ethernet (chips whose firmware
      /// converts), and whether it came encrypted.
      pub fn received_ethernet(&self, ethernet: Vec<u8>, protected: bool) {
@@ -11132,7 +11859,7 @@ index c10f4e9..df40be2
          let link = self.link.load(Ordering::Acquire);
          let encrypted = self.encrypted.load(Ordering::Acquire);
          match wifi::ethertype(&ethernet) {
-@@ -299,6 +432,12 @@ impl Device {
+@@ -299,6 +458,12 @@ impl Device {
                  // Unencrypted only until the pairwise key is in place.
                  if link != LINK_NONE && (protected || !encrypted) {
                      self.push(Event::Port(ethernet, !protected));
@@ -11145,7 +11872,33 @@ index c10f4e9..df40be2
                  }
              }
              Some(_) => {
-@@ -320,11 +459,46 @@ impl Device {
+@@ -310,6 +475,25 @@ impl Device {
+         }
+     }
+ 
++    /// Sends a management frame through the radio; under
++    /// `ManagementProtection::Software` a protected one is encrypted here
++    /// first (without the pairwise key's copy, it goes plain).
++    pub(crate) fn transmit_management(&self, frame: &[u8]) -> radio::Result<()> {
++        let protected = frame.get(1).is_some_and(|flags| flags & wifi::PROTECTED != 0);
++        if !protected || self.info.management != ManagementProtection::Software {
++            return self.radio.send_management(frame);
++        }
++        let encrypted = self.soft_keys.lock().management.as_mut().and_then(|key| key.encrypt(frame));
++        match encrypted {
++            Some(encrypted) => self.radio.send_management(&encrypted),
++            None => {
++                let mut plain = frame.to_vec();
++                plain[1] &= !wifi::PROTECTED;
++                self.radio.send_management(&plain)
++            }
++        }
++    }
++
+     /// The scan the radio was running ended.
+     pub fn scan_done(&self, aborted: bool) {
+         self.push(Event::ScanDone { aborted });
+@@ -320,11 +504,46 @@ impl Device {
          self.push(Event::Lost);
      }
  
@@ -11192,7 +11945,7 @@ index c10f4e9..df40be2
      fn push(&self, event: Event) {
          {
              let mut events = self.events.lock();
-@@ -346,6 +520,18 @@ impl Device {
+@@ -346,6 +565,18 @@ impl Device {
          loop {
              let Some(event) = self.events.lock().pop_front() else { break };
              let mut state = self.state.lock();
@@ -11211,7 +11964,7 @@ index c10f4e9..df40be2
              match event {
                  Event::Management(frame, info) => self.management(&mut state, &frame, &info, now),
                  Event::Data(frame, info) => {
-@@ -354,27 +540,133 @@ impl Device {
+@@ -354,27 +585,133 @@ impl Device {
                      }
                  }
                  Event::Port(ethernet, unencrypted) => self.port_frame(&state, ethernet, unencrypted),
@@ -11265,9 +12018,8 @@ index c10f4e9..df40be2
 +        let frame = wifi::deauth(&bssid, &self.info.address, &bssid, wifi::REASON_DISASSOC_INACTIVITY, false);
 +        self.disconnect(state);
 +        self.report_end(cfg::Mlme::Deauthenticate, &frame, wifi::REASON_DISASSOC_INACTIVITY, true);
-     }
- 
--    fn send_queued(&self, state: &State) {
++    }
++
 +    /// Tells the supplicant the link ended: the frame that ended it
 +    /// (SoftMAC: the supplicant runs the link's steps), or nl80211's
 +    /// disconnection (FullMAC).
@@ -11277,8 +12029,9 @@ index c10f4e9..df40be2
 +        } else {
 +            cfg::mlme_frame(self, command, frame, None);
 +        }
-+    }
-+
+     }
+ 
+-    fn send_queued(&self, state: &State) {
 +    /// FullMAC: the firmware's answer to the connection asked for.
 +    fn connect_answer(&self, state: &mut State, result: Connected, now: u64) {
 +        let Link::Connecting { bss, .. } = &state.link else { return };
@@ -11350,7 +12103,7 @@ index c10f4e9..df40be2
 +        }
 +        let rates: Vec<u8> = BandId::of(bss.freq).rates().to_vec();
 +        let probe = wifi::directed_probe_request(&self.info.address, &bss.bssid, bss.ssid(), &rates);
-+        let _ = self.radio.send_management(&probe);
++        let _ = self.transmit_management(&probe);
 +        state.probes += 1;
 +        state.next_probe = now + PROBE_INTERVAL_MS;
 +    }
@@ -11359,7 +12112,7 @@ index c10f4e9..df40be2
          if !state.up {
              self.net.clear_tx();
              return;
-@@ -387,6 +679,11 @@ impl Device {
+@@ -387,6 +724,11 @@ impl Device {
              if matches!(wifi::ethertype(&ethernet), Some(wifi::ETHERTYPE_EAPOL)) && state.control_port.is_some() {
                  continue;
              }
@@ -11371,7 +12124,25 @@ index c10f4e9..df40be2
              match self.radio.send(&ethernet, !self.encrypted.load(Ordering::Acquire)) {
                  Err(radio::Error::Busy) => {
                      self.net.put_back(ethernet);
-@@ -432,11 +729,19 @@ impl Device {
+@@ -409,7 +751,7 @@ impl Device {
+                 if *tries < MLME_TRIES && *algorithm != ALGORITHM_SAE {
+                     *tries += 1;
+                     *deadline = now + MLME_TIMEOUT_MS;
+-                    let _ = self.radio.send_management(frame);
++                    let _ = self.transmit_management(frame);
+                 } else {
+                     let bssid = bss.bssid;
+                     ostd::notice!("{}: no answer to the authentication", self.name);
+@@ -421,7 +763,7 @@ impl Device {
+                 if *tries < MLME_TRIES {
+                     *tries += 1;
+                     *deadline = now + MLME_TIMEOUT_MS;
+-                    let _ = self.radio.send_management(frame);
++                    let _ = self.transmit_management(frame);
+                 } else {
+                     let bssid = bss.bssid;
+                     ostd::notice!("{}: no answer to the association", self.name);
+@@ -432,11 +774,19 @@ impl Device {
              Link::Authenticated { since, .. } if now >= *since + AUTHENTICATED_IDLE_MS => {
                  self.disconnect(state);
              }
@@ -11392,8 +12163,26 @@ index c10f4e9..df40be2
          if state.scan.take().is_none() {
              return;
          }
-@@ -459,8 +764,12 @@ impl Device {
+@@ -457,10 +807,30 @@ impl Device {
+     }
+ 
      fn management(&self, state: &mut State, frame: &[u8], info: &RxInfo, now: u64) {
++        // A robust frame the radio left encrypted: decrypted here with the
++        // pairwise key's copy (its Protected bit stays, its header goes).
++        let plain;
++        let decrypted_info;
++        let (frame, info) = if frame.len() > 1 && frame[1] & wifi::PROTECTED != 0 && !info.decrypted {
++            match self.soft_keys.lock().management.as_mut().and_then(|key| key.decrypt(frame)) {
++                Some(found) => {
++                    plain = found;
++                    decrypted_info = RxInfo { decrypted: true, security_header: 0, ..*info };
++                    (&plain[..], &decrypted_info)
++                }
++                None => (frame, info),
++            }
++        } else {
++            (frame, info)
++        };
          let Some(kind) = wifi::kind(frame) else { return };
          let Some((receiver, transmitter, _)) = wifi::addresses(frame) else { return };
 +        if state.link.bss().is_some_and(|bss| bss.bssid == transmitter) {
@@ -11405,7 +12194,19 @@ index c10f4e9..df40be2
              wifi::AUTH if receiver == self.info.address => self.auth_answer(state, frame, &transmitter),
              wifi::ASSOC_RESPONSE | wifi::REASSOC_RESPONSE if receiver == self.info.address => {
                  self.assoc_answer(state, frame, &transmitter)
-@@ -491,6 +800,51 @@ impl Device {
+@@ -474,7 +844,10 @@ impl Device {
+                 let command = if kind == wifi::DEAUTH { cfg::Mlme::Deauthenticate } else { cfg::Mlme::Disassociate };
+                 // With management frame protection, a frame that came
+                 // unprotected is only reported: anyone can send one.
+-                let protected = frame[1] & wifi::PROTECTED != 0 && info.decrypted;
++                // A broadcast one is protected by its MMIE (BIP).
++                let protected = (frame[1] & wifi::PROTECTED != 0 && info.decrypted)
++                    || (receiver == wifi::BROADCAST
++                        && self.soft_keys.lock().igtk.as_mut().is_some_and(|igtk| igtk.verify(frame)));
+                 if state.protect_management && self.encrypted.load(Ordering::Acquire) && !protected {
+                     cfg::mlme_frame(self, command.unprotected(), frame, None);
+                     return;
+@@ -491,6 +864,51 @@ impl Device {
          }
      }
  
@@ -11451,13 +12252,13 @@ index c10f4e9..df40be2
 +            }
 +        };
 +        let frame = wifi::action(from, &self.info.address, from, &answer, pmf && wifi::robust_category(category));
-+        let _ = self.radio.send_management(&frame);
++        let _ = self.transmit_management(&frame);
 +    }
 +
      fn heard(&self, state: &mut State, frame: &[u8], info: &RxInfo, now: u64) {
          let Some(beacon) = wifi::parse_beacon(frame) else { return };
          // The channel the network says it is on, when it says: frames are
-@@ -584,7 +938,35 @@ impl Device {
+@@ -584,12 +1002,40 @@ impl Device {
          }
          let bss = bss.clone();
          let qos = wifi::Elements(elements).vendor(wifi::WMM_OUI_TYPE).is_some();
@@ -11494,7 +12295,13 @@ index c10f4e9..df40be2
          let (control_port, owner, protect_management) = (request.control_port, request.owner, request.protect_management);
          if let Err(error) = self.radio.associated(&association) {
              ostd::warn!("{}: the radio did not take the association: {:?}", self.name, error);
-@@ -603,17 +985,41 @@ impl Device {
+             let leave = wifi::deauth(&bss.bssid, &self.info.address, &bss.bssid, wifi::REASON_DEAUTH_LEAVING, false);
+-            let _ = self.radio.send_management(&leave);
++            let _ = self.transmit_management(&leave);
+             self.disconnect(state);
+             cfg::mlme_timeout(self, cfg::Mlme::Associate, &bss.bssid);
+             return;
+@@ -603,23 +1049,48 @@ impl Device {
          state.control_port = control_port;
          state.owner = owner;
          state.protect_management = protect_management;
@@ -11514,7 +12321,7 @@ index c10f4e9..df40be2
 +        let Some(bss) = state.link.bss().cloned() else { return };
 +        let frame = wifi::deauth(&bss.bssid, &self.info.address, &bss.bssid, wifi::REASON_DEAUTH_LEAVING, false);
 +        if matches!(state.link, Link::Associated { .. }) && !self.full_mac {
-+            let _ = self.radio.send_management(&frame);
++            let _ = self.transmit_management(&frame);
 +        }
 +        self.disconnect(state);
 +        self.report_end(cfg::Mlme::Deauthenticate, &frame, wifi::REASON_DEAUTH_LEAVING, false);
@@ -11537,7 +12344,14 @@ index c10f4e9..df40be2
          let was_authorized = self.link.swap(LINK_NONE, Ordering::AcqRel) == LINK_AUTHORIZED;
          self.associating.store(false, Ordering::Release);
          self.encrypted.store(false, Ordering::Release);
-@@ -665,11 +1071,14 @@ impl Device {
+         *self.bssid.lock() = [0; 6];
+         state.link = Link::Idle;
+         state.keys.clear();
++        *self.soft_keys.lock() = SoftKeys::default();
+         state.control_port = None;
+         state.owner = None;
+         state.protect_management = false;
+@@ -665,11 +1136,14 @@ impl Device {
                  self.radio.abort_scan();
                  self.end_scan(&mut state, true, crate::now_ms());
              }
@@ -11546,7 +12360,7 @@ index c10f4e9..df40be2
                  let frame = wifi::deauth(&bss.bssid, &self.info.address, &bss.bssid, wifi::REASON_DEAUTH_LEAVING, false);
 -                let _ = self.radio.send_management(&frame);
 +                if !self.full_mac {
-+                    let _ = self.radio.send_management(&frame);
++                    let _ = self.transmit_management(&frame);
 +                }
                  self.disconnect(&mut state);
 -                cfg::mlme_frame(self, cfg::Mlme::Deauthenticate, &frame, None);
@@ -11554,7 +12368,7 @@ index c10f4e9..df40be2
              }
              self.radio.stop();
              state.up = false;
-@@ -683,11 +1092,15 @@ impl Device {
+@@ -683,11 +1157,15 @@ impl Device {
          if !state.up {
              return Err(ENETDOWN);
          }
@@ -11571,7 +12385,7 @@ index c10f4e9..df40be2
              return Err(EBUSY);
          }
          if flush {
-@@ -717,7 +1130,7 @@ impl Device {
+@@ -717,7 +1195,7 @@ impl Device {
          let now = crate::now_ms();
          let current = match &state.link {
              Link::Associated { bss } => Some((bss.bssid, true)),
@@ -11580,7 +12394,7 @@ index c10f4e9..df40be2
              _ => None,
          };
          let list = state
-@@ -736,14 +1149,118 @@ impl Device {
+@@ -736,14 +1214,118 @@ impl Device {
              freq: bss.freq,
              ssid: bss.ssid().to_vec(),
              associated: matches!(state.link, Link::Associated { .. }),
@@ -11699,7 +12513,25 @@ index c10f4e9..df40be2
          // SAE takes several frames: the next one of an exchange in
          // progress goes out on the link as it is.
          if let Link::Authenticating { bss, algorithm, frame, deadline, .. } = &mut state.link
-@@ -772,16 +1289,22 @@ impl Device {
+@@ -753,7 +1335,7 @@ impl Device {
+         {
+             *frame = self.auth_frame(&request);
+             *deadline = crate::now_ms() + SAE_TIMEOUT_MS;
+-            return self.radio.send_management(frame).map_err(radio::Error::errno);
++            return self.transmit_management(frame).map_err(radio::Error::errno);
+         }
+         let Some(bss) = state.networks.get(&request.bssid).cloned() else {
+             return Err(ENOENT);
+@@ -762,7 +1344,7 @@ impl Device {
+             // Another network (or the same one again): leave first.
+             if matches!(state.link, Link::Associated { .. }) {
+                 let frame = wifi::deauth(&current.bssid, &self.info.address, &current.bssid, wifi::REASON_DEAUTH_LEAVING, false);
+-                let _ = self.radio.send_management(&frame);
++                let _ = self.transmit_management(&frame);
+                 self.disconnect(&mut state);
+                 cfg::mlme_frame(self, cfg::Mlme::Deauthenticate, &frame, None);
+             } else {
+@@ -772,19 +1354,25 @@ impl Device {
          if state.scan.is_some() {
              self.radio.abort_scan();
          }
@@ -11723,17 +12555,24 @@ index c10f4e9..df40be2
 +            chandef.width.mhz(),
              request.algorithm
          );
-         if let Err(error) = self.radio.send_management(&frame) {
-@@ -826,7 +1349,7 @@ impl Device {
+-        if let Err(error) = self.radio.send_management(&frame) {
++        if let Err(error) = self.transmit_management(&frame) {
+             self.radio.leave();
+             return Err(error.errno());
+         }
+@@ -826,9 +1414,9 @@ impl Device {
              return Err(ENOTCONN);
          }
          let bss = bss.clone();
 -        let frame = self.assoc_frame(&bss, &request);
 +        let frame = self.assoc_frame(&bss, &request, &state.chandef);
          self.associating.store(true, Ordering::Release);
-         if let Err(error) = self.radio.send_management(&frame) {
+-        if let Err(error) = self.radio.send_management(&frame) {
++        if let Err(error) = self.transmit_management(&frame) {
              self.associating.store(false, Ordering::Release);
-@@ -838,7 +1361,7 @@ impl Device {
+             return Err(error.errno());
+         }
+@@ -838,7 +1426,7 @@ impl Device {
          Ok(())
      }
  
@@ -11742,7 +12581,7 @@ index c10f4e9..df40be2
          let theirs = wifi::Elements(&bss.elements);
          let Some((band, _)) = self.info.channel(bss.freq) else {
              return Vec::new();
-@@ -863,19 +1386,36 @@ impl Device {
+@@ -863,19 +1451,36 @@ impl Device {
          let has = |id: u8| wifi::Elements(&request.elements).get(id).is_some();
          if modern && band.id != BandId::Ghz6 && theirs.get(wifi::IE_HT_CAP).is_some() && !has(wifi::IE_HT_CAP) {
              if let Some(ht) = &band.ht {
@@ -11782,13 +12621,14 @@ index c10f4e9..df40be2
              }
          }
          if wmm {
-@@ -897,18 +1437,21 @@ impl Device {
+@@ -897,18 +1502,21 @@ impl Device {
              return if disassoc { Err(ENOTCONN) } else { Ok(()) };
          }
          let frame = wifi::deauth(bssid, &self.info.address, bssid, reason, disassoc);
 -        if !silent {
+-            let _ = self.radio.send_management(&frame);
 +        if !silent && !self.full_mac {
-             let _ = self.radio.send_management(&frame);
++            let _ = self.transmit_management(&frame);
          }
          ostd::notice!("{}: left {} (reason {})", self.name, crate::Mac(bssid), reason);
          self.disconnect(&mut state);
@@ -11806,7 +12646,32 @@ index c10f4e9..df40be2
          let mut state = self.state.lock();
          if !state.up {
              return Err(ENETDOWN);
-@@ -931,7 +1474,10 @@ impl Device {
+@@ -919,10 +1527,20 @@ impl Device {
+         if !self.info.ciphers.contains(&key.cipher) {
+             return Err(EINVAL);
+         }
+-        self.radio.set_key(&key).map_err(|error| {
+-            ostd::warn!("{}: the radio did not take the key: {:?}", self.name, error);
+-            error.errno()
+-        })?;
++        if self.software_bip && crate::crypt::is_bip(key.cipher) {
++            // The group's integrity key stays here: this component checks
++            // the broadcast management frames.
++            let igtk = crate::crypt::Igtk::new(key.index, key.cipher, &key.key, &key.seq).ok_or(EINVAL)?;
++            self.soft_keys.lock().igtk = Some(igtk);
++        } else {
++            self.radio.set_key(&key).map_err(|error| {
++                ostd::warn!("{}: the radio did not take the key: {:?}", self.name, error);
++                error.errno()
++            })?;
++            if key.pairwise && self.info.management != ManagementProtection::None {
++                self.soft_keys.lock().management = crate::crypt::ManagementKey::new(key.index, key.cipher, &key.key);
++            }
++        }
+         state.keys.retain(|(index, pairwise, _)| !(*index == key.index && *pairwise == key.pairwise));
+         state.keys.push((key.index, key.pairwise, key.cipher));
+         if key.pairwise {
+@@ -931,15 +1549,23 @@ impl Device {
          Ok(())
      }
  
@@ -11816,9 +12681,26 @@ index c10f4e9..df40be2
 +            return self.ap_remove_key(index, pairwise, address);
 +        }
          let mut state = self.state.lock();
-         let before = state.keys.len();
-         state.keys.retain(|(found, found_pairwise, _)| !(*found == index && *found_pairwise == pairwise));
-@@ -958,6 +1504,15 @@ impl Device {
+-        let before = state.keys.len();
+-        state.keys.retain(|(found, found_pairwise, _)| !(*found == index && *found_pairwise == pairwise));
+-        if state.keys.len() == before {
++        let Some(&(_, _, cipher)) = state.keys.iter().find(|(found, found_pairwise, _)| *found == index && *found_pairwise == pairwise)
++        else {
+             return Err(ENOENT);
++        };
++        state.keys.retain(|(found, found_pairwise, _)| !(*found == index && *found_pairwise == pairwise));
++        if self.software_bip && crate::crypt::is_bip(cipher) {
++            self.soft_keys.lock().igtk = None;
++        } else {
++            self.radio.remove_key(index, pairwise);
+         }
+-        self.radio.remove_key(index, pairwise);
+         if pairwise {
++            self.soft_keys.lock().management = None;
+             self.encrypted.store(false, Ordering::Release);
+         }
+         Ok(())
+@@ -958,6 +1584,15 @@ impl Device {
          self.radio.authorize(authorized);
          let new = if authorized { LINK_AUTHORIZED } else { LINK_ASSOCIATED };
          let old = self.link.swap(new, Ordering::AcqRel);
@@ -11834,7 +12716,7 @@ index c10f4e9..df40be2
          drop(state);
          if old != new {
              if authorized {
-@@ -968,8 +1523,27 @@ impl Device {
+@@ -968,8 +1603,27 @@ impl Device {
          Ok(())
      }
  
@@ -11862,7 +12744,7 @@ index c10f4e9..df40be2
          let state = self.state.lock();
          if !matches!(state.link, Link::Associated { .. }) {
              return Err(ENOLINK);
-@@ -996,19 +1570,26 @@ impl Device {
+@@ -996,19 +1650,26 @@ impl Device {
      /// The socket bound to `port` closed: a link it owned ends with it.
      pub(crate) fn released(&self, port: u32) {
          let mut state = self.state.lock();
@@ -11876,7 +12758,7 @@ index c10f4e9..df40be2
 -            let _ = self.radio.send_management(&frame);
 +            if !self.full_mac {
 +                let frame = wifi::deauth(&bss.bssid, &self.info.address, &bss.bssid, wifi::REASON_DEAUTH_LEAVING, false);
-+                let _ = self.radio.send_management(&frame);
++                let _ = self.transmit_management(&frame);
 +            }
              self.disconnect(&mut state);
          }
@@ -12099,10 +12981,10 @@ index 55dd700..f4cbb00
 diff --git a/kernel/comps/wlan/src/lib.rs b/kernel/comps/wlan/src/lib.rs
 old mode 100755
 new mode 100644
-index 4efe00f..33b4783
+index 4efe00f..70e77fe
 --- a/kernel/comps/wlan/src/lib.rs
 +++ b/kernel/comps/wlan/src/lib.rs
-@@ -26,7 +26,11 @@ macro_rules! __log_prefix {
+@@ -26,8 +26,13 @@ macro_rules! __log_prefix {
      };
  }
  
@@ -12112,9 +12994,19 @@ index 4efe00f..33b4783
  mod cfg;
 +pub mod chan;
  mod consts;
++mod crypt;
  mod device;
  pub mod genl;
-@@ -59,6 +63,14 @@ static DEVICES: SpinLock<Vec<Arc<Device>>> = SpinLock::new(Vec::new());
+ pub mod ieee80211;
+@@ -35,6 +40,7 @@ mod netdev;
+ mod nl;
+ pub mod radio;
+ mod sim;
++pub mod tkip;
+ 
+ use alloc::{format, sync::Arc, vec::Vec};
+ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+@@ -59,6 +65,14 @@ static DEVICES: SpinLock<Vec<Arc<Device>>> = SpinLock::new(Vec::new());
  /// `wlan.sim`: a simulated radio and its access points.
  static SIMULATED: AtomicBool = AtomicBool::new(false);
  aster_cmdline::define_flag_param!("wlan.sim", SIMULATED);
@@ -12129,7 +13021,7 @@ index 4efe00f..33b4783
  
  /// What the kernel's network stack does for this component.
  #[derive(Clone, Copy)]
-@@ -68,6 +80,9 @@ pub struct Hooks {
+@@ -68,6 +82,9 @@ pub struct Hooks {
      /// A link was made (its keys are in place) or ended: the interface
      /// asks for an address again, or drops the one it had.
      pub link_changed: fn(name: &str, connected: bool),
@@ -12139,7 +13031,7 @@ index 4efe00f..33b4783
  }
  
  static HOOKS: Once<Hooks> = Once::new();
-@@ -86,6 +101,12 @@ pub(crate) fn link_changed(name: &str, connected: bool) {
+@@ -86,6 +103,12 @@ pub(crate) fn link_changed(name: &str, connected: bool) {
      }
  }
  
@@ -12152,7 +13044,7 @@ index 4efe00f..33b4783
  pub(crate) fn now_ms() -> u64 {
      Jiffies::elapsed().as_duration().as_millis() as u64
  }
-@@ -95,6 +116,12 @@ pub(crate) fn wake() {
+@@ -95,6 +118,12 @@ pub(crate) fn wake() {
      WAKE.wake_all();
  }
  
@@ -12165,7 +13057,7 @@ index 4efe00f..33b4783
  /// Each timer tick (1 ms): every 20, the task, while something waits on a
  /// time-out.
  fn tick() {
-@@ -114,6 +141,23 @@ impl core::fmt::Display for Mac<'_> {
+@@ -114,6 +143,23 @@ impl core::fmt::Display for Mac<'_> {
      }
  }
  
@@ -12221,7 +13113,7 @@ new mode 100644
 diff --git a/kernel/comps/wlan/src/radio.rs b/kernel/comps/wlan/src/radio.rs
 old mode 100755
 new mode 100644
-index e710358..1351e9a
+index e710358..0ffaad1
 --- a/kernel/comps/wlan/src/radio.rs
 +++ b/kernel/comps/wlan/src/radio.rs
 @@ -170,6 +170,131 @@ impl HeCap {
@@ -12356,25 +13248,46 @@ index e710358..1351e9a
  #[derive(Clone, Debug, PartialEq, Eq)]
  pub struct Band {
      pub id: BandId,
-@@ -177,6 +302,8 @@ pub struct Band {
+@@ -177,6 +302,27 @@ pub struct Band {
      pub ht: Option<HtCap>,
      pub vht: Option<VhtCap>,
      pub he: Option<HeCap>,
 +    /// 802.11be as a station (never as an access point here).
 +    pub eht: Option<EhtCap>,
++}
++
++/// What a radio does of 802.11w (management frame protection) when it
++/// does not list `CIPHER_BIP_CMAC` among its ciphers (a radio that lists it
++/// does it all in its firmware).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum ManagementProtection {
++    /// Nothing: networks that require it are refused.
++    #[default]
++    None,
++    /// It encrypts and decrypts robust unicast management frames with the
++    /// pairwise key, as it does data; this component checks broadcast ones
++    /// (BIP) itself.
++    Unicast,
++    /// It protects data only: this component encrypts robust unicast
++    /// management frames before `send_management` (which then sends a frame
++    /// with the Protected bit as it is), decrypts those the radio hands up
++    /// undecrypted (with their MIC), and checks broadcast ones (BIP).
++    Software,
  }
  
  /// What a chip is and can do.
-@@ -193,6 +320,8 @@ pub struct Info {
+@@ -193,6 +339,10 @@ pub struct Info {
      pub max_scan_ssids: u8,
      /// The most bytes of extra elements in a probe request.
      pub max_scan_ie_len: u16,
 +    /// It runs a network of its own (an access point, for a hotspot).
 +    pub ap: bool,
++    /// Its part in 802.11w; this component does the rest.
++    pub management: ManagementProtection,
  }
  
  impl Info {
-@@ -228,6 +357,8 @@ pub struct Join {
+@@ -228,6 +378,8 @@ pub struct Join {
      pub capability: u16,
      /// The elements of its last beacon or probe response.
      pub elements: Vec<u8>,
@@ -12383,7 +13296,7 @@ index e710358..1351e9a
  }
  
  /// What the association settled.
-@@ -241,6 +372,9 @@ pub struct Association {
+@@ -241,6 +393,9 @@ pub struct Association {
      pub request_elements: Vec<u8>,
      /// The network takes QoS data frames (WMM).
      pub qos: bool,
@@ -12393,7 +13306,7 @@ index e710358..1351e9a
  }
  
  /// A key to install.
-@@ -251,6 +385,8 @@ pub struct Key {
+@@ -251,6 +406,8 @@ pub struct Key {
      /// For frames between this station and the access point alone;
      /// otherwise the group's, for broadcasts.
      pub pairwise: bool,
@@ -12402,7 +13315,7 @@ index e710358..1351e9a
      pub key: Vec<u8>,
      /// The packet number the receiver starts from.
      pub seq: Vec<u8>,
-@@ -288,6 +424,152 @@ pub struct RxInfo {
+@@ -288,6 +445,152 @@ pub struct RxInfo {
      /// header is still there if `security_header` is not 0.
      pub decrypted: bool,
      pub security_header: u8,
@@ -12555,18 +13468,20 @@ index e710358..1351e9a
  }
  
  /// The operations of a chip's driver. They are called from tasks that may
-@@ -323,7 +605,9 @@ pub trait Radio: Send + Sync {
+@@ -323,7 +626,11 @@ pub trait Radio: Send + Sync {
      fn authorize(&self, authorized: bool);
  
      /// Sends a management frame, complete but for the sequence number,
 -    /// which is the radio's.
 +    /// which is the radio's. With the Protected bit set (a robust action
 +    /// frame under 802.11w) the radio encrypts it with the pairwise key:
-+    /// the cipher's header is the radio's to insert.
++    /// the cipher's header is the radio's to insert; under
++    /// `ManagementProtection::Software` the frame comes encrypted already
++    /// and goes as it is.
      fn send_management(&self, frame: &[u8]) -> Result<()>;
  
      /// Sends an Ethernet frame to the network, encrypted with the pairwise
-@@ -337,4 +621,88 @@ pub trait Radio: Send + Sync {
+@@ -337,4 +644,88 @@ pub trait Radio: Send + Sync {
      /// Called every 20 ms or so while a scan or a link's step is under
      /// way, for radios without a task of their own.
      fn tick(&self, _now_ms: u64) {}
@@ -13125,7 +14040,7 @@ new mode 100644
 diff --git a/kernel/comps/wlan/src/sim/mod.rs b/kernel/comps/wlan/src/sim/mod.rs
 old mode 100755
 new mode 100644
-index 8df2682..c5b78bf
+index 8df2682..395ea96
 --- a/kernel/comps/wlan/src/sim/mod.rs
 +++ b/kernel/comps/wlan/src/sim/mod.rs
 @@ -1,18 +1,29 @@
@@ -13315,7 +14230,7 @@ index 8df2682..c5b78bf
              },
              Band {
                  id: BandId::Ghz5,
-@@ -144,14 +243,33 @@ pub(crate) fn register() {
+@@ -144,14 +243,34 @@ pub(crate) fn register() {
                      .iter()
                      .map(|channel| Channel { passive: true, radar: (52..=64).contains(channel), ..Channel::new(5000 + 5 * channel) })
                      .collect(),
@@ -13348,10 +14263,11 @@ index 8df2682..c5b78bf
          max_scan_ie_len: 512,
 +        // As an access point too: a FullMAC one takes its stations itself.
 +        ap: true,
++        management: radio::ManagementProtection::None,
      };
      let device = crate::register(info, sim.clone());
      sim.device.call_once(|| device);
-@@ -163,7 +281,7 @@ impl Sim {
+@@ -163,7 +282,7 @@ impl Sim {
      }
  
      fn deliver(&self, frame: &[u8], ap: &AccessPoint, decrypted: bool) {
@@ -13360,7 +14276,7 @@ index 8df2682..c5b78bf
          self.device().received(frame, info);
      }
  
-@@ -177,7 +295,33 @@ impl Sim {
+@@ -177,7 +296,33 @@ impl Sim {
              wifi::put_element(&mut elements, wifi::IE_DS_PARAMS, &[channel]);
          }
          if ap.passphrase.is_some() {
@@ -13395,7 +14311,7 @@ index 8df2682..c5b78bf
          }
          elements.extend_from_slice(&WMM);
          elements
-@@ -211,6 +355,11 @@ impl Sim {
+@@ -211,6 +356,11 @@ impl Sim {
      /// An Ethernet frame from the access point's side, as the data frame
      /// the station hears.
      fn data(&self, ap: &AccessPoint, ethernet: &[u8], protected: bool) {
@@ -13407,7 +14323,7 @@ index 8df2682..c5b78bf
          let mut frame = Vec::with_capacity(ethernet.len() + 20);
          let flags = wifi::FROM_DS | if protected { wifi::PROTECTED } else { 0 };
          frame.extend_from_slice(&[wifi::QOS_DATA, flags, 0, 0]);
-@@ -220,7 +369,33 @@ impl Sim {
+@@ -220,7 +370,33 @@ impl Sim {
          frame.extend_from_slice(&[0, 0, 0, 0]);
          frame.extend_from_slice(&[0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00]);
          frame.extend_from_slice(&ethernet[12..]);
@@ -13441,7 +14357,7 @@ index 8df2682..c5b78bf
      }
  
      fn eapol_key(info: u16, replay: u64, nonce: &[u8; 32], key_data: &[u8]) -> Vec<u8> {
-@@ -299,17 +474,28 @@ impl Sim {
+@@ -299,17 +475,28 @@ impl Sim {
                  let ptk: [u8; 48] = crypto::prf(&pmk, b"Pairwise key expansion", &data);
                  if !Self::mic_valid(eapol, &ptk[..16]) {
                      ostd::notice!("sim: the station's passphrase is wrong");
@@ -13473,7 +14389,7 @@ index 8df2682..c5b78bf
                  if key_data.len() % 8 != 0 {
                      key_data.push(0xdd);
                      key_data.resize(key_data.len().next_multiple_of(8), 0);
-@@ -337,7 +523,40 @@ impl Sim {
+@@ -337,7 +524,40 @@ impl Sim {
          }
      }
  
@@ -13514,7 +14430,7 @@ index 8df2682..c5b78bf
          state.joined = None;
          state.associated = false;
          state.handshake = Handshake::None;
-@@ -379,6 +598,22 @@ impl Radio for Sim {
+@@ -379,6 +599,22 @@ impl Radio for Sim {
      }
  
      fn tick(&self, now_ms: u64) {
@@ -13537,7 +14453,7 @@ index 8df2682..c5b78bf
          let request = {
              let mut state = self.state.lock();
              match &state.scan {
-@@ -419,9 +654,16 @@ impl Radio for Sim {
+@@ -419,9 +655,16 @@ impl Radio for Sim {
  
      fn set_key(&self, key: &Key) -> radio::Result<()> {
          let mut state = self.state.lock();
@@ -13554,7 +14470,7 @@ index 8df2682..c5b78bf
          if key.pairwise {
              state.pairwise_key = true;
          } else {
-@@ -445,6 +687,15 @@ impl Radio for Sim {
+@@ -445,6 +688,15 @@ impl Radio for Sim {
  
      fn send_management(&self, frame: &[u8]) -> radio::Result<()> {
          let mut state = self.state.lock();
@@ -13570,7 +14486,7 @@ index 8df2682..c5b78bf
          let Some(ap) = state.joined.map(|index| &ACCESS_POINTS[index]) else {
              return Err(radio::Error::Failed);
          };
-@@ -470,9 +721,27 @@ impl Radio for Sim {
+@@ -470,9 +722,27 @@ impl Radio for Sim {
                  // add (status 40: invalid element).
                  let rsn_matches = match (theirs.get(wifi::IE_RSN), ap.passphrase) {
                      (None, None) => true,
@@ -13599,7 +14515,7 @@ index 8df2682..c5b78bf
                  let named = theirs.get(wifi::IE_SSID) == Some(ap.ssid);
                  let status: u16 = if rsn_matches && named { 0 } else { 40 };
                  let capability = wifi::CAP_ESS | wifi::CAP_SHORT_SLOT | if ap.passphrase.is_some() { wifi::CAP_PRIVACY } else { 0 };
-@@ -484,11 +753,25 @@ impl Radio for Sim {
+@@ -484,11 +754,25 @@ impl Radio for Sim {
                  self.deliver(&Self::management(wifi::ASSOC_RESPONSE, ap, &STATION, &body), ap, false);
                  if status == 0 {
                      state.associated = true;
@@ -13625,7 +14541,7 @@ index 8df2682..c5b78bf
              Some(wifi::DEAUTH | wifi::DISASSOC) => self.reset(&mut state),
              _ => {}
          }
-@@ -497,6 +780,22 @@ impl Radio for Sim {
+@@ -497,6 +781,22 @@ impl Radio for Sim {
  
      fn send(&self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
          let mut state = self.state.lock();
@@ -13648,7 +14564,7 @@ index 8df2682..c5b78bf
          let Some(ap) = state.joined.map(|index| &ACCESS_POINTS[index]).filter(|_| state.associated) else {
              return Err(radio::Error::Failed);
          };
-@@ -517,6 +816,116 @@ impl Radio for Sim {
+@@ -517,6 +817,116 @@ impl Radio for Sim {
          Ok(())
      }
  
@@ -13798,3 +14714,132 @@ index 184adc5..7001163
      let mut packet = Vec::with_capacity(20 + payload.len());
      packet.extend_from_slice(&[0x45, 0]);
      packet.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+diff --git a/kernel/comps/wlan/src/tkip.rs b/kernel/comps/wlan/src/tkip.rs
+new file mode 100644
+index 0000000..5b4b3ae
+--- /dev/null
++++ b/kernel/comps/wlan/src/tkip.rs
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! TKIP's Michael message integrity code, for radios whose chip decrypts
++//! TKIP but leaves the MIC to the host (Realtek's: Linux's mac80211 checks
++//! it for them, `IEEE80211_KEY_FLAG_GENERATE_MMIC`). These radios take TKIP
++//! as the group's cipher only, as WPA/WPA2 networks that still offer it to
++//! older stations use it: broadcasts come with it, this station sends with
++//! its pairwise CCMP key.
++//!
++//! Reference: IEEE 802.11-2020 12.5.2.3 (Michael), Linux's `michael.c`.
++
++use crate::ieee80211 as wifi;
++
++fn block(l: &mut u32, r: &mut u32) {
++    *r ^= l.rotate_left(17);
++    *l = l.wrapping_add(*r);
++    *r ^= ((*l & 0xff00_ff00) >> 8) | ((*l & 0x00ff_00ff) << 8);
++    *l = l.wrapping_add(*r);
++    *r ^= l.rotate_left(3);
++    *l = l.wrapping_add(*r);
++    *r ^= l.rotate_right(2);
++    *l = l.wrapping_add(*r);
++}
++
++/// Michael over `parts`, one after the other.
++pub fn michael(key: &[u8; 8], parts: &[&[u8]]) -> [u8; 8] {
++    let mut l = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
++    let mut r = u32::from_le_bytes([key[4], key[5], key[6], key[7]]);
++    let mut word = [0u8; 4];
++    let mut filled = 0;
++    for byte in parts.iter().flat_map(|part| part.iter()) {
++        word[filled] = *byte;
++        filled += 1;
++        if filled == 4 {
++            l ^= u32::from_le_bytes(word);
++            block(&mut l, &mut r);
++            filled = 0;
++        }
++    }
++    // The last word with 0x5a after the message, then a word of zeros.
++    word[filled] = 0x5a;
++    word[filled + 1..].fill(0);
++    l ^= u32::from_le_bytes(word);
++    block(&mut l, &mut r);
++    block(&mut l, &mut r);
++    let mut out = [0u8; 8];
++    out[..4].copy_from_slice(&l.to_le_bytes());
++    out[4..].copy_from_slice(&r.to_le_bytes());
++    out
++}
++
++/// The receive MIC key of a TKIP key as the supplicant hands it (the
++/// temporal key, then the transmit and the receive MIC keys).
++pub fn rx_mic_key(key: &[u8]) -> Option<[u8; 8]> {
++    key.get(24..32)?.try_into().ok()
++}
++
++/// Checks and removes the Michael MIC at the end of a data frame (an MSDU)
++/// the chip decrypted: its 802.11 header, then the TKIP header
++/// (`security_header` bytes), the body and the MIC, the ICV already gone.
++/// False: it does not check, and the frame is to be dropped.
++pub fn check_and_strip(frame: &mut alloc::vec::Vec<u8>, security_header: usize, key: &[u8; 8]) -> bool {
++    if frame.len() < wifi::HEADER || !wifi::is_data(frame) {
++        return false;
++    }
++    let to_ds = frame[1] & 1 != 0;
++    let from_ds = frame[1] & 2 != 0;
++    let four = to_ds && from_ds;
++    let qos = frame[0] & 0x80 != 0;
++    let mut header = wifi::HEADER + if four { 6 } else { 0 };
++    let priority = if qos { frame.get(header).map_or(0, |control| control & 0x0f) } else { 0 };
++    if qos {
++        header += 2;
++        // A frame with an HT control field (the Order bit on QoS data).
++        if frame[1] & 0x80 != 0 {
++            header += 4;
++        }
++    }
++    let start = header + security_header;
++    if frame.len() < start + 8 {
++        return false;
++    }
++    let address = |at: usize| -> [u8; 6] { frame[at..at + 6].try_into().unwrap() };
++    let (destination, source) = match (to_ds, from_ds) {
++        (false, false) => (address(4), address(10)),
++        (false, true) => (address(4), address(16)),
++        (true, false) => (address(16), address(10)),
++        (true, true) => (address(16), address(24)),
++    };
++    let end = frame.len() - 8;
++    let computed = michael(key, &[&destination, &source, &[priority, 0, 0, 0], &frame[start..end]]);
++    if computed != frame[end..] {
++        return false;
++    }
++    frame.truncate(end);
++    true
++}
++
++#[cfg(ktest)]
++mod test {
++    use ostd::prelude::*;
++
++    use super::michael;
++
++    #[ktest]
++    fn michael_vectors() {
++        // IEEE 802.11's test vectors: each key is the MIC before it.
++        let steps: [(&[u8], [u8; 8]); 6] = [
++            (b"", [0x82, 0x92, 0x5c, 0x1c, 0xa1, 0xd1, 0x30, 0xb8]),
++            (b"M", [0x43, 0x47, 0x21, 0xca, 0x40, 0x63, 0x9b, 0x3f]),
++            (b"Mi", [0xe8, 0xf9, 0xbe, 0xca, 0xe9, 0x7e, 0x5d, 0x29]),
++            (b"Mic", [0x90, 0x03, 0x8f, 0xc6, 0xcf, 0x13, 0xc1, 0xdb]),
++            (b"Mich", [0xd5, 0x5e, 0x10, 0x05, 0x10, 0x12, 0x89, 0x86]),
++            (b"Michael", [0x0a, 0x94, 0x2b, 0x12, 0x4e, 0xca, 0xa5, 0x46]),
++        ];
++        let mut key = [0u8; 8];
++        for (message, expected) in steps {
++            let mic = michael(&key, &[message]);
++            assert_eq!(mic, expected);
++            key = mic;
++        }
++    }
++}

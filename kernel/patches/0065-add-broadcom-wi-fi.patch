@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index fb22f10..1b5e2bb 100644
+index eff1f53..b18a62c 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -175,6 +175,20 @@ dependencies = [
@@ -23,7 +23,7 @@ index fb22f10..1b5e2bb 100644
  [[package]]
  name = "aster-cmdline"
  version = "0.1.0"
-@@ -701,6 +715,7 @@ dependencies = [
+@@ -702,6 +716,7 @@ dependencies = [
   "aster-ath11k",
   "aster-backlight",
   "aster-bluetooth",
@@ -2728,10 +2728,10 @@ index 0000000..3230612
 +}
 diff --git a/kernel/comps/brcmfmac/src/sta.rs b/kernel/comps/brcmfmac/src/sta.rs
 new file mode 100644
-index 0000000..a907fdd
+index 0000000..3bc2d2c
 --- /dev/null
 +++ b/kernel/comps/brcmfmac/src/sta.rs
-@@ -0,0 +1,1118 @@
+@@ -0,0 +1,1119 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The station on a FullMAC chip as Linux's brcmfmac `cfg80211.c` and
@@ -2977,6 +2977,7 @@ index 0000000..a907fdd
 +            max_scan_ie_len: SCAN_IE_LEN_MAX,
 +            // An access point the firmware runs (`brcmf_cfg80211_start_ap`).
 +            ap: true,
++            management: radio::ManagementProtection::None,
 +        })
 +    }
 +

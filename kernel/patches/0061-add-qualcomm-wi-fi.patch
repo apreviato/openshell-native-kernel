@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 0a8653b..576bef2 100644
+index 958314a..967c83e 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -88,6 +88,20 @@ dependencies = [
@@ -23,7 +23,7 @@ index 0a8653b..576bef2 100644
  [[package]]
  name = "aster-backlight"
  version = "0.1.0"
-@@ -655,6 +669,7 @@ name = "asterinas"
+@@ -656,6 +670,7 @@ name = "asterinas"
  version = "0.1.0"
  dependencies = [
   "aster-ahci",
@@ -1289,10 +1289,10 @@ index 0000000..69e0fb4
 +}
 diff --git a/kernel/comps/ath10k/src/lib.rs b/kernel/comps/ath10k/src/lib.rs
 new file mode 100644
-index 0000000..368da6f
+index 0000000..1072614
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/lib.rs
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,335 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Qualcomm Atheros Wi-Fi of Linux's ath10k family on PCIe: the QCA6174
@@ -1306,9 +1306,10 @@ index 0000000..368da6f
 +//! The station on it is [`sta`]: scans by the firmware, one STA vdev, the
 +//! access point's peer, keys in the firmware, native Wi-Fi frames.
 +//!
-+//! Not yet: the older QCA988x/QCA99x0 firmware interfaces, 40/80 MHz,
-+//! VHT, power save, 802.11w. `dmesg | grep ath10k` says how far a card
-+//! gets; `ath10k.off` leaves the cards alone.
++//! TKIP runs in the firmware with its MIC; robust management frames
++//! arrive decrypted (802.11w, the BIP in the Wi-Fi component). Not yet:
++//! the older QCA988x/QCA99x0 firmware interfaces. `dmesg | grep ath10k`
++//! says how far a card gets; `ath10k.off` leaves the cards alone.
 +
 +#![no_std]
 +#![deny(unsafe_code)]
@@ -2290,10 +2291,10 @@ index 0000000..fd049bb
 +}
 diff --git a/kernel/comps/ath10k/src/sta.rs b/kernel/comps/ath10k/src/sta.rs
 new file mode 100644
-index 0000000..8834176
+index 0000000..b855622
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/sta.rs
-@@ -0,0 +1,1330 @@
+@@ -0,0 +1,1334 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface as Linux's ath10k `mac.c` runs it on the TLV firmware:
@@ -3397,9 +3398,12 @@ index 0000000..8834176
 +    /// `ath10k_set_key`: CCMP, the pairwise key for the access point's peer,
 +    /// the group key under its address too.
 +    pub(crate) fn set_key(&mut self, key: &Key) -> radio::Result<()> {
-+        if key.cipher != radio::CIPHER_CCMP || key.key.len() != 16 {
-+            return Err(radio::Error::Unsupported);
-+        }
++        let cipher = match key.cipher {
++            radio::CIPHER_CCMP if key.key.len() == 16 => wmi::CIPHER_AES_CCM,
++            // The firmware runs TKIP with its MIC (`ath10k_install_key`).
++            radio::CIPHER_TKIP if key.key.len() == 32 && self.ap.is_none() => wmi::CIPHER_TKIP,
++            _ => return Err(radio::Error::Unsupported),
++        };
 +        // As an access point: a station's pairwise key, the group's on its
 +        // own peer.
 +        let address = match (&self.ap, key.pairwise) {
@@ -3408,7 +3412,7 @@ index 0000000..8834176
 +            (None, _) => self.network.as_ref().ok_or(radio::Error::Invalid)?.join.bssid,
 +        };
 +        let flags = if key.pairwise { wmi::KEY_PAIRWISE } else { wmi::KEY_GROUP };
-+        self.wmi_send(wmi::install_key(VDEV, &address, key.index, flags, wmi::CIPHER_AES_CCM, &key.key)).map_err(|()| radio::Error::Failed)?;
++        self.wmi_send(wmi::install_key(VDEV, &address, key.index, flags, cipher, &key.key)).map_err(|()| radio::Error::Failed)?;
 +        match &mut self.ap {
 +            Some(ap) if key.pairwise => {
 +                if let Some(station) = ap.stations.get_mut(&address) {
@@ -3617,19 +3621,20 @@ index 0000000..8834176
 +            driver: String::from("ath10k"),
 +            address: self.address,
 +            bands,
-+            ciphers: vec![radio::CIPHER_CCMP],
++            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_TKIP],
 +            max_scan_ssids: 16,
 +            max_scan_ie_len: 200,
 +            ap: true,
++            management: radio::ManagementProtection::Unicast,
 +        }
 +    }
 +}
 diff --git a/kernel/comps/ath10k/src/wmi.rs b/kernel/comps/ath10k/src/wmi.rs
 new file mode 100644
-index 0000000..831f541
+index 0000000..f5fbecc
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/wmi.rs
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,523 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! WMI over TLVs, the QCA6174/QCA9377 firmware's control interface as
@@ -3802,6 +3807,7 @@ index 0000000..831f541
 +pub(crate) const KEY_PAIRWISE: u32 = 0x0;
 +pub(crate) const KEY_GROUP: u32 = 0x1;
 +pub(crate) const CIPHER_NONE: u32 = 0x0;
++pub(crate) const CIPHER_TKIP: u32 = 0x2;
 +pub(crate) const CIPHER_AES_CCM: u32 = 0x4;
 +// Received management frames' errors (`WMI_RX_STATUS_ERR_*`).
 +pub(crate) const RX_STATUS_ERRORS: u32 = 0x01 | 0x08 | 0x10;
@@ -4128,7 +4134,10 @@ index 0000000..831f541
 +    head.extend_from_slice(&[vdev, lo, hi, index as u32, flags, cipher]);
 +    head.extend_from_slice(&[0u32; 6]);
 +    head.extend_from_slice(&[0u32; 8]);
-+    head.extend_from_slice(&[key.len() as u32, 0, 0]);
++    // TKIP's MIC keys follow its temporal key (`key_txmic_len`,
++    // `key_rxmic_len`).
++    let mic = if cipher == CIPHER_TKIP { 8 } else { 0 };
++    head.extend_from_slice(&[key.len() as u32, mic, mic]);
 +    Cmd::new(VDEV_INSTALL_KEY).tlv(TAG_VDEV_INSTALL_KEY, &head).bytes(TAG_ARRAY_BYTE, key)
 +}
 +

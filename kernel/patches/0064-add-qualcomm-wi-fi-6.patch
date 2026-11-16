@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 65d4313..fb22f10 100644
+index e4b4f37..eff1f53 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -102,6 +102,20 @@ dependencies = [
@@ -23,7 +23,7 @@ index 65d4313..fb22f10 100644
  [[package]]
  name = "aster-backlight"
  version = "0.1.0"
-@@ -684,6 +698,7 @@ version = "0.1.0"
+@@ -685,6 +699,7 @@ version = "0.1.0"
  dependencies = [
   "aster-ahci",
   "aster-ath10k",
@@ -2667,10 +2667,10 @@ index 0000000..f16ba22
 +];
 diff --git a/kernel/comps/ath11k/src/lib.rs b/kernel/comps/ath11k/src/lib.rs
 new file mode 100644
-index 0000000..deaecea
+index 0000000..75f0372
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/lib.rs
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,317 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Qualcomm's Wi-Fi 6 chips on PCIe, as Linux's ath11k runs them: the
@@ -2691,7 +2691,8 @@ index 0000000..deaecea
 +//! interfaces; the rest follows Linux's ath11k (BSD-3-Clause-Clear, see
 +//! NOTICE). linux-firmware's `ath11k/` has the firmware (`amss.bin`,
 +//! `m3.bin`, `board-2.bin`, `regdb.bin`). Block-ack sessions, power save
-+//! and the 6 GHz band run. Not yet: 802.11w. `dmesg | grep ath11k` says
++//! and the 6 GHz band run, and 802.11w (the BIP in the Wi-Fi component).
++//! `dmesg | grep ath11k` says
 +//! how far a card gets; `ath11k.off`
 +//! leaves the cards alone.
 +
@@ -4773,10 +4774,10 @@ index 0000000..f642bd8
 +pub(crate) const WMI_VHT_CAP_MAX_MPDU_LEN_MASK: u32 = 0x3;
 diff --git a/kernel/comps/ath11k/src/sta.rs b/kernel/comps/ath11k/src/sta.rs
 new file mode 100644
-index 0000000..2294175
+index 0000000..2e49dfe
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/sta.rs
-@@ -0,0 +1,1930 @@
+@@ -0,0 +1,1946 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface, as Linux's ath11k `core.c` brings the firmware up
@@ -5069,6 +5070,9 @@ index 0000000..2294175
 +    qos: bool,
 +    /// The pairwise and group keys are in place.
 +    keys: (bool, bool),
++    /// The MIC length of the pairwise key's cipher: CCMP's 8, GCMP's and
++    /// CCMP-256's 16.
++    pairwise_mic: usize,
 +    scan: Option<Scan>,
 +    scan_freq: u16,
 +    mgmt: BTreeMap<u32, DmaCoherent>,
@@ -5128,6 +5132,7 @@ index 0000000..2294175
 +            associated: false,
 +            qos: false,
 +            keys: (false, false),
++            pairwise_mic: 8,
 +            scan: None,
 +            scan_freq: 0,
 +            mgmt: BTreeMap::new(),
@@ -5618,6 +5623,7 @@ index 0000000..2294175
 +            max_scan_ssids: WLAN_SCAN_PARAMS_MAX_SSID as u8,
 +            max_scan_ie_len: (WLAN_SCAN_PARAMS_MAX_IE_LEN as u16).saturating_sub(16),
 +            ap: true,
++            management: radio::ManagementProtection::Unicast,
 +        }
 +    }
 +
@@ -5743,12 +5749,20 @@ index 0000000..2294175
 +            }
 +        };
 +        let signal = (NOISE_FLOOR + snr as i32).clamp(-127, -1) as i8;
-+        // Protected management frames other than robust ones arrive
-+        // decrypted, their protection gone.
-+        let mut decrypted = false;
-+        if frame[1] & wifi::PROTECTED != 0 && frame[0] & 0xfc != wifi::AUTH {
++        // Protected management frames arrive decrypted; robust ones (action,
++        // deauthentication, disassociation) keep the cipher's header and
++        // MIC (`ath11k_mgmt_rx_event`), the others lose their protection.
++        let (mut decrypted, mut security_header) = (false, 0);
++        let subtype = frame[0] & 0xfc;
++        if frame[1] & wifi::PROTECTED != 0 && subtype != wifi::AUTH {
 +            decrypted = true;
-+            frame[1] &= !wifi::PROTECTED;
++            if matches!(subtype, wifi::ACTION | wifi::DEAUTH | wifi::DISASSOC) {
++                security_header = 8;
++                let mic = self.pairwise_mic;
++                frame.truncate(frame.len().saturating_sub(mic));
++            } else {
++                frame[1] &= !wifi::PROTECTED;
++            }
 +        }
 +        if let Some(network) = &self.network
 +            && wifi::addresses(&frame).is_some_and(|(_, transmitter, _)| transmitter == network.join.bssid)
@@ -5756,7 +5770,7 @@ index 0000000..2294175
 +            self.signal = Some(signal);
 +        }
 +        if let Some(device) = &self.device {
-+            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0, amsdu_more: false });
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header, amsdu_more: false });
 +        }
 +    }
 +
@@ -6376,7 +6390,10 @@ index 0000000..2294175
 +                }
 +            }
 +            Some(ap) => ap.group_key = true,
-+            None if key.pairwise => self.keys.0 = true,
++            None if key.pairwise => {
++                self.keys.0 = true;
++                self.pairwise_mic = if matches!(key.cipher, radio::CIPHER_CCMP | radio::CIPHER_TKIP) { 8 } else { 16 };
++            }
 +            None => self.keys.1 = true,
 +        }
 +        Ok(())

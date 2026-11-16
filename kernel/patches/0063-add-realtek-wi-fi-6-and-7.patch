@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 576bef2..65d4313 100644
+index 967c83e..e4b4f37 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -507,6 +507,20 @@ dependencies = [
+@@ -508,6 +508,20 @@ dependencies = [
   "ostd",
  ]
  
@@ -23,7 +23,7 @@ index 576bef2..65d4313 100644
  [[package]]
  name = "aster-simpledrm"
  version = "0.1.0"
-@@ -680,6 +694,7 @@ dependencies = [
+@@ -681,6 +695,7 @@ dependencies = [
   "aster-iwlwifi",
   "aster-mt7921",
   "aster-rtw88",
@@ -18801,10 +18801,10 @@ index 0000000..9490a19
 +}
 diff --git a/kernel/comps/rtw89/src/sta.rs b/kernel/comps/rtw89/src/sta.rs
 new file mode 100644
-index 0000000..0918838
+index 0000000..8eb445b
 --- /dev/null
 +++ b/kernel/comps/rtw89/src/sta.rs
-@@ -0,0 +1,2431 @@
+@@ -0,0 +1,2461 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface as mac80211 runs it over rtw89 on the 802.11ax chips: the
@@ -18890,6 +18890,7 @@ index 0000000..0918838
 +const HW_RATE_OFDM6: u32 = 4;
 +/// Security CAM types (`RTW89_SEC_KEY_TYPE_*`) as the TX descriptor and
 +/// the CAM name them.
++const SEC_TKIP: u32 = 3;
 +const SEC_CCMP128: u32 = 6;
 +const SEC_CCMP256: u32 = 7;
 +const SEC_GCMP128: u32 = 8;
@@ -19232,6 +19233,9 @@ index 0000000..0918838
 +    /// The pairwise key: index, CAM entry, cipher, the next PN.
 +    pairwise: Option<(u8, u32, u32, u64)>,
 +    group: Option<(u8, u32, u32)>,
++    /// The group's TKIP key's receive MIC key: the chip decrypts, the MIC
++    /// is checked here (`IEEE80211_KEY_FLAG_GENERATE_MMIC`).
++    group_mic: Option<[u8; 8]>,
 +    scan: Option<Scan>,
 +    sequence: u16,
 +    /// QoS data to the access point (as a station), and the receive
@@ -19392,6 +19396,7 @@ index 0000000..0918838
 +            qos: false,
 +            pairwise: None,
 +            group: None,
++            group_mic: None,
 +            scan: None,
 +            sequence: 0,
 +            aggregates: Aggregates::default(),
@@ -20583,12 +20588,23 @@ index 0000000..0918838
 +            radio::CIPHER_CCMP_256 => SEC_CCMP256,
 +            radio::CIPHER_GCMP => SEC_GCMP128,
 +            radio::CIPHER_GCMP_256 => SEC_GCMP256,
++            // A station's group key of a mixed WPA/WPA2 network.
++            radio::CIPHER_TKIP if !key.pairwise && self.ap.is_none() => SEC_TKIP,
 +            _ if remove => SEC_CCMP128,
 +            _ => return Err(radio::Error::Unsupported),
 +        };
 +        if key.key.len() > 32 {
 +            return Err(radio::Error::Invalid);
 +        }
++        // TKIP's temporal key goes to the chip, its MIC keys stay here.
++        let material = if kind == SEC_TKIP && !remove {
++            if key.key.len() != 32 {
++                return Err(radio::Error::Invalid);
++            }
++            &key.key[..16]
++        } else {
++            &key.key[..]
++        };
 +        if self.ap.is_some() {
 +            return self.set_key_ap(key, kind, remove);
 +        }
@@ -20598,9 +20614,13 @@ index 0000000..0918838
 +                self.pairwise = None;
 +            } else {
 +                self.group = None;
++                self.group_mic = None;
 +            }
 +        } else {
-+            if let Err(error) = self.sec_cam(cam, kind, &key.key) {
++            if !key.pairwise {
++                self.group_mic = if kind == SEC_TKIP { aster_wlan::tkip::rx_mic_key(&key.key) } else { None };
++            }
++            if let Err(error) = self.sec_cam(cam, kind, material) {
 +                ostd::warn!("rtw89: key: {}", error);
 +                return Err(radio::Error::Failed);
 +            }
@@ -21131,8 +21151,17 @@ index 0000000..0918838
 +                None if multicast => self.group.map(|(_, _, kind)| kind),
 +                None => self.pairwise.map(|(_, _, kind, _)| kind),
 +            };
-+            let mic = if kind == Some(SEC_CCMP128) { 8 } else { 16 };
-+            frame.truncate(frame.len().saturating_sub(mic));
++            if kind == Some(SEC_TKIP) {
++                // TKIP: the ICV goes, the MIC is checked here.
++                frame.truncate(frame.len().saturating_sub(4));
++                let Some(key) = self.group_mic else { return };
++                if !aster_wlan::tkip::check_and_strip(&mut frame, 8, &key) {
++                    return;
++                }
++            } else {
++                let mic = if kind == Some(SEC_CCMP128) { 8 } else { 16 };
++                frame.truncate(frame.len().saturating_sub(mic));
++            }
 +        }
 +        if let Some(device) = &self.device {
 +            device.received(&frame, RxInfo { freq: held.freq, signal, decrypted, security_header: if decrypted { 8 } else { 0 }, amsdu_more: false });
@@ -21192,10 +21221,11 @@ index 0000000..0918838
 +            driver: String::from("rtw89"),
 +            address: self.address,
 +            bands,
-+            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_CCMP_256, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256],
++            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_CCMP_256, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_TKIP],
 +            max_scan_ssids: 4,
 +            max_scan_ie_len: 512,
 +            ap: true,
++            management: radio::ManagementProtection::Unicast,
 +        }
 +    }
 +
