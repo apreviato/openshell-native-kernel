@@ -1101,10 +1101,10 @@ index 0000000..d2afdac
 +}
 diff --git a/kernel/comps/mt7921/src/lib.rs b/kernel/comps/mt7921/src/lib.rs
 new file mode 100644
-index 0000000..3e16cb0
+index 0000000..c0fbbc5
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/lib.rs
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,390 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! MediaTek Wi-Fi: the MT7921 (AMD RZ608), MT7922 (AMD RZ616) and MT7920
@@ -1118,8 +1118,9 @@ index 0000000..3e16cb0
 +//! the MT7925.
 +//!
 +//! Both run as stations or as access points (the beacon offloaded to the
-+//! firmware). Not yet: block-ack agreements, power save, 6 GHz,
-+//! multi-link operation, management frame protection. The kernel's log
++//! firmware), with block-ack sessions and power save; 6 GHz where the
++//! chip has it, EHT on the MT7925. Not yet: multi-link operation,
++//! management frame protection. The kernel's log
 +//! says how far a card gets (`dmesg | grep mt7921`); `mt7921.off` leaves
 +//! the cards alone.
 +
@@ -1150,7 +1151,7 @@ index 0000000..3e16cb0
 +use aster_wlan::{
 +    Device,
 +    ieee80211::Address,
-+    radio::{self, ApConfig, Association, BeaconTemplate, Info, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++    radio::{self, ApConfig, Association, BeaconTemplate, BlockAck, Info, Join, Key, LinkStats, Radio, Reorder, ScanRequest, StationEntry},
 +};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
@@ -1310,6 +1311,30 @@ index 0000000..3e16cb0
 +    fn remove_station(&mut self, address: &Address) {
 +        each!(self, station => station.remove_station(address))
 +    }
++
++    fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        each!(self, station => station.set_power_save(enabled))
++    }
++
++    fn rx_ba_start(&mut self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        each!(self, station => station.rx_ba_start(ba))
++    }
++
++    fn rx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        each!(self, station => station.rx_ba_stop(peer, tid))
++    }
++
++    fn tx_ba_start(&mut self, peer: &Address, tid: u8) -> radio::Result<u16> {
++        each!(self, station => station.tx_ba_start(peer, tid))
++    }
++
++    fn tx_ba_operational(&mut self, ba: &BlockAck) -> radio::Result<()> {
++        each!(self, station => station.tx_ba_operational(ba))
++    }
++
++    fn tx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        each!(self, station => station.tx_ba_stop(peer, tid))
++    }
 +}
 +
 +struct Card {
@@ -1398,6 +1423,30 @@ index 0000000..3e16cb0
 +    // The firmware lets a station's data through once its entry is there
 +    // (`mt7921_mac_sta_event` does nothing more when it is authorized).
 +    fn authorize_station(&self, _address: &Address, _authorized: bool) {}
++
++    fn set_power_save(&self, enabled: bool) -> radio::Result<()> {
++        self.card.state.lock().set_power_save(enabled)
++    }
++
++    fn rx_ba_start(&self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        self.card.state.lock().rx_ba_start(ba)
++    }
++
++    fn rx_ba_stop(&self, peer: &Address, tid: u8) {
++        self.card.state.lock().rx_ba_stop(peer, tid);
++    }
++
++    fn tx_ba_start(&self, peer: &Address, tid: u8) -> radio::Result<u16> {
++        self.card.state.lock().tx_ba_start(peer, tid)
++    }
++
++    fn tx_ba_operational(&self, ba: &BlockAck) -> radio::Result<()> {
++        self.card.state.lock().tx_ba_operational(ba)
++    }
++
++    fn tx_ba_stop(&self, peer: &Address, tid: u8) {
++        self.card.state.lock().tx_ba_stop(peer, tid);
++    }
 +}
 +
 +/// A card's task: the chip started, its firmware, the station registered,
@@ -1448,10 +1497,10 @@ index 0000000..3e16cb0
 +}
 diff --git a/kernel/comps/mt7921/src/mac.rs b/kernel/comps/mt7921/src/mac.rs
 new file mode 100644
-index 0000000..865a78d
+index 0000000..0049cd2
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mac.rs
-@@ -0,0 +1,1655 @@
+@@ -0,0 +1,1837 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface on the MediaTek firmware, as Linux's mt7921 and
@@ -1469,7 +1518,7 @@ index 0000000..865a78d
 +    Device,
 +    chan,
 +    ieee80211::{self as wifi, Address},
-+    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, Chandef, HeCap, HtCap, Info, Join, Key, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, BlockAck, Chandef, HeCap, HtCap, Info, Join, Key, Reorder, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
 +};
 +use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
 +
@@ -1526,11 +1575,24 @@ index 0000000..865a78d
 +const WTBL_HDR_TRANS: u16 = 0x06;
 +const WTBL_SMPS: u16 = 0x0d;
 +const WTBL_RESET_AND_SET: u8 = 1;
++/// Block acknowledgment: the station record's and the WTBL's entries, the
++/// WTBL's operation that changes one entry (`WTBL_SET`), the agreement's
++/// side (`MT_BA_TYPE_*`).
++const STA_REC_BA: u16 = 0x06;
++const WTBL_BA: u16 = 0x08;
++const WTBL_SET: u8 = 2;
++const BA_TYPE_ORIGINATOR: u8 = 1;
++const BA_TYPE_RECIPIENT: u8 = 2;
 +const UNI_BSS_INFO_BASIC: u16 = 0x00;
 +const UNI_BSS_INFO_RLM: u16 = 0x02;
 +const UNI_BSS_INFO_BSS_COLOR: u16 = 0x04;
 +const UNI_BSS_INFO_HE_BASIC: u16 = 0x05;
 +const UNI_BSS_INFO_QBSS: u16 = 0x0f;
++/// The BSS's power save state (`UNI_BSS_INFO_PS`'s `ps_state`): awake,
++/// or the firmware's dynamic power save.
++const UNI_BSS_INFO_PS: u16 = 21;
++const PS_STATE_AWAKE: u8 = 0;
++const PS_STATE_DYNAMIC: u8 = 2;
 +// Channel widths (`CMD_CBW_*`).
 +const CMD_CBW_20MHZ: u8 = 0;
 +const CMD_CBW_40MHZ: u8 = 1;
@@ -1670,7 +1732,8 @@ index 0000000..865a78d
 +        Width::NoHt20 | Width::W20 => CMD_CBW_20MHZ,
 +        Width::W40 => CMD_CBW_40MHZ,
 +        Width::W80 => CMD_CBW_80MHZ,
-+        Width::W160 => CMD_CBW_160MHZ,
++        // The MT7921 and MT7922 go to 160 MHz (no 802.11be).
++        Width::W160 | Width::W320 => CMD_CBW_160MHZ,
 +    }
 +}
 +
@@ -1723,9 +1786,33 @@ index 0000000..865a78d
 +
 +/// A channel's number and its band as the firmware's scan and ROC name
 +/// them (1: 2.4 GHz, 2: 5 GHz).
++/// A channel's number and band for the firmware's lists (1: 2.4 GHz,
++/// 2: 5 GHz, 3: 6 GHz).
 +fn channel_band(freq: u16) -> (u8, u8) {
-+    (wifi::channel_of(freq).unwrap_or(0), if is_2ghz(freq) { 1 } else { 2 })
++    let band = match BandId::of(freq) {
++        BandId::Ghz2 => 1,
++        BandId::Ghz5 => 2,
++        BandId::Ghz6 => 3,
++    };
++    (wifi::channel_of(freq).unwrap_or(0), band)
 +}
++
++/// The channel of a frame's RXD (`mt792x_get_status_freq_info`): 2.4 GHz's
++/// up to 14, 5 GHz's up to 180, 6 GHz's from 181 on (its channels by four).
++pub(crate) fn rx_freq(chfreq: u16) -> Option<u16> {
++    let (band, channel) = match chfreq {
++        1..=14 => (BandId::Ghz2, chfreq),
++        15..=180 => (BandId::Ghz5, chfreq),
++        181..=239 => (BandId::Ghz6, (chfreq - 181) * 4 + 1),
++        _ => return None,
++    };
++    Some(chan::freq_of(band, channel as u8))
++}
++
++/// The STA record of an access point's HE 6 GHz band capabilities.
++pub(crate) const STA_REC_HE_6G: u16 = 0x17;
++/// The BSS's modes beyond `phymode` (`phymode_ext`): HE on 6 GHz.
++pub(crate) const PHY_MODE_AX_6G: u8 = 1 << 0;
 +
 +/// Rates (in 500 kbit/s, the basic ones flagged) as the band's bitmaps:
 +/// all of them and the basic ones, the band's when none is given.
@@ -1820,6 +1907,9 @@ index 0000000..865a78d
 +    wcid: u8,
 +    qos: bool,
 +    key: bool,
++    /// QoS data frames sent per TID: the hardware numbers them so, and an
++    /// agreement to send aggregates starts from there.
++    tx_seq: [u16; 8],
 +}
 +
 +/// A peer's station record: the access point's (this radio a station) or
@@ -1868,6 +1958,9 @@ index 0000000..865a78d
 +    sequence: u16,
 +    pub(crate) signal: Option<i8>,
 +    pub(crate) dead: bool,
++    /// QoS data frames sent per TID to the access point (the hardware's
++    /// numbering), for the agreements to send aggregates.
++    tx_seq: [u16; 8],
 +}
 +
 +impl Mt7921 {
@@ -1896,6 +1989,7 @@ index 0000000..865a78d
 +            roc_granted: false,
 +            sequence: 0,
 +            signal: None,
++            tx_seq: [0; 8],
 +            dead: false,
 +        }
 +    }
@@ -1985,7 +2079,12 @@ index 0000000..865a78d
 +        out[2] = cbw(chandef.width);
 +        out[3] = self.nss;
 +        out[4] = if command == EXT_CHANNEL_SWITCH { self.nss } else { mask };
-+        out[10] = if is_2ghz(chandef.control) { 0 } else { 1 };
++        // The channel's band (`mt7921_mcu_set_chan_info`: nl80211's, 6 GHz 2).
++        out[10] = match BandId::of(chandef.control) {
++            BandId::Ghz2 => 0,
++            BandId::Ghz5 => 1,
++            BandId::Ghz6 => 2,
++        };
 +        self.chip.mcu(Cmd::Ext(command), &out, true).map(|_| ())
 +    }
 +
@@ -2015,7 +2114,7 @@ index 0000000..865a78d
 +    /// `struct mt76_connac_bss_basic_tlv`'s value: the interface's BSS,
 +    /// `conn_state` 1 when not connected, the network when there is one.
 +    fn bss_basic(&self, conn_state: u8, network: Option<&Network>) -> Vec<u8> {
-+        let bss = network.map(|network| (network.ghz2(), network.join.bssid, network.join.beacon_interval, network.dtim));
++        let bss = network.map(|network| (BandId::of(network.join.freq), network.join.bssid, network.join.beacon_interval, network.dtim));
 +        Self::basic_value(true, CONNECTION_INFRA_STA, conn_state, bss)
 +    }
 +
@@ -2023,8 +2122,9 @@ index 0000000..865a78d
 +    /// network's band, BSSID, beacon interval and DTIM period when there is
 +    /// one, with the interface's own modes (`mt76_connac_get_phy_mode` and
 +    /// `_v2` without a station: HT and HE on both bands, VHT at 5 GHz).
-+    fn basic_value(active: bool, conn_type: u32, conn_state: u8, bss: Option<(bool, Address, u16, u8)>) -> Vec<u8> {
-+        let ghz2 = bss.is_none_or(|(ghz2, ..)| ghz2);
++    fn basic_value(active: bool, conn_type: u32, conn_state: u8, bss: Option<(BandId, Address, u16, u8)>) -> Vec<u8> {
++        let ghz2 = bss.is_none_or(|(band, ..)| band == BandId::Ghz2);
++        let ghz6 = bss.is_some_and(|(band, ..)| band == BandId::Ghz6);
 +        let phymode = if ghz2 { PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN | PHY_MODE_AX_24G } else { PHY_MODE_A | PHY_MODE_AN | PHY_MODE_AC | PHY_MODE_AX_5G };
 +        let basic_phy = if ghz2 { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP | PHY_TYPE_BIT_HT | PHY_TYPE_BIT_HE } else { PHY_TYPE_BIT_OFDM | PHY_TYPE_BIT_HT | PHY_TYPE_BIT_VHT | PHY_TYPE_BIT_HE };
 +        let (bssid, interval, dtim) = bss.map_or(([0; 6], 0, 0), |(_, bssid, interval, dtim)| (bssid, interval, dtim));
@@ -2038,7 +2138,7 @@ index 0000000..865a78d
 +        value.extend_from_slice(&[dtim, if bss.is_some() { phymode } else { 0 }]);
 +        value.extend_from_slice(&(WCID_OWN as u16).to_le_bytes());
 +        value.extend_from_slice(&(if bss.is_some() { basic_phy as u16 } else { 0 }).to_le_bytes());
-+        value.extend_from_slice(&[0, 0]);
++        value.extend_from_slice(&[if ghz6 { PHY_MODE_AX_6G } else { 0 }, 0]);
 +        value
 +    }
 +
@@ -2071,7 +2171,12 @@ index 0000000..865a78d
 +        let bw = cbw(chandef.width);
 +        let ht_op = if bw == CMD_CBW_20MHZ { 0 } else { 4 };
 +        let mut rlm = vec![0u8; 4];
-+        let band = if is_2ghz(chandef.control) { 0 } else { 1 };
++        // nl80211's band number.
++        let band = match BandId::of(chandef.control) {
++            BandId::Ghz2 => 0,
++            BandId::Ghz5 => 1,
++            BandId::Ghz6 => 3,
++        };
 +        rlm.extend(tlv(UNI_BSS_INFO_RLM, &[channel, center, 0, bw, self.nss, (1 << self.nss) - 1, 1, ht_op, sco(chandef), band, 0, 0]));
 +        self.uni(UNI_BSS_INFO_UPDATE, &rlm)
 +    }
@@ -2103,7 +2208,7 @@ index 0000000..865a78d
 +        let Some(ap) = &self.ap else { return Ok(()) };
 +        let (ghz2, chandef, qos, he) = (ap.ghz2(), ap.config.chandef, ap.qos, ap.he);
 +        let operation = ap.he_operation.clone();
-+        let bss = Some((ghz2, self.address, ap.config.beacon_interval, ap.config.dtim_period.max(1)));
++        let bss = Some((BandId::of(chandef.control), self.address, ap.config.beacon_interval, ap.config.dtim_period.max(1)));
 +        let mut out = vec![0u8; 4];
 +        out.extend(tlv(UNI_BSS_INFO_BASIC, &Self::basic_value(enable, CONNECTION_INFRA_AP, !enable as u8, bss)));
 +        out.extend(tlv(UNI_BSS_INFO_QBSS, &[qos as u8, 0, 0, 0]));
@@ -2173,7 +2278,11 @@ index 0000000..865a78d
 +
 +    /// A WTBL request in its STA_REC TLV.
 +    fn wtbl(wcid: u8, tlvs: &[Vec<u8>]) -> Vec<u8> {
-+        let mut value = vec![wcid, WTBL_RESET_AND_SET];
++        Self::wtbl_op(wcid, WTBL_RESET_AND_SET, tlvs)
++    }
++
++    fn wtbl_op(wcid: u8, operation: u8, tlvs: &[Vec<u8>]) -> Vec<u8> {
++        let mut value = vec![wcid, operation];
 +        value.extend_from_slice(&(tlvs.len() as u16).to_le_bytes());
 +        value.extend_from_slice(&[0, 0, 0, 0]);
 +        for inner in tlvs {
@@ -2211,6 +2320,17 @@ index 0000000..865a78d
 +            ap: false,
 +        };
 +        self.peer_record(&record, enable, state)
++    }
++
++    /// The access point's HE 6 GHz band capabilities (its beacon's), on
++    /// 6 GHz: A-MPDU factor and spacing where HT's are not.
++    fn he_6ghz_of(&self, record_ap: bool, freq: u16) -> Option<u16> {
++        if record_ap || BandId::of(freq) != BandId::Ghz6 {
++            return None;
++        }
++        let network = self.network.as_ref()?;
++        let value = wifi::Elements(&network.join.elements).extension(wifi::EXT_HE_6GHZ_CAP)?;
++        Some(u16::from_le_bytes([*value.first()?, *value.get(1)?]))
 +    }
 +
 +    /// `mt7921_mcu_sta_update` for a peer (`mt76_connac_mcu_sta_cmd`): its
@@ -2277,6 +2397,13 @@ index 0000000..865a78d
 +        }
 +        if peer.he.is_some() {
 +            phy_type |= PHY_TYPE_BIT_HE;
++        }
++        // On 6 GHz the aggregates are HE's band capabilities' (`mt76_connac_mcu_sta_tlv`).
++        let he_6ghz = self.he_6ghz_of(record.ap, record.chandef.control);
++        if let Some(capa) = he_6ghz {
++            let factor = ((capa >> chan::HE_6GHZ_CAP_MAX_AMPDU_SHIFT) & 7) as u8;
++            ampdu = (factor.min(3) & 3) | (((capa & 7) as u8) << 2);
++            tlvs.push(tlv(STA_REC_HE_6G, &[capa as u8, (capa >> 8) as u8, 0, 0]));
 +        }
 +        let mut phy = record.basic.to_le_bytes().to_vec();
 +        phy.extend_from_slice(&[phy_type, ampdu, 0, rcpi, 0, 0]);
@@ -2469,7 +2596,7 @@ index 0000000..865a78d
 +        self.scan_seq = (self.scan_seq + 1) & 0x7f;
 +        let active = !request.ssids.is_empty();
 +        let ssids: Vec<&Vec<u8>> = request.ssids.iter().filter(|ssid| !ssid.is_empty()).take(4).collect();
-+        let freqs: Vec<u16> = request.freqs.iter().copied().filter(|&freq| wifi::channel_of(freq).is_some() && BandId::of(freq) != BandId::Ghz6).collect();
++        let freqs: Vec<u16> = request.freqs.iter().copied().filter(|&freq| wifi::channel_of(freq).is_some() && (BandId::of(freq) != BandId::Ghz6 || self.wide160)).collect();
 +        let listed = !freqs.is_empty() && freqs.len() <= 64;
 +        let mut out = Vec::with_capacity(1186);
 +        let ssid_type = if ssids.is_empty() { 1 << 0 } else { 1 << 2 };
@@ -2541,6 +2668,7 @@ index 0000000..865a78d
 +        }
 +        self.leave();
 +        self.network = Some(Network::new(join));
++        self.tx_seq = [0; 8];
 +        self.aid = 0;
 +        self.qos = false;
 +        if let Err(error) = self.station_record(true, STATE_NONE) {
@@ -2658,7 +2786,7 @@ index 0000000..865a78d
 +        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
 +        let used: Vec<u8> = ap.stations.values().map(|station| station.wcid).collect();
 +        let Some(wcid) = (1..=AP_STATIONS).find(|wcid| !used.contains(wcid)) else { return Err(radio::Error::Busy) };
-+        ap.stations.insert(station.address, ApStation { wcid, qos: station.peer.qos, key: false });
++        ap.stations.insert(station.address, ApStation { wcid, qos: station.peer.qos, key: false, tx_seq: [0; 8] });
 +        let (rates, _) = rate_bitmaps(ap.ghz2(), station.peer.rates.iter().copied());
 +        let record = PeerRecord {
 +            wcid,
@@ -2864,13 +2992,114 @@ index 0000000..865a78d
 +                (station.qos.then(|| wifi::tid_of(ethernet)), station.key)
 +            };
 +            let frame = wifi::data_from_ethernet_ap(ethernet, &self.address, tid, !plain && keyed).ok_or(radio::Error::Invalid)?;
-+            return self.transmit(frame);
++            self.transmit(frame)?;
++            if let Some(tid) = tid
++                && let Some(station) = self.ap.as_mut().and_then(|ap| ap.stations.get_mut(&destination))
++            {
++                station.tx_seq[tid as usize & 7] = (station.tx_seq[tid as usize & 7] + 1) & 0x0fff;
++            }
++            return Ok(());
 +        }
 +        let Some(network) = &self.network else { return Err(radio::Error::Down) };
 +        let tid = self.qos.then(|| wifi::tid_of(ethernet));
 +        let protected = !plain && self.pairwise.is_some();
 +        let frame = wifi::data_from_ethernet(ethernet, &network.join.bssid, tid, protected).ok_or(radio::Error::Invalid)?;
-+        self.transmit(frame)
++        self.transmit(frame)?;
++        if let Some(tid) = tid {
++            self.tx_seq[tid as usize & 7] = (self.tx_seq[tid as usize & 7] + 1) & 0x0fff;
++        }
++        Ok(())
++    }
++
++    /// `mt7921_mcu_uni_bss_ps`/`mt7925_mcu_uni_bss_ps`: the firmware's
++    /// dynamic power save for the link (2), or awake (0).
++    pub(crate) fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.ap.is_some() || self.network.is_none() {
++            return Err(radio::Error::Invalid);
++        }
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(UNI_BSS_INFO_PS, &[if enabled { PS_STATE_DYNAMIC } else { PS_STATE_AWAKE }, 0, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &out).map(|_| ()).map_err(|error| {
++            ostd::info!("{}: power save: {}", self.name, error);
++            radio::Error::Failed
++        })
++    }
++
++    // ---- Block acknowledgment (`mt7921_ampdu_action`): the chip answers
++    // and sends aggregates by its WTBL entry and station record; frames
++    // are put back in order by the Wi-Fi component (`mt76_rx_aggr_*`). ----
++
++    /// A peer's WTBL entry: the access point's, or a station's of this
++    /// radio's network.
++    fn peer_wcid(&self, peer: &Address) -> Option<u8> {
++        if let Some(ap) = &self.ap {
++            return ap.stations.get(peer).map(|station| station.wcid);
++        }
++        self.network.as_ref().filter(|network| network.join.bssid == *peer).map(|_| WCID_AP)
++    }
++
++    /// `mt76_connac_mcu_sta_ba`: the agreement in the peer's WTBL entry
++    /// (`struct wtbl_ba`), then in its station record (`struct sta_rec_ba`).
++    fn block_ack(&mut self, ba: &BlockAck, enable: bool, originator: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        let wcid = self.peer_wcid(&ba.peer).ok_or(radio::Error::Invalid)?;
++        let kind = if originator { BA_TYPE_ORIGINATOR } else { BA_TYPE_RECIPIENT };
++        let window = if enable { ba.buffer } else { 0 };
++        let mut entry = vec![ba.tid, kind, 0, 0];
++        if originator {
++            entry.extend_from_slice(&(if enable { ba.ssn } else { 0 }).to_le_bytes());
++            entry.extend_from_slice(&[enable as u8, 0]);
++            entry.extend_from_slice(&window.to_le_bytes());
++            entry.extend_from_slice(&[0; 10]);
++        } else {
++            entry.extend_from_slice(&[0; 4]);
++            entry.extend_from_slice(&window.to_le_bytes());
++            entry.extend_from_slice(&ba.peer);
++            // Its scoreboard reset by address and TID (`RST_BA_MAC_TID_MATCH`).
++            entry.extend_from_slice(&[ba.tid, 0, 1, 0]);
++        }
++        entry.extend_from_slice(&[0; 4]);
++        let wtbl = Self::wtbl_op(wcid, WTBL_SET, &[tlv(WTBL_BA, &entry)]);
++        let mut record = vec![ba.tid, kind, ba.amsdu as u8, (enable as u8) << (ba.tid & 7)];
++        record.extend_from_slice(&ba.ssn.to_le_bytes());
++        record.extend_from_slice(&ba.buffer.to_le_bytes());
++        let result = self.sta_rec(wcid, 0, &[wtbl]).and_then(|()| self.sta_rec(wcid, 0, &[tlv(STA_REC_BA, &record)]));
++        result.map_err(|error| {
++            ostd::info!("{}: block acknowledgment of TID {}: {}", self.name, ba.tid, error);
++            radio::Error::Failed
++        })
++    }
++
++    pub(crate) fn rx_ba_start(&mut self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        self.block_ack(ba, true, false).map(|()| Reorder::Host)
++    }
++
++    pub(crate) fn rx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        let ba = BlockAck { peer: *peer, tid, ssn: 0, buffer: 0, amsdu: false };
++        let _ = self.block_ack(&ba, false, false);
++    }
++
++    /// The next sequence number of `tid` to the peer, for the offer.
++    pub(crate) fn tx_ba_start(&mut self, peer: &Address, tid: u8) -> radio::Result<u16> {
++        if let Some(ap) = &self.ap {
++            return ap.stations.get(peer).map(|station| station.tx_seq[tid as usize & 7]).ok_or(radio::Error::Invalid);
++        }
++        self.peer_wcid(peer).ok_or(radio::Error::Invalid)?;
++        Ok(self.tx_seq[tid as usize & 7])
++    }
++
++    pub(crate) fn tx_ba_operational(&mut self, ba: &BlockAck) -> radio::Result<()> {
++        self.block_ack(ba, true, true)
++    }
++
++    pub(crate) fn tx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        let ba = BlockAck { peer: *peer, tid, ssn: 0, buffer: 0, amsdu: false };
++        let _ = self.block_ack(&ba, false, true);
 +    }
 +
 +    // ---- What the chip says. ----
@@ -3033,6 +3262,9 @@ index 0000000..865a78d
 +            return;
 +        }
 +        let mut frame = frame.to_vec();
++        // The chip takes A-MSDUs apart (`MT_RXD4_NORMAL_PAYLOAD_FORMAT`:
++        // 3 the first subframe, 2 a middle one, 1 the last).
++        let amsdu_more = rxd4 & 2 != 0;
 +        if rxd4 & 3 != 0 {
 +            let header = if wifi::is_data(&frame) && frame[0] & 0x80 != 0 { 26 } else { 24 };
 +            if frame.len() < header + 2 {
@@ -3040,13 +3272,7 @@ index 0000000..865a78d
 +            }
 +            drop(frame.drain(header..header + 2));
 +        }
-+        let channel = ((rxd3 >> 8) & 0xff) as u16;
-+        let freq = match channel {
-+            1..=13 => 2407 + 5 * channel,
-+            14 => 2484,
-+            15..=180 => 5000 + 5 * channel,
-+            _ => return,
-+        };
++        let Some(freq) = rx_freq(((rxd3 >> 8) & 0xff) as u16) else { return };
 +        let decrypted = (rxd1 >> 16) & 0x1f != 0 && rxd1 & ((1 << 23) | (1 << 24)) == 0;
 +        let signal = signal.unwrap_or(-100).clamp(-127, -1) as i8;
 +        if let Some(network) = &self.network
@@ -3055,7 +3281,7 @@ index 0000000..865a78d
 +            self.signal = Some(signal);
 +        }
 +        if let Some(device) = &self.device {
-+            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0 });
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0, amsdu_more });
 +        }
 +    }
 +
@@ -3095,11 +3321,16 @@ index 0000000..865a78d
 +            }
 +            HeCap { mac: HE_MAC, phy, mcs, ppe: connac_ppe(self.nss, id) }
 +        };
-+        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: Some(he(id)) };
++        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: Some(he(id)), eht: None };
 +        Info {
 +            driver: String::from("mt7921"),
 +            address: self.address,
-+            bands: vec![band(BandId::Ghz2), band(BandId::Ghz5)],
++            // The MT7922 has 6 GHz too: HE alone there.
++            bands: if self.wide160 {
++                vec![band(BandId::Ghz2), band(BandId::Ghz5), Band { id: BandId::Ghz6, channels: chan::default_channels(BandId::Ghz6), ht: None, vht: None, he: Some(he(BandId::Ghz6)), eht: None }]
++            } else {
++                vec![band(BandId::Ghz2), band(BandId::Ghz5)]
++            },
 +            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
 +            max_scan_ssids: 4,
 +            max_scan_ie_len: 600,
@@ -3109,10 +3340,10 @@ index 0000000..865a78d
 +}
 diff --git a/kernel/comps/mt7921/src/mt7925.rs b/kernel/comps/mt7921/src/mt7925.rs
 new file mode 100644
-index 0000000..c18f5c2
+index 0000000..225783e
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mt7925.rs
-@@ -0,0 +1,1527 @@
+@@ -0,0 +1,1712 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The MT7925 (Wi-Fi 7, "connac3") as a station or an access point, as
@@ -3131,13 +3362,13 @@ index 0000000..c18f5c2
 +use aster_wlan::{
 +    Device, chan,
 +    ieee80211::{self as wifi, Address},
-+    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, Chandef, HeCap, HtCap, Info, Join, Key, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, BlockAck, Chandef, EhtCap, HeCap, HtCap, Info, Join, Key, Reorder, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
 +};
 +use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
 +
 +use crate::{
 +    hw::{self, BUFFER, Chip, Cmd},
-+    mac::{AP_STATIONS, element_rates, rate_bitmaps},
++    mac::{self, AP_STATIONS, element_rates, rate_bitmaps, rx_freq},
 +};
 +
 +// Unified commands (`mt76_connac_mcu.h`).
@@ -3160,6 +3391,11 @@ index 0000000..c18f5c2
 +const UNI_BSS_INFO_BCN_CONTENT: u16 = 7;
 +const UNI_BSS_INFO_RATE: u16 = 11;
 +const UNI_BSS_INFO_QBSS: u16 = 15;
++/// The BSS's power save state (`UNI_BSS_INFO_PS`'s `ps_state`): awake,
++/// or the firmware's dynamic power save.
++const UNI_BSS_INFO_PS: u16 = 21;
++const PS_STATE_AWAKE: u8 = 0;
++const PS_STATE_DYNAMIC: u8 = 2;
 +const UNI_BSS_INFO_SEC: u16 = 16;
 +const UNI_BSS_INFO_BCNFT: u16 = 22;
 +const UNI_BSS_INFO_IFS_TIME: u16 = 23;
@@ -3182,6 +3418,10 @@ index 0000000..c18f5c2
 +const UNI_ROC_ACQUIRE: u16 = 0;
 +const UNI_ROC_ABORT: u16 = 1;
 +const STA_REC_BASIC: u16 = 0x00;
++/// Block acknowledgment's record and the agreement's side (`MT_BA_TYPE_*`).
++const STA_REC_BA: u16 = 0x06;
++const BA_TYPE_ORIGINATOR: u8 = 1;
++const BA_TYPE_RECIPIENT: u8 = 2;
 +const STA_REC_RA: u16 = 0x01;
 +const STA_REC_STATE: u16 = 0x07;
 +const STA_REC_HT: u16 = 0x09;
@@ -3231,6 +3471,13 @@ index 0000000..c18f5c2
 +const PHY_TYPE_BIT_HT: u8 = 1 << 4;
 +const PHY_TYPE_BIT_VHT: u8 = 1 << 5;
 +const PHY_TYPE_BIT_HE: u8 = 1 << 6;
++const PHY_TYPE_BIT_BE: u8 = 1 << 7;
++/// The BSS's 802.11be modes (`phymode_ext`, beside 6 GHz HE's).
++const PHY_MODE_BE_24G: u8 = 1 << 1;
++const PHY_MODE_BE_5G: u8 = 1 << 2;
++const PHY_MODE_BE_6G: u8 = 1 << 3;
++/// The STA record of a peer's 802.11be capabilities.
++const STA_REC_EHT: u16 = 0x22;
 +const PHY_TYPE_ERP_INDEX: u16 = 1;
 +const PHY_TYPE_OFDM_INDEX: u16 = 3;
 +/// Channel widths of the firmware (`CMD_CBW_*`).
@@ -3238,6 +3485,7 @@ index 0000000..c18f5c2
 +const CMD_CBW_40MHZ: u8 = 1;
 +const CMD_CBW_80MHZ: u8 = 2;
 +const CMD_CBW_160MHZ: u8 = 3;
++const CMD_CBW_320MHZ: u8 = 7;
 +/// Ciphers (`enum connac3_mcu_cipher_type`).
 +const CIPHER_AES_CCMP: u8 = 4;
 +const CIPHER_CCMP_256: u8 = 10;
@@ -3318,6 +3566,7 @@ index 0000000..c18f5c2
 +        Width::W40 => CMD_CBW_40MHZ,
 +        Width::W80 => CMD_CBW_80MHZ,
 +        Width::W160 => CMD_CBW_160MHZ,
++        Width::W320 => CMD_CBW_320MHZ,
 +    }
 +}
 +
@@ -3386,6 +3635,8 @@ index 0000000..c18f5c2
 +    wcid: u16,
 +    qos: bool,
 +    key: bool,
++    /// QoS data frames sent per TID (the hardware's numbering).
++    tx_seq: [u16; 8],
 +}
 +
 +/// A peer's station record: the access point's, or a station's of this
@@ -3412,6 +3663,8 @@ index 0000000..c18f5c2
 +    interval: u16,
 +    dtim: u8,
 +    phymode: u8,
++    /// The network runs 802.11be with this station.
++    eht: bool,
 +    /// The station its frames go through.
 +    sta: u16,
 +}
@@ -3442,6 +3695,9 @@ index 0000000..c18f5c2
 +    sequence: u16,
 +    pub(crate) signal: Option<i8>,
 +    pub(crate) dead: bool,
++    /// QoS data frames sent per TID to the access point (the hardware's
++    /// numbering), for the agreements to send aggregates.
++    tx_seq: [u16; 8],
 +}
 +
 +impl Mt7925 {
@@ -3470,6 +3726,7 @@ index 0000000..c18f5c2
 +            band_idx: 0,
 +            sequence: 0,
 +            signal: None,
++            tx_seq: [0; 8],
 +            dead: false,
 +        }
 +    }
@@ -3605,6 +3862,7 @@ index 0000000..c18f5c2
 +            interval: network.map_or(0, |network| network.join.beacon_interval),
 +            dtim: network.map_or(0, |network| network.dtim),
 +            phymode,
++            eht: peer.is_some_and(|peer| peer.eht.is_some()),
 +            sta,
 +        })
 +    }
@@ -3621,7 +3879,18 @@ index 0000000..c18f5c2
 +        value.push(basic.phymode);
 +        value.extend_from_slice(&basic.sta.to_le_bytes());
 +        value.extend_from_slice(&(if is_2ghz(basic.freq) { PHY_TYPE_ERP_INDEX } else { PHY_TYPE_OFDM_INDEX }).to_le_bytes());
-+        value.extend_from_slice(&[0, 0]);
++        // `phymode_ext` (`mt7925_get_phy_mode_ext`): HE on 6 GHz, 802.11be
++        // by band.
++        let band = BandId::of(basic.freq);
++        let mut ext = if band == BandId::Ghz6 { mac::PHY_MODE_AX_6G } else { 0 };
++        if basic.eht {
++            ext |= match band {
++                BandId::Ghz2 => PHY_MODE_BE_24G,
++                BandId::Ghz5 => PHY_MODE_BE_5G,
++                BandId::Ghz6 => PHY_MODE_BE_6G,
++            };
++        }
++        value.extend_from_slice(&[ext, 0]);
 +        tlv(UNI_BSS_INFO_BASIC, &value)
 +    }
 +
@@ -3714,6 +3983,7 @@ index 0000000..c18f5c2
 +            interval: ap.config.beacon_interval,
 +            dtim: ap.config.dtim_period.max(1),
 +            phymode,
++            eht: false,
 +            sta: WCID_OWN,
 +        };
 +        let short = !is_2ghz(freq) || ap.config.beacon.capability() & wifi::CAP_SHORT_SLOT != 0;
@@ -3802,6 +4072,17 @@ index 0000000..c18f5c2
 +        self.peer_record(&record, enable, state)
 +    }
 +
++    /// The access point's HE 6 GHz band capabilities (its beacon's), on
++    /// 6 GHz: A-MPDU factor and spacing where HT's are not.
++    fn he_6ghz_of(&self, record_ap: bool, freq: u16) -> Option<u16> {
++        if record_ap || BandId::of(freq) != BandId::Ghz6 {
++            return None;
++        }
++        let network = self.network.as_ref()?;
++        let value = wifi::Elements(&network.join.elements).extension(wifi::EXT_HE_6GHZ_CAP)?;
++        Some(u16::from_le_bytes([*value.first()?, *value.get(1)?]))
++    }
++
 +    /// A peer's station record: its basics, PHY, HT, VHT, HE, rates and
 +    /// state, header translation off; or the entry removed.
 +    fn peer_record(&mut self, record: &PeerRecord<'_>, enable: bool, state: u8) -> Result<(), String> {
@@ -3832,8 +4113,18 @@ index 0000000..c18f5c2
 +        if peer.he.is_some() {
 +            phy_type |= PHY_TYPE_BIT_HE;
 +        }
-+        let factor = peer.vht.map_or(peer.ht.map_or(0, |ht| ht.ampdu_factor as u32), |vht| (vht.info >> chan::VHT_CAP_MAX_AMPDU_SHIFT) & 7) as u8;
-+        let density = peer.ht.map_or(0, |ht| ht.ampdu_density);
++        if peer.eht.is_some() {
++            phy_type |= PHY_TYPE_BIT_BE;
++        }
++        let mut factor = peer.vht.map_or(peer.ht.map_or(0, |ht| ht.ampdu_factor as u32), |vht| (vht.info >> chan::VHT_CAP_MAX_AMPDU_SHIFT) & 7) as u8;
++        let mut density = peer.ht.map_or(0, |ht| ht.ampdu_density);
++        // On 6 GHz the aggregates are HE's band capabilities'
++        // (`mt7925_mcu_sta_he_6g_tlv`).
++        if let Some(capa) = self.he_6ghz_of(record.ap, freq) {
++            factor = ((capa >> chan::HE_6GHZ_CAP_MAX_AMPDU_SHIFT) & 7) as u8;
++            density = (capa & 7) as u8;
++            tlvs.push(tlv(mac::STA_REC_HE_6G, &[capa as u8, (capa >> 8) as u8, 0, 0]));
++        }
 +        let mut phy = Vec::with_capacity(8);
 +        phy.extend_from_slice(&record.basic.to_le_bytes());
 +        phy.extend_from_slice(&[phy_type, (factor & 3) | ((density & 7) << 2), 0, 0, factor, 0]);
@@ -3862,6 +4153,27 @@ index 0000000..c18f5c2
 +            value.extend_from_slice(&(if he.mcs.len() >= 6 { le16(&he.mcs, 4) } else { 0xffff }).to_le_bytes());
 +            value.extend_from_slice(&0xffffu16.to_le_bytes());
 +            tlvs.push(tlv(STA_REC_HE_V2, &value));
++        }
++        if let (Some(eht), Some(he)) = (&peer.eht, &peer.he) {
++            // `struct sta_rec_eht` (`mt7925_mcu_sta_eht_tlv`): every TID,
++            // the MAC and PHY capabilities, the MCS sets at 20 (a 20 MHz
++            // link's), 80 and 160 MHz.
++            let mut value = vec![0xff, 0];
++            value.extend_from_slice(&eht.mac);
++            value.extend_from_slice(&eht.phy[..8]);
++            value.extend_from_slice(&(eht.phy[8] as u64).to_le_bytes());
++            let mut only_20 = [0u8; 4];
++            if peer.width <= Width::W20 {
++                for (slot, byte) in only_20.iter_mut().zip(&eht.mcs) {
++                    *slot = *byte;
++                }
++            }
++            value.extend_from_slice(&only_20);
++            value.extend_from_slice(&eht.mcs_set(he, true, 0).unwrap_or([0; 3]));
++            value.extend_from_slice(&eht.mcs_set(he, true, 1).unwrap_or([0; 3]));
++            // 320 MHz (none here), reserved.
++            value.extend_from_slice(&[0; 6]);
++            tlvs.push(tlv(STA_REC_EHT, &value));
 +        }
 +        // Rates: legacy OFDM and CCK, and HT's MCS.
 +        let legacy = if is_2ghz(freq) { ((record.rates >> 4) << 6) | (record.rates & 0xf) } else { (record.rates & 0xff) << 6 };
@@ -3965,7 +4277,7 @@ index 0000000..c18f5c2
 +        self.scan_seq = (self.scan_seq + 1) & 0x7f;
 +        let active = !request.ssids.is_empty();
 +        let ssids: Vec<&Vec<u8>> = request.ssids.iter().filter(|ssid| !ssid.is_empty()).take(10).collect();
-+        let freqs: Vec<u16> = request.freqs.iter().copied().filter(|&freq| wifi::channel_of(freq).is_some() && BandId::of(freq) != BandId::Ghz6).take(64).collect();
++        let freqs: Vec<u16> = request.freqs.iter().copied().filter(|&freq| wifi::channel_of(freq).is_some()).take(64).collect();
 +        let mut out = vec![self.scan_seq | (self.band_idx << 7), 0, 0, 0];
 +        let mut req = vec![active as u8, if active { 2 } else { 0 }, 1 << 5, 0];
 +        req.extend_from_slice(&[0; 12]);
@@ -4017,7 +4329,7 @@ index 0000000..c18f5c2
 +            }
 +            elements.extend_from_slice(extra);
 +            let mut ie = (elements.len() as u16).to_le_bytes().to_vec();
-+            ie.extend_from_slice(&[if band.id == BandId::Ghz2 { 1 } else { 2 }, 0]);
++            ie.extend_from_slice(&[band_number(chan::freq_of(band.id, 1)), 0]);
 +            ie.extend_from_slice(&elements);
 +            ie.resize(ie.len().next_multiple_of(4), 0);
 +            out.extend_from_slice(&tlv(UNI_SCAN_IE, &ie));
@@ -4056,6 +4368,7 @@ index 0000000..c18f5c2
 +        }
 +        self.leave();
 +        self.network = Some(Network::new(join));
++        self.tx_seq = [0; 8];
 +        self.aid = 0;
 +        self.qos = false;
 +        let result = self.add_bss(true).and_then(|()| self.station_record(true, STATE_NONE));
@@ -4159,7 +4472,7 @@ index 0000000..c18f5c2
 +        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
 +        let used: Vec<u16> = ap.stations.values().map(|station| station.wcid).collect();
 +        let Some(wcid) = (1..=AP_STATIONS as u16).find(|wcid| !used.contains(wcid)) else { return Err(radio::Error::Busy) };
-+        ap.stations.insert(station.address, ApStation { wcid, qos: station.peer.qos, key: false });
++        ap.stations.insert(station.address, ApStation { wcid, qos: station.peer.qos, key: false, tx_seq: [0; 8] });
 +        let freq = ap.config.chandef.control;
 +        let (rates, _) = rate_bitmaps(is_2ghz(freq), station.peer.rates.iter().copied());
 +        let record = PeerRecord { wcid, address: station.address, aid: station.aid & 0x3fff, qos: station.peer.qos, peer: &station.peer, freq, rates, basic: ap.basic, ap: true };
@@ -4362,13 +4675,94 @@ index 0000000..c18f5c2
 +                (station.qos.then(|| wifi::tid_of(ethernet)), station.key)
 +            };
 +            let frame = wifi::data_from_ethernet_ap(ethernet, &self.address, tid, !plain && keyed).ok_or(radio::Error::Invalid)?;
-+            return self.transmit(frame);
++            self.transmit(frame)?;
++            if let Some(tid) = tid
++                && let Some(station) = self.ap.as_mut().and_then(|ap| ap.stations.get_mut(&destination))
++            {
++                station.tx_seq[tid as usize & 7] = (station.tx_seq[tid as usize & 7] + 1) & 0x0fff;
++            }
++            return Ok(());
 +        }
 +        let Some(network) = &self.network else { return Err(radio::Error::Down) };
 +        let tid = self.qos.then(|| wifi::tid_of(ethernet));
 +        let protected = !plain && self.pairwise.is_some();
 +        let frame = wifi::data_from_ethernet(ethernet, &network.join.bssid, tid, protected).ok_or(radio::Error::Invalid)?;
-+        self.transmit(frame)
++        self.transmit(frame)?;
++        if let Some(tid) = tid {
++            self.tx_seq[tid as usize & 7] = (self.tx_seq[tid as usize & 7] + 1) & 0x0fff;
++        }
++        Ok(())
++    }
++
++    /// `mt7921_mcu_uni_bss_ps`/`mt7925_mcu_uni_bss_ps`: the firmware's
++    /// dynamic power save for the link (2), or awake (0).
++    pub(crate) fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.ap.is_some() || self.network.is_none() {
++            return Err(radio::Error::Invalid);
++        }
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(UNI_BSS_INFO_PS, &[if enabled { PS_STATE_DYNAMIC } else { PS_STATE_AWAKE }, 0, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &out).map(|_| ()).map_err(|error| {
++            ostd::info!("{}: power save: {}", self.name, error);
++            radio::Error::Failed
++        })
++    }
++
++    // ---- Block acknowledgment (`mt7925_ampdu_action`): the agreement in
++    // the peer's station record; frames are put back in order by the
++    // Wi-Fi component. ----
++
++    fn peer_wcid(&self, peer: &Address) -> Option<u16> {
++        if let Some(ap) = &self.ap {
++            return ap.stations.get(peer).map(|station| station.wcid);
++        }
++        self.network.as_ref().filter(|network| network.join.bssid == *peer).map(|_| WCID_AP)
++    }
++
++    /// `mt7925_mcu_sta_ba`: `struct sta_rec_ba_uni`.
++    fn block_ack(&mut self, ba: &BlockAck, enable: bool, originator: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        let wcid = self.peer_wcid(&ba.peer).ok_or(radio::Error::Invalid)?;
++        let kind = if originator { BA_TYPE_ORIGINATOR } else { BA_TYPE_RECIPIENT };
++        let mut record = vec![ba.tid, kind, ba.amsdu as u8, (enable as u8) << (ba.tid & 7)];
++        record.extend_from_slice(&ba.ssn.to_le_bytes());
++        record.extend_from_slice(&ba.buffer.to_le_bytes());
++        record.extend_from_slice(&[0; 4]);
++        self.sta_rec(wcid, 0, &[tlv(STA_REC_BA, &record)]).map_err(|error| {
++            ostd::info!("{}: block acknowledgment of TID {}: {}", self.name, ba.tid, error);
++            radio::Error::Failed
++        })
++    }
++
++    pub(crate) fn rx_ba_start(&mut self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        self.block_ack(ba, true, false).map(|()| Reorder::Host)
++    }
++
++    pub(crate) fn rx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        let ba = BlockAck { peer: *peer, tid, ssn: 0, buffer: 0, amsdu: false };
++        let _ = self.block_ack(&ba, false, false);
++    }
++
++    pub(crate) fn tx_ba_start(&mut self, peer: &Address, tid: u8) -> radio::Result<u16> {
++        if let Some(ap) = &self.ap {
++            return ap.stations.get(peer).map(|station| station.tx_seq[tid as usize & 7]).ok_or(radio::Error::Invalid);
++        }
++        self.peer_wcid(peer).ok_or(radio::Error::Invalid)?;
++        Ok(self.tx_seq[tid as usize & 7])
++    }
++
++    pub(crate) fn tx_ba_operational(&mut self, ba: &BlockAck) -> radio::Result<()> {
++        self.block_ack(ba, true, true)
++    }
++
++    pub(crate) fn tx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        let ba = BlockAck { peer: *peer, tid, ssn: 0, buffer: 0, amsdu: false };
++        let _ = self.block_ack(&ba, false, true);
 +    }
 +
 +    // ---- What the chip says. ----
@@ -4554,6 +4948,9 @@ index 0000000..c18f5c2
 +            return;
 +        }
 +        let mut frame = frame.to_vec();
++        // The chip takes A-MSDUs apart (`MT_RXD4_NORMAL_PAYLOAD_FORMAT`:
++        // 3 the first subframe, 2 a middle one, 1 the last).
++        let amsdu_more = rxd4 & 2 != 0;
 +        if rxd4 & 3 != 0 {
 +            let header = if wifi::is_data(&frame) && frame[0] & 0x80 != 0 { 26 } else { 24 };
 +            if frame.len() < header + 2 {
@@ -4561,13 +4958,7 @@ index 0000000..c18f5c2
 +            }
 +            drop(frame.drain(header..header + 2));
 +        }
-+        let channel = ((rxd3 >> 8) & 0xff) as u16;
-+        let freq = match channel {
-+            1..=13 => 2407 + 5 * channel,
-+            14 => 2484,
-+            15..=180 => 5000 + 5 * channel,
-+            _ => return,
-+        };
++        let Some(freq) = rx_freq(((rxd3 >> 8) & 0xff) as u16) else { return };
 +        let decrypted = (rxd2 >> 16) & 0x1f != 0 && rxd1 & ((1 << 23) | (1 << 24)) == 0;
 +        let signal = signal.unwrap_or(-100).clamp(-127, -1) as i8;
 +        if let Some(network) = &self.network
@@ -4576,7 +4967,7 @@ index 0000000..c18f5c2
 +            self.signal = Some(signal);
 +        }
 +        if let Some(device) = &self.device {
-+            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0 });
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0, amsdu_more });
 +        }
 +    }
 +
@@ -4628,11 +5019,36 @@ index 0000000..c18f5c2
 +            }
 +            HeCap { mac: HE_MAC, phy, mcs, ppe: Vec::new() }
 +        };
-+        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: Some(he(id)) };
++        // 802.11be (`mt7925_init_eht_caps`): EPCS and OM control; NDP with
++        // 4x LTF and 3.2 µs GI, SU beamformer and beamformee with its
++        // streams and sounding dimensions at 80 and 160 MHz, the feedback
++        // kinds, 16 µs of padding, MU-MIMO and MU beamforming at 80 and 160
++        // MHz; every MCS on each stream to 160 MHz (no 320 MHz).
++        let eht = |id: BandId| {
++            let sts = (streams as u8).max(1) - 1;
++            let mut phy = [0u8; 9];
++            phy[0] = 0x08 | 0x20 | 0x40 | ((sts & 1) << 7);
++            phy[1] = ((sts >> 1) & 3) | ((sts << 2) & chan::EHT_PHY1_BEAMFORMEE_SS_160);
++            phy[2] = (sts & 7) | ((sts << 3) & chan::EHT_PHY2_SOUNDING_DIM_160);
++            phy[3] = 0xfe;
++            phy[4] = sts.min(2) << 4;
++            phy[5] = 0x61;
++            phy[6] = 0x0c;
++            phy[7] = 0x36;
++            let set = (streams as u8 & chan::EHT_MCS_NSS_RX) | ((streams as u8) << 4);
++            let sets = if id == BandId::Ghz2 { 3 } else { 6 };
++            EhtCap { mac: [0x03, 0], phy, mcs: vec![set; sets], ppe: Vec::new() }
++        };
++        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: Some(he(id)), eht: Some(eht(id)) };
 +        Info {
 +            driver: String::from("mt7925"),
 +            address: self.address,
-+            bands: vec![band(BandId::Ghz2), band(BandId::Ghz5)],
++            // 6 GHz: HE alone there.
++            bands: vec![
++                band(BandId::Ghz2),
++                band(BandId::Ghz5),
++                Band { id: BandId::Ghz6, channels: chan::default_channels(BandId::Ghz6), ht: None, vht: None, he: Some(he(BandId::Ghz6)), eht: Some(eht(BandId::Ghz6)) },
++            ],
 +            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
 +            max_scan_ssids: 10,
 +            max_scan_ie_len: 600,

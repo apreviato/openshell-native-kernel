@@ -376,10 +376,10 @@ index 0000000..727292b
 +}
 diff --git a/kernel/comps/ath11k/src/dp.rs b/kernel/comps/ath11k/src/dp.rs
 new file mode 100644
-index 0000000..5b3bcf9
+index 0000000..03b1633
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/dp.rs
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,944 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The data path as Linux's ath11k `dp.c`, `dp_rx.c`, `dp_tx.c`,
@@ -1158,6 +1158,45 @@ index 0000000..5b3bcf9
 +            }
 +            None => self.queues.clear(),
 +        }
++    }
++
++    /// `ath11k_peer_rx_tid_reo_update`: the window of a peer's TID queue,
++    /// and its first sequence number when one is given (REO puts the
++    /// frames back in order itself); the queue's address, for WMI's
++    /// reorder-queue command.
++    pub(crate) fn reo_window(&mut self, hal: &Hal, bus: &Bus, peer: [u8; 6], tid: u32, window: u32, ssn: Option<u16>) -> Option<u64> {
++        let mem = self.queues.get(&peer)?;
++        let paddr = mem.daddr() as u64 + (tid as usize * QDESC_SIZE) as u64;
++        let ring = &mut self.reo_cmd;
++        hal.access_begin(ring);
++        let Some(at) = ring.src_get_next_entry() else {
++            hal.access_end(bus, ring);
++            return None;
++        };
++        let header = word_at(&ring.read(at), 4) & HAL_REO_CMD_HDR_INFO0_CMD_NUMBER;
++        let mut info0 = field(HAL_REO_UPD_RX_QUEUE_INFO0_QUEUE_ADDR_HI, (paddr >> 32) as u32) | HAL_REO_UPD_RX_QUEUE_INFO0_UPD_BA_WINDOW_SIZE;
++        // The hardware takes no window of one.
++        let window = if window <= 1 { 2 } else { window };
++        let mut info2 = field(HAL_REO_UPD_RX_QUEUE_INFO2_BA_WINDOW_SIZE, window - 1);
++        if let Some(ssn) = ssn {
++            info0 |= HAL_REO_UPD_RX_QUEUE_INFO0_UPD_SSN;
++            info2 |= field(HAL_REO_UPD_RX_QUEUE_INFO2_SSN, ssn as u32 & 0xfff);
++        }
++        let words = [
++            field(HAL_TLV_HDR_TAG, HAL_REO_UPDATE_RX_REO_QUEUE) | field(HAL_TLV_HDR_LEN, 36),
++            header | HAL_REO_CMD_HDR_INFO0_STATUS_REQUIRED,
++            paddr as u32,
++            info0,
++            0,
++            info2,
++            0,
++            0,
++            0,
++            0,
++        ];
++        ring.write(at, &bytes_of(&words));
++        hal.access_end(bus, ring);
++        Some(paddr)
 +    }
 +
 +    /// `ath11k_dp_peer_rx_pn_replay_config`: REO checks the packet numbers
@@ -2093,10 +2132,10 @@ index 0000000..c98e20d
 +}
 diff --git a/kernel/comps/ath11k/src/hw.rs b/kernel/comps/ath11k/src/hw.rs
 new file mode 100644
-index 0000000..d81c03a
+index 0000000..cf637b6
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/hw.rs
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,172 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chips this driver runs, as Linux's ath11k `core.c` describes them
@@ -2148,6 +2187,8 @@ index 0000000..d81c03a
 +    pub(crate) rx_desc: RxDesc,
 +    /// The board file is looked up by the PCI ids too (WCN6855).
 +    pub(crate) bdf_bus_and_board: bool,
++    /// The firmware runs a station's power save (`supports_sta_ps`).
++    pub(crate) supports_sta_ps: bool,
 +    pub(crate) mhi_max_channels: usize,
 +    pub(crate) mhi_elements: usize,
 +    /// The TCL rings' return buffer manager for frames sent
@@ -2186,6 +2227,7 @@ index 0000000..d81c03a
 +    wmi_diag_event: true,
 +    rx_desc: RxDesc::Ipq8074,
 +    bdf_bus_and_board: false,
++    supports_sta_ps: true,
 +    mhi_max_channels: MHI_QCA6390.0,
 +    mhi_elements: MHI_QCA6390.1,
 +    rx_buf_rbm: HAL_RX_BUF_RBM_SW1_BM,
@@ -2219,6 +2261,7 @@ index 0000000..d81c03a
 +    wmi_diag_event: false,
 +    rx_desc: RxDesc::Qcn9074,
 +    bdf_bus_and_board: false,
++    supports_sta_ps: false,
 +    mhi_max_channels: MHI_QCN9074.0,
 +    mhi_elements: MHI_QCN9074.1,
 +    rx_buf_rbm: HAL_RX_BUF_RBM_SW3_BM,
@@ -2254,6 +2297,7 @@ index 0000000..d81c03a
 +        wmi_diag_event: true,
 +        rx_desc: RxDesc::Wcn6855,
 +        bdf_bus_and_board: true,
++        supports_sta_ps: true,
 +        mhi_max_channels: MHI_QCA6390.0,
 +        mhi_elements: MHI_QCA6390.1,
 +        rx_buf_rbm: HAL_RX_BUF_RBM_SW1_BM,
@@ -2623,10 +2667,10 @@ index 0000000..f16ba22
 +];
 diff --git a/kernel/comps/ath11k/src/lib.rs b/kernel/comps/ath11k/src/lib.rs
 new file mode 100644
-index 0000000..576959e
+index 0000000..deaecea
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/lib.rs
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,316 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Qualcomm's Wi-Fi 6 chips on PCIe, as Linux's ath11k runs them: the
@@ -2646,9 +2690,9 @@ index 0000000..576959e
 +//! MHI, QRTR and QMI are this driver's own implementations of those
 +//! interfaces; the rest follows Linux's ath11k (BSD-3-Clause-Clear, see
 +//! NOTICE). linux-firmware's `ath11k/` has the firmware (`amss.bin`,
-+//! `m3.bin`, `board-2.bin`, `regdb.bin`). Not yet: power save, 802.11w,
-+//! aggregation on receive (block-ack sessions are declined), the 6 GHz
-+//! band. `dmesg | grep ath11k` says how far a card gets; `ath11k.off`
++//! `m3.bin`, `board-2.bin`, `regdb.bin`). Block-ack sessions, power save
++//! and the 6 GHz band run. Not yet: 802.11w. `dmesg | grep ath11k` says
++//! how far a card gets; `ath11k.off`
 +//! leaves the cards alone.
 +
 +#![no_std]
@@ -2689,7 +2733,7 @@ index 0000000..576959e
 +use aster_pci::common_device::PciCommonDevice;
 +use aster_wlan::{
 +    ieee80211::Address,
-+    radio::{self, ApConfig, Association, BeaconTemplate, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++    radio::{self, ApConfig, Association, BeaconTemplate, BlockAck, Join, Key, LinkStats, Radio, Reorder, ScanRequest, StationEntry},
 +};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
@@ -2833,6 +2877,18 @@ index 0000000..576959e
 +
 +    fn authorize_station(&self, address: &Address, authorized: bool) {
 +        self.card.state.lock().authorize_station(address, authorized);
++    }
++
++    fn rx_ba_start(&self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        self.card.state.lock().rx_ba_start(ba)
++    }
++
++    fn rx_ba_stop(&self, peer: &Address, tid: u8) {
++        self.card.state.lock().rx_ba_stop(peer, tid);
++    }
++
++    fn set_power_save(&self, enabled: bool) -> radio::Result<()> {
++        self.card.state.lock().set_power_save(enabled)
 +    }
 +}
 +
@@ -4090,10 +4146,10 @@ index 0000000..61c4885
 +}
 diff --git a/kernel/comps/ath11k/src/regs.rs b/kernel/comps/ath11k/src/regs.rs
 new file mode 100644
-index 0000000..e465d3e
+index 0000000..f642bd8
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/regs.rs
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,621 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +// Copyright (c) 2018-2020 The Linux Foundation; (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 +
@@ -4127,6 +4183,7 @@ index 0000000..e465d3e
 +pub(crate) const ATH11K_KEEPALIVE_MIN_IDLE: u32 = 0xea3;
 +pub(crate) const ATH11K_KICKOUT_THRESHOLD: u32 = 0x140;
 +pub(crate) const ATH11K_MAX_HW_LISTEN_INTERVAL: u32 = 0x5;
++pub(crate) const ATH11K_MIN_6G_FREQ: u32 = 0x1725;
 +pub(crate) const ATH11K_PCI_WINDOW_ENABLE_BIT: u32 = 0x40000000;
 +pub(crate) const ATH11K_PCI_WINDOW_RANGE_MASK: u32 = 0x7ffff;
 +pub(crate) const ATH11K_PCI_WINDOW_REG_ADDRESS: u32 = 0x310c;
@@ -4230,14 +4287,17 @@ index 0000000..e465d3e
 +pub(crate) const HAL_REO_SW2REO_RING_BASE_MSB_RING_SIZE: u32 = 0xffff;
 +pub(crate) const HAL_REO_UPDATE_RX_REO_QUEUE: u32 = 0x1a3;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_QUEUE_ADDR_HI: u32 = 0xff;
++pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_BA_WINDOW_SIZE: u32 = 0x40000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_PN: u32 = 0x40000000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_PN_CHECK: u32 = 0x80000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_PN_SIZE: u32 = 0x800000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_PN_VALID: u32 = 0x20000000;
++pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_SSN: u32 = 0x4000000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO0_UPD_SVLD: u32 = 0x2000000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO1_PN_CHECK: u32 = 0x8000000;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO2_BA_WINDOW_SIZE: u32 = 0xff;
 +pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO2_PN_SIZE: u32 = 0x300;
++pub(crate) const HAL_REO_UPD_RX_QUEUE_INFO2_SSN: u32 = 0x7ff800;
 +pub(crate) const HAL_RXDMA_RING_MAX_SIZE: u32 = 0xffff;
 +pub(crate) const HAL_RX_BUF_RBM_SW0_BM: u32 = 0x3;
 +pub(crate) const HAL_RX_BUF_RBM_SW1_BM: u32 = 0x4;
@@ -4507,6 +4567,7 @@ index 0000000..e465d3e
 +pub(crate) const WMI_CHAN_INFO_DFS: u32 = 0x400;
 +pub(crate) const WMI_CHAN_INFO_MODE: u32 = 0x3f;
 +pub(crate) const WMI_CHAN_INFO_PASSIVE: u32 = 0x80;
++pub(crate) const WMI_CHAN_INFO_PSC: u32 = 0x40000;
 +pub(crate) const WMI_CHAN_REG_INFO1_MAX_PWR: u32 = 0xff00;
 +pub(crate) const WMI_CHAN_REG_INFO1_MAX_REG_PWR: u32 = 0xff0000;
 +pub(crate) const WMI_CHAN_REG_INFO2_MAX_TX_PWR: u32 = 0xff00;
@@ -4613,6 +4674,8 @@ index 0000000..e465d3e
 +pub(crate) const WMI_STA_POWERSAVE_MODE_CMDID: u32 = 0x9001;
 +pub(crate) const WMI_STA_POWERSAVE_PARAM_CMDID: u32 = 0x9002;
 +pub(crate) const WMI_STA_PS_MODE_DISABLED: u32 = 0x0;
++pub(crate) const WMI_STA_PS_MODE_ENABLED: u32 = 0x1;
++pub(crate) const WMI_STA_PS_PARAM_INACTIVITY_TIME: u32 = 0x3;
 +pub(crate) const WMI_STA_PS_PARAM_PSPOLL_COUNT: u32 = 0x2;
 +pub(crate) const WMI_STA_PS_PARAM_RX_WAKE_POLICY: u32 = 0x0;
 +pub(crate) const WMI_STA_PS_PARAM_TX_WAKE_THRESHOLD: u32 = 0x1;
@@ -4627,6 +4690,7 @@ index 0000000..e465d3e
 +pub(crate) const WMI_TAG_BCN_PRB_INFO: u32 = 0x69;
 +pub(crate) const WMI_TAG_BCN_TMPL_CMD: u32 = 0x67;
 +pub(crate) const WMI_TAG_CHANNEL: u32 = 0x50;
++pub(crate) const WMI_TAG_HAL_REG_CAPABILITIES_EXT: u32 = 0x213;
 +pub(crate) const WMI_TAG_HE_RATE_SET: u32 = 0x285;
 +pub(crate) const WMI_TAG_HW_MODE_CAPABILITIES: u32 = 0x211;
 +pub(crate) const WMI_TAG_INIT_CMD: u32 = 0x4a;
@@ -4709,10 +4773,10 @@ index 0000000..e465d3e
 +pub(crate) const WMI_VHT_CAP_MAX_MPDU_LEN_MASK: u32 = 0x3;
 diff --git a/kernel/comps/ath11k/src/sta.rs b/kernel/comps/ath11k/src/sta.rs
 new file mode 100644
-index 0000000..fae679f
+index 0000000..2294175
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/sta.rs
-@@ -0,0 +1,1804 @@
+@@ -0,0 +1,1930 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface, as Linux's ath11k `core.c` brings the firmware up
@@ -4734,7 +4798,7 @@ index 0000000..fae679f
 +    chan as wchan,
 +    ieee80211::{self as wifi, Address, Elements},
 +    radio::{
-+        self, ApConfig, Association, Band, BandId, BeaconTemplate, Channel, Chandef, HeCap, HtCap, Info, Join, Key, LinkStats, Peer, RxInfo, ScanRequest, StationEntry, VhtCap, Width,
++        self, ApConfig, Association, Band, BandId, BeaconTemplate, BlockAck, Channel, Chandef, HeCap, HtCap, Info, Join, Key, LinkStats, Peer, Reorder, RxInfo, ScanRequest, StationEntry, VhtCap, Width,
 +    },
 +};
 +use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
@@ -4753,6 +4817,10 @@ index 0000000..fae679f
 +    wlfw::Wlfw,
 +    wmi::{self, Cmd, Event, Services, nested, word},
 +};
++
++/// The quiet before the firmware dozes under power save (mac80211's
++/// dynamic power save time-out), in milliseconds.
++const PS_INACTIVITY_MS: u32 = 100;
 +
 +const VDEV: u32 = 0;
 +/// How long the firmware gets for an answer.
@@ -4782,6 +4850,8 @@ index 0000000..fae679f
 +const HT_AMPDU_FACTOR: u32 = 13;
 +const HE_VHT_AMPDU_FACTOR: u32 = 20;
 +const HE_HT_AMPDU_FACTOR: u32 = 16;
++/// `IEEE80211_HE_6GHZ_MAX_AMPDU_FACTOR`.
++const HE_6GHZ_AMPDU_FACTOR: u32 = 13;
 +/// 802.11's VHT capability fields.
 +const VHT_CAP_AMPDU_EXP_SHIFT: u32 = 23;
 +const VHT_CAP_AMPDU_EXP_MASK: u32 = 7 << VHT_CAP_AMPDU_EXP_SHIFT;
@@ -4853,7 +4923,14 @@ index 0000000..fae679f
 +/// The radio's capabilities (`struct ath11k_pdev_cap`).
 +#[derive(Clone, Copy, Debug, Default)]
 +struct Caps {
++    /// 2.4 GHz's; 5 GHz's (6 GHz's too: the same PHY).
 +    bands: [BandCaps; 2],
++    /// The 6 GHz band (`ar->supports_6ghz`): the radio's range reaches
++    /// past 5925 MHz.
++    band_6: bool,
++    /// The ranges the PHYs tune to (`struct ath11k_hal_reg_capabilities_ext`):
++    /// 2.4 GHz's, 5 and 6 GHz's, `(low, high)` in MHz, zero for none told.
++    ranges: [(u32, u32); 2],
 +    vht_cap: u32,
 +    tx_chains: u32,
 +    rx_chains: u32,
@@ -5128,12 +5205,19 @@ index 0000000..fae679f
 +        }
 +        let info = self.build_info();
 +        // `ath11k_reg_update_chan_list`.
-+        let channels: Vec<(u32, bool, bool, u32, u32)> = info
++        let channels: Vec<wmi::ChanListEntry> = info
 +            .bands
 +            .iter()
 +            .flat_map(|band| {
 +                let mode = if band.id == BandId::Ghz2 { MODE_11G } else { MODE_11A };
-+                band.channels.iter().filter(|channel| !channel.disabled).map(move |channel| (channel.freq as u32, channel.passive, channel.radar, mode, channel.max_power as u32))
++                band.channels.iter().filter(|channel| !channel.disabled).map(move |channel| wmi::ChanListEntry {
++                    freq: channel.freq as u32,
++                    passive: channel.passive,
++                    dfs: channel.radar,
++                    mode,
++                    power: channel.max_power as u32,
++                    psc: wchan::is_psc(channel.freq),
++                })
 +            })
 +            .collect();
 +        self.wmi(wmi::scan_chan_list(pdev, &channels)).map_err(String::from)?;
@@ -5401,16 +5485,20 @@ index 0000000..fae679f
 +        let mut caps = Caps::default();
 +        let mut map = phy_map;
 +        let mut pdev_id = 0;
++        // Each band's PHY (`ath11k_get_phy_id`).
++        let (mut phy_2g, mut phy_5g) = (0, 0);
 +        while map != 0 {
 +            let Some(phy) = phys.get(index) else { break };
 +            pdev_id = word(phy, 1);
 +            let bands = word(phy, 4);
 +            if bands & WMI_HOST_WLAN_2G_CAP != 0 {
++                phy_2g = word(phy, 2);
 +                caps.tx_chain_mask = word(phy, 12);
 +                caps.rx_chain_mask = word(phy, 13);
 +                caps.bands[0] = BandCaps { present: true, ht_cap_info: word(phy, 7), he_mac: [word(phy, 10), word(phy, 50)], he_phy: [word(phy, 22), word(phy, 23), word(phy, 24)] };
 +            }
 +            if bands & WMI_HOST_WLAN_5G_CAP != 0 {
++                phy_5g = word(phy, 2);
 +                caps.vht_cap = word(phy, 16);
 +                caps.tx_chain_mask = word(phy, 20);
 +                caps.rx_chain_mask = word(phy, 21);
@@ -5423,6 +5511,28 @@ index 0000000..fae679f
 +            if !self.hw.single_pdev_only {
 +                break;
 +            }
++        }
++        // `ath11k_wmi_tlv_ext_hal_reg_caps`: each PHY's ranges (phy, low
++        // and high 2.4 GHz, low and high 5 GHz).
++        let ranges: Vec<[u32; 5]> = event
++            .nth(WMI_TAG_ARRAY_STRUCT, 2)
++            .map(|value| {
++                nested(value)
++                    .into_iter()
++                    .filter(|(tag, _)| *tag == WMI_TAG_HAL_REG_CAPABILITIES_EXT)
++                    .map(|(_, value)| [word(value, 0), word(value, 6), word(value, 7), word(value, 8), word(value, 9)])
++                    .collect()
++            })
++            .unwrap_or_default();
++        let range = |phy: u32| ranges.iter().find(|range| range[0] == phy);
++        // `ath11k_mac_setup_channels_rates`: 6 GHz when the first PHY's
++        // range reaches it; the limits of each band's PHY.
++        caps.band_6 = caps.bands[1].present && range(0).is_some_and(|own| own[4] >= ATH11K_MIN_6G_FREQ);
++        if let Some(range) = range(phy_2g) {
++            caps.ranges[0] = (range[1], range[2]);
++        }
++        if let Some(range) = range(phy_5g) {
++            caps.ranges[1] = (range[3], range[4]);
 +        }
 +        caps.tx_chains = caps.tx_chain_mask.count_ones().max(1);
 +        caps.rx_chains = caps.rx_chain_mask.count_ones().max(1);
@@ -5454,9 +5564,12 @@ index 0000000..fae679f
 +        let caps = &self.caps;
 +        let (tx, rx) = (caps.tx_chains.min(8), caps.rx_chains.min(8));
 +        let mut bands = Vec::new();
-+        for (index, id) in [BandId::Ghz2, BandId::Ghz5].into_iter().enumerate() {
++        // 6 GHz runs on the 5 GHz PHY, HE alone; a radio whose range
++        // starts at 6 GHz has no 5 GHz band.
++        let only_6 = caps.ranges[1].0 >= ATH11K_MIN_6G_FREQ;
++        for (index, id, present) in [(0, BandId::Ghz2, true), (1, BandId::Ghz5, !only_6), (1, BandId::Ghz6, caps.band_6)] {
 +            let band = &caps.bands[index];
-+            if !band.present {
++            if !band.present || !present {
 +                continue;
 +            }
 +            let mut channels = wchan::default_channels(id);
@@ -5472,15 +5585,30 @@ index 0000000..fae679f
 +                                channel.max_power = rule.power as u8;
 +                            }
 +                        }
++                        // 6 GHz without a rule of the country's (the older
++                        // event's 2.4 and 5 GHz ones): listened to only.
++                        None if id == BandId::Ghz6 => channel.passive = true,
 +                        None => channel.disabled = true,
 +                    }
 +                }
 +            }
++            // `ath11k_mac_update_ch_list`: what the PHY tunes to.
++            let (low, high) = caps.ranges[index];
++            if low != 0 && high != 0 {
++                for channel in channels.iter_mut() {
++                    if (channel.freq as u32) < low || channel.freq as u32 > high {
++                        channel.disabled = true;
++                    }
++                }
++            }
 +            channels.retain(|channel| !channel.disabled);
-+            let ht = self.ht_cap(band.ht_cap_info, rx);
++            let ht = if id == BandId::Ghz6 { None } else { self.ht_cap(band.ht_cap_info, rx) };
 +            let vht = (id == BandId::Ghz5 && ht.is_some()).then(|| self.vht_cap(tx, rx));
 +            let he = (band.he_mac[0] != 0 || band.he_phy[0] != 0).then(|| self.he_cap(band, tx, rx));
-+            bands.push(Band { id, channels, ht, vht, he });
++            if id == BandId::Ghz6 && he.is_none() {
++                continue;
++            }
++            bands.push(Band { id, channels, ht, vht, he, eht: None });
 +        }
 +        Info {
 +            driver: String::from("ath11k"),
@@ -5628,7 +5756,7 @@ index 0000000..fae679f
 +            self.signal = Some(signal);
 +        }
 +        if let Some(device) = &self.device {
-+            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0 });
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0, amsdu_more: false });
 +        }
 +    }
 +
@@ -5663,7 +5791,7 @@ index 0000000..fae679f
 +                frame[1] &= !wifi::PROTECTED;
 +            }
 +            let freq = self.current_freq();
-+            device.received(&frame, RxInfo { freq, signal: self.signal.unwrap_or(-60), decrypted, security_header: 0 });
++            device.received(&frame, RxInfo { freq, signal: self.signal.unwrap_or(-60), decrypted, security_header: 0, amsdu_more: false });
 +        } else {
 +            device.received_ethernet(frame, decrypted);
 +        }
@@ -5685,7 +5813,7 @@ index 0000000..fae679f
 +            freqs = known;
 +        }
 +        let mut parts = Vec::new();
-+        for band in [BandId::Ghz2, BandId::Ghz5] {
++        for band in [BandId::Ghz2, BandId::Ghz5, BandId::Ghz6] {
 +            let band_freqs: Vec<u32> = freqs.iter().copied().filter(|&freq| BandId::of(freq) == band).map(u32::from).collect();
 +            if band_freqs.is_empty() {
 +                continue;
@@ -5824,6 +5952,53 @@ index 0000000..fae679f
 +            self.wmi(wmi::reorder_queue_setup(VDEV, &address, tid, queue, 1)).map_err(|_| radio::Error::Failed)?;
 +        }
 +        Ok(())
++    }
++
++    /// `ath11k_mac_vif_setup_ps`: the firmware's power save, dozing after
++    /// 100 ms of quiet (mac80211's dynamic power save time-out), where the
++    /// chip runs it.
++    pub(crate) fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if !self.hw.supports_sta_ps {
++            return Err(radio::Error::Unsupported);
++        }
++        if self.ap_vdev {
++            return Err(radio::Error::Invalid);
++        }
++        let result = if enabled {
++            self.wmi(wmi::sta_ps_param(VDEV, WMI_STA_PS_PARAM_INACTIVITY_TIME, PS_INACTIVITY_MS)).and_then(|()| self.wmi(wmi::sta_powersave_mode(VDEV, WMI_STA_PS_MODE_ENABLED)))
++        } else {
++            self.wmi(wmi::sta_powersave_mode(VDEV, WMI_STA_PS_MODE_DISABLED))
++        };
++        result.map_err(|error| {
++            ostd::info!("{}: power save: {}", self.name, error);
++            radio::Error::Failed
++        })
++    }
++
++    // ---- Block acknowledgment (`ath11k_dp_rx_ampdu_start`/`_stop`): the
++    // peer's TID queue takes the window from its first sequence number and
++    // REO puts the frames in order; the firmware makes its own agreements
++    // to send (Linux's `TX_AMPDU_SETUP_IN_HW`). ----
++
++    pub(crate) fn rx_ba_start(&mut self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        let paddr = self.dp.reo_window(&self.hal, &self.bus, ba.peer, ba.tid as u32, ba.buffer as u32, Some(ba.ssn)).ok_or(radio::Error::Invalid)?;
++        self.wmi(wmi::reorder_queue_setup(VDEV, &ba.peer, ba.tid as u32, paddr, ba.buffer as u32)).map_err(|_| radio::Error::Failed)?;
++        Ok(Reorder::Radio)
++    }
++
++    pub(crate) fn rx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        if self.dead {
++            return;
++        }
++        if let Some(paddr) = self.dp.reo_window(&self.hal, &self.bus, *peer, tid as u32, 1, None) {
++            let _ = self.wmi(wmi::reorder_queue_setup(VDEV, peer, tid as u32, paddr, 1));
++        }
 +    }
 +
 +    /// `ath11k_peer_delete`: the firmware's answer and the unmap awaited,
@@ -6098,6 +6273,21 @@ index 0000000..fae679f
 +            if he.mac[0] & HE_MAC0_TWT_RES != 0 {
 +                assoc.flags |= WMI_PEER_TWT_RESP;
 +            }
++        }
++        // `ath11k_peer_assoc_h_he_6ghz`: on 6 GHz the width is HE's and
++        // the aggregates HE's band capabilities'.
++        if he_flag
++            && BandId::of(params.chandef.control) == BandId::Ghz6
++            && let Some(capa) = peer.he_6ghz
++        {
++            bw40 |= width == Width::W40;
++            bw80 |= width == Width::W80;
++            bw160 |= width == Width::W160;
++            assoc.he_6ghz = capa as u32;
++            assoc.mpdu_density = mpdu_density((capa & 7) as u8);
++            let he_exponent = peer.he.as_ref().map_or(0, |he| ((he.mac[3] & HE_MAC3_AMPDU_EXP_MASK) >> HE_MAC3_AMPDU_EXP_MASK.trailing_zeros()) as u32);
++            let exponent = ((capa >> wchan::HE_6GHZ_CAP_MAX_AMPDU_SHIFT) & 7) as u32;
++            assoc.max_mpdu = (1 << (HE_6GHZ_AMPDU_FACTOR + he_exponent + exponent)) - 1;
 +        }
 +        // `ath11k_wmi_copy_peer_flags`: the rate flags only with WMM.
 +        if peer.qos {
@@ -6986,10 +7176,10 @@ index 0000000..c55c303
 +const ATH11K_HOST_VERSION_STRING: &str = "WIN";
 diff --git a/kernel/comps/ath11k/src/wmi.rs b/kernel/comps/ath11k/src/wmi.rs
 new file mode 100644
-index 0000000..a42142a
+index 0000000..1fc60cc
 --- /dev/null
 +++ b/kernel/comps/ath11k/src/wmi.rs
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,688 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! WMI, the firmware's command interface, as Linux's ath11k `wmi.c` writes
@@ -7417,6 +7607,8 @@ index 0000000..a42142a
 +    pub(crate) ppet: [u32; 10],
 +    /// The HE rate sets (80, 160, 80+80 MHz): to it, from it.
 +    pub(crate) he_mcs: Vec<(u32, u32)>,
++    /// Its HE 6 GHz band capabilities (on 6 GHz).
++    pub(crate) he_6ghz: u32,
 +}
 +
 +/// `ath11k_wmi_send_peer_assoc_cmd` (the firmware reads the VHT set's
@@ -7452,7 +7644,7 @@ index 0000000..a42142a
 +    words.push(assoc.he_mcs.len() as u32);
 +    // The extended MAC capabilities, the internal ones, the lowest data
 +    // rate, the 6 GHz capabilities.
-+    words.extend_from_slice(&[assoc.he_mac[1], 0, 0, 0]);
++    words.extend_from_slice(&[assoc.he_mac[1], 0, 0, assoc.he_6ghz]);
 +    let mut cmd = Cmd::new(WMI_PEER_ASSOC_CMDID);
 +    cmd.tlv(WMI_TAG_PEER_ASSOC_COMPLETE_CMD, &words);
 +    cmd.bytes(WMI_TAG_ARRAY_BYTE, &assoc.legacy_rates);
@@ -7544,20 +7736,34 @@ index 0000000..a42142a
 +    cmd
 +}
 +
-+/// `ath11k_wmi_send_scan_chan_list_cmd`: the channels the firmware may
-+/// use (each `(freq, passive, dfs, legacy mode, max power in dBm)`).
-+pub(crate) fn scan_chan_list(pdev_id: u32, channels: &[(u32, bool, bool, u32, u32)]) -> Cmd {
++/// A channel the firmware may use (`struct channel_param`): listened to
++/// only, shared with radars, its legacy mode, its power limit in dBm, a
++/// 6 GHz preferred scanning channel.
++pub(crate) struct ChanListEntry {
++    pub(crate) freq: u32,
++    pub(crate) passive: bool,
++    pub(crate) dfs: bool,
++    pub(crate) mode: u32,
++    pub(crate) power: u32,
++    pub(crate) psc: bool,
++}
++
++/// `ath11k_wmi_send_scan_chan_list_cmd`: the channels the firmware may use.
++pub(crate) fn scan_chan_list(pdev_id: u32, channels: &[ChanListEntry]) -> Cmd {
 +    let mut cmd = Cmd::new(WMI_SCAN_CHAN_LIST_CMDID);
 +    cmd.tlv(WMI_TAG_SCAN_CHAN_LIST_CMD, &[channels.len() as u32, pdev_id, 0]);
 +    let items: Vec<(u32, Vec<u32>)> = channels
 +        .iter()
-+        .map(|&(freq, passive, dfs, mode, power)| {
++        .map(|&ChanListEntry { freq, passive, dfs, mode, power, psc }| {
 +            let mut info = WMI_CHAN_INFO_ALLOW_HE | field(WMI_CHAN_INFO_MODE, mode);
 +            if passive || dfs {
 +                info |= WMI_CHAN_INFO_PASSIVE;
 +            }
 +            if dfs {
 +                info |= WMI_CHAN_INFO_DFS;
++            }
++            if psc {
++                info |= WMI_CHAN_INFO_PSC;
 +            }
 +            let reg_1 = field(WMI_CHAN_REG_INFO1_MAX_PWR, power * 2) | field(WMI_CHAN_REG_INFO1_MAX_REG_PWR, power * 2);
 +            let reg_2 = field(WMI_CHAN_REG_INFO2_MAX_TX_PWR, power * 2);

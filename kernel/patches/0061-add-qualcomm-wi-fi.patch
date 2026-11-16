@@ -1289,10 +1289,10 @@ index 0000000..69e0fb4
 +}
 diff --git a/kernel/comps/ath10k/src/lib.rs b/kernel/comps/ath10k/src/lib.rs
 new file mode 100644
-index 0000000..398cc17
+index 0000000..368da6f
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/lib.rs
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,334 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Qualcomm Atheros Wi-Fi of Linux's ath10k family on PCIe: the QCA6174
@@ -1516,6 +1516,10 @@ index 0000000..398cc17
 +
 +    fn authorize_station(&self, address: &Address, authorized: bool) {
 +        self.card.state.lock().authorize_station(address, authorized);
++    }
++
++    fn set_power_save(&self, enabled: bool) -> radio::Result<()> {
++        self.card.state.lock().set_power_save(enabled)
 +    }
 +}
 +
@@ -2286,10 +2290,10 @@ index 0000000..fd049bb
 +}
 diff --git a/kernel/comps/ath10k/src/sta.rs b/kernel/comps/ath10k/src/sta.rs
 new file mode 100644
-index 0000000..d91ace9
+index 0000000..8834176
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/sta.rs
-@@ -0,0 +1,1306 @@
+@@ -0,0 +1,1330 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface as Linux's ath10k `mac.c` runs it on the TLV firmware:
@@ -2317,6 +2321,10 @@ index 0000000..d91ace9
 +    pci::{self, Pci, dma32},
 +    wmi::{self, Cmd},
 +};
++
++/// The quiet before the firmware dozes under power save (mac80211's
++/// dynamic power save time-out), in milliseconds.
++const PS_INACTIVITY_MS: u32 = 100;
 +
 +const VDEV: u32 = 0;
 +/// How long the firmware gets for an answer.
@@ -2842,7 +2850,7 @@ index 0000000..d91ace9
 +        }
 +        self.note_signal(&frame, signal);
 +        if let Some(device) = &self.device {
-+            device.received(&frame, RxInfo { freq, signal, decrypted, security_header });
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header, amsdu_more: false });
 +        }
 +    }
 +
@@ -2870,7 +2878,7 @@ index 0000000..d91ace9
 +                self.note_signal(&frame, signal);
 +                let freq = self.current_freq();
 +                if let Some(device) = &self.device {
-+                    device.received(&frame, RxInfo { freq, signal, decrypted, security_header });
++                    device.received(&frame, RxInfo { freq, signal, decrypted, security_header, amsdu_more: false });
 +                }
 +            }
 +            Received::Ethernet(ethernet, protected) => {
@@ -3331,6 +3339,26 @@ index 0000000..d91ace9
 +        peer
 +    }
 +
++    /// `ath10k_mac_vif_setup_ps`: the firmware's power save, dozing after
++    /// 100 ms of quiet (mac80211's dynamic power save time-out).
++    pub(crate) fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.ap_vdev {
++            return Err(radio::Error::Invalid);
++        }
++        let result = if enabled {
++            self.wmi_command(wmi::sta_ps_param(VDEV, wmi::STA_PS_PARAM_INACTIVITY_TIME, PS_INACTIVITY_MS)).and_then(|()| self.wmi_command(wmi::sta_ps_mode(VDEV, true)))
++        } else {
++            self.wmi_command(wmi::sta_ps_mode(VDEV, false))
++        };
++        result.map_err(|error| {
++            ostd::info!("{}: power save: {}", self.name, error);
++            radio::Error::Failed
++        })
++    }
++
 +    /// The vdev down, the peer gone, the vdev stopped (`ath10k_bss_disassoc`,
 +    /// `ath10k_peer_delete`, `ath10k_vdev_stop`).
 +    pub(crate) fn leave(&mut self) {
@@ -3576,7 +3604,7 @@ index 0000000..d91ace9
 +    pub(crate) fn info(&self) -> Info {
 +        let ht = self.ht_cap();
 +        let vht = (ht.is_some() && self.vht_cap_info != 0).then(|| self.vht_cap());
-+        let mut bands = vec![Band { id: BandId::Ghz2, channels: Vec::new(), ht, vht: None, he: None }, Band { id: BandId::Ghz5, channels: Vec::new(), ht, vht, he: None }];
++        let mut bands = vec![Band { id: BandId::Ghz2, channels: Vec::new(), ht, vht: None, he: None, eht: None }, Band { id: BandId::Ghz5, channels: Vec::new(), ht, vht, he: None, eht: None }];
 +        for (freq, flags) in self.channels() {
 +            let mut channel = Channel::new(freq);
 +            channel.radar = flags & wmi::CHAN_FLAG_DFS != 0;
@@ -3598,10 +3626,10 @@ index 0000000..d91ace9
 +}
 diff --git a/kernel/comps/ath10k/src/wmi.rs b/kernel/comps/ath10k/src/wmi.rs
 new file mode 100644
-index 0000000..44d6fa8
+index 0000000..831f541
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/wmi.rs
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,519 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! WMI over TLVs, the QCA6174/QCA9377 firmware's control interface as
@@ -3630,6 +3658,7 @@ index 0000000..44d6fa8
 +pub(crate) const BCN_TMPL: u32 = 0x7003;
 +pub(crate) const PRB_TMPL: u32 = 0x7007;
 +pub(crate) const STA_POWERSAVE_MODE: u32 = 0x9001;
++pub(crate) const STA_POWERSAVE_PARAM: u32 = 0x9002;
 +// Events.
 +pub(crate) const EV_SERVICE_READY: u32 = 0x1;
 +pub(crate) const EV_READY: u32 = 0x2;
@@ -3676,6 +3705,10 @@ index 0000000..44d6fa8
 +const TAG_PRB_TMPL: u16 = 0x68;
 +const TAG_BCN_PRB_INFO: u16 = 0x69;
 +const TAG_STA_POWERSAVE_MODE: u16 = 0x6c;
++const TAG_STA_POWERSAVE_PARAM: u16 = 0x6d;
++/// `WMI_STA_PS_PARAM_INACTIVITY_TIME`: the quiet before the firmware
++/// dozes, in milliseconds.
++pub(crate) const STA_PS_PARAM_INACTIVITY_TIME: u32 = 3;
 +// ABI (`wmi-tlv.c`).
 +const ABI: [u32; 6] = [0x0100_0000, 53, 0x5f41_4351, 0x0000_4c4d, 0, 0];
 +const SCAN_ID_PREFIX: u32 = 0xa000;
@@ -4011,7 +4044,17 @@ index 0000000..44d6fa8
 +
 +/// Power save off (`WMI_STA_PS_MODE_DISABLED`).
 +pub(crate) fn sta_ps_off(vdev: u32) -> Cmd {
-+    Cmd::new(STA_POWERSAVE_MODE).tlv(TAG_STA_POWERSAVE_MODE, &[vdev, 0])
++    sta_ps_mode(vdev, false)
++}
++
++/// Power save on or off (`WMI_STA_PS_MODE_ENABLED`, `_DISABLED`).
++pub(crate) fn sta_ps_mode(vdev: u32, enabled: bool) -> Cmd {
++    Cmd::new(STA_POWERSAVE_MODE).tlv(TAG_STA_POWERSAVE_MODE, &[vdev, enabled as u32])
++}
++
++/// One of the station power save's parameters (`WMI_STA_PS_PARAM_*`).
++pub(crate) fn sta_ps_param(vdev: u32, param: u32, value: u32) -> Cmd {
++    Cmd::new(STA_POWERSAVE_PARAM).tlv(TAG_STA_POWERSAVE_PARAM, &[vdev, param, value])
 +}
 +
 +pub(crate) fn peer_create(vdev: u32, address: &[u8; 6]) -> Cmd {

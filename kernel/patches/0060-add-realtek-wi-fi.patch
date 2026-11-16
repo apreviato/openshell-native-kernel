@@ -570,10 +570,10 @@ index 0000000..5d915ba
 +pub(crate) const RPWM_ADDR: u32 = 0x03d9;
 diff --git a/kernel/comps/rtw88/src/hw.rs b/kernel/comps/rtw88/src/hw.rs
 new file mode 100644
-index 0000000..4ce42c3
+index 0000000..a91ea7a
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/hw.rs
-@@ -0,0 +1,1796 @@
+@@ -0,0 +1,1825 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip brought up as Linux's rtw88 does it (`rtw_power_on`): MAC
@@ -604,6 +604,9 @@ index 0000000..4ce42c3
 +/// RF 0x18's width of the RTL8821C and RTL8822B (`RF18_BW_*`).
 +pub(crate) const RF18_BW_40M: u32 = 1 << 11;
 +pub(crate) const RF18_BW_80M: u32 = 1 << 10;
++/// How many times leaving power save is checked, 20 ms apart
++/// (`LEAVE_LPS_TRY_CNT`).
++const LEAVE_LPS_TRIES: u32 = 5;
 +/// The MAC's beacon interval of port 0, in TU (Realtek's `BCN_INTERVAL`,
 +/// the "beacon space" of the 88xx MACs; rtw88 leaves its reset value).
 +const REG_BCN_INTERVAL: u32 = 0x0554;
@@ -1511,6 +1514,32 @@ index 0000000..4ce42c3
 +
 +    /// The link's signal for the rate adaptation (`rtw_fw_send_rssi_info`),
 +    /// in Linux's 0..100 scale.
++    /// `rtw_fw_set_pwr_mode`: leisure power save (`rtw_enter_lps_core`: the
++    /// firmware dozes between beacons, the access point told by null
++    /// frames, `smart_ps` 2) on port 0, or awake again
++    /// (`rtw_leave_lps_core`), waiting for the firmware's null frame to be
++    /// acknowledged (`__rtw_fw_leave_lps_check_reg`).
++    pub(crate) fn set_pwr_mode(&mut self, lps: bool) {
++        let (mode, rlbm, smart_ps, state) = if lps { (RTW_MODE_LPS, 1, 2, RTW_RF_OFF) } else { (RTW_MODE_ACTIVE, 0, 0, RTW_ALL_ON) };
++        let word0 = H2C_CMD_SET_PWR_MODE | (mode << 8) | (rlbm << 16) | (smart_ps << 20) | (1 << 24);
++        let word1 = state << 8;
++        let mut command = [0u8; 8];
++        command[0..4].copy_from_slice(&word0.to_le_bytes());
++        command[4..8].copy_from_slice(&word1.to_le_bytes());
++        self.h2c(&command);
++        if lps {
++            return;
++        }
++        for _ in 0..LEAVE_LPS_TRIES {
++            if self.chip.r32(REG_TCR) & BIT_PWRMGT_HWDATA_EN == 0 {
++                return;
++            }
++            crate::sleep_ms(20);
++        }
++        self.chip.clr32(REG_TCR, BIT_PWRMGT_HWDATA_EN);
++        ostd::warn!("{}: the firmware did not leave power save", self.chip.name);
++    }
++
 +    pub(crate) fn rssi_info(&mut self, mac_id: u8, signal: i8) {
 +        let rssi = (signal as i32 + 100).clamp(0, 100) as u32;
 +        let word0 = H2C_CMD_RSSI_MONITOR | ((mac_id as u32) << 8) | (rssi << 24);
@@ -2372,10 +2401,10 @@ index 0000000..4ce42c3
 +}
 diff --git a/kernel/comps/rtw88/src/lib.rs b/kernel/comps/rtw88/src/lib.rs
 new file mode 100644
-index 0000000..c9d7ed1
+index 0000000..b1a4472
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/lib.rs
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,277 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Realtek Wi-Fi of Linux's rtw88 family on PCIe, as Linux's `rtw88_pci`
@@ -2434,7 +2463,7 @@ index 0000000..c9d7ed1
 +use aster_pci::common_device::PciCommonDevice;
 +use aster_wlan::{
 +    ieee80211::Address,
-+    radio::{self, ApConfig, Association, BeaconTemplate, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++    radio::{self, ApConfig, Association, BeaconTemplate, BlockAck, Join, Key, LinkStats, Radio, Reorder, ScanRequest, StationEntry},
 +};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
@@ -2571,6 +2600,26 @@ index 0000000..c9d7ed1
 +
 +    // The keys decide what the chip lets through (as `authorize` above).
 +    fn authorize_station(&self, _address: &Address, _authorized: bool) {}
++
++    fn set_power_save(&self, enabled: bool) -> radio::Result<()> {
++        self.card.state.lock().set_power_save(enabled)
++    }
++
++    fn rx_ba_start(&self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        self.card.state.lock().rx_ba_start(ba)
++    }
++
++    fn tx_ba_start(&self, peer: &Address, tid: u8) -> radio::Result<u16> {
++        self.card.state.lock().tx_ba_start(peer, tid)
++    }
++
++    fn tx_ba_operational(&self, ba: &BlockAck) -> radio::Result<()> {
++        self.card.state.lock().tx_ba_operational(ba)
++    }
++
++    fn tx_ba_stop(&self, peer: &Address, tid: u8) {
++        self.card.state.lock().tx_ba_stop(peer, tid);
++    }
 +}
 +
 +/// A card's task: the chip up, the station registered, then what the chip
@@ -2635,10 +2684,10 @@ index 0000000..c9d7ed1
 +}
 diff --git a/kernel/comps/rtw88/src/pci.rs b/kernel/comps/rtw88/src/pci.rs
 new file mode 100644
-index 0000000..391d46b
+index 0000000..d2ce60c
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/pci.rs
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,338 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The PCIe side as Linux's rtw88 `pci.c` runs it: a ring of buffer
@@ -2732,6 +2781,11 @@ index 0000000..391d46b
 +    pub(crate) bw: u8,
 +    pub(crate) ldpc: bool,
 +    pub(crate) stbc: u8,
++    /// In an aggregate (`RTW_TX_DESC_W2_AGG_EN`): the most frames in one
++    /// (`W3_MAX_AGG_NUM`, in twos) and their spacing (`W2_AMPDU_DEN`).
++    pub(crate) ampdu_en: bool,
++    pub(crate) ampdu_factor: u8,
++    pub(crate) ampdu_density: u8,
 +}
 +
 +impl TxInfo {
@@ -2742,7 +2796,8 @@ index 0000000..391d46b
 +        let more_data = self.qsel == TX_DESC_QSEL_HIGH as u8;
 +        w[0] = (size as u32 & 0xffff) | ((self.offset as u32) << 16) | ((self.bmc as u32) << 24) | ((self.ls as u32) << 26) | ((self.dis_qselseq as u32) << 31);
 +        w[1] = (self.mac_id as u32 & 0x7f) | ((self.qsel as u32 & 0x1f) << 8) | ((self.rate_id as u32 & 0x1f) << 16) | ((self.sec_type as u32 & 3) << 22) | ((more_data as u32) << 29);
-+        w[3] = ((self.use_rate as u32) << 8) | ((self.dis_rate_fallback as u32) << 10);
++        w[2] = ((self.ampdu_en as u32) << 12) | ((self.ampdu_density as u32 & 7) << 20);
++        w[3] = ((self.use_rate as u32) << 8) | ((self.dis_rate_fallback as u32) << 10) | ((self.ampdu_factor as u32 & 0x1f) << 17);
 +        w[4] = self.rate as u32 & 0x7f;
 +        if fb_limit {
 +            w[4] |= 0x1f << 8;
@@ -2973,10 +3028,10 @@ index 0000000..391d46b
 +}
 diff --git a/kernel/comps/rtw88/src/regs.rs b/kernel/comps/rtw88/src/regs.rs
 new file mode 100644
-index 0000000..3bf8219
+index 0000000..c861e08
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/regs.rs
-@@ -0,0 +1,890 @@
+@@ -0,0 +1,897 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright(c) 2018-2019 Realtek Corporation
 +
@@ -3168,6 +3223,7 @@ index 0000000..3bf8219
 +pub(crate) const BIT_PTA_EDCCA_EN: u32 = 0x20;
 +pub(crate) const BIT_PTA_WL_TX_EN: u32 = 0x10;
 +pub(crate) const BIT_PT_OPT: u32 = 0x200000;
++pub(crate) const BIT_PWRMGT_HWDATA_EN: u32 = 0x80;
 +pub(crate) const BIT_RCR_ADF: u32 = 0x800;
 +pub(crate) const BIT_RFE_BUF_EN: u32 = 0x8;
 +pub(crate) const BIT_RFMOD: u32 = 0x180;
@@ -3291,6 +3347,7 @@ index 0000000..3bf8219
 +pub(crate) const H2C_CMD_RA_INFO: u32 = 0x40;
 +pub(crate) const H2C_CMD_RECOVER_BT_DEV: u32 = 0xd1;
 +pub(crate) const H2C_CMD_RSSI_MONITOR: u32 = 0x42;
++pub(crate) const H2C_CMD_SET_PWR_MODE: u32 = 0x20;
 +pub(crate) const H2C_PKT_CATEGORY: u32 = 0x1;
 +pub(crate) const H2C_PKT_CMD_ID: u32 = 0xff;
 +pub(crate) const H2C_PKT_GENERAL_INFO: u32 = 0xd;
@@ -3762,6 +3819,7 @@ index 0000000..3bf8219
 +pub(crate) const RTK_PCI_TXBD_NUM_VOQ: u32 = 0x384;
 +pub(crate) const RTK_PCI_TXBD_OWN_OFFSET: u32 = 0xf;
 +pub(crate) const RTK_PCI_TXBD_RWPTR_CLR: u32 = 0x39c;
++pub(crate) const RTW_ALL_ON: u32 = 0xc;
 +pub(crate) const RTW_CAM_AES: u32 = 0x4;
 +pub(crate) const RTW_CHANNEL_WIDTH_20: u32 = 0x0;
 +pub(crate) const RTW_CHANNEL_WIDTH_40: u32 = 0x1;
@@ -3771,6 +3829,8 @@ index 0000000..3bf8219
 +pub(crate) const RTW_DMA_MAPPING_LOW: u32 = 0x1;
 +pub(crate) const RTW_DMA_MAPPING_NORMAL: u32 = 0x2;
 +pub(crate) const RTW_IP_SEL_PHY: u32 = 0x0;
++pub(crate) const RTW_MODE_ACTIVE: u32 = 0x0;
++pub(crate) const RTW_MODE_LPS: u32 = 0x1;
 +pub(crate) const RTW_NET_AP_MODE: u32 = 0x3;
 +pub(crate) const RTW_NET_MGD_LINKED: u32 = 0x2;
 +pub(crate) const RTW_NET_NO_LINK: u32 = 0x0;
@@ -3799,6 +3859,7 @@ index 0000000..3bf8219
 +pub(crate) const RTW_RATEID_G: u32 = 0x7;
 +pub(crate) const RTW_RATEID_GN_N1SS: u32 = 0x5;
 +pub(crate) const RTW_RATEID_GN_N2SS: u32 = 0x4;
++pub(crate) const RTW_RF_OFF: u32 = 0x0;
 +pub(crate) const RTW_SC_20_LOWER: u32 = 0x2;
 +pub(crate) const RTW_SC_20_LOWEST: u32 = 0x4;
 +pub(crate) const RTW_SC_20_UPMOST: u32 = 0x3;
@@ -3820,6 +3881,7 @@ index 0000000..3bf8219
 +pub(crate) const RTW_SEC_TX_DEC_EN: u32 = 0x4;
 +pub(crate) const RTW_SEC_TX_UNI_USE_DK: u32 = 0x1;
 +pub(crate) const RTW_SEC_WRITE_REG: u32 = 0x674;
++pub(crate) const RTW_TX_DESC_W2_AGG_EN: u32 = 0x1000;
 +pub(crate) const RTW_TX_DESC_W5_DATA_BW: u32 = 0x60;
 +pub(crate) const RTW_WCPU_8051: u32 = 0x1;
 +pub(crate) const RX_TAG_MAX: u32 = 0x2000;
@@ -6323,10 +6385,10 @@ index 0000000..4d1e7a0
 +}
 diff --git a/kernel/comps/rtw88/src/sta.rs b/kernel/comps/rtw88/src/sta.rs
 new file mode 100644
-index 0000000..6a8a665
+index 0000000..8edfb72
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/sta.rs
-@@ -0,0 +1,975 @@
+@@ -0,0 +1,1142 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The interface as mac80211 runs it over rtw88: as a station, a software
@@ -6343,7 +6405,7 @@ index 0000000..6a8a665
 +    Device,
 +    chan,
 +    ieee80211::{self as wifi, Address},
-+    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, HtCap, Info, Join, Key, Peer, RxInfo, ScanRequest, StationEntry, VhtCap},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, BlockAck, HtCap, Info, Join, Key, Peer, Reorder, RxInfo, ScanRequest, StationEntry, VhtCap},
 +};
 +
 +use crate::{
@@ -6352,6 +6414,9 @@ index 0000000..6a8a665
 +    regs::*,
 +};
 +
++/// The data frames either way in the watchdog's 2 s above which the
++/// link stays awake (`RTW_LPS_THRESHOLD`).
++const LPS_THRESHOLD: u32 = 50;
 +/// The interface's MAC ID and port (the first of each, as Linux takes them).
 +const MAC_ID: u8 = 0;
 +const PORT: u8 = 0;
@@ -6510,6 +6575,17 @@ index 0000000..6a8a665
 +    rate_id: u8,
 +    link: (u8, bool, u8),
 +    pairwise: Option<(u8, u64)>,
++    /// Its QoS data's sequence numbers per TID, and the TIDs it takes
++    /// aggregates of.
++    tid_seq: [u16; 8],
++    aggregates: u8,
++}
++
++/// `rtw_tx_data_pkt_info_update` under an agreement to send aggregates:
++/// the most frames in one (`get_tx_ampdu_factor`, in twos: the peer's
++/// largest aggregate, from 8 KiB) and the peer's spacing.
++fn ampdu(peer: &Peer) -> (u8, u8) {
++    peer.ht.map_or((0, 0), |ht| (((4u16 << (ht.ampdu_factor & 3)) - 1) as u8, ht.ampdu_density & 7))
 +}
 +
 +/// The CCMP header of a frame with this key index and packet number.
@@ -6541,12 +6617,22 @@ index 0000000..6a8a665
 +    pairwise: Option<(u8, u64)>,
 +    scan: Option<Scan>,
 +    sequence: u16,
++    /// QoS data's sequence numbers per TID (mac80211's `tid_seq`: under an
++    /// agreement a TID's must follow one another), and the TIDs the access
++    /// point takes aggregates of.
++    tid_seq: [u16; 8],
++    aggregates: u8,
 +    /// The rate adaptation's set for the access point (`RTW_RATEID_*`).
 +    rate_id: u8,
 +    /// The link's width, LDPC and STBC for the TX descriptors.
 +    link: (u8, bool, u8),
 +    /// When the watchdog runs next (Linux's every 2 s).
 +    watchdog: u64,
++    /// Power save asked for the link, the firmware in it (leisure power
++    /// save), the data frames sent and received since the watchdog.
++    power_save: bool,
++    lps: bool,
++    traffic: (u32, u32),
 +    pub(crate) signal: Option<i8>,
 +    pub(crate) dead: bool,
 +}
@@ -6565,9 +6651,14 @@ index 0000000..6a8a665
 +            pairwise: None,
 +            scan: None,
 +            sequence: 0,
++            tid_seq: [0; 8],
++            aggregates: 0,
 +            rate_id: RTW_RATEID_BG as u8,
 +            link: (0, false, 0),
 +            watchdog: 0,
++            power_save: false,
++            lps: false,
++            traffic: (0, 0),
 +            signal: None,
 +            dead: false,
 +        }
@@ -6589,6 +6680,7 @@ index 0000000..6a8a665
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
++        self.leave_lps();
 +        if self.scan.is_some() || self.ap.is_some() {
 +            return Err(radio::Error::Busy);
 +        }
@@ -6750,6 +6842,7 @@ index 0000000..6a8a665
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
++        self.leave_lps();
 +        if self.ap.is_some() {
 +            return Err(radio::Error::Busy);
 +        }
@@ -6765,6 +6858,8 @@ index 0000000..6a8a665
 +        self.hw.set_tune(network.tune, false);
 +        self.hw.port_bssid(&join.bssid);
 +        self.network = Some(network);
++        self.tid_seq = [0; 8];
++        self.aggregates = 0;
 +        self.update_ra(true);
 +        self.hw.media_status(MAC_ID, true);
 +        self.hw.prepare_tx(false);
@@ -6816,6 +6911,8 @@ index 0000000..6a8a665
 +        if self.network.is_none() {
 +            return;
 +        }
++        self.leave_lps();
++        self.power_save = false;
 +        if !self.dead {
 +            self.hw.media_status(MAC_ID, false);
 +            self.hw.port_net_type(false);
@@ -6841,6 +6938,7 @@ index 0000000..6a8a665
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
++        self.leave_lps();
 +        self.stop_ap();
 +        self.leave();
 +        if self.scan.is_some() {
@@ -6912,7 +7010,7 @@ index 0000000..6a8a665
 +        let (rate_id, link) = self.send_ra(mac_id, &station.peer, ghz2, rates, width, true);
 +        self.hw.media_status(mac_id, true);
 +        if let Some(ap) = &mut self.ap {
-+            ap.stations.insert(station.address, ApStation { mac_id, peer: station.peer.clone(), rates, rate_id, link, pairwise: None });
++            ap.stations.insert(station.address, ApStation { mac_id, peer: station.peer.clone(), rates, rate_id, link, pairwise: None, tid_seq: [0; 8], aggregates: 0 });
 +        }
 +        Ok(())
 +    }
@@ -7035,9 +7133,16 @@ index 0000000..6a8a665
 +            *pn += 1;
 +            drop(frame.splice(header..header, ccmp_header(*index, value)));
 +        }
-+        let sequence = self.sequence;
-+        self.sequence = (sequence + 1) & 0x0fff;
++        let counter = match tid {
++            Some(tid) => &mut self.tid_seq[tid as usize & 7],
++            None => &mut self.sequence,
++        };
++        let sequence = *counter;
++        *counter = (sequence + 1) & 0x0fff;
 +        frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
++        self.traffic.0 = self.traffic.0.saturating_add(1);
++        let ampdu_en = tid.is_some_and(|tid| self.aggregates & (1 << (tid & 7)) != 0);
++        let (ampdu_factor, ampdu_density) = if ampdu_en { ampdu(&network.peer) } else { (0, 0) };
 +        let tid = tid.unwrap_or(0);
 +        let queue = match tid {
 +            1 | 2 => QUEUE_BK,
@@ -7071,6 +7176,9 @@ index 0000000..6a8a665
 +            bw: self.link.0,
 +            ldpc: self.link.1,
 +            stbc: self.link.2,
++            ampdu_en,
++            ampdu_factor,
++            ampdu_density,
 +            ..TxInfo::default()
 +        };
 +        self.hw.pci.write(&self.hw.chip, queue, &info, &frame).map_err(|()| radio::Error::Busy)
@@ -7092,11 +7200,11 @@ index 0000000..6a8a665
 +                (*index, value)
 +            })
 +        };
-+        let (mac_id, tid, key, rate_id, rate, link) = if multicast {
++        let (mac_id, tid, key, rate_id, rate, link, tid_sequence, ampdu_params) = if multicast {
 +            let key = if plain { None } else { next(&mut ap.group) };
 +            let lowest = if ghz2 { DESC_RATE1M } else { DESC_RATE6M } as u8;
 +            let rate = if ap.basic == 0 { lowest } else { lowest + ap.basic.trailing_zeros() as u8 };
-+            (MAC_ID, None, key, if ghz2 { RTW_RATEID_B_20M } else { RTW_RATEID_G } as u8, rate, (0, false, 0))
++            (MAC_ID, None, key, if ghz2 { RTW_RATEID_B_20M } else { RTW_RATEID_G } as u8, rate, (0, false, 0), None, None)
 +        } else {
 +            let station = ap.stations.get_mut(&destination).ok_or(radio::Error::Invalid)?;
 +            let key = if plain { None } else { next(&mut station.pairwise) };
@@ -7110,16 +7218,28 @@ index 0000000..6a8a665
 +            } else {
 +                DESC_RATE54M
 +            } as u8;
-+            (station.mac_id, tid, key, station.rate_id, rate, station.link)
++            // A TID's own sequence numbers, aggregates when agreed.
++            let tid_sequence = tid.map(|tid| {
++                let counter = &mut station.tid_seq[tid as usize & 7];
++                let value = *counter;
++                *counter = (value + 1) & 0x0fff;
++                value
++            });
++            let ampdu_params = tid.filter(|tid| station.aggregates & (1 << (tid & 7)) != 0).map(|_| ampdu(&station.peer));
++            (station.mac_id, tid, key, station.rate_id, rate, station.link, tid_sequence, ampdu_params)
 +        };
 +        let mut frame = wifi::data_from_ethernet_ap(ethernet, &address, tid, key.is_some()).ok_or(radio::Error::Invalid)?;
 +        let header = if tid.is_some() { 26 } else { 24 };
 +        if let Some((index, pn)) = key {
 +            drop(frame.splice(header..header, ccmp_header(index, pn)));
 +        }
-+        let sequence = self.sequence;
-+        self.sequence = (sequence + 1) & 0x0fff;
++        let sequence = tid_sequence.unwrap_or_else(|| {
++            let value = self.sequence;
++            self.sequence = (value + 1) & 0x0fff;
++            value
++        });
 +        frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
++        let (ampdu_factor, ampdu_density) = ampdu_params.unwrap_or((0, 0));
 +        let tid = tid.unwrap_or(0);
 +        let queue = match tid {
 +            1 | 2 => QUEUE_BK,
@@ -7144,9 +7264,107 @@ index 0000000..6a8a665
 +            bw: link.0,
 +            ldpc: link.1,
 +            stbc: link.2,
++            ampdu_en: ampdu_params.is_some(),
++            ampdu_factor,
++            ampdu_density,
 +            ..TxInfo::default()
 +        };
 +        self.hw.pci.write(&self.hw.chip, queue, &info, &frame).map_err(|()| radio::Error::Busy)
++    }
++
++    // ---- Block acknowledgment (`rtw_ops_ampdu_action`): the MAC answers
++    // aggregates by itself, the Wi-Fi component puts them back in order;
++    // frames of an agreed TID go out as aggregates (`AGG_EN`). ----
++
++    fn knows(&self, peer: &Address) -> bool {
++        match &self.ap {
++            Some(ap) => ap.stations.contains_key(peer),
++            None => self.network.as_ref().is_some_and(|network| network.join.bssid == *peer),
++        }
++    }
++
++    pub(crate) fn rx_ba_start(&mut self, ba: &mut BlockAck) -> radio::Result<Reorder> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if !self.knows(&ba.peer) {
++            return Err(radio::Error::Invalid);
++        }
++        Ok(Reorder::Host)
++    }
++
++    pub(crate) fn tx_ba_start(&mut self, peer: &Address, tid: u8) -> radio::Result<u16> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        let tid = tid as usize & 7;
++        match &self.ap {
++            Some(ap) => ap.stations.get(peer).map(|station| station.tid_seq[tid]).ok_or(radio::Error::Invalid),
++            None if self.knows(peer) => Ok(self.tid_seq[tid]),
++            None => Err(radio::Error::Invalid),
++        }
++    }
++
++    fn set_aggregates(&mut self, peer: &Address, tid: u8, on: bool) {
++        let bit = 1u8 << (tid & 7);
++        let aggregates = match &mut self.ap {
++            Some(ap) => match ap.stations.get_mut(peer) {
++                Some(station) => &mut station.aggregates,
++                None => return,
++            },
++            None => &mut self.aggregates,
++        };
++        if on {
++            *aggregates |= bit;
++        } else {
++            *aggregates &= !bit;
++        }
++    }
++
++    pub(crate) fn tx_ba_operational(&mut self, ba: &BlockAck) -> radio::Result<()> {
++        if !self.knows(&ba.peer) {
++            return Err(radio::Error::Invalid);
++        }
++        self.set_aggregates(&ba.peer, ba.tid, true);
++        Ok(())
++    }
++
++    pub(crate) fn tx_ba_stop(&mut self, peer: &Address, tid: u8) {
++        self.set_aggregates(peer, tid, false);
++    }
++
++    // ---- Power save (`ps.c`): leisure power save, entered by the
++    // watchdog while the link idles, left for scans, a new link and the
++    // watchdog's own work. ----
++
++    pub(crate) fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.ap.is_some() {
++            return Err(radio::Error::Invalid);
++        }
++        self.power_save = enabled;
++        if !enabled {
++            self.leave_lps();
++        }
++        Ok(())
++    }
++
++    fn enter_lps(&mut self) {
++        if !self.lps && !self.dead {
++            self.hw.set_pwr_mode(true);
++            self.lps = true;
++        }
++    }
++
++    fn leave_lps(&mut self) {
++        if self.lps {
++            self.lps = false;
++            if !self.dead {
++                self.hw.set_pwr_mode(false);
++            }
++        }
 +    }
 +
 +    // ---- What the chip says. ----
@@ -7184,10 +7402,18 @@ index 0000000..6a8a665
 +        let now = crate::now_ms();
 +        if now >= self.watchdog {
 +            self.watchdog = now + 2000;
++            // `rtw_watch_dog_work`: awake for the dynamic mechanisms, back
++            // to leisure power save when the link idled (50 frames at most
++            // either way in the 2 s).
++            let (sent, received) = core::mem::take(&mut self.traffic);
++            self.leave_lps();
 +            if self.associated
 +                && let Some(signal) = self.signal
 +            {
 +                self.hw.rssi_info(MAC_ID, signal);
++            }
++            if self.power_save && self.associated && self.ap.is_none() && self.scan.is_none() && sent <= LPS_THRESHOLD && received <= LPS_THRESHOLD {
++                self.enter_lps();
 +            }
 +        }
 +    }
@@ -7221,6 +7447,9 @@ index 0000000..6a8a665
 +            return;
 +        }
 +        let mut frame = frame[..frame.len() - 4].to_vec();
++        if wifi::is_data(&frame) {
++            self.traffic.1 = self.traffic.1.saturating_add(1);
++        }
 +        let decrypted = !swdec && enc_type != 0;
 +        if decrypted && frame[1] & wifi::PROTECTED != 0 {
 +            if frame.len() < wifi::HEADER + 16 {
@@ -7246,7 +7475,7 @@ index 0000000..6a8a665
 +            }
 +        };
 +        if let Some(device) = &self.device {
-+            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: if decrypted { 8 } else { 0 } });
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: if decrypted { 8 } else { 0 }, amsdu_more: false });
 +        }
 +    }
 +
@@ -7286,7 +7515,7 @@ index 0000000..6a8a665
 +        vht_mcs[4..6].copy_from_slice(&map.to_le_bytes());
 +        vht_mcs[6..8].copy_from_slice(&(390 * (1 + two as u16)).to_le_bytes());
 +        let vht = VhtCap { info: vht_info, mcs: vht_mcs };
-+        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: None };
++        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: None, eht: None };
 +        let mut bands = vec![band(BandId::Ghz2)];
 +        if self.hw.spec.band_5g {
 +            bands.push(band(BandId::Ghz5));

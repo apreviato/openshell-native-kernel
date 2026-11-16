@@ -526,10 +526,10 @@ index 0000000..e9a095d
 +}
 diff --git a/kernel/comps/brcmfmac/src/consts.rs b/kernel/comps/brcmfmac/src/consts.rs
 new file mode 100644
-index 0000000..37fa0f8
+index 0000000..6de6315
 --- /dev/null
 +++ b/kernel/comps/brcmfmac/src/consts.rs
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,409 @@
 +// SPDX-License-Identifier: ISC
 +// Copyright (c) 2010-2014 Broadcom Corporation
 +
@@ -768,6 +768,10 @@ index 0000000..37fa0f8
 +pub(crate) const C_GET_VERSION: u32 = 1;
 +pub(crate) const C_UP: u32 = 2;
 +pub(crate) const C_DOWN: u32 = 3;
++pub(crate) const C_SET_BCNPRD: u32 = 76;
++pub(crate) const C_SET_DTIMPRD: u32 = 78;
++pub(crate) const C_SET_AP: u32 = 118;
++pub(crate) const C_SCB_DEAUTHENTICATE_FOR_REASON: u32 = 201;
 +pub(crate) const C_GET_RATE: u32 = 12;
 +pub(crate) const C_SET_INFRA: u32 = 20;
 +pub(crate) const C_GET_BSSID: u32 = 23;
@@ -802,6 +806,8 @@ index 0000000..37fa0f8
 +pub(crate) const E_SET_SSID: u32 = 0;
 +pub(crate) const E_DEAUTH: u32 = 5;
 +pub(crate) const E_DEAUTH_IND: u32 = 6;
++pub(crate) const E_ASSOC_IND: u32 = 8;
++pub(crate) const E_REASSOC_IND: u32 = 10;
 +pub(crate) const E_DISASSOC: u32 = 11;
 +pub(crate) const E_DISASSOC_IND: u32 = 12;
 +pub(crate) const E_LINK: u32 = 16;
@@ -837,6 +843,8 @@ index 0000000..37fa0f8
 +pub(crate) const CRYPTO_ALGO_WEP128: u32 = 3;
 +pub(crate) const CRYPTO_ALGO_AES_CCM: u32 = 4;
 +pub(crate) const PRIMARY_KEY: u32 = 1 << 1;
++/// The RSN capabilities' PTKSA replay counters (`RSN_CAP_PTK_REPLAY_CNTR_MASK`).
++pub(crate) const RSN_CAP_PTK_REPLAY_CNTR: u16 = 0x000c;
 +pub(crate) const MFP_NONE: u32 = 0;
 +pub(crate) const MFP_CAPABLE: u32 = 1;
 +pub(crate) const MFP_REQUIRED: u32 = 2;
@@ -1039,10 +1047,10 @@ index 0000000..2d8183d
 +}
 diff --git a/kernel/comps/brcmfmac/src/lib.rs b/kernel/comps/brcmfmac/src/lib.rs
 new file mode 100644
-index 0000000..f6ca63f
+index 0000000..6660739
 --- /dev/null
 +++ b/kernel/comps/brcmfmac/src/lib.rs
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,321 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Broadcom's and Cypress's FullMAC Wi-Fi on PCIe, as Linux's brcmfmac
@@ -1061,9 +1069,9 @@ index 0000000..f6ca63f
 +//! linux-firmware has the BCM4350, 4356, 43570, 4358, 4366, 4371, 43602
 +//! and 54591 files; Apple's chips need the firmware of their machine, and
 +//! boards whose NVRAM lives in the system's EFI variables or device tree
-+//! need it as `brcm/brcmfmac<chip>-pcie.txt`. Not yet: an access point,
-+//! the firmware's own handshake (SAE through it, WPA3), power save, the
-+//! SDIO and USB chips. `dmesg | grep brcmfmac` says how far a card gets;
++//! need it as `brcm/brcmfmac<chip>-pcie.txt`. Stations and access points
++//! run, with power save. Not yet: the firmware's own handshake (SAE
++//! through it, WPA3), 6 GHz, the SDIO and USB chips. `dmesg | grep brcmfmac` says how far a card gets;
 +//! `brcmfmac.off` leaves the cards alone.
 +
 +#![no_std]
@@ -1096,7 +1104,10 @@ index 0000000..f6ca63f
 +    wait::Waker,
 +};
 +use aster_pci::common_device::PciCommonDevice;
-+use aster_wlan::radio::{self, Association, Connect, Join, Key, LinkStats, Radio, ScanRequest};
++use aster_wlan::{
++    ieee80211::Address,
++    radio::{self, ApConfig, Association, BeaconTemplate, Connect, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
 +
@@ -1255,6 +1266,32 @@ index 0000000..f6ca63f
 +    fn connect(&self, request: &Connect) -> radio::Result<()> {
 +        self.card.state.lock().connect(request)
 +    }
++
++    fn set_power_save(&self, enabled: bool) -> radio::Result<()> {
++        self.card.state.lock().set_power_save(enabled)
++    }
++
++    fn start_ap(&self, config: &ApConfig) -> radio::Result<()> {
++        self.card.state.lock().start_ap(config)
++    }
++
++    // The firmware writes its own beacons from the network's settings.
++    fn set_beacon(&self, _beacon: &BeaconTemplate) -> radio::Result<()> {
++        Ok(())
++    }
++
++    fn stop_ap(&self) {
++        self.card.state.lock().stop_ap();
++    }
++
++    // The firmware took the station already (`ap_station_joined`).
++    fn add_station(&self, _station: &StationEntry) -> radio::Result<()> {
++        Ok(())
++    }
++
++    fn remove_station(&self, address: &Address) {
++        self.card.state.lock().remove_station(address);
++    }
 +}
 +
 +/// A card's task: the chip up, its firmware running, the station
@@ -1337,10 +1374,10 @@ index 0000000..f6ca63f
 +}
 diff --git a/kernel/comps/brcmfmac/src/msgbuf.rs b/kernel/comps/brcmfmac/src/msgbuf.rs
 new file mode 100644
-index 0000000..c75dcba
+index 0000000..6283e2f
 --- /dev/null
 +++ b/kernel/comps/brcmfmac/src/msgbuf.rs
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,630 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The message protocol over the rings as Linux's brcmfmac `msgbuf.c`
@@ -1392,10 +1429,6 @@ index 0000000..c75dcba
 +        if (id as usize) < self.count && !self.free.contains(&id) {
 +            self.free.push(id);
 +        }
-+    }
-+
-+    fn reset(&mut self) {
-+        self.free = (0..self.count as u32).rev().collect();
 +    }
 +
 +    fn place(&self, id: u32) -> (&DmaCoherent, usize) {
@@ -1455,14 +1488,27 @@ index 0000000..c75dcba
 +    })
 +}
 +
-+/// The TX flow ring (one: a station's frames all go to its access point,
-+/// as Linux's indirect address mode keys them by priority alone).
++/// A TX flow ring's state.
 +enum Flow {
-+    None,
 +    Creating { ring: Ring, queue: VecDeque<(Vec<u8>, bool)> },
 +    Open { ring: Ring },
 +    Deleting { _ring: Ring },
 +}
++
++/// A TX flow ring: as a station one, to the access point (Linux's indirect
++/// address mode keys them by priority alone); as an access point one per
++/// station and one for group frames (direct mode, by destination,
++/// `brcmf_flowring_lookup`).
++struct FlowRing {
++    /// Its key: the station's address, all ones for group frames, all
++    /// zeros as a station.
++    da: [u8; 6],
++    index: u16,
++    state: Flow,
++}
++
++/// A TX buffer of no flow ring.
++const NO_FLOW: u16 = u16::MAX;
 +
 +/// What came back for an IOCTL.
 +struct IoctlDone {
@@ -1472,9 +1518,8 @@ index 0000000..c75dcba
 +    trans_id: u16,
 +}
 +
-+/// The flow ring this driver uses: the first, at its priority's FIFO
-+/// (`brcmf_flowring_prio2fifo[0]`, best effort).
-+const FLOW_INDEX: u16 = 0;
++/// The FIFO of the flow rings (`brcmf_flowring_prio2fifo[0]`, best
++/// effort).
 +const FLOW_FIFO: u8 = 1;
 +/// Frames held while the flow ring is created.
 +const FLOW_QUEUE: usize = 64;
@@ -1502,7 +1547,11 @@ index 0000000..c75dcba
 +    ioctbuf: DmaCoherent,
 +    reqid: u16,
 +    ioctl_done: Option<IoctlDone>,
-+    flow: Flow,
++    flows: Vec<FlowRing>,
++    /// The flow ring each TX buffer went on.
++    tx_flow: Vec<u16>,
++    /// An access point's addressing: a flow ring per destination.
++    pub(crate) direct: bool,
 +    pub(crate) own: [u8; 6],
 +    pub(crate) events: VecDeque<Event>,
 +    pub(crate) frames: VecDeque<Vec<u8>>,
@@ -1533,7 +1582,9 @@ index 0000000..c75dcba
 +            ioctbuf,
 +            reqid: 0,
 +            ioctl_done: None,
-+            flow: Flow::None,
++            flows: Vec::new(),
++            tx_flow: vec![NO_FLOW; TX_BUFFERS],
++            direct: false,
 +            own: [0; 6],
 +            events: VecDeque::new(),
 +            frames: VecDeque::new(),
@@ -1709,37 +1760,32 @@ index 0000000..c75dcba
 +            MSGBUF_TYPE_TX_STATUS => {
 +                let id = request_id.wrapping_sub(1);
 +                if (id as usize) < TX_BUFFERS {
-+                    self.tx.release(id);
-+                    self.outstanding = self.outstanding.saturating_sub(1);
-+                    if core::mem::take(&mut self.tx_eapol[id as usize]) {
-+                        self.pend_8021x = self.pend_8021x.saturating_sub(1);
-+                    }
++                    self.tx_done(id);
 +                }
 +            }
 +            MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT => {
 +                let status = get_le16(msg, 8);
-+                if get_le16(msg, 10) != H2D_MSGRING_FLOWRING_IDSTART + FLOW_INDEX {
-+                    return;
-+                }
-+                if let Flow::Creating { ring, queue } = core::mem::replace(&mut self.flow, Flow::None) {
-+                    if status != 0 {
-+                        ostd::warn!("brcmfmac: the firmware did not create the TX flow ring ({})", status);
-+                        return;
++                let Some(index) = get_le16(msg, 10).checked_sub(H2D_MSGRING_FLOWRING_IDSTART) else { return };
++                let Some(at) = self.flows.iter().position(|flow| flow.index == index) else { return };
++                let FlowRing { da, index, state } = self.flows.swap_remove(at);
++                match state {
++                    Flow::Creating { ring, queue } if status == 0 => {
++                        self.flows.push(FlowRing { da, index, state: Flow::Open { ring } });
++                        let at = self.flows.len() - 1;
++                        for (frame, eapol) in queue {
++                            let _ = self.post(at, &frame, eapol);
++                        }
 +                    }
-+                    self.flow = Flow::Open { ring };
-+                    for (frame, eapol) in queue {
-+                        let _ = self.post(&frame, eapol);
-+                    }
++                    Flow::Creating { .. } => ostd::warn!("brcmfmac: the firmware did not create a TX flow ring ({})", status),
++                    state => self.flows.push(FlowRing { da, index, state }),
 +                }
 +            }
 +            MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT => {
-+                if matches!(self.flow, Flow::Deleting { .. }) {
-+                    self.flow = Flow::None;
++                let Some(index) = get_le16(msg, 8).checked_sub(H2D_MSGRING_FLOWRING_IDSTART) else { return };
++                if let Some(at) = self.flows.iter().position(|flow| flow.index == index && matches!(flow.state, Flow::Deleting { .. })) {
++                    self.flows.swap_remove(at);
 +                    // Frames the firmware dropped with the ring.
-+                    self.tx.reset();
-+                    self.tx_eapol.iter_mut().for_each(|eapol| *eapol = false);
-+                    self.outstanding = 0;
-+                    self.pend_8021x = 0;
++                    self.release_flow(index);
 +                }
 +            }
 +            MSGBUF_TYPE_GEN_STATUS | MSGBUF_TYPE_RING_STATUS => {
@@ -1824,14 +1870,31 @@ index 0000000..c75dcba
 +
 +    // ---- Frames to send (`brcmf_msgbuf_tx_queue_data`). ----
 +
-+    /// An Ethernet frame to the network; `eapol`: a handshake frame, which
-+    /// keys wait for. `Err`: later (no room).
++    /// An Ethernet frame to the network (as an access point, to the station
++    /// its destination names, or to all of them); `eapol`: a handshake
++    /// frame, which keys wait for. `Err`: later (no room).
 +    pub(crate) fn send(&mut self, frame: &[u8], eapol: bool) -> Result<(), ()> {
 +        if frame.len() < 14 || frame.len() > MSGBUF_MAX_PKT_SIZE {
 +            return Ok(());
 +        }
-+        match &mut self.flow {
-+            Flow::Open { .. } => self.post(frame, eapol),
++        let da: [u8; 6] = frame[0..6].try_into().unwrap();
++        let key = if !self.direct {
++            [0u8; 6]
++        } else if da[0] & 1 != 0 {
++            [0xff; 6]
++        } else {
++            da
++        };
++        let Some(at) = self.flows.iter().position(|flow| flow.da == key) else {
++            let target = if self.direct { key } else { da };
++            self.create_flow(key, &target).map_err(|error| ostd::warn!("brcmfmac: {}", error))?;
++            if let Some(FlowRing { state: Flow::Creating { queue, .. }, .. }) = self.flows.last_mut() {
++                queue.push_back((frame.to_vec(), eapol));
++            }
++            return Ok(());
++        };
++        match &mut self.flows[at].state {
++            Flow::Open { .. } => self.post(at, frame, eapol),
 +            Flow::Creating { queue, .. } => {
 +                if queue.len() >= FLOW_QUEUE {
 +                    return Err(());
@@ -1840,42 +1903,54 @@ index 0000000..c75dcba
 +                Ok(())
 +            }
 +            Flow::Deleting { .. } => Err(()),
-+            Flow::None => {
-+                let da: [u8; 6] = frame[0..6].try_into().unwrap();
-+                self.create_flow(&da).map_err(|error| ostd::warn!("brcmfmac: {}", error))?;
-+                if let Flow::Creating { queue, .. } = &mut self.flow {
-+                    queue.push_back((frame.to_vec(), eapol));
-+                }
-+                Ok(())
-+            }
 +        }
 +    }
 +
-+    /// `brcmf_msgbuf_flowring_create_worker`.
-+    fn create_flow(&mut self, da: &[u8; 6]) -> Result<(), &'static str> {
-+        if self.pcie.shared.max_flowrings == 0 {
-+            return Err("the firmware has no TX flow rings");
-+        }
-+        let ring = self.pcie.flow_ring(FLOW_INDEX, H2D_TXFLOWRING_MAX_ITEM, H2D_TXFLOWRING_ITEMSIZE).ok_or("no memory for the TX flow ring")?;
++    /// `brcmf_msgbuf_flowring_create_worker`: the next free ring, to `da`.
++    fn create_flow(&mut self, key: [u8; 6], da: &[u8; 6]) -> Result<(), &'static str> {
++        let Some(index) = (0..self.pcie.shared.max_flowrings).find(|index| !self.flows.iter().any(|flow| flow.index == *index)) else {
++            return Err("no TX flow ring left");
++        };
++        let ring = self.pcie.flow_ring(index, H2D_TXFLOWRING_MAX_ITEM, H2D_TXFLOWRING_ITEMSIZE).ok_or("no memory for a TX flow ring")?;
 +        let mut item = [0u8; 40];
 +        item[0] = MSGBUF_TYPE_FLOW_RING_CREATE;
 +        item[8..14].copy_from_slice(da);
 +        item[14..20].copy_from_slice(&self.own);
 +        item[20] = FLOW_FIFO;
-+        put_le16(&mut item, 22, H2D_MSGRING_FLOWRING_IDSTART + FLOW_INDEX);
++        put_le16(&mut item, 22, H2D_MSGRING_FLOWRING_IDSTART + index);
 +        put_le16(&mut item, 28, H2D_TXFLOWRING_MAX_ITEM);
 +        put_le16(&mut item, 30, H2D_TXFLOWRING_ITEMSIZE);
 +        let address = ring.daddr();
 +        put_le32(&mut item, 32, address as u32);
 +        put_le32(&mut item, 36, (address >> 32) as u32);
 +        self.submit(&item)?;
-+        self.flow = Flow::Creating { ring, queue: VecDeque::new() };
++        self.flows.push(FlowRing { da: key, index, state: Flow::Creating { ring, queue: VecDeque::new() } });
 +        Ok(())
 +    }
 +
-+    /// `brcmf_msgbuf_txflow` for one frame.
-+    fn post(&mut self, frame: &[u8], eapol: bool) -> Result<(), ()> {
-+        let Flow::Open { ring } = &mut self.flow else { return Err(()) };
++    /// A TX buffer the firmware is done with.
++    fn tx_done(&mut self, id: u32) {
++        self.tx.release(id);
++        self.tx_flow[id as usize] = NO_FLOW;
++        self.outstanding = self.outstanding.saturating_sub(1);
++        if core::mem::take(&mut self.tx_eapol[id as usize]) {
++            self.pend_8021x = self.pend_8021x.saturating_sub(1);
++        }
++    }
++
++    /// The buffers of a ring the firmware dropped with it.
++    fn release_flow(&mut self, index: u16) {
++        for id in 0..TX_BUFFERS {
++            if self.tx_flow[id] == index {
++                self.tx_done(id as u32);
++            }
++        }
++    }
++
++    /// `brcmf_msgbuf_txflow` for one frame on the flow ring at `at`.
++    fn post(&mut self, at: usize, frame: &[u8], eapol: bool) -> Result<(), ()> {
++        let index = self.flows[at].index;
++        let Flow::Open { ring } = &mut self.flows[at].state else { return Err(()) };
 +        if !self.pcie.write_available(ring) {
 +            return Err(());
 +        }
@@ -1901,6 +1976,7 @@ index 0000000..c75dcba
 +        Pcie::ring_write(ring, at, &item);
 +        self.pcie.write_complete(ring);
 +        self.outstanding += 1;
++        self.tx_flow[id as usize] = index;
 +        self.tx_eapol[id as usize] = eapol;
 +        if eapol {
 +            self.pend_8021x += 1;
@@ -1908,23 +1984,27 @@ index 0000000..c75dcba
 +        Ok(())
 +    }
 +
-+    /// `brcmf_msgbuf_delete_flowring`: the link ended, its ring goes.
++    /// `brcmf_msgbuf_delete_flowring`: the link ended (or the network), its
++    /// rings go.
 +    pub(crate) fn delete_flow(&mut self) {
-+        match core::mem::replace(&mut self.flow, Flow::None) {
-+            Flow::None => {}
-+            Flow::Deleting { _ring } => self.flow = Flow::Deleting { _ring },
-+            Flow::Creating { ring, .. } | Flow::Open { ring } => {
-+                let mut item = [0u8; 40];
-+                item[0] = MSGBUF_TYPE_FLOW_RING_DELETE;
-+                put_le16(&mut item, 8, H2D_MSGRING_FLOWRING_IDSTART + FLOW_INDEX);
-+                if self.submit(&item).is_ok() {
-+                    self.flow = Flow::Deleting { _ring: ring };
-+                } else {
-+                    self.tx.reset();
-+                    self.outstanding = 0;
-+                    self.pend_8021x = 0;
-+                }
-+            }
++        let keys: Vec<[u8; 6]> = self.flows.iter().map(|flow| flow.da).collect();
++        for key in keys {
++            self.delete_flow_to(&key);
++        }
++    }
++
++    /// The ring to one destination (a station that left).
++    pub(crate) fn delete_flow_to(&mut self, da: &[u8; 6]) {
++        let Some(at) = self.flows.iter().position(|flow| flow.da == *da && !matches!(flow.state, Flow::Deleting { .. })) else { return };
++        let FlowRing { da, index, state } = self.flows.swap_remove(at);
++        let (Flow::Creating { ring, .. } | Flow::Open { ring } | Flow::Deleting { _ring: ring }) = state;
++        let mut item = [0u8; 40];
++        item[0] = MSGBUF_TYPE_FLOW_RING_DELETE;
++        put_le16(&mut item, 8, H2D_MSGRING_FLOWRING_IDSTART + index);
++        if self.submit(&item).is_ok() {
++            self.flows.push(FlowRing { da, index, state: Flow::Deleting { _ring: ring } });
++        } else {
++            self.release_flow(index);
 +        }
 +    }
 +}
@@ -2648,10 +2728,10 @@ index 0000000..3230612
 +}
 diff --git a/kernel/comps/brcmfmac/src/sta.rs b/kernel/comps/brcmfmac/src/sta.rs
 new file mode 100644
-index 0000000..1f329a4
+index 0000000..a907fdd
 --- /dev/null
 +++ b/kernel/comps/brcmfmac/src/sta.rs
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,1118 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The station on a FullMAC chip as Linux's brcmfmac `cfg80211.c` and
@@ -2662,13 +2742,13 @@ index 0000000..1f329a4
 +//! firmware makes from the supplicant's request (security mode, its RSN
 +//! element, `join`), the keys, the link's end.
 +
-+use alloc::{string::String, sync::Arc, vec, vec::Vec};
++use alloc::{collections::BTreeSet, string::String, sync::Arc, vec, vec::Vec};
 +
 +use aster_linuxkpi::bits::{get_le16, get_le32, put_le16, put_le32};
 +use aster_wlan::{
 +    Device, chan,
 +    ieee80211::{self as wifi, Elements},
-+    radio::{self, AuthType, Band, BandId, Channel, Connect, Connected, HtCap, Info, Key, ScanRequest, VhtCap},
++    radio::{self, ApConfig, AuthType, Band, BandId, Chandef, Channel, Connect, Connected, HtCap, Info, Key, ScanRequest, VhtCap, Width},
 +};
 +
 +use crate::{
@@ -2678,6 +2758,9 @@ index 0000000..1f329a4
 +    now_ms,
 +};
 +
++/// The firmware's fast power save (`PM_FAST`): it dozes once the link
++/// idles.
++const PM_FAST: u32 = 2;
 +/// nl80211's key management suites (`WLAN_AKM_SUITE_*`).
 +const AKM_8021X: u32 = 0x000f_ac01;
 +const AKM_FT_8021X: u32 = 0x000f_ac03;
@@ -2723,6 +2806,9 @@ index 0000000..1f329a4
 +    pub(crate) signal: Option<i8>,
 +    pub(crate) dead: bool,
 +    pub(crate) firmware: String,
++    /// The network this chip runs as an access point: the stations whose
++    /// pairwise key is in place (their frames come encrypted).
++    ap: Option<BTreeSet<[u8; 6]>>,
 +}
 +
 +/// 2.4 GHz channel 14 and the others, 5 GHz.
@@ -2748,6 +2834,7 @@ index 0000000..1f329a4
 +            signal: None,
 +            dead: false,
 +            firmware: String::new(),
++            ap: None,
 +        }
 +    }
 +
@@ -2780,6 +2867,31 @@ index 0000000..1f329a4
 +                control = if spec & D11N_SB_MASK == D11N_SB_L { control - 2 } else { control + 2 };
 +            }
 +            Some(Chan { control, band_5g: spec & D11N_BND_MASK == D11N_BND_5G, width })
++        }
++    }
++
++    /// A channel's chanspec (`chandef_to_chanspec`): its center, width and
++    /// the primary's place in it (the older firmware's: 40 MHz at most).
++    fn encode(&self, chandef: &Chandef) -> u16 {
++        let control = wifi::channel_of(chandef.control).unwrap_or(1);
++        let center = wifi::channel_of(chandef.center).unwrap_or(control) as u16;
++        let band_5g = control > CH_MAX_2G_CHANNEL;
++        let sb = chandef.primary_index() as u16;
++        match chandef.width {
++            Width::W40 | Width::W80 | Width::W160 if self.d11ac => {
++                let width = match chandef.width {
++                    Width::W40 => D11AC_BW_40,
++                    Width::W80 => D11AC_BW_80,
++                    _ => D11AC_BW_160,
++                };
++                center | width | (sb << D11AC_SB_SHIFT) | if band_5g { D11AC_BND_5G } else { D11AC_BND_2G }
++            }
++            Width::W40 | Width::W80 | Width::W160 => {
++                let center = wifi::channel_of(chandef.center_40()).unwrap_or(control) as u16;
++                let side = if chandef.secondary_above() { D11N_SB_L } else { D11N_SB_U };
++                center | D11N_BW_40 | side | if band_5g { D11N_BND_5G } else { D11N_BND_2G }
++            }
++            _ => self.encode20(control),
 +        }
 +    }
 +
@@ -2863,7 +2975,8 @@ index 0000000..1f329a4
 +            ciphers,
 +            max_scan_ssids: WL_NUM_SCAN_MAX,
 +            max_scan_ie_len: SCAN_IE_LEN_MAX,
-+            ap: false,
++            // An access point the firmware runs (`brcmf_cfg80211_start_ap`).
++            ap: true,
 +        })
 +    }
 +
@@ -2895,7 +3008,7 @@ index 0000000..1f329a4
 +    fn set_events(&mut self) -> FwResult<()> {
 +        let mut mask = [0u8; EVENTING_MASK_LEN];
 +        self.msg.iovar_get("event_msgs", &mut mask)?;
-+        for event in [E_SET_SSID, E_DEAUTH, E_DEAUTH_IND, E_DISASSOC, E_DISASSOC_IND, E_LINK, E_MIC_ERROR, E_ROAM, E_PSK_SUP, E_IF, E_ESCAN_RESULT] {
++        for event in [E_SET_SSID, E_DEAUTH, E_DEAUTH_IND, E_DISASSOC, E_DISASSOC_IND, E_LINK, E_MIC_ERROR, E_ROAM, E_PSK_SUP, E_IF, E_ESCAN_RESULT, E_ASSOC_IND, E_REASSOC_IND] {
 +            mask[event as usize / 8] |= 1 << (event % 8);
 +        }
 +        self.msg.iovar_set("event_msgs", &mask)
@@ -2995,7 +3108,7 @@ index 0000000..1f329a4
 +                mcs[4..6].copy_from_slice(&map.to_le_bytes());
 +                VhtCap { info, mcs }
 +            });
-+            bands.push(Band { id: if band_5g { BandId::Ghz5 } else { BandId::Ghz2 }, channels: out, ht, vht, he: None });
++            bands.push(Band { id: if band_5g { BandId::Ghz5 } else { BandId::Ghz2 }, channels: out, ht, vht, he: None, eht: None });
 +        }
 +        if bands.is_empty() {
 +            return Err(FwError::Bus("the firmware allows no channel"));
@@ -3128,7 +3241,7 @@ index 0000000..1f329a4
 +        frame.extend_from_slice(&bi[16..18]);
 +        frame.extend_from_slice(elements);
 +        let rssi = get_le16(bi, 78) as i16;
-+        let info = radio::RxInfo { freq, signal: rssi.clamp(-127, 0) as i8, decrypted: false, security_header: 0 };
++        let info = radio::RxInfo { freq, signal: rssi.clamp(-127, 0) as i8, decrypted: false, security_header: 0, amsdu_more: false };
 +        if let Some(device) = &self.device {
 +            device.received(&frame, info);
 +        }
@@ -3276,6 +3389,15 @@ index 0000000..1f329a4
 +        Ok(())
 +    }
 +
++    /// `brcmf_cfg80211_set_power_mgmt`: the firmware's fast power save
++    /// (`PM_FAST`), or none.
++    pub(crate) fn set_power_save(&mut self, enabled: bool) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.msg.cmd_int_set(C_SET_PM, if enabled { PM_FAST } else { PM_OFF }).map_err(|_| radio::Error::Failed)
++    }
++
 +    /// `brcmf_cfg80211_disconnect`, the flow ring with it.
 +    pub(crate) fn leave(&mut self) {
 +        if !self.connecting && !self.connected {
@@ -3322,7 +3444,9 @@ index 0000000..1f329a4
 +            }
 +            put_le32(&mut wsec_key, 112, algo);
 +            if key.pairwise {
-+                wsec_key[156..162].copy_from_slice(&self.bssid);
++                // As an access point, the station's; else the network's.
++                let peer = if self.ap.is_some() { key.address.ok_or(radio::Error::Invalid)? } else { self.bssid };
++                wsec_key[156..162].copy_from_slice(&peer);
 +            } else {
 +                put_le32(&mut wsec_key, 116, PRIMARY_KEY);
 +            }
@@ -3350,7 +3474,13 @@ index 0000000..1f329a4
 +            ostd::warn!("brcmfmac: the key was refused: {}", error);
 +            radio::Error::Failed
 +        })?;
-+        if key.pairwise {
++        if let (Some(keyed), true, Some(address)) = (self.ap.as_mut(), key.pairwise, key.address) {
++            if remove {
++                keyed.remove(&address);
++            } else {
++                keyed.insert(address);
++            }
++        } else if key.pairwise {
 +            self.pairwise = !remove;
 +        } else if !remove
 +            && let Ok(current) = self.msg.iovar_int_get("wsec")
@@ -3361,7 +3491,7 @@ index 0000000..1f329a4
 +    }
 +
 +    pub(crate) fn send(&mut self, ethernet: &[u8]) -> radio::Result<()> {
-+        if !self.connected {
++        if !self.connected && self.ap.is_none() {
 +            return Ok(());
 +        }
 +        let eapol = ethernet.len() >= 14 && u16::from_be_bytes([ethernet[12], ethernet[13]]) == wifi::ETHERTYPE_EAPOL;
@@ -3397,8 +3527,13 @@ index 0000000..1f329a4
 +        self.msg.pcie.acknowledge();
 +        self.msg.process();
 +        while let Some(frame) = self.msg.frames.pop_front() {
++            // As an access point, encrypted once the station's key is in.
++            let protected = match &self.ap {
++                Some(keyed) => frame.get(6..12).is_some_and(|source| keyed.iter().any(|address| address[..] == *source)),
++                None => self.pairwise,
++            };
 +            if let Some(device) = &self.device {
-+                device.received_ethernet(frame, self.pairwise);
++                device.received_ethernet(frame, protected);
 +            }
 +        }
 +        while let Some(event) = self.msg.events.pop_front() {
@@ -3410,6 +3545,10 @@ index 0000000..1f329a4
 +    }
 +
 +    fn event(&mut self, event: Event) {
++        if self.ap.is_some() {
++            self.ap_event(&event);
++            return;
++        }
 +        match event.code {
 +            E_ESCAN_RESULT => self.escan_result(&event),
 +            E_SET_SSID => {
@@ -3531,6 +3670,172 @@ index 0000000..1f329a4
 +        self.msg.delete_flow();
 +        if let Some(device) = &self.device {
 +            device.disconnected(reason, by_ap);
++        }
++    }
++}
++
++impl Brcmf {
++    // ---- As an access point (`brcmf_cfg80211_start_ap`, `_stop_ap`,
++    // `_del_station`, `brcmf_notify_connect_status_ap`): the firmware runs
++    // the network, takes the stations and says so; the daemon (hostapd)
++    // runs WPA's handshake over the data path. ----
++
++    pub(crate) fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.scanning {
++            self.abort_scan();
++        }
++        self.leave();
++        self.try_start_ap(config).map_err(|error| {
++            ostd::warn!("brcmfmac: the access point did not start: {}", error);
++            let _ = self.msg.cmd_int_set(C_SET_AP, 0);
++            let _ = self.msg.cmd_int_set(C_UP, 1);
++            radio::Error::Failed
++        })
++    }
++
++    fn try_start_ap(&mut self, config: &ApConfig) -> FwResult<()> {
++        let elements = config.beacon.elements();
++        let _ = self.msg.iovar_int_set("mpc", 0);
++        self.msg.cmd_int_set(C_SET_BCNPRD, config.beacon_interval.max(1) as u32)?;
++        self.msg.cmd_int_set(C_SET_DTIMPRD, config.dtim_period.max(1) as u32)?;
++        self.msg.cmd_int_set(C_DOWN, 1)?;
++        let _ = self.msg.iovar_int_set("apsta", 0);
++        self.msg.cmd_int_set(C_SET_INFRA, 1)?;
++        self.msg.cmd_int_set(C_SET_AP, 1)?;
++        // Firmware 10.x takes the channel after AP mode, before UP.
++        self.msg.iovar_int_set("chanspec", self.encode(&config.chandef) as u32)?;
++        self.msg.cmd_int_set(C_UP, 1)?;
++        self.ap_security(Elements(&elements).get(wifi::IE_RSN))?;
++        // `brcmf_join_params`: the name; the rest zero creates the network.
++        let mut join = vec![0u8; SSID_LE + 16];
++        let ssid_len = config.ssid.len().min(32);
++        put_le32(&mut join, 0, ssid_len as u32);
++        join[4..4 + ssid_len].copy_from_slice(&config.ssid[..ssid_len]);
++        self.msg.cmd_set(C_SET_SSID, &join)?;
++        self.msg.iovar_int_set("closednet", config.hidden as u32)?;
++        self.msg.direct = true;
++        self.ap = Some(BTreeSet::new());
++        ostd::notice!("brcmfmac: running the network on channel {}", wifi::channel_of(config.chandef.control).unwrap_or(0));
++        Ok(())
++    }
++
++    /// `brcmf_parse_configure_security` for an access point: WPA2's
++    /// ciphers, key management and management frame protection from the
++    /// beacon's RSN element (`brcmf_configure_wpaie`), or none. WPA3's SAE
++    /// is the firmware's to run (its password offload) and not offered.
++    fn ap_security(&mut self, rsn: Option<&[u8]>) -> FwResult<()> {
++        let Some(rsn) = rsn else {
++            self.msg.iovar_int_set("auth", 0)?;
++            self.msg.iovar_int_set("wsec", 0)?;
++            return self.msg.iovar_int_set("wpa_auth", WPA_AUTH_DISABLED);
++        };
++        let wsec_of = |kind: u8| match kind {
++            2 => TKIP_ENABLED,
++            4 => AES_ENABLED,
++            _ => 0,
++        };
++        // Version, then the group cipher (OUI and type).
++        let group = rsn.get(5).map_or(0, |kind| wsec_of(*kind));
++        let mut at = 6;
++        let mut pairwise = 0;
++        let count = rsn.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
++        at += 2;
++        for index in 0..count {
++            pairwise |= rsn.get(at + 4 * index + 3).map_or(0, |kind| wsec_of(*kind));
++        }
++        at += 4 * count;
++        let count = rsn.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize);
++        at += 2;
++        let mut wpa_auth = 0;
++        for index in 0..count {
++            wpa_auth |= match rsn.get(at + 4 * index + 3) {
++                Some(1) => WPA2_AUTH_UNSPECIFIED,
++                Some(2) => WPA2_AUTH_PSK,
++                Some(5) => WPA2_AUTH_1X_SHA256,
++                Some(6) => WPA2_AUTH_PSK_SHA256,
++                Some(8) => WPA3_AUTH_SAE_PSK,
++                _ => 0,
++            };
++        }
++        at += 4 * count;
++        if wpa_auth == WPA3_AUTH_SAE_PSK {
++            return Err(FwError::Bus("WPA3-only (SAE) networks are the firmware's to authenticate"));
++        }
++        wpa_auth &= !WPA3_AUTH_SAE_PSK;
++        let capabilities = rsn.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
++        let mut mfp = MFP_NONE;
++        if capabilities & RSN_CAP_MFPR != 0 && wpa_auth & (WPA2_AUTH_PSK_SHA256 | WPA2_AUTH_1X_SHA256) != 0 {
++            mfp = MFP_REQUIRED;
++            if wpa_auth & WPA2_AUTH_PSK_SHA256 != 0 {
++                wpa_auth |= WPA2_AUTH_PSK;
++            } else {
++                wpa_auth |= WPA2_AUTH_UNSPECIFIED;
++            }
++        } else if capabilities & (RSN_CAP_MFPC | RSN_CAP_MFPR) != 0 {
++            mfp = MFP_CAPABLE;
++        }
++        // The RSN capabilities' replay counters keep WMM on.
++        let _ = self.msg.iovar_int_set("wme_bss_disable", (capabilities & RSN_CAP_PTK_REPLAY_CNTR == 0) as u32);
++        self.msg.iovar_int_set("auth", 0)?;
++        self.msg.iovar_int_set("wsec", pairwise | group)?;
++        self.msg.iovar_int_set("wpa_auth", wpa_auth)?;
++        if self.mfp {
++            let _ = self.msg.iovar_int_set("mfp", mfp);
++        }
++        // The daemon runs the handshake.
++        if self.fwsup {
++            let _ = self.msg.iovar_int_set("sup_wpa", 0);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn stop_ap(&mut self) {
++        if self.ap.take().is_none() {
++            return;
++        }
++        let _ = self.msg.iovar_int_set("closednet", 0);
++        let _ = self.msg.cmd_set(C_SET_SSID, &vec![0u8; SSID_LE + 16]);
++        let _ = self.msg.cmd_int_set(C_DOWN, 1);
++        let _ = self.msg.cmd_int_set(C_SET_AP, 0);
++        let _ = self.msg.cmd_int_set(C_UP, 1);
++        let _ = self.msg.iovar_int_set("mpc", 1);
++        self.msg.delete_flow();
++        self.msg.direct = false;
++        ostd::notice!("brcmfmac: the network stopped");
++    }
++
++    /// The daemon dropped a station: the firmware deauthenticates it.
++    pub(crate) fn remove_station(&mut self, address: &[u8; 6]) {
++        let Some(keyed) = self.ap.as_mut() else { return };
++        keyed.remove(address);
++        let mut scb = [0u8; 12];
++        put_le32(&mut scb, 0, wifi::REASON_DEAUTH_LEAVING as u32);
++        scb[4..10].copy_from_slice(address);
++        let _ = self.msg.cmd_set(C_SCB_DEAUTHENTICATE_FOR_REASON, &scb);
++        self.msg.delete_flow_to(address);
++    }
++
++    /// The firmware's word on the network's stations.
++    fn ap_event(&mut self, event: &Event) {
++        match event.code {
++            E_ASSOC_IND | E_REASSOC_IND if event.reason == E_STATUS_SUCCESS => {
++                if let Some(device) = &self.device {
++                    device.ap_station_joined(event.addr, event.data.clone());
++                }
++            }
++            E_DISASSOC_IND | E_DEAUTH_IND | E_DEAUTH => {
++                if let Some(keyed) = self.ap.as_mut() {
++                    keyed.remove(&event.addr);
++                }
++                self.msg.delete_flow_to(&event.addr);
++                if let Some(device) = &self.device {
++                    device.ap_station_left(event.addr);
++                }
++            }
++            _ => {}
 +        }
 +    }
 +}
