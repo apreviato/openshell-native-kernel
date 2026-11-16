@@ -10,6 +10,7 @@ pub mod sound;
 pub mod ssh;
 pub mod update;
 pub mod usb_update;
+pub mod hotspot;
 pub mod wifi;
 pub mod session;
 

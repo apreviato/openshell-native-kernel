@@ -713,11 +713,14 @@ wait "$supervisor" || status=$?
 if kill -0 "$supervisor" 2>/dev/null; then
     wait "$supervisor" || status=$?
 fi
-# The session ended: so does the supplicant, which leaves its network.
+# The session ended: so does the supplicant, which leaves its network, and
+# the hotspot the supervisor started (userspace/shell/src/hotspot.rs).
 if [ -n "$wifi" ]; then
     kill "$wifi" 2>/dev/null || true
     killall wpa_supplicant 2>/dev/null || true
 fi
+killall hostapd 2>/dev/null || true
+rm -f /run/openshell-wifi/hostapd.conf /run/openshell-wifi/hostapd.pid
 # And the SSH server, with whoever is signed in, and the printing scheduler.
 if [ -n "$ssh_service" ]; then
     kill "$ssh_service" 2>/dev/null || true

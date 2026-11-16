@@ -21,6 +21,8 @@
 //! wifi autoconnect <id> on|off     → "ok"
 //! wifi disconnect                  → "ok"
 //! wifi enable on|off               → "ok": the radio, kept across restarts
+//! wifi hotspot, hotspot-start, hotspot-stop
+//!                                  → the hotspot (`hotspot.rs`)
 //! ```
 //!
 //! `<ssid>` and `<secret>` are hexadecimal (a name is any 1 to 32 bytes);
@@ -42,6 +44,8 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+
+use crate::hotspot::{self, Hostapd, Hotspot};
 
 pub const PREFIX: &str = "wifi ";
 /// Where wpa_supplicant listens (installed-session.sh starts it with the
@@ -84,16 +88,19 @@ pub enum Request {
     Autoconnect(u32, bool),
     Disconnect,
     Enable(bool),
+    Hotspot,
+    HotspotStart(hotspot::Settings),
+    HotspotStop,
 }
 
-fn unhex(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn unhex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
         let _ = write!(out, "{byte:02x}");
         out
@@ -138,6 +145,20 @@ impl Request {
             "forget" => Request::Forget(network_id(words.next()?)?),
             "autoconnect" => Request::Autoconnect(network_id(words.next()?)?, switch(words.next()?)?),
             "enable" => Request::Enable(switch(words.next()?)?),
+            "hotspot" => Request::Hotspot,
+            "hotspot-stop" => Request::HotspotStop,
+            "hotspot-start" => {
+                let ssid = unhex(words.next()?)?;
+                let password = unhex(words.next()?)?;
+                let band = match words.next() {
+                    None => hotspot::Band::Bg,
+                    Some(word) => hotspot::Band::parse(word)?,
+                };
+                if !hotspot::valid(&ssid, &password) {
+                    return None;
+                }
+                Request::HotspotStart(hotspot::Settings { ssid, password, band })
+            }
             "connect" => {
                 let ssid = unhex(words.next()?)?;
                 if ssid.is_empty() || ssid.len() > 32 {
@@ -181,7 +202,7 @@ pub struct ControlSockets;
 
 static CLIENTS: AtomicU32 = AtomicU32::new(0);
 
-fn ask(server: &Path, command: &str) -> io::Result<String> {
+pub(crate) fn ask(server: &Path, command: &str) -> io::Result<String> {
     // The answer comes to a socket with a name: one of root's own, next to
     // the server's, gone when it is answered.
     let folder = server.parent().unwrap_or(Path::new("/run"));
@@ -262,11 +283,13 @@ pub struct Wifi {
     /// the networks.
     pub settings: Option<PathBuf>,
     pub proc_net_dev: PathBuf,
+    /// Where hostapd's configuration goes (in /run).
+    pub hostapd_config: PathBuf,
 }
 
 impl Wifi {
     pub fn new(settings: Option<PathBuf>) -> Self {
-        Self { settings, proc_net_dev: PathBuf::from("/proc/net/dev") }
+        Self { settings, proc_net_dev: PathBuf::from("/proc/net/dev"), hostapd_config: PathBuf::from(hotspot::CONFIG) }
     }
 
     /// The folder of the saved networks, which only root enters.
@@ -398,13 +421,69 @@ impl Wifi {
 
     /// The answer to a request line.
     pub fn answer(&self, line: &str, supplicant: &mut dyn Supplicant) -> String {
+        self.answer_with(line, supplicant, &mut hotspot::Daemon)
+    }
+
+    /// The answer to a request line, with this hostapd for the hotspot.
+    pub fn answer_with(&self, line: &str, supplicant: &mut dyn Supplicant, hostapd: &mut dyn Hostapd) -> String {
         let Some(request) = Request::parse(line) else { return "invalid".into() };
         let Some(name) = self.interface() else { return "unavailable".into() };
+        let folder = match self.folder() {
+            Ok(folder) => folder,
+            Err(error) => return format!("failed {error}"),
+        };
+        let mut hotspot = Hotspot::new(&folder);
+        hotspot.config = self.hostapd_config.clone();
+        match &request {
+            Request::Hotspot => return hotspot.status(hostapd, &name),
+            Request::HotspotStart(settings) => {
+                if !self.enabled() {
+                    return "failed Wi-Fi is off".into();
+                }
+                // The interface is the hotspot's while it runs.
+                if let Err(error) = self.detach(supplicant, &name) {
+                    return format!("failed {error}");
+                }
+                return match hotspot.start(hostapd, &name, settings, Hotspot::start_timeout()) {
+                    Ok(()) => "ok".into(),
+                    Err(why) => {
+                        let _ = self.attach(supplicant, &name);
+                        why
+                    }
+                };
+            }
+            Request::HotspotStop => {
+                hotspot.stop(hostapd);
+                if self.enabled() {
+                    if let Err(error) = self.attach(supplicant, &name) {
+                        return format!("failed {error}");
+                    }
+                }
+                return "ok".into();
+            }
+            _ => {}
+        }
         if let Request::Enable(enabled) = request {
+            if !enabled {
+                hotspot.stop(hostapd);
+            }
             let changed = self.set_enabled(enabled).and_then(|()| if enabled { self.attach(supplicant, &name) } else { self.detach(supplicant, &name) });
             return changed.map_or_else(|error| format!("failed {error}"), |()| "ok".into());
         }
         let enabled = self.enabled();
+        // While the hotspot runs, wpa_supplicant does not have the interface.
+        if enabled && hotspot.active(hostapd, &name) {
+            return match request {
+                Request::Status => {
+                    let mut out = String::from("wifi {\"enabled\":true,\"interface\":");
+                    json_string(&mut out, &name);
+                    out.push_str(",\"status\":\"\",\"signal\":\"\",\"hotspot\":true}");
+                    out
+                }
+                Request::Networks => "wifi {\"scan\":\"\",\"saved\":\"\"}".into(),
+                _ => "failed the hotspot uses Wi-Fi".into(),
+            };
+        }
         if enabled {
             if let Err(error) = self.attach(supplicant, &name) {
                 return format!("failed {error}");
@@ -418,7 +497,7 @@ impl Wifi {
             Self::done(supplicant, &name, command).map_or_else(|why| why, |()| "ok".into())
         };
         match request {
-            Request::Enable(_) => unreachable!(),
+            Request::Enable(_) | Request::Hotspot | Request::HotspotStart(_) | Request::HotspotStop => unreachable!(),
             Request::Status => {
                 let mut out = format!("wifi {{\"enabled\":{enabled},\"interface\":");
                 json_string(&mut out, &name);
@@ -536,7 +615,7 @@ mod tests {
         fs::create_dir_all(folder).unwrap();
         let dev = folder.join("dev");
         fs::write(&dev, "Inter-|   Receive\n face |bytes\n    lo:  10 1\n  eth0:  10 1\n wlan0:  10 1\n").unwrap();
-        Wifi { settings: Some(folder.join("system")), proc_net_dev: dev }
+        Wifi { settings: Some(folder.join("system")), proc_net_dev: dev, hostapd_config: folder.join("run").join("hostapd.conf") }
     }
 
     fn folder(name: &str) -> PathBuf {
@@ -695,6 +774,48 @@ mod tests {
         assert_eq!(wifi.answer("wifi enable on", &mut fake), "ok");
         assert_eq!(fake.attached, ["wlan0"]);
         assert!(!folder.join("system").join(FOLDER).join(DISABLED_MARK).exists());
+        let _ = fs::remove_dir_all(folder);
+    }
+
+    /// A hostapd that runs whatever it is given.
+    #[derive(Default)]
+    struct FakeHostapd {
+        running: bool,
+    }
+
+    impl Hostapd for FakeHostapd {
+        fn start(&mut self, _: &Path) -> io::Result<()> {
+            self.running = true;
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.running = false;
+        }
+        fn status(&mut self, _: &str) -> Option<String> {
+            self.running.then(|| "state=ENABLED\n".into())
+        }
+        fn stations(&mut self, _: &str) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn the_hotspot_takes_the_interface_and_gives_it_back() {
+        assert_eq!(Request::parse("wifi hotspot-start 6e6574 70617373776f7264 a").map(|request| matches!(request, Request::HotspotStart(_))), Some(true));
+        for bad in ["wifi hotspot-start 6e6574 7368", "wifi hotspot-start 6e6574 70617373776f7264 n", "wifi hotspot now", "wifi hotspot-start 6e6574 70617373776f72640a"] {
+            assert_eq!(Request::parse(bad), None, "{bad:?}");
+        }
+        let folder = folder("hotspot");
+        let wifi = wifi(&folder);
+        let mut fake = Fake { attached: vec!["wlan0".into()], ..Fake::default() };
+        let mut hostapd = FakeHostapd::default();
+        assert_eq!(wifi.answer_with("wifi hotspot-start 6e6574 70617373776f7264", &mut fake, &mut hostapd), "ok");
+        assert!(fake.attached.is_empty());
+        assert!(wifi.answer_with("wifi status", &mut fake, &mut hostapd).ends_with("\"hotspot\":true}"));
+        assert_eq!(wifi.answer_with("wifi scan", &mut fake, &mut hostapd), "failed the hotspot uses Wi-Fi");
+        assert!(wifi.answer_with("wifi hotspot", &mut fake, &mut hostapd).starts_with("wifi {\"active\":true,\"interface\":\"wlan0\",\"ssid\":\"6e6574\""));
+        assert_eq!(wifi.answer_with("wifi hotspot-stop", &mut fake, &mut hostapd), "ok");
+        assert_eq!(fake.attached, ["wlan0"]);
         let _ = fs::remove_dir_all(folder);
     }
 

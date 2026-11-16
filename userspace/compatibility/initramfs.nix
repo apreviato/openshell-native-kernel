@@ -124,6 +124,10 @@ let
           in
           {
             supplicant = pkgs.wpa_supplicant;
+            # The hotspot (userspace/shell/src/hotspot.rs): hostapd runs the
+            # Wi-Fi interface as an access point; the kernel gives it its
+            # address, a DHCP server and the shared connection.
+            hostapd = pkgs.hostapd;
             # Bluetooth: BlueZ's daemon on the system bus (installed-session.sh
             # starts it) and bluetoothctl, which hostd runs for Settings ▸
             # Bluetooth, as on Live; the kernel serves the controllers.
@@ -722,6 +726,9 @@ let
       # is /usr/lib).
       for program in wpa_supplicant wpa_cli; do
         ln -s ${graphics.wireless.supplicant}/bin/$program "$out/opt/openshell-compat/bin/"
+      done
+      for program in hostapd hostapd_cli; do
+        ln -s ${graphics.wireless.hostapd}/bin/$program "$out/opt/openshell-compat/bin/"
       done
       chmod u+w "$out/usr/lib"
       ln -sfn ${graphics.wireless.firmware}/lib/firmware "$out/usr/lib/firmware"
