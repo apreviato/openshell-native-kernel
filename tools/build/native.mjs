@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -93,6 +94,25 @@ async function startContainer(container) {
   }
 }
 
+// The root certificates Windows trusts, as PEM, for a build container behind
+// an antivirus or proxy that inspects HTTPS (Norton's Web/Mail Shield, a
+// company proxy): it re-signs every site with its own root, which Windows
+// trusts and the builder image does not. run.sh takes from them only the
+// root that signs what it sees, and only when its own bundle fails.
+// Elsewhere null: a Linux or macOS host's roots are the image's.
+function hostRoots() {
+  if (process.platform !== "win32") return null;
+  const script = "Get-ChildItem Cert:\\LocalMachine\\Root, Cert:\\CurrentUser\\Root | ForEach-Object { "
+    + "'-----BEGIN CERTIFICATE-----'; [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks'); '-----END CERTIFICATE-----' }";
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, windowsHide: true });
+  if (result.status !== 0 || !result.stdout?.includes("BEGIN CERTIFICATE")) return null;
+  const folder = mkdtempSync(join(tmpdir(), "openshell-native-roots-"));
+  const file = join(folder, "host-roots.pem");
+  writeFileSync(file, result.stdout.replace(/\r\n/g, "\n"));
+  return { file, folder };
+}
+
 // Reads the identity of an OpenShell Desktop bundle and checks that it has the
 // files that the Native session starts.
 function readBundle(path) {
@@ -144,6 +164,14 @@ async function run(action, bundlePath) {
       lock.repository, lock.tag, lock.commit, lock.rust, String(bundle?.version ?? ""),
     ]);
     docker(["cp", join(root, "tools", "qemu", "run.sh"), `${container}:/tmp/openshell-native-run.sh`]);
+    const roots = hostRoots();
+    if (roots) {
+      try {
+        docker(["cp", roots.file, `${container}:/tmp/openshell-native-host-roots.pem`]);
+      } finally {
+        rmSync(roots.folder, { recursive: true, force: true });
+      }
+    }
     docker(["cp", join(root, "userspace", "compatibility"), `${container}:/tmp/openshell-native-compat`]);
     docker(["cp", join(root, "distro", "ab"), `${container}:/tmp/openshell-native-ab`]);
     docker(["cp", join(root, "distro", "image"), `${container}:/tmp/openshell-native-image`]);

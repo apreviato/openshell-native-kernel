@@ -13,6 +13,50 @@ artifacts=/tmp/openshell-native-out
 mkdir -p "$work" "$artifacts"
 cd "$work"
 
+# Behind an antivirus or proxy that inspects HTTPS (Norton's Web/Mail Shield, a
+# company proxy) every site comes signed by its own root, which the host trusts
+# and this image does not. native.mjs copies in the host's roots (on Windows);
+# the one that signs what github.com shows here, with any intermediates up to
+# it, joins the image's bundle, which git, curl, cargo and Nix read. Where the
+# image's own bundle verifies, nothing changes.
+host_roots=/tmp/openshell-native-host-roots.pem
+https_verifies() { curl -sS --max-time 30 -o /dev/null https://github.com 2> /dev/null; }
+if [[ -s $host_roots ]] && ! https_verifies; then
+    roots_dir=$(mktemp -d)
+    awk -v dir="$roots_dir" '
+        /-----BEGIN CERTIFICATE-----/ { count++; file = sprintf("%s/%04d.pem", dir, count) }
+        file { print > file }
+        /-----END CERTIFICATE-----/ { close(file); file = "" }' "$host_roots"
+    name_of() { openssl x509 -in "$1" -noout "-$2" -nameopt RFC2253 2> /dev/null | sed "s/^$2= *//"; }
+    signer=$(echo | timeout 30 openssl s_client -connect github.com:443 -servername github.com 2> /dev/null \
+        | openssl x509 -noout -issuer -nameopt RFC2253 2> /dev/null | sed 's/^issuer= *//') || signer=
+    issuer=$signer
+    added=0
+    for _ in 1 2 3 4; do
+        [[ -n $issuer ]] || break
+        next=
+        for pem in "$roots_dir"/*.pem; do
+            subject=$(name_of "$pem" subject) || continue
+            [[ $subject == "$issuer" ]] || continue
+            added=$((added + 1))
+            cp "$pem" "/usr/local/share/ca-certificates/openshell-host-$added.crt"
+            next=$(name_of "$pem" issuer) || next=
+            [[ $next != "$subject" ]] || next=
+            break
+        done
+        issuer=$next
+    done
+    rm -rf "$roots_dir"
+    if (( added > 0 )); then
+        update-ca-certificates > /dev/null 2>&1 || true
+        printf 'HTTPS here is re-signed by %s; its root is trusted as the host trusts it.\n' "$signer"
+    fi
+    if ! https_verifies; then
+        printf 'HTTPS to github.com does not verify (signed by %s), and no root the host trusts signs it.\n' "${signer:-an unknown issuer}" >&2
+        exit 1
+    fi
+fi
+
 git init --quiet source
 cd source
 timeout 10m git fetch --no-tags --depth=1 "$repository" "refs/tags/$tag"
