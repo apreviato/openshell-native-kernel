@@ -570,10 +570,10 @@ index 0000000..5d915ba
 +pub(crate) const RPWM_ADDR: u32 = 0x03d9;
 diff --git a/kernel/comps/rtw88/src/hw.rs b/kernel/comps/rtw88/src/hw.rs
 new file mode 100644
-index 0000000..5be8328
+index 0000000..4ce42c3
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/hw.rs
-@@ -0,0 +1,1674 @@
+@@ -0,0 +1,1796 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip brought up as Linux's rtw88 does it (`rtw_power_on`): MAC
@@ -589,12 +589,63 @@ index 0000000..5be8328
 +
 +use alloc::{format, string::String, vec::Vec};
 +
++use aster_wlan::{
++    ieee80211 as wifi,
++    radio::{Chandef, Width},
++};
++
 +use crate::{
 +    chip::{Chip, IntfPara, Ltecoex, PwrCmd, SipiRead},
 +    pci::{Pci, TxInfo},
 +    regs::*,
 +    tables,
 +};
++
++/// RF 0x18's width of the RTL8821C and RTL8822B (`RF18_BW_*`).
++pub(crate) const RF18_BW_40M: u32 = 1 << 11;
++pub(crate) const RF18_BW_80M: u32 = 1 << 10;
++/// The MAC's beacon interval of port 0, in TU (Realtek's `BCN_INTERVAL`,
++/// the "beacon space" of the 88xx MACs; rtw88 leaves its reset value).
++const REG_BCN_INTERVAL: u32 = 0x0554;
++
++/// A channel as the chips tune to it (`struct rtw_channel_params` and
++/// `rtw_update_channel`): the centre channel (what the chips' code is
++/// given), the primary one, the width, where the primary 20 MHz channel
++/// sits in it (`RTW_SC_*`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Tune {
++    pub(crate) center: u8,
++    pub(crate) primary: u8,
++    pub(crate) bw: u32,
++    pub(crate) pri_idx: u8,
++}
++
++impl Tune {
++    pub(crate) fn simple(channel: u8) -> Self {
++        Self { center: channel, primary: channel, bw: RTW_CHANNEL_WIDTH_20, pri_idx: RTW_SC_DONT_CARE as u8 }
++    }
++
++    /// `rtw_get_channel_params`: 40 and 80 MHz (wider spans run at 80).
++    pub(crate) fn of(chandef: &Chandef) -> Self {
++        let primary = wifi::channel_of(chandef.control).unwrap_or(1);
++        let (bw, center_freq) = match chandef.width {
++            Width::W40 => (RTW_CHANNEL_WIDTH_40, chandef.center),
++            Width::W80 | Width::W160 => (RTW_CHANNEL_WIDTH_80, chandef.center_80()),
++            _ => return Self::simple(primary),
++        };
++        let center = wifi::channel_of(center_freq).unwrap_or(primary);
++        let (control, center_freq) = (chandef.control as i32, center_freq as i32);
++        let pri_idx = match (bw == RTW_CHANNEL_WIDTH_40, control > center_freq, (control - center_freq).abs() == 10) {
++            (true, true, _) => RTW_SC_20_UPPER,
++            (true, false, _) => RTW_SC_20_LOWER,
++            (false, true, true) => RTW_SC_20_UPPER,
++            (false, true, false) => RTW_SC_20_UPMOST,
++            (false, false, true) => RTW_SC_20_LOWER,
++            (false, false, false) => RTW_SC_20_LOWEST,
++        };
++        Self { center, primary, bw, pri_idx: pri_idx as u8 }
++    }
++}
 +
 +/// The parts of the efuse the driver uses (`struct rtw_efuse`, from the
 +/// chip's `struct rtw88xx_efuse`).
@@ -1342,11 +1393,17 @@ index 0000000..5be8328
 +        if ok { Ok(()) } else { Err(String::from("the firmware's checksum is wrong")) }
 +    }
 +
-+    /// Linux's `rtw_fw_write_data_rsvd_page`.
++    /// Linux's `rtw_fw_write_data_rsvd_page` (the 8051 CPU's chips flag
++    /// the beacon's page in `DWBCN0_CTRL`).
 +    pub(crate) fn write_rsvd_page(&mut self, page: u32, data: &[u8]) -> Result<(), String> {
++        let legacy = self.spec.wcpu_8051;
 +        let c = &self.chip;
 +        let backup_bcn = c.r8(REG_BCN_CTRL);
-+        c.w16(REG_FIFOPAGE_CTRL_2, ((page & BIT_MASK_BCN_HEAD_1_V1) | BIT_BCN_VALID_V1) as u16);
++        if legacy {
++            c.set32(REG_DWBCN0_CTRL, BIT_BCN_VALID);
++        } else {
++            c.w16(REG_FIFOPAGE_CTRL_2, ((page & BIT_MASK_BCN_HEAD_1_V1) | BIT_BCN_VALID_V1) as u16);
++        }
 +        let backup_cr = c.r8(REG_CR + 1);
 +        c.w8(REG_CR + 1, backup_cr | (BIT_ENSWBCN >> 8) as u8);
 +        c.w8(REG_BCN_CTRL, (backup_bcn & !(BIT_EN_BCN_FUNCTION as u8)) | BIT_DIS_TSF_UDT as u8);
@@ -1368,7 +1425,8 @@ index 0000000..5be8328
 +            ..TxInfo::default()
 +        };
 +        let mut result = self.pci.write_rsvd_page(&self.chip, &info, data).map_err(|()| String::from("a reserved page did not fit"));
-+        if result.is_ok() && !self.chip.ready(REG_FIFOPAGE_CTRL_2, BIT_BCN_VALID_V1, 1) {
++        let (valid_at, valid) = if legacy { (REG_DWBCN0_CTRL, BIT_BCN_VALID) } else { (REG_FIFOPAGE_CTRL_2, BIT_BCN_VALID_V1) };
++        if result.is_ok() && !self.chip.ready(valid_at, valid, 1) {
 +            result = Err(String::from("the reserved page was not taken"));
 +        }
 +        let c = &self.chip;
@@ -1431,8 +1489,20 @@ index 0000000..5be8328
 +
 +    /// The access point's rates for the firmware's rate adaptation
 +    /// (`rtw_fw_send_ra_info`).
-+    pub(crate) fn ra_info(&mut self, mac_id: u8, rate_id: u8, mask: u32, init_level: u8, sgi: bool, ldpc: bool, reset: bool) {
-+        let word0 = H2C_CMD_RA_INFO | ((mac_id as u32) << 8) | ((rate_id as u32 & 0x1f) << 16) | ((init_level as u32 & 3) << 21) | ((sgi as u32) << 23) | ((ldpc as u32) << 26) | ((!reset as u32) << 27) | (1 << 30);
++    /// `rtw_fw_send_ra_info`: the station's rate set, its width
++    /// (`RTW_CHANNEL_WIDTH_*`) and whether it runs VHT.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) fn ra_info(&mut self, mac_id: u8, rate_id: u8, mask: u32, init_level: u8, sgi: bool, bw: u32, ldpc: bool, vht: bool, reset: bool) {
++        let word0 = H2C_CMD_RA_INFO
++            | ((mac_id as u32) << 8)
++            | ((rate_id as u32 & 0x1f) << 16)
++            | ((init_level as u32 & 3) << 21)
++            | ((sgi as u32) << 23)
++            | ((bw & 3) << 24)
++            | ((ldpc as u32) << 26)
++            | ((!reset as u32) << 27)
++            | ((vht as u32) << 28)
++            | (1 << 30);
 +        let mut command = [0u8; 8];
 +        command[0..4].copy_from_slice(&word0.to_le_bytes());
 +        command[4..8].copy_from_slice(&mask.to_le_bytes());
@@ -1781,32 +1851,53 @@ index 0000000..5be8328
 +
 +    // ---- The channel. ----
 +
-+    /// Linux's `rtw_set_channel` at 20 MHz: the chip's `set_channel`, the
-+    /// coexistence's band, the TX power.
++    /// A channel at 20 MHz.
 +    pub(crate) fn set_channel(&mut self, channel: u8, scanning: bool) {
-+        self.channel = channel;
++        self.set_tune(Tune::simple(channel), scanning);
++    }
++
++    /// Linux's `rtw_set_channel`: the chip's `set_channel` on the centre
++    /// channel at the width, the coexistence's band, the TX power.
++    pub(crate) fn set_tune(&mut self, tune: Tune, scanning: bool) {
++        // The RTL8723D has 40 MHz at most, the others 80.
++        let tune = if self.model == Model::Rtl8723d && tune.bw == RTW_CHANNEL_WIDTH_80 { Tune::simple(tune.primary) } else { tune };
++        self.channel = tune.center;
 +        match self.model {
-+            Model::Rtl8821c => self.set_channel_8821c(channel),
-+            Model::Rtl8822b => self.set_channel_8822b(channel),
-+            Model::Rtl8822c => self.set_channel_8822c(channel),
-+            Model::Rtl8723d => self.set_channel_8723d(channel),
++            Model::Rtl8821c => self.set_channel_8821c(tune),
++            Model::Rtl8822b => self.set_channel_8822b(tune),
++            Model::Rtl8822c => self.set_channel_8822c(tune),
++            Model::Rtl8723d => self.set_channel_8723d(tune),
 +        }
-+        if channel > 14 {
++        if tune.center > 14 {
 +            self.coex_band_5g();
 +        } else {
 +            self.coex_band_2g();
 +        }
-+        self.set_tx_power(channel);
++        self.set_tx_power(tune.center);
 +        if !scanning {
 +            self.need_rfk = true;
 +        }
 +    }
 +
-+    /// `rtw_set_channel_mac` at 20 MHz.
-+    pub(crate) fn set_channel_mac(&self, channel: u8) {
++    /// `rtw_set_channel_mac`: the TX sub-channels, the MAC's width.
++    pub(crate) fn set_channel_mac(&self, tune: Tune) {
 +        let c = &self.chip;
-+        c.w8(REG_DATA_SC, 0);
-+        c.clr32(REG_WMAC_TRXPTCL_CTL, BIT_RFMOD);
++        let txsc20 = tune.pri_idx as u32;
++        let txsc40 = if tune.bw == RTW_CHANNEL_WIDTH_80 {
++            if txsc20 == RTW_SC_20_UPPER || txsc20 == RTW_SC_20_UPMOST { RTW_SC_40_UPPER } else { RTW_SC_40_LOWER }
++        } else {
++            0
++        };
++        // `BIT_TXSC_20M` and `BIT_TXSC_40M`.
++        c.w8(REG_DATA_SC, ((txsc20 & 0xf) | ((txsc40 & 0xf) << 4)) as u8);
++        let mut value = c.r32(REG_WMAC_TRXPTCL_CTL) & !BIT_RFMOD;
++        if tune.bw == RTW_CHANNEL_WIDTH_80 {
++            value |= BIT_RFMOD_80M;
++        } else if tune.bw == RTW_CHANNEL_WIDTH_40 {
++            value |= BIT_RFMOD_40M;
++        }
++        c.w32(REG_WMAC_TRXPTCL_CTL, value);
++        let channel = tune.center;
 +        // The 8051 CPU's chips keep their MAC clock.
 +        if self.spec.wcpu_8051 {
 +            return;
@@ -2151,6 +2242,37 @@ index 0000000..5be8328
 +        self.chip.w8_mask(0x0550, 0xff, BIT_EN_BCN_FUNCTION);
 +    }
 +
++    /// Port 0 as an access point's (`rtw_ops_add_interface` for an AP):
++    /// its network type, beacons on with the TSF its own; or a station's
++    /// again. The beacon's interval and DTIM period with it.
++    pub(crate) fn port_ap(&self, ap: bool, beacon_interval: u16, dtim_period: u8) {
++        let c = &self.chip;
++        if ap {
++            c.w32_mask(0x0100, 0x30000, RTW_NET_AP_MODE);
++            c.w8_mask(0x0550, 0xff, BIT_EN_BCN_FUNCTION | BIT_DIS_TSF_UDT);
++            // The port's beacon space (the MAC's beacon interval register,
++            // 100 TU after reset).
++            c.w32_mask(REG_BCN_INTERVAL, 0xffff, beacon_interval.max(1) as u32);
++            c.w8(REG_DTIM_COUNTER_ROOT, dtim_period.max(1) - 1);
++            c.set32(REG_TCR, BIT_TCR_UPDATE_HGQMD);
++        } else {
++            c.clr32(REG_FWHW_TXQ_CTRL, BIT_EN_BCNQ_DL);
++            c.clr32(REG_TCR, BIT_TCR_UPDATE_HGQMD);
++            c.w32_mask(0x0100, 0x30000, RTW_NET_NO_LINK);
++            c.w8_mask(0x0550, 0xff, BIT_EN_BCN_FUNCTION);
++        }
++    }
++
++    /// The access point's beacon as the first reserved page, the hardware
++    /// sending it from there at each TBTT (`rtw_fw_download_rsvd_page`,
++    /// `BSS_CHANGED_BEACON_ENABLED`).
++    pub(crate) fn beacon(&mut self, frame: &[u8]) -> Result<(), String> {
++        let page = self.rsvd_boundary;
++        self.write_rsvd_page(page, frame)?;
++        self.chip.set32(REG_FWHW_TXQ_CTRL, BIT_EN_BCNQ_DL);
++        Ok(())
++    }
++
 +    pub(crate) fn set_rcr(&mut self, scanning: bool) {
 +        if scanning {
 +            self.rcr &= !(BIT_CBSSID_BCN | BIT_CBSSID_DATA);
@@ -2250,10 +2372,10 @@ index 0000000..5be8328
 +}
 diff --git a/kernel/comps/rtw88/src/lib.rs b/kernel/comps/rtw88/src/lib.rs
 new file mode 100644
-index 0000000..cd49308
+index 0000000..c9d7ed1
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/lib.rs
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,257 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Realtek Wi-Fi of Linux's rtw88 family on PCIe, as Linux's `rtw88_pci`
@@ -2310,7 +2432,10 @@ index 0000000..cd49308
 +};
 +pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms, udelay as delay_us};
 +use aster_pci::common_device::PciCommonDevice;
-+use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
++use aster_wlan::{
++    ieee80211::Address,
++    radio::{self, ApConfig, Association, BeaconTemplate, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
 +
@@ -2377,6 +2502,7 @@ index 0000000..cd49308
 +    fn stop(&self) {
 +        let mut state = self.card.state.lock();
 +        state.abort_scan();
++        state.stop_ap();
 +        state.leave();
 +    }
 +
@@ -2422,6 +2548,29 @@ index 0000000..cd49308
 +    fn link_stats(&self) -> LinkStats {
 +        LinkStats { signal: self.card.state.lock().signal, tx_rate: None }
 +    }
++
++    fn start_ap(&self, config: &ApConfig) -> radio::Result<()> {
++        self.card.state.lock().start_ap(config)
++    }
++
++    fn set_beacon(&self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        self.card.state.lock().set_beacon(beacon)
++    }
++
++    fn stop_ap(&self) {
++        self.card.state.lock().stop_ap();
++    }
++
++    fn add_station(&self, station: &StationEntry) -> radio::Result<()> {
++        self.card.state.lock().add_station(station)
++    }
++
++    fn remove_station(&self, address: &Address) {
++        self.card.state.lock().remove_station(address);
++    }
++
++    // The keys decide what the chip lets through (as `authorize` above).
++    fn authorize_station(&self, _address: &Address, _authorized: bool) {}
 +}
 +
 +/// A card's task: the chip up, the station registered, then what the chip
@@ -2486,10 +2635,10 @@ index 0000000..cd49308
 +}
 diff --git a/kernel/comps/rtw88/src/pci.rs b/kernel/comps/rtw88/src/pci.rs
 new file mode 100644
-index 0000000..115473c
+index 0000000..391d46b
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/pci.rs
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,332 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The PCIe side as Linux's rtw88 `pci.c` runs it: a ring of buffer
@@ -2579,6 +2728,10 @@ index 0000000..115473c
 +    pub(crate) en_hwseq: bool,
 +    pub(crate) seq: u16,
 +    pub(crate) sn: u16,
++    /// The station's width (`RTW_CHANNEL_WIDTH_*`), its LDPC and STBC.
++    pub(crate) bw: u8,
++    pub(crate) ldpc: bool,
++    pub(crate) stbc: u8,
 +}
 +
 +impl TxInfo {
@@ -2594,6 +2747,8 @@ index 0000000..115473c
 +        if fb_limit {
 +            w[4] |= 0x1f << 8;
 +        }
++        // `RTW_TX_DESC_W5_DATA_BW`, `_LDPC`, `_STBC`.
++        w[5] = ((self.bw as u32 & 3) << 5) | ((self.ldpc as u32) << 7) | ((self.stbc as u32 & 3) << 8);
 +        w[6] = self.sn as u32 & 0xfff;
 +        w[8] = (self.en_hwseq as u32) << 15;
 +        w[9] = (self.seq as u32 & 0xfff) << 12;
@@ -2818,10 +2973,10 @@ index 0000000..115473c
 +}
 diff --git a/kernel/comps/rtw88/src/regs.rs b/kernel/comps/rtw88/src/regs.rs
 new file mode 100644
-index 0000000..a7e530f
+index 0000000..3bf8219
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/regs.rs
-@@ -0,0 +1,854 @@
+@@ -0,0 +1,890 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +// Copyright(c) 2018-2019 Realtek Corporation
 +
@@ -2861,6 +3016,7 @@ index 0000000..a7e530f
 +pub(crate) const BIT_BA_PARSER_EN: u32 = 0x20;
 +pub(crate) const BIT_BB_CCK_CHECK_EN: u32 = 0x40000;
 +pub(crate) const BIT_BCN_QUEUE: u32 = 0x8;
++pub(crate) const BIT_BCN_VALID: u32 = 0x10000;
 +pub(crate) const BIT_BCN_VALID_V1: u32 = 0x8000;
 +pub(crate) const BIT_BOOT_FSPI_EN: u32 = 0x100000;
 +pub(crate) const BIT_BTCCA_CTRL: u32 = 0x3;
@@ -2873,6 +3029,7 @@ index 0000000..a7e530f
 +pub(crate) const BIT_CBSSID_DATA: u32 = 0x40;
 +pub(crate) const BIT_CCKEN: u32 = 0x1000000;
 +pub(crate) const BIT_CCK_OFDM_BLK_EN: u32 = 0x3;
++pub(crate) const BIT_CCK_SIDE_BAND: u32 = 0x10;
 +pub(crate) const BIT_CHECK_CCK_EN: u32 = 0x80;
 +pub(crate) const BIT_CHECK_SUM_OK: u32 = 0x50;
 +pub(crate) const BIT_CK320M_AFE_EN: u32 = 0x10;
@@ -3014,6 +3171,8 @@ index 0000000..a7e530f
 +pub(crate) const BIT_RCR_ADF: u32 = 0x800;
 +pub(crate) const BIT_RFE_BUF_EN: u32 = 0x8;
 +pub(crate) const BIT_RFMOD: u32 = 0x180;
++pub(crate) const BIT_RFMOD_40M: u32 = 0x80;
++pub(crate) const BIT_RFMOD_80M: u32 = 0x100;
 +pub(crate) const BIT_RF_EN: u32 = 0x1;
 +pub(crate) const BIT_RF_RSTB: u32 = 0x2;
 +pub(crate) const BIT_RF_SDM_RSTB: u32 = 0x4;
@@ -3054,6 +3213,7 @@ index 0000000..a7e530f
 +pub(crate) const BIT_SHIFT_TXDMA_VOQ_MAP: u32 = 0x4;
 +pub(crate) const BIT_SHIFT_WMAC_TXMU_ACKPOLICY: u32 = 0x4;
 +pub(crate) const BIT_SIFS_BK_EN: u32 = 0x1000;
++pub(crate) const BIT_TCR_UPDATE_HGQMD: u32 = 0x10;
 +pub(crate) const BIT_TSFT_SEL_TIMER0: u32 = 0x70;
 +pub(crate) const BIT_TXDMA_EN: u32 = 0x4;
 +pub(crate) const BIT_USB_SUS_DIS: u32 = 0x100;
@@ -3098,6 +3258,7 @@ index 0000000..a7e530f
 +pub(crate) const DESC_RATE54M: u32 = 0xb;
 +pub(crate) const DESC_RATE6M: u32 = 0x4;
 +pub(crate) const DESC_RATEMCS7: u32 = 0x13;
++pub(crate) const DESC_RATEVHT1SS_MCS9: u32 = 0x35;
 +pub(crate) const DIS_3WIRE: u32 = 0xccf000c0;
 +pub(crate) const DIS_DPD_MASK: u32 = 0x3ff;
 +pub(crate) const DIS_DPD_RATEALL: u32 = 0x3ff;
@@ -3204,6 +3365,7 @@ index 0000000..a7e530f
 +pub(crate) const REG_ACKTO: u32 = 0x640;
 +pub(crate) const REG_ACKTO_CCK: u32 = 0x639;
 +pub(crate) const REG_ADC160: u32 = 0x8c4;
++pub(crate) const REG_ADC40: u32 = 0x8c8;
 +pub(crate) const REG_ADCCLK: u32 = 0x8ac;
 +pub(crate) const REG_ADCINI: u32 = 0xa04;
 +pub(crate) const REG_AFE_CTRL1: u32 = 0x24;
@@ -3264,6 +3426,8 @@ index 0000000..a7e530f
 +pub(crate) const REG_CCANRX: u32 = 0x1a2c;
 +pub(crate) const REG_CCASEL: u32 = 0x82c;
 +pub(crate) const REG_CCK0_FAREPORT: u32 = 0xa2c;
++pub(crate) const REG_CCK0_SYS: u32 = 0xa00;
++pub(crate) const REG_CCKSB: u32 = 0x1a00;
 +pub(crate) const REG_CCKTXONLY: u32 = 0x1a80;
 +pub(crate) const REG_CCK_ANT_SEL_11N: u32 = 0xa04;
 +pub(crate) const REG_CCK_CHECK: u32 = 0x454;
@@ -3289,6 +3453,7 @@ index 0000000..a7e530f
 +pub(crate) const REG_DMEM_CTRL: u32 = 0x1080;
 +pub(crate) const REG_DPD_CTL1_S0: u32 = 0x1b08;
 +pub(crate) const REG_DRVERLYINT: u32 = 0x558;
++pub(crate) const REG_DTIM_COUNTER_ROOT: u32 = 0x5a8;
 +pub(crate) const REG_DUMMY_PAGE4_V1: u32 = 0x4fc;
 +pub(crate) const REG_DWBCN0_CTRL: u32 = 0x208;
 +pub(crate) const REG_EDCA_BE_PARAM: u32 = 0x508;
@@ -3346,6 +3511,7 @@ index 0000000..a7e530f
 +pub(crate) const REG_IQK_RES_RY: u32 = 0xeac;
 +pub(crate) const REG_IQK_RES_TX: u32 = 0xe94;
 +pub(crate) const REG_IQK_RES_TY: u32 = 0xe9c;
++pub(crate) const REG_L1PKWT: u32 = 0x840;
 +pub(crate) const REG_L1WT: u32 = 0x83c;
 +pub(crate) const REG_LDO_EFUSE_CTRL: u32 = 0x34;
 +pub(crate) const REG_LDO_SWR_CTRL: u32 = 0x7c;
@@ -3442,6 +3608,7 @@ index 0000000..a7e530f
 +pub(crate) const REG_RXPSEL: u32 = 0x808;
 +pub(crate) const REG_RXPSF_CTRL: u32 = 0x1610;
 +pub(crate) const REG_RXPSF_TYPE_CTRL: u32 = 0x1614;
++pub(crate) const REG_RXSB: u32 = 0xa00;
 +pub(crate) const REG_RXTSF_OFFSET_CCK: u32 = 0x55e;
 +pub(crate) const REG_RX_DRVINFO_SZ: u32 = 0x60f;
 +pub(crate) const REG_RX_IQK_TONE_B: u32 = 0xe54;
@@ -3516,12 +3683,15 @@ index 0000000..a7e530f
 +pub(crate) const RF18_BAND_5G: u32 = 0x10100;
 +pub(crate) const RF18_BAND_MASK: u32 = 0x10300;
 +pub(crate) const RF18_BW_20M: u32 = 0xc00;
++pub(crate) const RF18_BW_40M: u32 = 0x800;
++pub(crate) const RF18_BW_80M: u32 = 0x400;
 +pub(crate) const RF18_BW_MASK: u32 = 0xc00;
 +pub(crate) const RF18_CHANNEL_MASK: u32 = 0xff;
 +pub(crate) const RF18_RFSI_GE: u32 = 0x20000;
 +pub(crate) const RF18_RFSI_GT: u32 = 0x40000;
 +pub(crate) const RF18_RFSI_MASK: u32 = 0x60000;
 +pub(crate) const RFCFGCH_BW_20M: u32 = 0xc00;
++pub(crate) const RFCFGCH_BW_40M: u32 = 0x400;
 +pub(crate) const RFCFGCH_BW_MASK: u32 = 0xc00;
 +pub(crate) const RFCFGCH_CHANNEL_MASK: u32 = 0xff;
 +pub(crate) const RFREG_MASK: u32 = 0xfffff;
@@ -3594,11 +3764,14 @@ index 0000000..a7e530f
 +pub(crate) const RTK_PCI_TXBD_RWPTR_CLR: u32 = 0x39c;
 +pub(crate) const RTW_CAM_AES: u32 = 0x4;
 +pub(crate) const RTW_CHANNEL_WIDTH_20: u32 = 0x0;
++pub(crate) const RTW_CHANNEL_WIDTH_40: u32 = 0x1;
++pub(crate) const RTW_CHANNEL_WIDTH_80: u32 = 0x2;
 +pub(crate) const RTW_DMA_MAPPING_EXTRA: u32 = 0x0;
 +pub(crate) const RTW_DMA_MAPPING_HIGH: u32 = 0x3;
 +pub(crate) const RTW_DMA_MAPPING_LOW: u32 = 0x1;
 +pub(crate) const RTW_DMA_MAPPING_NORMAL: u32 = 0x2;
 +pub(crate) const RTW_IP_SEL_PHY: u32 = 0x0;
++pub(crate) const RTW_NET_AP_MODE: u32 = 0x3;
 +pub(crate) const RTW_NET_MGD_LINKED: u32 = 0x2;
 +pub(crate) const RTW_NET_NO_LINK: u32 = 0x0;
 +pub(crate) const RTW_PCI_MDIO_PG_OFFS_G1: u32 = 0x0;
@@ -3613,13 +3786,26 @@ index 0000000..a7e530f
 +pub(crate) const RTW_PWR_DELAY_US: u32 = 0x0;
 +pub(crate) const RTW_PWR_INTF_PCI_MSK: u32 = 0x4;
 +pub(crate) const RTW_PWR_POLLING_CNT: u32 = 0x4e20;
++pub(crate) const RTW_RATEID_ARFR0_AC_2SS: u32 = 0x9;
++pub(crate) const RTW_RATEID_ARFR1_AC_1SS: u32 = 0xa;
++pub(crate) const RTW_RATEID_ARFR2_AC_2G_1SS: u32 = 0xb;
++pub(crate) const RTW_RATEID_ARFR3_AC_2G_2SS: u32 = 0xc;
 +pub(crate) const RTW_RATEID_BG: u32 = 0x6;
 +pub(crate) const RTW_RATEID_BGN_20M_1SS: u32 = 0x3;
 +pub(crate) const RTW_RATEID_BGN_20M_2SS: u32 = 0x2;
++pub(crate) const RTW_RATEID_BGN_40M_1SS: u32 = 0x1;
++pub(crate) const RTW_RATEID_BGN_40M_2SS: u32 = 0x0;
 +pub(crate) const RTW_RATEID_B_20M: u32 = 0x8;
 +pub(crate) const RTW_RATEID_G: u32 = 0x7;
 +pub(crate) const RTW_RATEID_GN_N1SS: u32 = 0x5;
 +pub(crate) const RTW_RATEID_GN_N2SS: u32 = 0x4;
++pub(crate) const RTW_SC_20_LOWER: u32 = 0x2;
++pub(crate) const RTW_SC_20_LOWEST: u32 = 0x4;
++pub(crate) const RTW_SC_20_UPMOST: u32 = 0x3;
++pub(crate) const RTW_SC_20_UPPER: u32 = 0x1;
++pub(crate) const RTW_SC_40_LOWER: u32 = 0xa;
++pub(crate) const RTW_SC_40_UPPER: u32 = 0x9;
++pub(crate) const RTW_SC_DONT_CARE: u32 = 0x0;
 +pub(crate) const RTW_SEC_CAM_ENTRY_SHIFT: u32 = 0x3;
 +pub(crate) const RTW_SEC_CMD_POLLING: u32 = 0x80000000;
 +pub(crate) const RTW_SEC_CMD_REG: u32 = 0x670;
@@ -3634,6 +3820,7 @@ index 0000000..a7e530f
 +pub(crate) const RTW_SEC_TX_DEC_EN: u32 = 0x4;
 +pub(crate) const RTW_SEC_TX_UNI_USE_DK: u32 = 0x1;
 +pub(crate) const RTW_SEC_WRITE_REG: u32 = 0x674;
++pub(crate) const RTW_TX_DESC_W5_DATA_BW: u32 = 0x60;
 +pub(crate) const RTW_WCPU_8051: u32 = 0x1;
 +pub(crate) const RX_TAG_MAX: u32 = 0x2000;
 +pub(crate) const SPS_SEL: u32 = 0x83;
@@ -3647,6 +3834,10 @@ index 0000000..a7e530f
 +pub(crate) const TX_DESC_QSEL_MGMT: u32 = 0x12;
 +pub(crate) const TX_PAGE_SIZE_SHIFT: u32 = 0x7;
 +pub(crate) const VAL_FW_TRIGGER: u32 = 0x1;
++pub(crate) const WIRELESS_CCK: u32 = 0x1;
++pub(crate) const WIRELESS_HT: u32 = 0x4;
++pub(crate) const WIRELESS_OFDM: u32 = 0x2;
++pub(crate) const WIRELESS_VHT: u32 = 0x8;
 +pub(crate) const WLAN_AMPDU_MAX_TIME: u32 = 0x70;
 +pub(crate) const WLAN_BAR_RETRY_LIMIT: u32 = 0x1;
 +pub(crate) const WLAN_BCN_DMA_TIME: u32 = 0x2;
@@ -3678,10 +3869,10 @@ index 0000000..a7e530f
 +pub(crate) const WLG_LNA: u32 = 0x7532;
 diff --git a/kernel/comps/rtw88/src/rtw8723d.rs b/kernel/comps/rtw88/src/rtw8723d.rs
 new file mode 100644
-index 0000000..0f14f95
+index 0000000..ccc4504
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/rtw8723d.rs
-@@ -0,0 +1,818 @@
+@@ -0,0 +1,827 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! What is the RTL8723D's own (Linux's `rtw8723d.c`, and `rtw8723x.c` it
@@ -3694,7 +3885,7 @@ index 0000000..0f14f95
 +//! antenna's selection for the BT coexistence.
 +
 +use crate::{
-+    hw::{Hw, RATE_SECTIONS, RfeTables},
++    hw::{Hw, RATE_SECTIONS, RfeTables, Tune},
 +    regs::*,
 +};
 +
@@ -4037,26 +4228,35 @@ index 0000000..0f14f95
 +
 +    // ---- The channel. ----
 +
-+    /// `rtw8723d_set_channel` at 20 MHz: the RF, the MAC, the BB.
-+    pub(crate) fn set_channel_8723d(&mut self, channel: u8) {
-+        // The channel on both RF paths, 20 MHz on path A's.
++    /// `rtw8723d_set_channel`: the RF, the MAC, the BB (20 or 40 MHz).
++    pub(crate) fn set_channel_8723d(&mut self, tune: Tune) {
++        let channel = tune.center;
++        let wide = tune.bw == RTW_CHANNEL_WIDTH_40;
++        // The channel on both RF paths, the width on path A's.
 +        let mut a = self.read_rf_path(0, RF_CFGCH, RFREG_MASK);
 +        let mut b = self.read_rf_path(1, RF_CFGCH, RFREG_MASK);
 +        a = (a & !RFCFGCH_CHANNEL_MASK) | (channel as u32 & RFCFGCH_CHANNEL_MASK);
 +        b = (b & !RFCFGCH_CHANNEL_MASK) | (channel as u32 & RFCFGCH_CHANNEL_MASK);
-+        a = (a & !RFCFGCH_BW_MASK) | RFCFGCH_BW_20M;
++        a = (a & !RFCFGCH_BW_MASK) | if wide { RFCFGCH_BW_40M } else { RFCFGCH_BW_20M };
 +        self.write_rf_path(0, RF_CFGCH, RFREG_MASK, a);
 +        self.write_rf_path(1, RF_CFGCH, RFREG_MASK, b);
 +        self.spur_cal_8723d(channel);
-+        self.set_channel_mac(channel);
++        self.set_channel_mac(tune);
 +        let c = &self.chip;
 +        for (register, value) in CCK_DFIR[if channel <= 13 { 0 } else { 1 }] {
 +            c.w32(register, value);
 +        }
-+        c.w32_mask(REG_FPGA0_RFMOD, BIT_MASK_RFMOD, 0x0);
-+        c.w32_mask(REG_FPGA1_RFMOD, BIT_MASK_RFMOD, 0x0);
-+        c.w32_mask(REG_BBRX_DFIR, BIT_RXBB_DFIR_EN, 1);
-+        c.w32_mask(REG_BBRX_DFIR, BIT_MASK_RXBB_DFIR, 0xa);
++        if wide {
++            c.w32_mask(REG_FPGA0_RFMOD, BIT_MASK_RFMOD, 0x1);
++            c.w32_mask(REG_FPGA1_RFMOD, BIT_MASK_RFMOD, 0x1);
++            c.w32_mask(REG_BBRX_DFIR, BIT_RXBB_DFIR_EN, 0);
++            c.w32_mask(REG_CCK0_SYS, BIT_CCK_SIDE_BAND, (tune.pri_idx as u32 == RTW_SC_20_UPPER) as u32);
++        } else {
++            c.w32_mask(REG_FPGA0_RFMOD, BIT_MASK_RFMOD, 0x0);
++            c.w32_mask(REG_FPGA1_RFMOD, BIT_MASK_RFMOD, 0x0);
++            c.w32_mask(REG_BBRX_DFIR, BIT_RXBB_DFIR_EN, 1);
++            c.w32_mask(REG_BBRX_DFIR, BIT_MASK_RXBB_DFIR, 0xa);
++        }
 +    }
 +
 +    /// `rtw8723d_spur_cal`: on channels 13 and 14, a notch where the PSD
@@ -4502,10 +4702,10 @@ index 0000000..0f14f95
 +}
 diff --git a/kernel/comps/rtw88/src/rtw8821c.rs b/kernel/comps/rtw88/src/rtw8821c.rs
 new file mode 100644
-index 0000000..89f9c1f
+index 0000000..90a3bb8
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/rtw8821c.rs
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,284 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! What is the RTL8821C's own (Linux's `rtw8821c.c`): its efuse fields, MAC
@@ -4513,7 +4713,7 @@ index 0000000..89f9c1f
 +//! swing, the RX DFIR) and the antenna it shares with Bluetooth.
 +
 +use crate::{
-+    hw::{Hw, Switch, SwitchCtrl},
++    hw::{Hw, RF18_BW_40M, RF18_BW_80M, Switch, SwitchCtrl, Tune},
 +    regs::*,
 +};
 +
@@ -4611,25 +4811,32 @@ index 0000000..89f9c1f
 +        self.chip.w32(0x1c94, 0xafff_afff);
 +    }
 +
-+    /// `rtw8821c_set_channel` at 20 MHz, with the BB swing of the band.
-+    pub(crate) fn set_channel_8821c(&mut self, channel: u8) {
-+        self.set_channel_bb_8821c(channel);
++    /// `rtw8821c_set_channel`, with the BB swing of the band.
++    pub(crate) fn set_channel_8821c(&mut self, tune: Tune) {
++        let channel = tune.center;
++        self.set_channel_bb_8821c(tune);
 +        // BB swing (`rtw8821c_set_channel_bb_swing`).
 +        let swing = if channel <= 14 { self.efuse.tx_bb_swing_2g } else { self.efuse.tx_bb_swing_5g };
 +        let swing = if swing > 9 { 0 } else { swing };
 +        self.chip.w32_mask(REG_TXSCALE_A, 0xffe0_0000, [0x200, 0x16a, 0x101, 0x0b6][(swing / 3) as usize]);
 +        self.pwrtrack_init();
-+        self.set_channel_mac(channel);
-+        self.set_channel_rf_8821c(channel);
-+        // RX DFIR for 20 MHz.
++        self.set_channel_mac(tune);
++        self.set_channel_rf_8821c(tune);
++        // `rtw8821c_set_channel_rxdfir`.
++        let (acbb0, rxfir, txdfir, chfir) = match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => (0x2, 0x2, 0x0, 0x0),
++            RTW_CHANNEL_WIDTH_80 => (0x2, 0x1, 0x0, 0x1),
++            _ => (0x2, 0x2, 0x1, 0x0),
++        };
 +        let c = &self.chip;
-+        c.w32_mask(REG_ACBB0, (1 << 29) | (1 << 28), 0x2);
-+        c.w32_mask(REG_ACBBRXFIR, (1 << 29) | (1 << 28), 0x2);
-+        c.w32_mask(REG_TXDFIR, 1 << 31, 0x1);
-+        c.w32_mask(REG_CHFIR, 1 << 31, 0x0);
++        c.w32_mask(REG_ACBB0, (1 << 29) | (1 << 28), acbb0);
++        c.w32_mask(REG_ACBBRXFIR, (1 << 29) | (1 << 28), rxfir);
++        c.w32_mask(REG_TXDFIR, 1 << 31, txdfir);
++        c.w32_mask(REG_CHFIR, 1 << 31, chfir);
 +    }
 +
-+    fn set_channel_bb_8821c(&self, channel: u8) {
++    fn set_channel_bb_8821c(&self, tune: Tune) {
++        let channel = tune.center;
 +        let c = &self.chip;
 +        if channel <= 14 {
 +            c.w32_mask(REG_RXPSEL, 1 << 28, 0x1);
@@ -4666,14 +4873,26 @@ index 0000000..89f9c1f
 +            };
 +            c.w32_mask(REG_CLKTRK, 0x1ffe_0000, track);
 +        }
-+        // 20 MHz.
-+        let value = (c.r32(REG_ADCCLK) & 0xffcf_fc00) | 0x1001_0000;
++        let pri = tune.pri_idx as u32 & 0xf;
++        let value = match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => {
++                if pri == RTW_SC_20_UPPER {
++                    c.set32(REG_RXSB, 1 << 4);
++                } else {
++                    c.clr32(REG_RXSB, 1 << 4);
++                }
++                (c.r32(REG_ADCCLK) & 0xff3f_f300) | 0x2002_0000 | (pri << 2) | RTW_CHANNEL_WIDTH_40
++            }
++            RTW_CHANNEL_WIDTH_80 => (c.r32(REG_ADCCLK) & 0xfcff_cf00) | 0x4004_0000 | (pri << 2) | RTW_CHANNEL_WIDTH_80,
++            _ => (c.r32(REG_ADCCLK) & 0xffcf_fc00) | 0x1001_0000,
++        };
 +        c.w32(REG_ADCCLK, value);
 +        c.w32_mask(REG_ADC160, 1 << 30, 0x1);
 +    }
 +
 +    /// `rtw8821c_set_channel_rf`.
-+    fn set_channel_rf_8821c(&self, channel: u8) {
++    fn set_channel_rf_8821c(&self, tune: Tune) {
++        let channel = tune.center;
 +        let mut reg18 = self.read_rf(0x18, RFREG_MASK);
 +        reg18 &= !(RF18_BAND_MASK | RF18_CHANNEL_MASK | RF18_RFSI_MASK | RF18_BW_MASK);
 +        reg18 |= if channel <= 14 { RF18_BAND_2G } else { RF18_BAND_5G };
@@ -4683,7 +4902,11 @@ index 0000000..89f9c1f
 +        } else if channel > 140 {
 +            reg18 |= RF18_RFSI_GT;
 +        }
-+        reg18 |= RF18_BW_20M;
++        reg18 |= match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => RF18_BW_40M,
++            RTW_CHANNEL_WIDTH_80 => RF18_BW_80M,
++            _ => RF18_BW_20M,
++        };
 +        if channel <= 14 {
 +            self.switch_rf_set(if self.efuse.rfe_btg { RfSet::Btg } else { RfSet::Wlg });
 +            self.write_rf(RF_LUTDBG, 1 << 6, 0x1);
@@ -4769,10 +4992,10 @@ index 0000000..89f9c1f
 +}
 diff --git a/kernel/comps/rtw88/src/rtw8822b.rs b/kernel/comps/rtw88/src/rtw8822b.rs
 new file mode 100644
-index 0000000..a8e62c1
+index 0000000..3d0b259
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/rtw8822b.rs
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,376 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! What is the RTL8822B's own (Linux's `rtw8822b.c`): two paths (both used
@@ -4781,7 +5004,7 @@ index 0000000..a8e62c1
 +//! and the coexistence's antenna switch and RFE type.
 +
 +use crate::{
-+    hw::{Hw, Switch, SwitchCtrl},
++    hw::{Hw, RF18_BW_40M, RF18_BW_80M, Switch, SwitchCtrl, Tune},
 +    regs::*,
 +};
 +
@@ -4923,22 +5146,29 @@ index 0000000..a8e62c1
 +        self.set_channel_rfe_8822b(channel);
 +    }
 +
-+    /// `rtw8822b_set_channel` at 20 MHz.
-+    pub(crate) fn set_channel_8822b(&mut self, channel: u8) {
-+        self.set_channel_bb_8822b(channel);
-+        self.set_channel_mac(channel);
-+        self.set_channel_rf_8822b(channel);
-+        // RX DFIR for 20 MHz.
++    /// `rtw8822b_set_channel`.
++    pub(crate) fn set_channel_8822b(&mut self, tune: Tune) {
++        let channel = tune.center;
++        self.set_channel_bb_8822b(tune);
++        self.set_channel_mac(tune);
++        self.set_channel_rf_8822b(tune);
++        // `rtw8822b_set_channel_rxdfir`.
++        let (acbb0, rxfir, txdfir) = match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => (0x1, 0x0, 0x0),
++            RTW_CHANNEL_WIDTH_80 => (0x2, 0x1, 0x0),
++            _ => (0x2, 0x2, 0x1),
++        };
 +        let c = &self.chip;
-+        c.w32_mask(REG_ACBB0, (1 << 29) | (1 << 28), 0x2);
-+        c.w32_mask(REG_ACBBRXFIR, (1 << 29) | (1 << 28), 0x2);
-+        self.w32s_mask(REG_TXDFIR, 1 << 31, 0x1);
++        c.w32_mask(REG_ACBB0, (1 << 29) | (1 << 28), acbb0);
++        c.w32_mask(REG_ACBBRXFIR, (1 << 29) | (1 << 28), rxfir);
++        self.w32s_mask(REG_TXDFIR, 1 << 31, txdfir);
 +        self.toggle_igi_8822b();
 +        self.set_channel_cca_8822b(channel);
 +        self.set_channel_rfe_8822b(channel);
 +    }
 +
-+    fn set_channel_bb_8822b(&self, channel: u8) {
++    fn set_channel_bb_8822b(&self, tune: Tune) {
++        let channel = tune.center;
 +        let c = &self.chip;
 +        if channel <= 14 {
 +            c.w32_mask(REG_RXPSEL, 1 << 28, 0x1);
@@ -4975,14 +5205,30 @@ index 0000000..a8e62c1
 +            c.w32_mask(REG_CLKTRK, 0x1ffe_0000, track);
 +            c.w32_mask(0xcbc, 0x300, 0x1);
 +        }
-+        // 20 MHz.
-+        let value = (c.r32(REG_ADCCLK) & 0xffcf_fc00) | RTW_CHANNEL_WIDTH_20;
++        let pri = tune.pri_idx as u32 & 0xf;
++        let value = match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => {
++                if pri == RTW_SC_20_UPPER {
++                    c.set32(REG_RXSB, 1 << 4);
++                } else {
++                    c.clr32(REG_RXSB, 1 << 4);
++                }
++                (c.r32(REG_ADCCLK) & 0xff3f_f300) | (pri << 2) | RTW_CHANNEL_WIDTH_40
++            }
++            RTW_CHANNEL_WIDTH_80 => (c.r32(REG_ADCCLK) & 0xfcef_cf00) | (pri << 2) | RTW_CHANNEL_WIDTH_80,
++            _ => (c.r32(REG_ADCCLK) & 0xffcf_fc00) | RTW_CHANNEL_WIDTH_20,
++        };
 +        c.w32(REG_ADCCLK, value);
 +        c.w32_mask(REG_ADC160, 1 << 30, 0x1);
++        if tune.bw == RTW_CHANNEL_WIDTH_80 && matches!(self.efuse.rfe_option, 2 | 3) {
++            c.w32_mask(REG_L1PKWT, 0x0000_f000, 0x6);
++            c.w32_mask(REG_ADC40, 1 << 10, 0x1);
++        }
 +    }
 +
 +    /// `rtw8822b_set_channel_rf`: RF 0x18 of both paths, the band's RF 0xbe.
-+    fn set_channel_rf_8822b(&self, channel: u8) {
++    fn set_channel_rf_8822b(&self, tune: Tune) {
++        let channel = tune.center;
 +        let mut reg18 = self.read_rf(0x18, RFREG_MASK);
 +        reg18 &= !(RF18_BAND_MASK | RF18_CHANNEL_MASK | RF18_RFSI_MASK | RF18_BW_MASK);
 +        reg18 |= if channel <= 14 { RF18_BAND_2G } else { RF18_BAND_5G };
@@ -4992,7 +5238,11 @@ index 0000000..a8e62c1
 +        } else if channel >= 80 {
 +            reg18 |= RF18_RFSI_GE_CH80;
 +        }
-+        reg18 |= RF18_BW_20M;
++        reg18 |= match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => RF18_BW_40M,
++            RTW_CHANNEL_WIDTH_80 => RF18_BW_80M,
++            _ => RF18_BW_20M,
++        };
 +        let index = |first: u8| ((channel - first) >> 1) as usize;
 +        let reg_be = match channel {
 +            ..=14 => 0,
@@ -5124,10 +5374,10 @@ index 0000000..a8e62c1
 +}
 diff --git a/kernel/comps/rtw88/src/rtw8822c.rs b/kernel/comps/rtw88/src/rtw8822c.rs
 new file mode 100644
-index 0000000..6b3053c
+index 0000000..4d1e7a0
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/rtw8822c.rs
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,943 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! What is the RTL8822C's own (Linux's `rtw8822c.c`): its MAC settings,
@@ -5139,7 +5389,7 @@ index 0000000..6b3053c
 +use alloc::vec::Vec;
 +
 +use crate::{
-+    hw::{Hw, RATE_SECTIONS, RfeTables},
++    hw::{Hw, RATE_SECTIONS, RfeTables, Tune},
 +    regs::*,
 +};
 +
@@ -5219,8 +5469,12 @@ index 0000000..6b3053c
 +const RF18_RFSI_GT_CH140: u32 = 1 << 18;
 +const RF18_BW_MASK: u32 = (1 << 13) | (1 << 12);
 +const RF18_BW_20M: u32 = (1 << 13) | (1 << 12);
-+/// The RX baseband filter for 20 MHz.
++const RF18_BW_40M: u32 = 1 << 13;
++const RF18_BW_80M: u32 = 1 << 12;
++/// The RX baseband filter by width.
 +const RXBB_20M: u32 = 0x18;
++const RXBB_40M: u32 = 0x10;
++const RXBB_80M: u32 = 0x8;
 +/// The firmware's IQK is done (`IQK_DONE_8822C` in `REG_RPT_CIP`).
 +const IQK_DONE: u8 = 0xaa;
 +/// Where each path's TX power references are (`txref_cck`, `txref_ofdm`).
@@ -5483,15 +5737,16 @@ index 0000000..6b3053c
 +        c.w32_mask(REG_RXIGI, 0x7f00, igi);
 +    }
 +
-+    /// `rtw8822c_set_channel` at 20 MHz.
-+    pub(crate) fn set_channel_8822c(&mut self, channel: u8) {
-+        self.set_channel_bb_8822c(channel);
-+        self.set_channel_mac(channel);
-+        self.set_channel_rf_8822c(channel);
++    /// `rtw8822c_set_channel`.
++    pub(crate) fn set_channel_8822c(&mut self, tune: Tune) {
++        self.set_channel_bb_8822c(tune);
++        self.set_channel_mac(tune);
++        self.set_channel_rf_8822c(tune);
 +        self.toggle_igi_8822c();
 +    }
 +
-+    fn set_channel_bb_8822c(&self, channel: u8) {
++    fn set_channel_bb_8822c(&self, tune: Tune) {
++        let channel = tune.center;
 +        let c = &self.chip;
 +        if channel <= 14 {
 +            c.clr32(REG_BGCTRL, BITS_RX_IQ_WEIGHT);
@@ -5548,15 +5803,35 @@ index 0000000..6b3053c
 +            };
 +            c.w32_mask(REG_SCOTRK, 0xfff, track);
 +        }
-+        // 20 MHz.
-+        c.w32_mask(REG_DFIRBW, 0x3ff0, 0x19b);
-+        c.w32_mask(REG_TXBWCTL, 0xf, 0x0);
-+        c.w32_mask(REG_TXBWCTL, 0xffc0, 0x0);
-+        c.w32_mask(REG_TXCLK, 0x700, 0x7);
-+        c.w32_mask(REG_TXCLK, 0x70_0000, 0x6);
-+        c.w32_mask(REG_CCK_SOURCE, BIT_NBI_EN, 0x0);
-+        c.w32_mask(REG_SBD, BITS_SUBTUNE, 0x1);
-+        c.w32_mask(REG_PT_CHSMO, BIT_PT_OPT, 0x0);
++        let pri = tune.pri_idx as u32;
++        match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => {
++                c.w32_mask(REG_CCKSB, 1 << 4, (pri == RTW_SC_20_UPPER) as u32);
++                c.w32_mask(REG_TXBWCTL, 0xf, 0x5);
++                c.w32_mask(REG_TXBWCTL, 0xc0, 0x0);
++                c.w32_mask(REG_TXBWCTL, 0xff00, pri | (pri << 4));
++                c.w32_mask(REG_CCK_SOURCE, BIT_NBI_EN, 0x1);
++                c.w32_mask(REG_SBD, BITS_SUBTUNE, 0x1);
++                c.w32_mask(REG_PT_CHSMO, BIT_PT_OPT, 0x1);
++            }
++            RTW_CHANNEL_WIDTH_80 => {
++                c.w32_mask(REG_TXBWCTL, 0xf, 0xa);
++                c.w32_mask(REG_TXBWCTL, 0xc0, 0x0);
++                c.w32_mask(REG_TXBWCTL, 0xff00, pri | (pri << 4));
++                c.w32_mask(REG_SBD, BITS_SUBTUNE, 0x6);
++                c.w32_mask(REG_PT_CHSMO, BIT_PT_OPT, 0x1);
++            }
++            _ => {
++                c.w32_mask(REG_DFIRBW, 0x3ff0, 0x19b);
++                c.w32_mask(REG_TXBWCTL, 0xf, 0x0);
++                c.w32_mask(REG_TXBWCTL, 0xffc0, 0x0);
++                c.w32_mask(REG_TXCLK, 0x700, 0x7);
++                c.w32_mask(REG_TXCLK, 0x70_0000, 0x6);
++                c.w32_mask(REG_CCK_SOURCE, BIT_NBI_EN, 0x0);
++                c.w32_mask(REG_SBD, BITS_SUBTUNE, 0x1);
++                c.w32_mask(REG_PT_CHSMO, BIT_PT_OPT, 0x0);
++            }
++        }
 +    }
 +
 +    /// `rtw8822c_rstb_3wire`.
@@ -5570,7 +5845,8 @@ index 0000000..6b3053c
 +    }
 +
 +    /// `rtw8822c_set_channel_rf`: both paths' RX filter and RF 0x18.
-+    fn set_channel_rf_8822c(&self, channel: u8) {
++    fn set_channel_rf_8822c(&self, tune: Tune) {
++        let channel = tune.center;
 +        let mut reg18 = self.read_rf(0x18, RFREG_MASK);
 +        reg18 &= !(RF18_BAND_MASK | RF18_CHANNEL_MASK | RF18_RFSI_MASK | RF18_BW_MASK);
 +        if channel > 14 {
@@ -5582,12 +5858,17 @@ index 0000000..6b3053c
 +        } else if (100..=144).contains(&channel) {
 +            reg18 |= RF18_RFSI_GE_CH80;
 +        }
-+        reg18 |= RF18_BW_20M;
++        let (bw, rxbb) = match tune.bw {
++            RTW_CHANNEL_WIDTH_40 => (RF18_BW_40M, RXBB_40M),
++            RTW_CHANNEL_WIDTH_80 => (RF18_BW_80M, RXBB_80M),
++            _ => (RF18_BW_20M, RXBB_20M),
++        };
++        reg18 |= bw;
 +        self.rstb_3wire_8822c(false);
 +        for path in 0..2 {
 +            self.write_rf_path(path, RF_LUTWE2, 0x04, 0x01);
 +            self.write_rf_path(path, RF_LUTWA, 0x1f, 0x12);
-+            self.write_rf_path(path, RF_LUTWD0, 0xfffff, RXBB_20M);
++            self.write_rf_path(path, RF_LUTWD0, 0xfffff, rxbb);
 +            self.write_rf_path(path, RF_LUTWE2, 0x04, 0x00);
 +        }
 +        self.write_rf_path(0, RF_CFGCH, RFREG_MASK, reg18);
@@ -6042,28 +6323,31 @@ index 0000000..6b3053c
 +}
 diff --git a/kernel/comps/rtw88/src/sta.rs b/kernel/comps/rtw88/src/sta.rs
 new file mode 100644
-index 0000000..d256d71
+index 0000000..6a8a665
 --- /dev/null
 +++ b/kernel/comps/rtw88/src/sta.rs
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,975 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
-+//! The station as mac80211 runs it over rtw88: a software scan (the
-+//! channel, probe requests, a dwell, the next channel), the access point's
-+//! rates for the firmware's rate adaptation, keys in the security CAM, and
-+//! frames with their TX and RX descriptors. The driver puts the CCMP header
-+//! on data frames (`IEEE80211_KEY_FLAG_GENERATE_IV`); the chip encrypts.
++//! The interface as mac80211 runs it over rtw88: as a station, a software
++//! scan (the channel, probe requests, a dwell, the next channel) and the
++//! access point's rates for the firmware's rate adaptation; as an access
++//! point, port 0 beaconing from the reserved page and each station's MAC
++//! ID and rates; keys in the security CAM, and frames with their TX and
++//! RX descriptors. The driver puts the CCMP header on data frames
++//! (`IEEE80211_KEY_FLAG_GENERATE_IV`); the chip encrypts.
 +
-+use alloc::{string::String, sync::Arc, vec, vec::Vec};
++use alloc::{collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 +
 +use aster_wlan::{
 +    Device,
++    chan,
 +    ieee80211::{self as wifi, Address},
-+    radio::{self, Association, Band, BandId, Channel, HtCap, Info, Join, Key, RxInfo, ScanRequest},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, HtCap, Info, Join, Key, Peer, RxInfo, ScanRequest, StationEntry, VhtCap},
 +};
 +
 +use crate::{
-+    hw::Hw,
++    hw::{Hw, Model, Tune},
 +    pci::{QUEUE_BE, QUEUE_BK, QUEUE_MGMT, QUEUE_VI, QUEUE_VO, TxInfo},
 +    regs::*,
 +};
@@ -6074,27 +6358,79 @@ index 0000000..d256d71
 +/// The security CAM: group keys at their index (default key search),
 +/// pairwise keys from entry 4 (`RTW_SEC_DEFAULT_KEY_NUM`).
 +const CAM_PAIRWISE: u8 = 4;
++/// As an access point: its stations' MAC IDs, from 1 (`rtw_acquire_macid`
++/// after the interface's), each with its pairwise key in CAM entry
++/// `CAM_PAIRWISE` + MAC ID - 1.
++const AP_STATIONS: u8 = 16;
 +/// Dwell times of a software scan (mac80211's `IEEE80211_CHANNEL_TIME`
 +/// after the probe delay, `IEEE80211_PASSIVE_CHANNEL_TIME`).
 +const DWELL_ACTIVE_MS: u64 = 60;
 +const DWELL_PASSIVE_MS: u64 = 110;
 +/// While associated, the operating channel between two scanned ones.
 +const HOME_MS: u64 = 100;
-+/// The rates of each band in the chip's bitmap order, 500 kbit/s each.
-+const RATES_2GHZ: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
-+const RATES_5GHZ: [u8; 8] = [12, 18, 24, 36, 48, 72, 96, 108];
-+/// The 5 GHz channels offered; the radar ones are scanned passively.
-+const CHANNELS_5GHZ: [u16; 25] = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165];
-+/// HT: 20 MHz with its short guard interval, one stream of STBC received,
-+/// no SM power save (`rtw_init_ht_cap` without 40 MHz).
-+const HT_INFO: u16 = 0x0020 | 0x0100 | 0x000c;
++/// 802.11's HT and VHT capability bits (`rtw_init_ht_cap`,
++/// `rtw_init_vht_cap`).
++const HT_CAP_SM_PS_DISABLED: u16 = 3 << 2;
++const HT_CAP_SGI_20: u16 = 1 << 5;
++const HT_CAP_SGI_40: u16 = 1 << 6;
++const HT_CAP_TX_STBC: u16 = 1 << 7;
++const HT_CAP_RX_STBC_1: u16 = 1 << 8;
++const HT_CAP_RX_STBC: u16 = 3 << 8;
++const VHT_CAP_MAX_MPDU_11454: u32 = 2;
++const VHT_CAP_RXSTBC_1: u32 = 1 << 8;
++const VHT_CAP_RXSTBC_MASK: u32 = 7 << 8;
++const VHT_CAP_HTC_VHT: u32 = 1 << 22;
++/// The rate adaptation's masks (Linux's `RA_MASK_*`).
++const RA_MASK_CCK_RATES: u32 = 0x0000f;
++const RA_MASK_OFDM_RATES: u32 = 0x00ff0;
++const RA_MASK_HT_RATES_1SS: u32 = 0xff000;
++const RA_MASK_HT_RATES_2SS: u32 = 0xff000 << 8;
++const RA_MASK_VHT_RATES_1SS: u32 = 0x3ff000;
++const RA_MASK_VHT_RATES_2SS: u32 = 0x3ff000 << 10;
++const RA_MASK_CCK_IN_BG: u32 = 0x00005;
++const RA_MASK_CCK_IN_HT: u32 = 0x00005;
++const RA_MASK_OFDM_IN_VHT: u32 = 0x00010;
++const RA_MASK_OFDM_IN_HT_2G: u32 = 0x00010;
++const RA_MASK_OFDM_IN_HT_5G: u32 = 0x00030;
++/// The phy modes of `get_rate_id` (`WIRELESS_*`).
++const WIRELESS_CCK: u8 = 1;
++const WIRELESS_OFDM: u8 = 2;
++const WIRELESS_HT: u8 = 4;
++const WIRELESS_VHT: u8 = 8;
 +
-+fn channel_freq(channel: u8) -> u16 {
-+    match channel {
-+        1..=13 => 2407 + 5 * channel as u16,
-+        14 => 2484,
-+        _ => 5000 + 5 * channel as u16,
++/// Linux's `get_rate_id` for up to two streams.
++fn rate_id_of(wireless: u8, bw: u32, two: bool) -> u32 {
++    match wireless {
++        WIRELESS_CCK => RTW_RATEID_B_20M,
++        WIRELESS_OFDM => RTW_RATEID_G,
++        w if w == WIRELESS_CCK | WIRELESS_OFDM => RTW_RATEID_BG,
++        w if w == WIRELESS_OFDM | WIRELESS_HT => if two { RTW_RATEID_GN_N2SS } else { RTW_RATEID_GN_N1SS },
++        w if w == WIRELESS_CCK | WIRELESS_OFDM | WIRELESS_HT => match (bw == RTW_CHANNEL_WIDTH_40, two) {
++            (true, true) => RTW_RATEID_BGN_40M_2SS,
++            (true, false) => RTW_RATEID_BGN_40M_1SS,
++            (false, true) => RTW_RATEID_BGN_20M_2SS,
++            (false, false) => RTW_RATEID_BGN_20M_1SS,
++        },
++        w if w == WIRELESS_OFDM | WIRELESS_VHT => if two { RTW_RATEID_ARFR0_AC_2SS } else { RTW_RATEID_ARFR1_AC_1SS },
++        _ => match (bw >= RTW_CHANNEL_WIDTH_80, two) {
++            (true, true) => RTW_RATEID_ARFR0_AC_2SS,
++            (true, false) => RTW_RATEID_ARFR1_AC_1SS,
++            (false, true) => RTW_RATEID_ARFR3_AC_2G_2SS,
++            (false, false) => RTW_RATEID_ARFR2_AC_2G_1SS,
++        },
 +    }
++}
++
++/// `get_vht_ra_mask`: MCS 7, 8 or 9 per stream, from bit 12, ten a stream.
++fn vht_ra_mask(map: u16) -> u32 {
++    (0..2).fold(0u32, |mask, stream| {
++        mask | match (map >> (2 * stream)) & 3 {
++            2 => 0x3ff,
++            1 => 0x1ff,
++            0 => 0x0ff,
++            _ => 0,
++        } << (12 + 10 * stream)
++    })
 +}
 +
 +/// The network being joined.
@@ -6102,41 +6438,83 @@ index 0000000..d256d71
 +struct Network {
 +    join: Join,
 +    channel: u8,
-+    ht: Option<[u8; 26]>,
++    /// The channel as the chip tunes to it.
++    tune: Tune,
++    /// What the access point and this station run, known once it took the
++    /// station.
++    peer: Peer,
 +    rates: u16,
 +    basic: u16,
 +}
 +
-+impl Network {
-+    fn new(join: &Join) -> Self {
-+        let elements = wifi::Elements(&join.elements);
-+        let ht = elements.get(wifi::IE_HT_CAP).filter(|value| value.len() >= 26).map(|value| {
-+            let mut cap = [0u8; 26];
-+            cap.copy_from_slice(&value[..26]);
-+            cap
-+        });
-+        let ghz2 = join.freq < 3000;
-+        let table: &[u8] = if ghz2 { &RATES_2GHZ } else { &RATES_5GHZ };
-+        let (mut rates, mut basic) = (0u16, 0u16);
-+        for id in [wifi::IE_RATES, wifi::IE_EXT_RATES] {
-+            for &rate in elements.get(id).unwrap_or(&[]) {
-+                if let Some(index) = table.iter().position(|&known| known == rate & 0x7f) {
-+                    rates |= 1 << index;
-+                    if rate & 0x80 != 0 {
-+                        basic |= 1 << index;
-+                    }
-+                }
++/// Rates (in 500 kbit/s, basic ones flagged) as bitmaps over the band's
++/// table: all of them (the whole table when none is given) and the basic
++/// ones.
++fn rate_bitmaps(band: BandId, rates: impl Iterator<Item = u8>) -> (u16, u16) {
++    let table = band.rates();
++    let (mut all, mut basic) = (0u16, 0u16);
++    for rate in rates {
++        if let Some(index) = table.iter().position(|&known| known == rate & 0x7f) {
++            all |= 1 << index;
++            if rate & 0x80 != 0 {
++                basic |= 1 << index;
 +            }
 +        }
-+        if rates == 0 {
-+            rates = (1 << table.len()) - 1;
-+        }
-+        Self { join: join.clone(), channel: wifi::channel_of(join.freq).unwrap_or(1), ht, rates, basic }
++    }
++    if all == 0 {
++        all = (1 << table.len()) - 1;
++    }
++    (all, basic)
++}
++
++/// The supported and extended rates of some elements.
++fn element_rates(elements: &[u8]) -> Vec<u8> {
++    let elements = wifi::Elements(elements);
++    [wifi::IE_RATES, wifi::IE_EXT_RATES].iter().flat_map(|&id| elements.get(id).unwrap_or(&[]).iter().copied()).collect()
++}
++
++impl Network {
++    fn new(join: &Join) -> Self {
++        let (rates, basic) = rate_bitmaps(BandId::of(join.freq), element_rates(&join.elements).into_iter());
++        Self { join: join.clone(), channel: wifi::channel_of(join.freq).unwrap_or(1), tune: Tune::of(&join.chandef), peer: Peer::default(), rates, basic }
 +    }
 +
 +    fn ghz2(&self) -> bool {
 +        self.channel <= 14
 +    }
++}
++
++/// The network this radio runs as an access point.
++struct Ap {
++    config: ApConfig,
++    tune: Tune,
++    /// Its basic rates, as the band's bitmap.
++    basic: u16,
++    stations: BTreeMap<Address, ApStation>,
++    /// The group key's index and the PN of the next group frame.
++    group: Option<(u8, u64)>,
++}
++
++impl Ap {
++    fn ghz2(&self) -> bool {
++        BandId::of(self.config.chandef.control) == BandId::Ghz2
++    }
++}
++
++/// A station of the access point: its MAC ID, rates for the TX
++/// descriptors, its pairwise key's index and next PN.
++struct ApStation {
++    mac_id: u8,
++    peer: Peer,
++    rates: u16,
++    rate_id: u8,
++    link: (u8, bool, u8),
++    pairwise: Option<(u8, u64)>,
++}
++
++/// The CCMP header of a frame with this key index and packet number.
++fn ccmp_header(index: u8, pn: u64) -> [u8; 8] {
++    [pn as u8, (pn >> 8) as u8, 0, 0x20 | (index << 6), (pn >> 16) as u8, (pn >> 24) as u8, (pn >> 32) as u8, (pn >> 40) as u8]
 +}
 +
 +/// A software scan in progress.
@@ -6156,6 +6534,7 @@ index 0000000..d256d71
 +    pub(crate) address: Address,
 +    pub(crate) device: Option<Arc<Device>>,
 +    network: Option<Network>,
++    ap: Option<Ap>,
 +    associated: bool,
 +    qos: bool,
 +    /// The pairwise key's index and the PN of the next protected frame.
@@ -6164,6 +6543,8 @@ index 0000000..d256d71
 +    sequence: u16,
 +    /// The rate adaptation's set for the access point (`RTW_RATEID_*`).
 +    rate_id: u8,
++    /// The link's width, LDPC and STBC for the TX descriptors.
++    link: (u8, bool, u8),
 +    /// When the watchdog runs next (Linux's every 2 s).
 +    watchdog: u64,
 +    pub(crate) signal: Option<i8>,
@@ -6173,7 +6554,23 @@ index 0000000..d256d71
 +impl Rtw88 {
 +    pub(crate) fn new(hw: Hw) -> Self {
 +        let address = hw.efuse.address;
-+        Self { hw, address, device: None, network: None, associated: false, qos: false, pairwise: None, scan: None, sequence: 0, rate_id: RTW_RATEID_BG as u8, watchdog: 0, signal: None, dead: false }
++        Self {
++            hw,
++            address,
++            device: None,
++            network: None,
++            ap: None,
++            associated: false,
++            qos: false,
++            pairwise: None,
++            scan: None,
++            sequence: 0,
++            rate_id: RTW_RATEID_BG as u8,
++            link: (0, false, 0),
++            watchdog: 0,
++            signal: None,
++            dead: false,
++        }
 +    }
 +
 +    /// `rtw_ops_add_interface` for a station on port 0, and the first
@@ -6192,12 +6589,12 @@ index 0000000..d256d71
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
-+        if self.scan.is_some() {
++        if self.scan.is_some() || self.ap.is_some() {
 +            return Err(radio::Error::Busy);
 +        }
 +        let mut channels: Vec<u8> = request.freqs.iter().filter_map(|&freq| wifi::channel_of(freq)).filter(|&channel| self.supports(channel)).collect();
 +        if channels.is_empty() {
-+            channels = (1..=13).chain(CHANNELS_5GHZ.iter().map(|&channel| channel as u8)).filter(|&channel| self.supports(channel)).collect();
++            channels = (1..=13).chain(chan::CHANNELS_5GHZ).filter(|&channel| self.supports(channel)).collect();
 +        }
 +        self.hw.set_rcr(true);
 +        self.scan = Some(Scan { channels, next: 0, ssids: request.ssids.clone(), elements: request.elements.clone(), deadline: 0, home: false, aborted: false });
@@ -6208,7 +6605,7 @@ index 0000000..d256d71
 +    /// The channels offered: 2.4 GHz's, and 5 GHz's on the chips that have
 +    /// the band.
 +    fn supports(&self, channel: u8) -> bool {
-+        (1..=13).contains(&channel) || (self.hw.spec.band_5g && CHANNELS_5GHZ.contains(&(channel as u16)))
++        (1..=13).contains(&channel) || (self.hw.spec.band_5g && chan::CHANNELS_5GHZ.contains(&channel))
 +    }
 +
 +    pub(crate) fn abort_scan(&mut self) {
@@ -6227,12 +6624,12 @@ index 0000000..d256d71
 +        if now < scan.deadline {
 +            return;
 +        }
-+        let home = self.network.as_ref().filter(|_| self.associated).map(|network| network.channel);
++        let home = self.network.as_ref().filter(|_| self.associated).map(|network| network.tune);
 +        if scan.aborted || scan.next >= scan.channels.len() {
 +            let aborted = scan.aborted;
 +            self.scan = None;
-+            let channel = self.network.as_ref().map_or(self.hw.channel, |network| network.channel);
-+            self.hw.set_channel(channel, false);
++            let tune = self.network.as_ref().map_or(Tune::simple(self.hw.channel), |network| network.tune);
++            self.hw.set_tune(tune, false);
 +            self.hw.set_rcr(false);
 +            if let Some(device) = &self.device {
 +                device.scan_done(aborted);
@@ -6245,18 +6642,18 @@ index 0000000..d256d71
 +        {
 +            scan.home = true;
 +            scan.deadline = now + HOME_MS;
-+            self.hw.set_channel(home, false);
++            self.hw.set_tune(home, false);
 +            return;
 +        }
 +        scan.home = false;
 +        let channel = scan.channels[scan.next];
 +        scan.next += 1;
-+        let passive = scan.ssids.is_empty() || (52..=144).contains(&channel);
++        let passive = scan.ssids.is_empty() || chan::radar_channel(channel);
 +        scan.deadline = now + if passive { DWELL_PASSIVE_MS } else { DWELL_ACTIVE_MS };
 +        let probes: Vec<Vec<u8>> = if passive {
 +            Vec::new()
 +        } else {
-+            let rates: &[u8] = if channel <= 14 { &RATES_2GHZ } else { &RATES_5GHZ };
++            let rates = if channel <= 14 { BandId::Ghz2 } else { BandId::Ghz5 }.rates();
 +            scan.ssids.iter().map(|ssid| wifi::probe_request(&self.address, ssid, rates, &scan.elements)).collect()
 +        };
 +        self.hw.set_channel(channel, true);
@@ -6268,49 +6665,83 @@ index 0000000..d256d71
 +    // ---- Joining. ----
 +
 +    /// The rates and capabilities of the access point for the firmware
-+    /// (`rtw_update_sta_info`), 20 MHz.
++    /// (`rtw_update_sta_info`): HT's or VHT's MCS as far as both sides
++    /// go, the link's width, its guard interval, STBC and LDPC.
 +    fn update_ra(&mut self, init: bool) {
 +        let Some(network) = &self.network else { return };
-+        let ht = network.ht.filter(|_| self.associated);
-+        // The access point's MCS, as many streams as both sides have
-+        // (`RA_MASK_HT_RATES_1SS`, `_2SS`).
-+        let two = self.hw.paths() > 1 && ht.is_some_and(|cap| cap[4] != 0);
-+        let ht_mask = |cap: &[u8; 26]| ((cap[3] as u32) << 12) | if two { (cap[4] as u32) << 20 } else { 0 };
-+        let ht_rates = if two { 0x0fff_f000 } else { 0x000f_f000 };
-+        let mut mask: u32;
-+        let rate_id;
-+        let ghz2 = network.ghz2();
-+        if ghz2 {
-+            mask = network.rates as u32;
-+            if let Some(cap) = &ht {
-+                mask |= ht_mask(cap);
-+                mask &= ht_rates | 0x0000_0005 | 0x0000_0010;
-+                rate_id = if two { RTW_RATEID_BGN_20M_2SS } else { RTW_RATEID_BGN_20M_1SS };
-+            } else if network.rates <= 0xf {
-+                rate_id = RTW_RATEID_B_20M;
++        let peer = if self.associated { network.peer.clone() } else { Peer::default() };
++        let (ghz2, rates, width) = (network.ghz2(), network.rates, network.tune.bw);
++        let (rate_id, link) = self.send_ra(MAC_ID, &peer, ghz2, rates, width, init);
++        self.rate_id = rate_id;
++        self.link = link;
++    }
++
++    /// `rtw_update_sta_info` for a peer by its MAC ID: its rates (the
++    /// band's bitmap) and capabilities, on a channel of `width`; the rate
++    /// set and the TX descriptors' width, LDPC and STBC for it.
++    fn send_ra(&mut self, mac_id: u8, peer: &Peer, ghz2: bool, rates: u16, width: u32, init: bool) -> (u8, (u8, bool, u8)) {
++        let two_paths = self.hw.paths() > 1;
++        let (ht, vht) = (peer.ht, peer.vht.filter(|_| self.hw.spec.band_5g && !ghz2));
++        let mut mask: u32 = 0;
++        let (mut stbc, mut ldpc) = (0u8, false);
++        if let Some(vht) = &vht {
++            mask |= vht_ra_mask(u16::from_le_bytes([vht.mcs[0], vht.mcs[1]]));
++            if vht.info & VHT_CAP_RXSTBC_MASK != 0 {
++                stbc = 2;
++            }
++            ldpc = vht.info & chan::VHT_CAP_RXLDPC != 0;
++        } else if let Some(ht) = &ht {
++            mask |= ((ht.mcs[1] as u32) << 20) | ((ht.mcs[0] as u32) << 12);
++            if ht.info & HT_CAP_RX_STBC != 0 {
++                stbc = 1;
++            }
++            ldpc = ht.info & chan::HT_CAP_LDPC != 0;
++        }
++        mask &= if two_paths { RA_MASK_VHT_RATES_2SS | RA_MASK_HT_RATES_2SS | RA_MASK_VHT_RATES_1SS | RA_MASK_HT_RATES_1SS } else { RA_MASK_VHT_RATES_1SS | RA_MASK_HT_RATES_1SS };
++        let wireless;
++        let backup;
++        if !ghz2 {
++            mask |= (rates as u32) << 4;
++            backup = mask;
++            if vht.is_some() {
++                mask &= RA_MASK_VHT_RATES_1SS | RA_MASK_VHT_RATES_2SS | RA_MASK_OFDM_IN_VHT;
++                wireless = WIRELESS_OFDM | WIRELESS_VHT;
++            } else if ht.is_some() {
++                mask &= RA_MASK_HT_RATES_1SS | RA_MASK_HT_RATES_2SS | RA_MASK_OFDM_IN_HT_5G;
++                wireless = WIRELESS_OFDM | WIRELESS_HT;
 +            } else {
-+                mask &= 0x0000_0ff0 | 0x0000_0005;
-+                rate_id = RTW_RATEID_BG;
++                wireless = WIRELESS_OFDM;
 +            }
 +        } else {
-+            mask = (network.rates as u32) << 4;
-+            if let Some(cap) = &ht {
-+                mask |= ht_mask(cap);
-+                mask &= ht_rates | 0x0000_0030;
-+                rate_id = if two { RTW_RATEID_GN_N2SS } else { RTW_RATEID_GN_N1SS };
++            mask |= rates as u32;
++            backup = mask;
++            if ht.is_some() {
++                mask &= RA_MASK_HT_RATES_1SS | RA_MASK_HT_RATES_2SS | RA_MASK_CCK_IN_HT | RA_MASK_OFDM_IN_HT_2G;
++                wireless = WIRELESS_CCK | WIRELESS_OFDM | WIRELESS_HT;
++            } else if rates <= 0xf {
++                wireless = WIRELESS_CCK;
 +            } else {
-+                rate_id = RTW_RATEID_G;
++                mask &= RA_MASK_OFDM_RATES | RA_MASK_CCK_IN_BG;
++                wireless = WIRELESS_CCK | WIRELESS_OFDM;
 +            }
 +        }
-+        self.rate_id = rate_id as u8;
-+        if mask == 0 {
-+            mask = if ghz2 { network.rates as u32 } else { (network.rates as u32) << 4 };
++        let sgi = match width {
++            RTW_CHANNEL_WIDTH_80 => vht.is_some_and(|vht| vht.info & chan::VHT_CAP_SGI_80 != 0),
++            RTW_CHANNEL_WIDTH_40 => ht.is_some_and(|ht| ht.info & HT_CAP_SGI_40 != 0),
++            _ => ht.is_some_and(|ht| ht.info & HT_CAP_SGI_20 != 0),
++        };
++        let two = (vht.is_some() || ht.is_some()) && two_paths;
++        let rate_id = rate_id_of(wireless, width, two);
++        // `rtw_rate_mask_recover`.
++        if mask & !(RA_MASK_CCK_RATES | RA_MASK_OFDM_RATES) == 0 {
++            mask |= backup & !(RA_MASK_CCK_RATES | RA_MASK_OFDM_RATES);
 +        }
-+        let (sgi, ldpc) = ht.map_or((false, false), |cap| {
-+            let info = u16::from_le_bytes([cap[0], cap[1]]);
-+            (info & 0x0020 != 0, false)
-+        });
-+        self.hw.ra_info(MAC_ID, rate_id as u8, mask, if init { 1 } else { 0 }, sgi, ldpc, true);
++        if mask == 0 {
++            mask |= backup & (RA_MASK_CCK_RATES | RA_MASK_OFDM_RATES);
++        }
++        let link = (width as u8, ldpc && self.hw.model != Model::Rtl8821c && self.hw.model != Model::Rtl8723d, stbc);
++        self.hw.ra_info(mac_id, rate_id as u8, mask, if init { 1 } else { 0 }, sgi, width, ldpc, vht.is_some(), true);
++        (rate_id as u8, link)
 +    }
 +
 +    /// mac80211's `prep_connection` (the channel, the BSSID) and rtw88's
@@ -6318,6 +6749,9 @@ index 0000000..d256d71
 +    pub(crate) fn join(&mut self, join: &Join) -> radio::Result<()> {
 +        if self.dead {
 +            return Err(radio::Error::Down);
++        }
++        if self.ap.is_some() {
++            return Err(radio::Error::Busy);
 +        }
 +        self.leave();
 +        if self.scan.is_some() {
@@ -6328,7 +6762,7 @@ index 0000000..d256d71
 +        if !self.supports(network.channel) {
 +            return Err(radio::Error::Invalid);
 +        }
-+        self.hw.set_channel(network.channel, false);
++        self.hw.set_tune(network.tune, false);
 +        self.hw.port_bssid(&join.bssid);
 +        self.network = Some(network);
 +        self.update_ra(true);
@@ -6340,8 +6774,12 @@ index 0000000..d256d71
 +    /// `bss_info_changed` (ASSOC): the link, the AID, the default port,
 +    /// the EDCA of the network; the rates with HT.
 +    pub(crate) fn associated(&mut self, association: &Association) -> radio::Result<()> {
-+        if self.network.is_none() {
-+            return Err(radio::Error::Invalid);
++        let Some(network) = self.network.as_mut() else { return Err(radio::Error::Invalid) };
++        network.peer = association.peer.clone();
++        let tune = Tune::of(&association.chandef);
++        if tune != network.tune {
++            network.tune = tune;
++            self.hw.set_tune(tune, false);
 +        }
 +        self.associated = true;
 +        self.qos = association.qos;
@@ -6394,10 +6832,119 @@ index 0000000..d256d71
 +        self.signal = None;
 +    }
 +
++    // ---- As an access point (`rtw_ops_add_interface` for an AP,
++    // `rtw_ops_start_ap`, `bss_info_changed` BEACON, `rtw_sta_add`). ----
++
++    /// Port 0 an access point's on the network's channel, the calibration,
++    /// the beacon in the reserved page and on.
++    pub(crate) fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.stop_ap();
++        self.leave();
++        if self.scan.is_some() {
++            self.abort_scan();
++            self.scan_step();
++        }
++        let channel = wifi::channel_of(config.chandef.control).unwrap_or(0);
++        if !self.supports(channel) {
++            return Err(radio::Error::Invalid);
++        }
++        let tune = Tune::of(&config.chandef);
++        let basic =rate_bitmaps(BandId::of(config.chandef.control), element_rates(&config.beacon.elements()).into_iter()).1;
++        self.ap = Some(Ap { config: config.clone(), tune, basic, stations: BTreeMap::new(), group: None });
++        self.hw.set_tune(tune, false);
++        self.hw.port_bssid(&self.address);
++        self.hw.port_ap(true, config.beacon_interval, config.dtim_period);
++        self.hw.prepare_tx(false);
++        let elements = config.beacon.elements();
++        self.qos = wifi::Elements(&elements).vendor(wifi::WMM_OUI_TYPE).is_some();
++        self.conf_tx(&elements);
++        if let Err(error) = self.hw.beacon(&config.beacon.frame(config.dtim_period)) {
++            ostd::warn!("{}: the beacon: {}", self.hw.name(), error);
++            self.stop_ap();
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn set_beacon(&mut self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        ap.config.beacon = beacon.clone();
++        let frame = beacon.frame(ap.config.dtim_period);
++        self.hw.beacon(&frame).map_err(|error| {
++            ostd::warn!("{}: the beacon: {}", self.hw.name(), error);
++            radio::Error::Failed
++        })
++    }
++
++    /// The beacon off, the stations gone, port 0 a station's again.
++    pub(crate) fn stop_ap(&mut self) {
++        let Some(ap) = &self.ap else { return };
++        let addresses: Vec<Address> = ap.stations.keys().copied().collect();
++        for address in &addresses {
++            self.remove_station(address);
++        }
++        if !self.dead {
++            self.hw.port_ap(false, 0, 1);
++            self.hw.port_bssid(&[0; 6]);
++            for entry in 0..CAM_PAIRWISE {
++                self.hw.clear_cam(entry);
++            }
++        }
++        self.ap = None;
++        self.qos = false;
++    }
++
++    /// `rtw_sta_add`: a MAC ID, the station's rates for the firmware, the
++    /// firmware told it is connected.
++    pub(crate) fn add_station(&mut self, station: &StationEntry) -> radio::Result<()> {
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        if ap.stations.contains_key(&station.address) {
++            self.remove_station(&station.address);
++        }
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        let used: Vec<u8> = ap.stations.values().map(|station| station.mac_id).collect();
++        let Some(mac_id) = (1..=AP_STATIONS).find(|id| !used.contains(id)) else { return Err(radio::Error::Busy) };
++        let (ghz2, width) = (ap.ghz2(), ap.tune.bw);
++        let (rates, _) = rate_bitmaps(BandId::of(ap.config.chandef.control), station.peer.rates.iter().copied());
++        let (rate_id, link) = self.send_ra(mac_id, &station.peer, ghz2, rates, width, true);
++        self.hw.media_status(mac_id, true);
++        if let Some(ap) = &mut self.ap {
++            ap.stations.insert(station.address, ApStation { mac_id, peer: station.peer.clone(), rates, rate_id, link, pairwise: None });
++        }
++        Ok(())
++    }
++
++    pub(crate) fn remove_station(&mut self, address: &Address) {
++        let Some(ap) = &mut self.ap else { return };
++        let Some(station) = ap.stations.remove(address) else { return };
++        if !self.dead {
++            self.hw.media_status(station.mac_id, false);
++            self.hw.clear_cam(CAM_PAIRWISE + station.mac_id - 1);
++        }
++    }
++
 +    /// `rtw_ops_set_key`: CCMP only (the chip's AES).
 +    pub(crate) fn set_key(&mut self, key: &Key) -> radio::Result<()> {
 +        if key.cipher != radio::CIPHER_CCMP || key.key.len() != 16 {
 +            return Err(radio::Error::Unsupported);
++        }
++        if let Some(ap) = &mut self.ap {
++            // A station's pairwise key in its own entry, the group's at its
++            // index for everyone.
++            if key.pairwise {
++                let address = key.address.ok_or(radio::Error::Invalid)?;
++                let station = ap.stations.get_mut(&address).ok_or(radio::Error::Invalid)?;
++                station.pairwise = Some((key.index, 1));
++                let entry = CAM_PAIRWISE + station.mac_id - 1;
++                self.hw.write_cam(entry, key.index, false, &address, &key.key);
++            } else {
++                ap.group = Some((key.index, 1));
++                self.hw.write_cam(key.index & 3, key.index, true, &wifi::BROADCAST, &key.key);
++            }
++            return Ok(());
 +        }
 +        let Some(network) = &self.network else { return Err(radio::Error::Invalid) };
 +        if key.pairwise {
@@ -6410,6 +6957,14 @@ index 0000000..d256d71
 +    }
 +
 +    pub(crate) fn remove_key(&mut self, index: u8, pairwise: bool) {
++        if let Some(ap) = &mut self.ap {
++            // A station's pairwise key goes with it.
++            if !pairwise {
++                ap.group = None;
++                self.hw.clear_cam(index & 3);
++            }
++            return;
++        }
 +        if pairwise {
 +            self.hw.clear_cam(CAM_PAIRWISE);
 +            self.pairwise = None;
@@ -6435,15 +6990,21 @@ index 0000000..d256d71
 +        frame[1] &= !wifi::PROTECTED;
 +        let ghz2 = self.hw.channel <= 14;
 +        let lowest = if ghz2 { DESC_RATE1M } else { DESC_RATE6M } as u8;
-+        let basic = self.network.as_ref().map_or(0, |network| network.basic);
++        let basic = match &self.ap {
++            Some(ap) => ap.basic,
++            None => self.network.as_ref().map_or(0, |network| network.basic),
++        };
 +        let rate = if basic == 0 { lowest } else { lowest + basic.trailing_zeros() as u8 };
++        // As an access point, to a station by its MAC ID.
++        let receiver: Option<Address> = frame.get(4..10).and_then(|b| b.try_into().ok());
++        let mac_id = self.ap.as_ref().and_then(|ap| receiver.and_then(|address| ap.stations.get(&address))).map_or(MAC_ID, |station| station.mac_id);
 +        let info = TxInfo {
 +            offset: self.hw.pci.tx_desc() as u8,
 +            bmc: frame[4] & 1 != 0,
 +            ls: true,
 +            dis_qselseq: true,
 +            en_hwseq: true,
-+            mac_id: MAC_ID,
++            mac_id,
 +            qsel: TX_DESC_QSEL_MGMT as u8,
 +            rate_id: if ghz2 { RTW_RATEID_B_20M } else { RTW_RATEID_G } as u8,
 +            rate,
@@ -6461,6 +7022,9 @@ index 0000000..d256d71
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
++        if self.ap.is_some() {
++            return self.send_ap(ethernet, plain);
++        }
 +        let Some(network) = &self.network else { return Err(radio::Error::Down) };
 +        let tid = self.qos.then(|| wifi::tid_of(ethernet));
 +        let protected = !plain && self.pairwise.is_some();
@@ -6469,8 +7033,7 @@ index 0000000..d256d71
 +        if protected && let Some((index, pn)) = self.pairwise.as_mut() {
 +            let value = *pn;
 +            *pn += 1;
-+            let ccmp = [value as u8, (value >> 8) as u8, 0, 0x20 | (*index << 6), (value >> 16) as u8, (value >> 24) as u8, (value >> 32) as u8, (value >> 40) as u8];
-+            drop(frame.splice(header..header, ccmp));
++            drop(frame.splice(header..header, ccmp_header(*index, value)));
 +        }
 +        let sequence = self.sequence;
 +        self.sequence = (sequence + 1) & 0x0fff;
@@ -6483,8 +7046,10 @@ index 0000000..d256d71
 +            _ => QUEUE_BE,
 +        };
 +        let ghz2 = network.ghz2();
-+        let ht = network.ht.is_some() && self.associated;
-+        let rate = if ht {
++        let (ht, vht) = (network.peer.ht.is_some() && self.associated, network.peer.vht.is_some() && self.associated);
++        let rate = if vht {
++            DESC_RATEVHT1SS_MCS9
++        } else if ht {
 +            DESC_RATEMCS7
 +        } else if ghz2 && network.rates <= 0xf {
 +            DESC_RATE11M
@@ -6503,6 +7068,82 @@ index 0000000..d256d71
 +            rate,
 +            sec_type: if protected { 3 } else { 0 },
 +            seq: sequence,
++            bw: self.link.0,
++            ldpc: self.link.1,
++            stbc: self.link.2,
++            ..TxInfo::default()
++        };
++        self.hw.pci.write(&self.hw.chip, queue, &info, &frame).map_err(|()| radio::Error::Busy)
++    }
++
++    /// As an access point: to the station the destination names (its MAC
++    /// ID, rate set, pairwise key), or to all of them at the lowest basic
++    /// rate with the group's key.
++    fn send_ap(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        let address = self.address;
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        let destination: Address = ethernet.get(..6).and_then(|b| b.try_into().ok()).ok_or(radio::Error::Invalid)?;
++        let ghz2 = ap.ghz2();
++        let multicast = wifi::is_multicast(&destination);
++        let next = |key: &mut Option<(u8, u64)>| {
++            key.as_mut().map(|(index, pn)| {
++                let value = *pn;
++                *pn += 1;
++                (*index, value)
++            })
++        };
++        let (mac_id, tid, key, rate_id, rate, link) = if multicast {
++            let key = if plain { None } else { next(&mut ap.group) };
++            let lowest = if ghz2 { DESC_RATE1M } else { DESC_RATE6M } as u8;
++            let rate = if ap.basic == 0 { lowest } else { lowest + ap.basic.trailing_zeros() as u8 };
++            (MAC_ID, None, key, if ghz2 { RTW_RATEID_B_20M } else { RTW_RATEID_G } as u8, rate, (0, false, 0))
++        } else {
++            let station = ap.stations.get_mut(&destination).ok_or(radio::Error::Invalid)?;
++            let key = if plain { None } else { next(&mut station.pairwise) };
++            let tid = station.peer.qos.then(|| wifi::tid_of(ethernet));
++            let rate = if station.peer.vht.is_some() {
++                DESC_RATEVHT1SS_MCS9
++            } else if station.peer.ht.is_some() {
++                DESC_RATEMCS7
++            } else if ghz2 && station.rates <= 0xf {
++                DESC_RATE11M
++            } else {
++                DESC_RATE54M
++            } as u8;
++            (station.mac_id, tid, key, station.rate_id, rate, station.link)
++        };
++        let mut frame = wifi::data_from_ethernet_ap(ethernet, &address, tid, key.is_some()).ok_or(radio::Error::Invalid)?;
++        let header = if tid.is_some() { 26 } else { 24 };
++        if let Some((index, pn)) = key {
++            drop(frame.splice(header..header, ccmp_header(index, pn)));
++        }
++        let sequence = self.sequence;
++        self.sequence = (sequence + 1) & 0x0fff;
++        frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
++        let tid = tid.unwrap_or(0);
++        let queue = match tid {
++            1 | 2 => QUEUE_BK,
++            4 | 5 => QUEUE_VI,
++            6 | 7 => QUEUE_VO,
++            _ => QUEUE_BE,
++        };
++        let info = TxInfo {
++            offset: self.hw.pci.tx_desc() as u8,
++            bmc: multicast,
++            ls: true,
++            mac_id,
++            qsel: tid,
++            rate_id,
++            rate,
++            // Group frames at a fixed rate; a station's by the firmware's
++            // rate adaptation.
++            use_rate: multicast,
++            dis_rate_fallback: multicast,
++            sec_type: if key.is_some() { 3 } else { 0 },
++            seq: sequence,
++            bw: link.0,
++            ldpc: link.1,
++            stbc: link.2,
 +            ..TxInfo::default()
 +        };
 +        self.hw.pci.write(&self.hw.chip, queue, &info, &frame).map_err(|()| radio::Error::Busy)
@@ -6594,36 +7235,58 @@ index 0000000..d256d71
 +        {
 +            self.signal = Some(signal);
 +        }
-+        let freq = channel_freq(self.hw.channel);
++        // The primary channel of the link (the chip tunes to the span's
++        // centre), else the one scanned.
++        let freq = match &self.network {
++            _ if self.ap.is_some() => self.ap.as_ref().map_or(0, |ap| ap.config.chandef.control),
++            Some(network) if self.scan.is_none() => network.join.freq,
++            _ => {
++                let channel = self.hw.channel;
++                chan::freq_of(if channel <= 14 { BandId::Ghz2 } else { BandId::Ghz5 }, channel)
++            }
++        };
 +        if let Some(device) = &self.device {
 +            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: if decrypted { 8 } else { 0 } });
 +        }
 +    }
 +
++    /// `rtw_init_ht_cap` and `rtw_init_vht_cap` (without beamforming,
++    /// which this driver does not set up): 40 MHz on both bands, VHT up to
++    /// 80 MHz on the 5 GHz chips, LDPC and TX STBC where the chip has them.
 +    pub(crate) fn info(&self) -> Info {
++        let two = self.hw.paths() > 1;
++        let rx_ldpc = matches!(self.hw.model, Model::Rtl8822b | Model::Rtl8822c);
++        let tx_stbc = self.hw.model == Model::Rtl8822c;
 +        let mut mcs = [0u8; 16];
 +        mcs[0] = 0xff;
-+        mcs[12] = 1;
-+        // A second stream with two paths.
-+        if self.hw.paths() > 1 {
++        if two {
 +            mcs[1] = 0xff;
 +        }
-+        let ht = HtCap { info: HT_INFO, ampdu_factor: 3, ampdu_density: self.hw.spec.ampdu_density, mcs };
-+        let band = |id: BandId| {
-+            let channels: Vec<Channel> = match id {
-+                BandId::Ghz2 => (1..=13u8).map(|channel| Channel::new(channel_freq(channel))).collect(),
-+                _ => CHANNELS_5GHZ
-+                    .iter()
-+                    .map(|&channel| {
-+                        let mut entry = Channel::new(5000 + 5 * channel);
-+                        entry.radar = (52..=144).contains(&channel);
-+                        entry.passive = entry.radar;
-+                        entry
-+                    })
-+                    .collect(),
-+            };
-+            Band { id, channels, ht: Some(ht.clone()), vht: None, he: None }
-+        };
++        mcs[4] = 0x01;
++        mcs[12] = 1;
++        let mut info = HT_CAP_SGI_20 | chan::HT_CAP_MAX_AMSDU | HT_CAP_RX_STBC_1 | HT_CAP_SM_PS_DISABLED | chan::HT_CAP_SUP_WIDTH_20_40 | chan::HT_CAP_DSSS_CCK_40 | HT_CAP_SGI_40;
++        if rx_ldpc {
++            info |= chan::HT_CAP_LDPC;
++        }
++        if tx_stbc {
++            info |= HT_CAP_TX_STBC;
++        }
++        let ht = HtCap { info, ampdu_factor: 3, ampdu_density: self.hw.spec.ampdu_density, mcs };
++        let mut vht_info = VHT_CAP_MAX_MPDU_11454 | chan::VHT_CAP_SGI_80 | VHT_CAP_RXSTBC_1 | VHT_CAP_HTC_VHT | (7 << chan::VHT_CAP_MAX_AMPDU_SHIFT);
++        if two {
++            vht_info |= chan::VHT_CAP_TXSTBC;
++        }
++        if rx_ldpc {
++            vht_info |= chan::VHT_CAP_RXLDPC;
++        }
++        let map: u16 = if two { 0xfffa } else { 0xfffe };
++        let mut vht_mcs = [0u8; 8];
++        vht_mcs[0..2].copy_from_slice(&map.to_le_bytes());
++        vht_mcs[2..4].copy_from_slice(&(390 * (1 + two as u16)).to_le_bytes());
++        vht_mcs[4..6].copy_from_slice(&map.to_le_bytes());
++        vht_mcs[6..8].copy_from_slice(&(390 * (1 + two as u16)).to_le_bytes());
++        let vht = VhtCap { info: vht_info, mcs: vht_mcs };
++        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: None };
 +        let mut bands = vec![band(BandId::Ghz2)];
 +        if self.hw.spec.band_5g {
 +            bands.push(band(BandId::Ghz5));
@@ -6635,6 +7298,7 @@ index 0000000..d256d71
 +            ciphers: vec![radio::CIPHER_CCMP],
 +            max_scan_ssids: 4,
 +            max_scan_ie_len: 512,
++            ap: true,
 +        }
 +    }
 +}

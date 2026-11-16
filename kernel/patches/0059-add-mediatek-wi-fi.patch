@@ -138,18 +138,21 @@ index 0000000..eb3e371
 +ships beside the files.
 diff --git a/kernel/comps/mt7921/src/hw.rs b/kernel/comps/mt7921/src/hw.rs
 new file mode 100644
-index 0000000..1a2f874
+index 0000000..d2afdac
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/hw.rs
-@@ -0,0 +1,731 @@
+@@ -0,0 +1,957 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! The chip as Linux's mt76 drives it over PCIe (`mt7921/pci.c`,
-+//! `mt792x_dma.c`, `mt76_connac_mcu.c`): the chip's addresses through the
-+//! bus window, the WFDMA rings, the MCU's messages and the firmware's
-+//! download (ROM patch, then RAM).
++//! `mt7925/pci.c`, `mt792x_dma.c`, `mt76_connac_mcu.c`): the chip's
++//! addresses through the bus windows, the WFDMA rings, the MCU's messages
++//! and the firmware's download (ROM patch, then RAM). The MT7925 has its
++//! own windows, rings, reset register, MAC addresses and a longer MCU event
++//! header; the rest is the same.
 +
 +use alloc::{format, string::String, vec, vec::Vec};
++use core::cell::Cell;
 +
 +use aster_pci::cfg_space::BarAccess;
 +use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
@@ -219,6 +222,41 @@ index 0000000..1a2f874
 +pub(crate) const INT_RX_DONE_WM2: u32 = 1 << 22;
 +pub(crate) const INT_TX_DONE_ALL: u32 = 0x0807_fff0;
 +pub(crate) const INT_MCU_CMD: u32 = 1 << 29;
++// The MT7925's (`mt7925/regs.h`): its MCU rings' completions, its events
++// and data, and the rest of the WFDMA it sets.
++const INT_TX_DONE_ALL_7925: u32 = (7 << 25) | (1 << 4) | (0x7fff << 4);
++const INT_RX_DONE_7925: u32 = (1 << 0) | (1 << 1) | (1 << 2);
++const RST_DRX_PTR: u32 = 0xd4280;
++const INT_RX_PRI: u32 = 0xd4298;
++const INT_TX_PRI: u32 = 0xd429c;
++const UWFDMA0_GLO_CFG_EXT1: u32 = 0x7c02_42b4;
++const HW_EMI_CTL: u32 = 0x1801_1100;
++const HW_EMI_CTL_SLPPROT_EN: u32 = 1 << 1;
++const WFSYS_RESET_7925: u32 = 0x7c00_0140;
++const HIF_REMAP_L1_7925: u32 = 0x155024;
++const HIF_REMAP_BASE_L1_7925: u32 = 0x130000;
++const HIF_REMAP_L2_7925: u32 = 0x0120;
++const HIF_REMAP_BASE_L2_7925: u32 = 0x1850_0000;
++const MDP_DCR0_7925: u32 = 0x820c_c800;
++const MDP_DCR1_7925: u32 = 0x820c_c804;
++const WTBL_UPDATE: u32 = 0x820d_4380;
++const WTBL_UPDATE_ADM_COUNT_CLEAR: u32 = 1 << 14;
++const WTBL_UPDATE_BUSY: u32 = 1 << 31;
++const WTBL_ITCR: u32 = 0x820d_43b0;
++const WTBL_ITDR0: u32 = 0x820d_43b8;
++const WTBL_ITDR1: u32 = 0x820d_43bc;
++const WTBL_ITCR_WR: u32 = 1 << 16;
++const WTBL_ITCR_EXEC: u32 = 1 << 31;
++const WTBL_SPE_IDX_SEL: u32 = 1 << 6;
++const WF_RMAC_MIB_TIME0: [u32; 2] = [0x820e_53c4, 0x820f_53c4];
++const WF_RMAC_MIB_AIRTIME0: [u32; 2] = [0x820e_5380, 0x820f_5380];
++const WF_RMAC_MIB_RXTIME_EN: u32 = 1 << 30;
++const MIB_SCR1: [u32; 2] = [0x820e_d004, 0x820f_d004];
++const MIB_TXDUR_EN: u32 = 1 << 8;
++const MIB_RXDUR_EN: u32 = 1 << 9;
++const WTBL_ENTRIES: u32 = 20;
++/// Where the fixed rates of management frames start (`MT792x_BASIC_RATES_TBL`).
++pub(crate) const BASIC_RATES_TBL: u8 = 11;
 +
 +const DMA_CTL_SD_LEN0_SHIFT: u32 = 16;
 +const DMA_CTL_LAST_SEC0: u32 = 1 << 30;
@@ -229,6 +267,8 @@ index 0000000..1a2f874
 +pub(crate) const TXQ_DATA: u32 = 0;
 +pub(crate) const TXQ_FWDL: u32 = 16;
 +pub(crate) const TXQ_MCU: u32 = 17;
++/// The MT7925's command ring.
++const TXQ_MCU_7925: u32 = 15;
 +pub(crate) const RXQ_MCU: u32 = 0;
 +pub(crate) const RXQ_DATA: u32 = 2;
 +pub(crate) const RXQ_MCU_WA: u32 = 4;
@@ -248,13 +288,17 @@ index 0000000..1a2f874
 +const MCU_Q_SET: u8 = 1;
 +const MCU_Q_NA: u8 = 3;
 +const MCU_CMD_UNI_EXT_ACK: u8 = 0x07;
++const MCU_UNI_HIF_CTRL: u16 = 0x07;
++const MCU_UNI_CHIP_CONFIG: u16 = 0x0e;
 +const MCU_PQ_ID: u16 = 0x8000;
 +const MT_TX_TYPE_CMD: u32 = 2;
 +const MT_TX_MCU_PORT_RX_Q0: u32 = 0x20;
 +const MT_HDR_FORMAT_CMD: u32 = 1;
 +const TXD1_LONG_FORMAT: u32 = 1 << 31;
-+/// An MCU event's header (`struct mt76_connac2_mcu_rxd`).
++/// An MCU event's header (`struct mt76_connac2_mcu_rxd`), and the
++/// MT7925's (`struct mt7925_mcu_rxd`).
 +pub(crate) const MCU_RXD: usize = 36;
++pub(crate) const MCU_RXD_7925: usize = 44;
 +const PATCH_SEM_RELEASE: u32 = 0;
 +const PATCH_SEM_GET: u32 = 1;
 +const PATCH_IS_DL: u8 = 1;
@@ -322,10 +366,15 @@ index 0000000..1a2f874
 +    seq: u8,
 +    /// Packets read from the MCU's rings while a command waited.
 +    pub(crate) pending: Vec<Vec<u8>>,
++    /// An MT7925 (connac3).
++    pub(crate) mt7925: bool,
++    /// The MT7925's windows, as they were before a far address moved them.
++    backup_l1: Cell<u32>,
++    backup_l2: Cell<u32>,
 +}
 +
 +impl Chip {
-+    pub(crate) fn new(mmio: BarAccess, name: String) -> Self {
++    pub(crate) fn new(mmio: BarAccess, name: String, mt7925: bool) -> Self {
 +        Self {
 +            mmio,
 +            name,
@@ -339,7 +388,104 @@ index 0000000..1a2f874
 +            rx_mcu_wa: None,
 +            seq: 0,
 +            pending: Vec::new(),
++            mt7925,
++            backup_l1: Cell::new(0),
++            backup_l2: Cell::new(0),
 +        }
++    }
++
++    /// The length of an MCU event's header.
++    pub(crate) fn mcu_rxd(&self) -> usize {
++        if self.mt7925 { MCU_RXD_7925 } else { MCU_RXD }
++    }
++
++    /// The MT7925's addresses (`__mt7925_reg_addr`): the low two megabytes
++    /// as they are, its fixed windows, the L1 window, then the L2 one.
++    fn map_7925(&self, addr: u32) -> u32 {
++        const FIXED: [(u32, u32, u32); 53] = [
++            (0x830c_0000, 0x000000, 0x0001000),
++            (0x5400_0000, 0x002000, 0x0001000),
++            (0x5500_0000, 0x003000, 0x0001000),
++            (0x5600_0000, 0x004000, 0x0001000),
++            (0x5700_0000, 0x005000, 0x0001000),
++            (0x5800_0000, 0x006000, 0x0001000),
++            (0x5900_0000, 0x007000, 0x0001000),
++            (0x820c_0000, 0x008000, 0x0004000),
++            (0x820c_8000, 0x00c000, 0x0002000),
++            (0x820c_c000, 0x00e000, 0x0002000),
++            (0x7403_0000, 0x010000, 0x0001000),
++            (0x820e_0000, 0x020000, 0x0000400),
++            (0x820e_1000, 0x020400, 0x0000200),
++            (0x820e_2000, 0x020800, 0x0000400),
++            (0x820e_3000, 0x020c00, 0x0000400),
++            (0x820e_4000, 0x021000, 0x0000400),
++            (0x820e_5000, 0x021400, 0x0000800),
++            (0x820c_e000, 0x021c00, 0x0000200),
++            (0x820e_7000, 0x021e00, 0x0000200),
++            (0x820c_f000, 0x022000, 0x0001000),
++            (0x820e_9000, 0x023400, 0x0000200),
++            (0x820e_a000, 0x024000, 0x0000200),
++            (0x820e_b000, 0x024200, 0x0000400),
++            (0x820e_c000, 0x024600, 0x0000200),
++            (0x820e_d000, 0x024800, 0x0000800),
++            (0x820c_a000, 0x026000, 0x0002000),
++            (0x820d_0000, 0x030000, 0x0010000),
++            (0x4000_0000, 0x070000, 0x0010000),
++            (0x0040_0000, 0x080000, 0x0010000),
++            (0x0041_0000, 0x090000, 0x0010000),
++            (0x820f_0000, 0x0a0000, 0x0000400),
++            (0x820f_1000, 0x0a0600, 0x0000200),
++            (0x820f_2000, 0x0a0800, 0x0000400),
++            (0x820f_3000, 0x0a0c00, 0x0000400),
++            (0x820f_4000, 0x0a1000, 0x0000400),
++            (0x820f_5000, 0x0a1400, 0x0000800),
++            (0x820f_7000, 0x0a1e00, 0x0000200),
++            (0x820f_9000, 0x0a3400, 0x0000200),
++            (0x820f_a000, 0x0a4000, 0x0000200),
++            (0x820f_b000, 0x0a4200, 0x0000400),
++            (0x820f_c000, 0x0a4600, 0x0000200),
++            (0x820f_d000, 0x0a4800, 0x0000800),
++            (0x820c_4000, 0x0a8000, 0x0004000),
++            (0x820b_0000, 0x0ae000, 0x0001000),
++            (0x8002_0000, 0x0b0000, 0x0010000),
++            (0x8102_0000, 0x0c0000, 0x0010000),
++            (0x7c02_0000, 0x0d0000, 0x0010000),
++            (0x7c06_0000, 0x0e0000, 0x0010000),
++            (0x7c00_0000, 0x0f0000, 0x0010000),
++            (0x7002_0000, 0x1f0000, 0x0010000),
++            (0x7c50_0000, 0x060000, 0x2000000),
++            (0, 0, 0),
++            (0, 0, 0),
++        ];
++        if addr < 0x20_0000 {
++            return addr;
++        }
++        // The windows go back to where they were.
++        let l1 = self.backup_l1.replace(0);
++        if l1 != 0 {
++            self.raw_write(HIF_REMAP_L1_7925, l1);
++        }
++        let l2 = self.backup_l2.replace(0);
++        if l2 != 0 {
++            self.raw_write(HIF_REMAP_L2_7925, l2);
++        }
++        for (phys, maps, size) in FIXED {
++            if size != 0 && addr >= phys && addr - phys <= size {
++                return maps + (addr - phys);
++            }
++        }
++        let l1_value = self.raw_read(HIF_REMAP_L1_7925);
++        if (0x1800_0000..0x18c0_0000).contains(&addr) || (0x7000_0000..0x7800_0000).contains(&addr) || (0x7c00_0000..0x7c40_0000).contains(&addr) {
++            self.backup_l1.set(l1_value);
++            self.raw_write(HIF_REMAP_L1_7925, (l1_value & 0xffff) | (addr & 0xffff_0000));
++            let _ = self.raw_read(HIF_REMAP_L1_7925);
++            return HIF_REMAP_BASE_L1_7925 + (addr & 0xffff);
++        }
++        self.backup_l2.set(self.raw_read(HIF_REMAP_L2_7925));
++        self.raw_write(HIF_REMAP_L1_7925, (l1_value & 0xffff) | (HIF_REMAP_BASE_L2_7925 & 0xffff_0000));
++        self.raw_write(HIF_REMAP_L2_7925, addr);
++        let _ = self.raw_read(HIF_REMAP_L1_7925);
++        HIF_REMAP_BASE_L1_7925
 +    }
 +
 +    // ---- Registers. ----
@@ -348,6 +494,9 @@ index 0000000..1a2f874
 +    /// windows of Linux's `__mt7921_reg_addr`, the rest through the L1
 +    /// window.
 +    fn map(&self, addr: u32) -> u32 {
++        if self.mt7925 {
++            return self.map_7925(addr);
++        }
 +        const FIXED: [(u32, u32, u32); 45] = [
 +            (0x820d_0000, 0x30000, 0x10000),
 +            (0x820e_d000, 0x24800, 0x00800),
@@ -477,11 +626,16 @@ index 0000000..1a2f874
 +        if self.chip_id == 0x7961 && self.rr(0x7001_0020) & (1 << 7) != 0 {
 +            self.chip_id = 0x7920;
 +        }
++        if self.mt7925 {
++            // Sleep protection of the memory interface.
++            self.set(HW_EMI_CTL, HW_EMI_CTL_SLPPROT_EN);
++        }
 +        // The Wi-Fi system's reset.
-+        self.clear(WFSYS_RESET, 1);
++        let reset = if self.mt7925 { WFSYS_RESET_7925 } else { WFSYS_RESET };
++        self.clear(reset, 1);
 +        crate::delay_ms(50);
-+        self.set(WFSYS_RESET, 1);
-+        if !self.poll(WFSYS_RESET, 0x10, 0x10, 500) {
++        self.set(reset, 1);
++        if !self.poll(reset, 0x10, 0x10, 500) {
 +            return Err(String::from("the Wi-Fi system did not come out of reset"));
 +        }
 +        self.wr(HOST_INT_ENA, 0);
@@ -531,30 +685,59 @@ index 0000000..1a2f874
 +        self.set(DMASHDL_SW_CONTROL, 1 << 28);
 +        self.clear(WFDMA0_RST, 0x30);
 +        self.set(WFDMA0_RST, 0x30);
-+        self.tx_data = Some(self.new_ring(TX_RING_BASE + TXQ_DATA * 16, 256, false)?);
-+        self.wr(TX_EXT_CTRL, 0x4);
-+        self.tx_mcu = Some(self.new_ring(TX_RING_BASE + TXQ_MCU * 16, 64, false)?);
-+        self.tx_fwdl = Some(self.new_ring(TX_RING_BASE + TXQ_FWDL * 16, 64, false)?);
-+        self.rx_mcu = Some(self.new_ring(RX_RING_BASE + RXQ_MCU * 16, 32, true)?);
-+        self.rx_mcu_wa = Some(self.new_ring(RX_RING_BASE + RXQ_MCU_WA * 16, 32, true)?);
-+        self.rx_data = Some(self.new_ring(RX_RING_BASE + RXQ_DATA * 16, 256, true)?);
-+        // Prefetch: each ring's place and depth in the WFDMA's SRAM.
 +        let prefetch = |base: u32, depth: u32| (base << 16) | depth;
-+        for (ring, base) in [(0u32, 0x0), (2, 0x40), (3, 0x80), (4, 0xc0), (5, 0x100)] {
-+            self.wr(RX_EXT_CTRL + ring * 4, prefetch(base, 4));
++        if self.mt7925 {
++            // The MT7925's rings (`mt7925_dma_init`): data, the command
++            // ring 15, the download ring 16; events on ring 0, data on 2.
++            self.tx_data = Some(self.new_ring(TX_RING_BASE + TXQ_DATA * 16, 256, false)?);
++            self.wr(TX_EXT_CTRL, 0x4);
++            self.tx_mcu = Some(self.new_ring(TX_RING_BASE + TXQ_MCU_7925 * 16, 64, false)?);
++            self.tx_fwdl = Some(self.new_ring(TX_RING_BASE + TXQ_FWDL * 16, 64, false)?);
++            self.rx_mcu = Some(self.new_ring(RX_RING_BASE + RXQ_MCU * 16, 64, true)?);
++            self.rx_data = Some(self.new_ring(RX_RING_BASE + RXQ_DATA * 16, 256, true)?);
++            for (ring, base) in [(0u32, 0x0000), (1, 0x0040), (2, 0x0080), (3, 0x00c0)] {
++                self.wr(RX_EXT_CTRL + ring * 4, prefetch(base, 4));
++            }
++            for (ring, base, depth) in [(0u32, 0x0100, 0x10), (1, 0x0200, 0x10), (2, 0x0300, 0x10), (3, 0x0400, 0x10), (15, 0x0500, 4), (16, 0x0540, 4)] {
++                self.wr(TX_EXT_CTRL + ring * 4, prefetch(base, depth));
++            }
++            self.wr(RST_DTX_PTR, !0);
++            self.wr(RST_DRX_PTR, !0);
++        } else {
++            self.tx_data = Some(self.new_ring(TX_RING_BASE + TXQ_DATA * 16, 256, false)?);
++            self.wr(TX_EXT_CTRL, 0x4);
++            self.tx_mcu = Some(self.new_ring(TX_RING_BASE + TXQ_MCU * 16, 64, false)?);
++            self.tx_fwdl = Some(self.new_ring(TX_RING_BASE + TXQ_FWDL * 16, 64, false)?);
++            self.rx_mcu = Some(self.new_ring(RX_RING_BASE + RXQ_MCU * 16, 32, true)?);
++            self.rx_mcu_wa = Some(self.new_ring(RX_RING_BASE + RXQ_MCU_WA * 16, 32, true)?);
++            self.rx_data = Some(self.new_ring(RX_RING_BASE + RXQ_DATA * 16, 256, true)?);
++            // Prefetch: each ring's place and depth in the WFDMA's SRAM.
++            for (ring, base) in [(0u32, 0x0), (2, 0x40), (3, 0x80), (4, 0xc0), (5, 0x100)] {
++                self.wr(RX_EXT_CTRL + ring * 4, prefetch(base, 4));
++            }
++            for (ring, base) in [(0u32, 0x140), (1, 0x180), (2, 0x1c0), (3, 0x200), (4, 0x240), (5, 0x280), (6, 0x2c0), (16, 0x340), (17, 0x380)] {
++                self.wr(TX_EXT_CTRL + ring * 4, prefetch(base, 4));
++            }
++            self.wr(RST_DTX_PTR, !0);
 +        }
-+        for (ring, base) in [(0u32, 0x140), (1, 0x180), (2, 0x1c0), (3, 0x200), (4, 0x240), (5, 0x280), (6, 0x2c0), (16, 0x340), (17, 0x380)] {
-+            self.wr(TX_EXT_CTRL + ring * 4, prefetch(base, 4));
-+        }
-+        self.wr(RST_DTX_PTR, !0);
 +        self.wr(PRI_DLY_INT_CFG0, 0);
 +        self.set(
 +            GLO_CFG,
 +            GLO_TX_WB_DDONE | GLO_FIFO_LITTLE_ENDIAN | GLO_CLK_GAT_DIS | GLO_OMIT_TX_INFO | GLO_DMA_SIZE_3 | GLO_FIFO_DIS_CHECK | GLO_RX_WB_DDONE | GLO_CSR_DISP_BASE_PTR_CHAIN_EN | GLO_OMIT_RX_INFO_PFET2,
 +        );
 +        self.set(GLO_CFG, GLO_TX_DMA_EN | GLO_RX_DMA_EN);
++        if self.mt7925 {
++            self.set(UWFDMA0_GLO_CFG_EXT1, 1 << 28);
++            self.set(INT_RX_PRI, 0x0f00);
++            self.set(INT_TX_PRI, 0x7f00);
++        }
 +        self.set(WFDMA_DUMMY_CR, 1 << 1);
-+        self.wr(HOST_INT_ENA, INT_TX_DONE_ALL | INT_RX_DONE_DATA | INT_RX_DONE_WM | INT_RX_DONE_WM2 | INT_MCU_CMD);
++        let interrupts = if self.mt7925 {
++            INT_TX_DONE_ALL_7925 | INT_RX_DONE_7925 | INT_MCU_CMD
++        } else {
++            INT_TX_DONE_ALL | INT_RX_DONE_DATA | INT_RX_DONE_WM | INT_RX_DONE_WM2 | INT_MCU_CMD
++        };
++        self.wr(HOST_INT_ENA, interrupts);
 +        self.set(MCU2HOST_SW_INT_ENA, 1);
 +        Ok(())
 +    }
@@ -562,8 +745,44 @@ index 0000000..1a2f874
 +    /// Before the firmware's download (`__mt7921_init_hardware`,
 +    /// `mt7921e_mcu_init`): its normal mode, and no L0s on the link.
 +    pub(crate) fn before_firmware(&self) {
-+        self.wr(SWDEF_MODE, SWDEF_NORMAL_MODE);
++        if !self.mt7925 {
++            self.wr(SWDEF_MODE, SWDEF_NORMAL_MODE);
++        }
 +        self.set(PCIE_MAC_PM, PCIE_MAC_PM_L0S_DIS);
++    }
++
++    /// The MT7925's MAC (`mt7925_mac_init`, `mt792x_mac_init_band`,
++    /// `mt7925_mac_init_basic_rates`): frames up to 1536 bytes, A-MSDUs
++    /// split by the chip, each WTBL entry's counters cleared, both bands'
++    /// timing, receive time and signal reporting, and the fixed-rate table
++    /// management frames use (`mt76_rates`: CCK 1-11, OFDM 6-54 Mbit/s).
++    pub(crate) fn mac_init_7925(&self) {
++        let field = |addr: u32, mask: u32, value: u32| self.wr(addr, (self.rr(addr) & !mask) | ((value << mask.trailing_zeros()) & mask));
++        field(MDP_DCR1_7925, MDP_DCR1_MAX_RX_LEN, 1536);
++        self.set(MDP_DCR0_7925, MDP_DCR0_DAMSDU_EN);
++        for index in 0..WTBL_ENTRIES {
++            self.wr(WTBL_UPDATE, (self.rr(WTBL_UPDATE) & !0xfff) | index | WTBL_UPDATE_ADM_COUNT_CLEAR);
++            let _ = self.poll(WTBL_UPDATE, WTBL_UPDATE_BUSY, 0, 50);
++        }
++        for band in 0..2 {
++            let ctcr0 = TMAC_CTCR0[band];
++            field(ctcr0, TMAC_CTCR0_INS_DDLMT_REFTIME, 0x3f);
++            self.set(ctcr0, TMAC_CTCR0_INS_DDLMT_VHT_SMPDU_EN | TMAC_CTCR0_INS_DDLMT_EN);
++            self.set(WF_RMAC_MIB_TIME0[band], WF_RMAC_MIB_RXTIME_EN);
++            self.set(WF_RMAC_MIB_AIRTIME0[band], WF_RMAC_MIB_RXTIME_EN);
++            self.set(MIB_SCR1[band], MIB_TXDUR_EN | MIB_RXDUR_EN);
++            field(DMA_DCR0[band], DMA_DCR0_MAX_RX_LEN, 1536);
++            self.clear(DMA_DCR0[band], DMA_DCR0_RXD_G5_EN);
++            field(WTBLOFF_TOP_RSCR[band], WTBLOFF_TOP_RSCR_RCPI_MODE, 0);
++            field(WTBLOFF_TOP_RSCR[band], WTBLOFF_TOP_RSCR_RCPI_PARAM, 3);
++        }
++        // CCK (mode 0) indices 0-3, then OFDM (mode 1) in mt76's order.
++        const RATES: [(u32, u32); 12] = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 11), (1, 15), (1, 10), (1, 14), (1, 9), (1, 13), (1, 8), (1, 12)];
++        for (index, (mode, rate)) in RATES.iter().enumerate() {
++            self.wr(WTBL_ITDR0, (mode << 6) | rate);
++            self.wr(WTBL_ITDR1, WTBL_SPE_IDX_SEL);
++            self.wr(WTBL_ITCR, WTBL_ITCR_WR | WTBL_ITCR_EXEC | (BASIC_RATES_TBL as u32 + index as u32));
++        }
 +    }
 +
 +    /// Linux's `mt7921_mac_init` and `mt792x_mac_init_band`: frames up to
@@ -711,7 +930,10 @@ index 0000000..1a2f874
 +                out.extend_from_slice(&length.to_le_bytes());
 +                out.extend_from_slice(&id.to_le_bytes());
 +                out.extend_from_slice(&[0, MCU_PKT_ID, 0, seq]);
-+                out.extend_from_slice(&[0, 0, 0, MCU_CMD_UNI_EXT_ACK]);
++                // The host interface's and the chip's settings go unacked;
++                // the answer (with what was asked) comes all the same.
++                let option = if matches!(id, MCU_UNI_HIF_CTRL | MCU_UNI_CHIP_CONFIG) { MCU_CMD_UNI_EXT_ACK & !1 } else { MCU_CMD_UNI_EXT_ACK };
++                out.extend_from_slice(&[0, 0, 0, option]);
 +                out.extend_from_slice(&[0; 4]);
 +            }
 +            _ => {
@@ -745,8 +967,11 @@ index 0000000..1a2f874
 +                    // An event (type 7) that is not a frame through the MCU
 +                    // (flag 1), answering this command.
 +                    let rxd0 = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
-+                    let is_event = packet.len() >= MCU_RXD && rxd0 >> 27 == 7 && (rxd0 >> 16) & 0xf != 1;
-+                    if found.is_none() && is_event && packet[29] == seq {
++                    let header = self.mcu_rxd();
++                    let is_event = packet.len() >= header && rxd0 >> 27 == 7 && (rxd0 >> 16) & 0xf != 1;
++                    // The sequence number is the header's 30th byte (38th
++                    // on the MT7925).
++                    if found.is_none() && is_event && packet[header - 7] == seq {
 +                        found = Some(packet);
 +                    } else {
 +                        self.pending.push(packet);
@@ -763,7 +988,8 @@ index 0000000..1a2f874
 +        };
 +        drop(waiting);
 +        let packet = result?;
-+        let skip = if matches!(cmd, Cmd::Legacy(MCU_CMD_PATCH_SEM_CONTROL) | Cmd::Legacy(MCU_CMD_PATCH_FINISH_REQ)) { MCU_RXD - 4 } else { MCU_RXD };
++        let header = self.mcu_rxd();
++        let skip = if matches!(cmd, Cmd::Legacy(MCU_CMD_PATCH_SEM_CONTROL) | Cmd::Legacy(MCU_CMD_PATCH_FINISH_REQ)) { header - 4 } else { header };
 +        Ok(packet.get(skip..).unwrap_or(&[]).to_vec())
 +    }
 +
@@ -875,23 +1101,27 @@ index 0000000..1a2f874
 +}
 diff --git a/kernel/comps/mt7921/src/lib.rs b/kernel/comps/mt7921/src/lib.rs
 new file mode 100644
-index 0000000..ddd130d
+index 0000000..3e16cb0
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/lib.rs
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,341 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! MediaTek Wi-Fi: the MT7921 (AMD RZ608), MT7922 (AMD RZ616) and MT7920
-+//! cards, as Linux's mt76 (`mt7921e`) runs them.
++//! cards, as Linux's mt76 (`mt7921e`) runs them, and the MT7925 (AMD
++//! RZ717, Wi-Fi 7) as `mt7925e` does.
 +//!
 +//! The chip ([`hw`]) runs MediaTek's firmware (a ROM patch and the RAM
 +//! code, in linux-firmware's `mediatek/`), which this driver downloads and
-+//! then commands over the MCU's rings; the station on it is [`mac`].
++//! then commands over the MCU's rings; the station on it is [`mac`] on the
++//! MT7921 family and [`mt7925`] (unified commands, connac3 descriptors) on
++//! the MT7925.
 +//!
-+//! Not yet: the MT7925 (its firmware speaks the newer connac3 commands),
-+//! 40 MHz and wider, VHT and HE, block-ack agreements, power save, 6 GHz,
-+//! management frame protection. The kernel's log says how far a card gets
-+//! (`dmesg | grep mt7921`); `mt7921.off` leaves the cards alone.
++//! Both run as stations or as access points (the beacon offloaded to the
++//! firmware). Not yet: block-ack agreements, power save, 6 GHz,
++//! multi-link operation, management frame protection. The kernel's log
++//! says how far a card gets (`dmesg | grep mt7921`); `mt7921.off` leaves
++//! the cards alone.
 +
 +#![no_std]
 +#![deny(unsafe_code)]
@@ -906,8 +1136,9 @@ index 0000000..ddd130d
 +
 +mod hw;
 +mod mac;
++mod mt7925;
 +
-+use alloc::{sync::Arc, vec::Vec};
++use alloc::{string::String, sync::Arc, vec::Vec};
 +use core::sync::atomic::{AtomicBool, Ordering};
 +
 +use aster_linuxkpi::{
@@ -916,13 +1147,18 @@ index 0000000..ddd130d
 +};
 +pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms};
 +use aster_pci::common_device::PciCommonDevice;
-+use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
++use aster_wlan::{
++    Device,
++    ieee80211::Address,
++    radio::{self, ApConfig, Association, BeaconTemplate, Info, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
 +
 +use crate::{
 +    hw::{BUFFER, Chip},
-+    mac::{Mt7921, TOKENS},
++    mac::Mt7921,
++    mt7925::Mt7925,
 +};
 +
 +/// The cards' tasks sleep here: woken by their interrupt, by the timer
@@ -938,14 +1174,22 @@ index 0000000..ddd130d
 +const VENDOR_MEDIATEK: u16 = 0x14c3;
 +const VENDOR_ITTIM: u16 = 0x1d2f;
 +
-+/// Linux's `mt7921_pci_device_table`.
++/// Linux's `mt7925_pci_device_table`.
++fn is_mt7925(vendor: u16, device: u16) -> bool {
++    matches!((vendor, device), (VENDOR_MEDIATEK, 0x7925 | 0x0717))
++}
++
++/// Linux's `mt7921_pci_device_table`, and the MT7925's.
 +fn claims(vendor: u16, device: u16) -> bool {
-+    matches!((vendor, device), (VENDOR_MEDIATEK, 0x7961 | 0x7922 | 0x0608 | 0x0616 | 0x7920) | (VENDOR_ITTIM, 0x7922))
++    is_mt7925(vendor, device) || matches!((vendor, device), (VENDOR_MEDIATEK, 0x7961 | 0x7922 | 0x0608 | 0x0616 | 0x7920) | (VENDOR_ITTIM, 0x7922))
 +}
 +
 +/// The firmware of a chip (`mt792x_patch_name`, `mt792x_ram_name`): ROM
 +/// patch, RAM code.
-+fn firmware_of(chip_id: u32) -> (&'static str, &'static str) {
++fn firmware_of(chip_id: u32, mt7925: bool) -> (&'static str, &'static str) {
++    if mt7925 {
++        return ("mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin", "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin");
++    }
 +    match chip_id {
 +        0x7922 => ("mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin", "mediatek/WIFI_RAM_CODE_MT7922_1.bin"),
 +        0x7920 => ("mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin", "mediatek/WIFI_RAM_CODE_MT7961_1a.bin"),
@@ -970,8 +1214,106 @@ index 0000000..ddd130d
 +    Ok(())
 +}
 +
++/// The station on the card: the MT7921 family's or the MT7925's, the same
++/// operations each.
++enum Station {
++    Mt7921(Mt7921),
++    Mt7925(Mt7925),
++}
++
++macro_rules! each {
++    ($station:expr, $inner:ident => $body:expr) => {
++        match $station {
++            Station::Mt7921($inner) => $body,
++            Station::Mt7925($inner) => $body,
++        }
++    };
++}
++
++impl Station {
++    fn dead(&self) -> bool {
++        each!(self, station => station.dead)
++    }
++
++    fn signal(&self) -> Option<i8> {
++        each!(self, station => station.signal)
++    }
++
++    fn address(&self) -> [u8; 6] {
++        each!(self, station => station.address)
++    }
++
++    fn set_device(&mut self, device: Arc<Device>) {
++        each!(self, station => station.device = Some(device))
++    }
++
++    fn bring_up(&mut self, patch: &str, ram: &str) -> Result<(), String> {
++        each!(self, station => station.bring_up(patch, ram))
++    }
++
++    fn info(&self) -> Info {
++        each!(self, station => station.info())
++    }
++
++    fn scan(&mut self, request: &ScanRequest) -> radio::Result<()> {
++        each!(self, station => station.scan(request))
++    }
++
++    fn abort_scan(&mut self) {
++        each!(self, station => station.abort_scan())
++    }
++
++    fn join(&mut self, network: &Join) -> radio::Result<()> {
++        each!(self, station => station.join(network))
++    }
++
++    fn associated(&mut self, association: &Association) -> radio::Result<()> {
++        each!(self, station => station.associated(association))
++    }
++
++    fn leave(&mut self) {
++        each!(self, station => station.leave())
++    }
++
++    fn set_key(&mut self, key: &Key, remove: bool) -> radio::Result<()> {
++        each!(self, station => station.set_key(key, remove))
++    }
++
++    fn transmit(&mut self, frame: Vec<u8>) -> radio::Result<()> {
++        each!(self, station => station.transmit(frame))
++    }
++
++    fn send(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        each!(self, station => station.send(ethernet, plain))
++    }
++
++    fn poll(&mut self) {
++        each!(self, station => station.poll())
++    }
++
++    fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
++        each!(self, station => station.start_ap(config))
++    }
++
++    fn set_beacon(&mut self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        each!(self, station => station.set_beacon(beacon))
++    }
++
++    fn stop_ap(&mut self) {
++        each!(self, station => station.stop_ap())
++    }
++
++    fn add_station(&mut self, entry: &StationEntry) -> radio::Result<()> {
++        each!(self, station => station.add_station(entry))
++    }
++
++    fn remove_station(&mut self, address: &Address) {
++        each!(self, station => station.remove_station(address))
++    }
++}
++
 +struct Card {
-+    state: Mutex<Mt7921>,
++    state: Mutex<Station>,
 +}
 +
 +struct MediaTekRadio {
@@ -980,12 +1322,13 @@ index 0000000..ddd130d
 +
 +impl Radio for MediaTekRadio {
 +    fn start(&self) -> radio::Result<()> {
-+        if self.card.state.lock().dead { Err(radio::Error::Down) } else { Ok(()) }
++        if self.card.state.lock().dead() { Err(radio::Error::Down) } else { Ok(()) }
 +    }
 +
 +    fn stop(&self) {
 +        let mut state = self.card.state.lock();
 +        state.abort_scan();
++        state.stop_ap();
 +        state.leave();
 +    }
 +
@@ -1014,7 +1357,7 @@ index 0000000..ddd130d
 +    }
 +
 +    fn remove_key(&self, index: u8, pairwise: bool) {
-+        let key = Key { index, cipher: radio::CIPHER_CCMP, pairwise, key: Vec::new(), seq: Vec::new() };
++        let key = Key { index, cipher: radio::CIPHER_CCMP, pairwise, address: None, key: Vec::new(), seq: Vec::new() };
 +        let _ = self.card.state.lock().set_key(&key, true);
 +    }
 +
@@ -1029,8 +1372,32 @@ index 0000000..ddd130d
 +    }
 +
 +    fn link_stats(&self) -> LinkStats {
-+        LinkStats { signal: self.card.state.lock().signal, tx_rate: None }
++        LinkStats { signal: self.card.state.lock().signal(), tx_rate: None }
 +    }
++
++    fn start_ap(&self, config: &ApConfig) -> radio::Result<()> {
++        self.card.state.lock().start_ap(config)
++    }
++
++    fn set_beacon(&self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        self.card.state.lock().set_beacon(beacon)
++    }
++
++    fn stop_ap(&self) {
++        self.card.state.lock().stop_ap();
++    }
++
++    fn add_station(&self, station: &StationEntry) -> radio::Result<()> {
++        self.card.state.lock().add_station(station)
++    }
++
++    fn remove_station(&self, address: &Address) {
++        self.card.state.lock().remove_station(address);
++    }
++
++    // The firmware lets a station's data through once its entry is there
++    // (`mt7921_mac_sta_event` does nothing more when it is authorized).
++    fn authorize_station(&self, _address: &Address, _authorized: bool) {}
 +}
 +
 +/// A card's task: the chip started, its firmware, the station registered,
@@ -1046,32 +1413,33 @@ index 0000000..ddd130d
 +        ostd::warn!("{}: no registers", name);
 +        return;
 +    };
-+    let mut chip = Chip::new(mmio, name.clone());
++    let mt7925 = is_mt7925(id.vendor_id, id.device_id);
++    let mut chip = Chip::new(mmio, name.clone(), mt7925);
 +    if let Err(error) = chip.start() {
 +        ostd::warn!("{}: {:04x}:{:04x} did not start: {}", name, id.vendor_id, id.device_id, error);
 +        return;
 +    }
 +    ostd::notice!("{}: MediaTek {:04x} (chip {:04x}, revision {:#x})", name, id.device_id, chip.chip_id, chip.rev);
-+    let Some(tokens) = hw::dma32(TOKENS * BUFFER) else {
++    let Some(tokens) = hw::dma32(mac::TOKENS.max(mt7925::TOKENS) * BUFFER) else {
 +        ostd::warn!("{}: no DMA memory below 4 GiB", name);
 +        return;
 +    };
-+    let (patch, ram) = firmware_of(chip.chip_id);
-+    let mut state = Mt7921::new(chip, name.clone(), tokens);
++    let (patch, ram) = firmware_of(chip.chip_id, mt7925);
++    let mut state = if mt7925 { Station::Mt7925(Mt7925::new(chip, name.clone(), tokens)) } else { Station::Mt7921(Mt7921::new(chip, name.clone(), tokens)) };
 +    if let Err(error) = state.bring_up(patch, ram) {
 +        ostd::warn!("{}: {}", name, error);
 +        return;
 +    }
 +    let info = state.info();
-+    ostd::notice!("{}: ready, MAC {:02x?}", name, state.address);
++    ostd::notice!("{}: ready, MAC {:02x?}", name, state.address());
 +    let card = Arc::new(Card { state: Mutex::new(state) });
 +    let wlan = aster_wlan::register(info, Arc::new(MediaTekRadio { card: card.clone() }));
-+    card.state.lock().device = Some(wlan);
++    card.state.lock().set_device(wlan);
 +    loop {
 +        sleep();
 +        let mut state = card.state.lock();
 +        state.poll();
-+        if state.dead {
++        if state.dead() {
 +            break;
 +        }
 +    }
@@ -1080,25 +1448,28 @@ index 0000000..ddd130d
 +}
 diff --git a/kernel/comps/mt7921/src/mac.rs b/kernel/comps/mt7921/src/mac.rs
 new file mode 100644
-index 0000000..48f8be3
+index 0000000..865a78d
 --- /dev/null
 +++ b/kernel/comps/mt7921/src/mac.rs
-@@ -0,0 +1,1077 @@
+@@ -0,0 +1,1655 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
-+//! The station on the MediaTek firmware, as Linux's mt7921 and
++//! The interface on the MediaTek firmware, as Linux's mt7921 and
 +//! mt76_connac drive it: the interface (`DEV_INFO_UPDATE`,
-+//! `BSS_INFO_UPDATE`), scans (`START_HW_SCAN`), the access point's station
-+//! record and its WTBL entry (`STA_REC_UPDATE`), the channel for joining
-+//! (`ROC`), keys (`STA_REC_KEY_V2`); frames out as a TXD and TXP the chip
-+//! reads, frames in after their RXD.
++//! `BSS_INFO_UPDATE`), scans (`START_HW_SCAN`), the peers' station records
++//! and WTBL entries (`STA_REC_UPDATE`: the access point's, or as an access
++//! point its stations'), the channel for joining (`ROC`) or for the
++//! network this radio runs (`CHANNEL_SWITCH`) and its beacon (offloaded
++//! to the firmware), keys (`STA_REC_KEY_V2`); frames out as a TXD and TXP
++//! the chip reads, frames in after their RXD.
 +
-+use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
++use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
 +
 +use aster_wlan::{
 +    Device,
++    chan,
 +    ieee80211::{self as wifi, Address},
-+    radio::{self, Association, Band, BandId, Channel, HtCap, Info, Join, Key, RxInfo, ScanRequest},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, Chandef, HeCap, HtCap, Info, Join, Key, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
 +};
 +use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
 +
@@ -1107,6 +1478,10 @@ index 0000000..48f8be3
 +// MCU commands and events (`mt76_connac_mcu.h`, `mt7921/mcu.h`).
 +const CE_START_HW_SCAN: u8 = 0x03;
 +const CE_SET_RX_FILTER: u8 = 0x0a;
++const CE_SET_BSS_CONNECTED: u8 = 0x16;
++const CE_SET_BSS_ABORT: u8 = 0x17;
++const EXT_CHANNEL_SWITCH: u8 = 0x08;
++const UNI_BSS_INFO_BCN_CONTENT: u16 = 0x07;
 +const CE_SET_CHAN_DOMAIN: u8 = 0x0f;
 +const CE_CANCEL_HW_SCAN: u8 = 0x1b;
 +const CE_SET_EDCA_PARMS: u8 = 0x1d;
@@ -1137,18 +1512,61 @@ index 0000000..48f8be3
 +const STA_REC_RA: u16 = 0x01;
 +const STA_REC_STATE: u16 = 0x07;
 +const STA_REC_HT: u16 = 0x09;
++const STA_REC_VHT: u16 = 0x0a;
 +const STA_REC_WTBL: u16 = 0x0d;
++const STA_REC_HE: u16 = 0x0e;
++const STA_REC_HW_AMSDU: u16 = 0x0f;
 +const STA_REC_KEY_V2: u16 = 0x11;
 +const STA_REC_PHY: u16 = 0x15;
++const STA_REC_HE_V2: u16 = 0x19;
 +const WTBL_GENERIC: u16 = 0x00;
 +const WTBL_RX: u16 = 0x01;
 +const WTBL_HT: u16 = 0x02;
++const WTBL_VHT: u16 = 0x03;
 +const WTBL_HDR_TRANS: u16 = 0x06;
 +const WTBL_SMPS: u16 = 0x0d;
 +const WTBL_RESET_AND_SET: u8 = 1;
 +const UNI_BSS_INFO_BASIC: u16 = 0x00;
 +const UNI_BSS_INFO_RLM: u16 = 0x02;
++const UNI_BSS_INFO_BSS_COLOR: u16 = 0x04;
++const UNI_BSS_INFO_HE_BASIC: u16 = 0x05;
 +const UNI_BSS_INFO_QBSS: u16 = 0x0f;
++// Channel widths (`CMD_CBW_*`).
++const CMD_CBW_20MHZ: u8 = 0;
++const CMD_CBW_40MHZ: u8 = 1;
++const CMD_CBW_80MHZ: u8 = 2;
++const CMD_CBW_160MHZ: u8 = 3;
++// `struct sta_rec_he`'s capability bits (`STA_REC_HE_CAP_*`), each with
++// the 802.11ax bit it comes from: (field, byte, bit of 802.11ax).
++const HE_CAP_MAP: [(u32, bool, usize, u8); 20] = [
++    (1 << 0, true, 0, 0x01),   // HTC: MAC 0, +HTC-HE
++    (1 << 2, true, 2, 0x08),   // BSR
++    (1 << 3, true, 3, 0x02),   // OM: OMI control
++    (1 << 4, true, 4, 0x40),   // A-MSDU in A-MPDU
++    (1 << 1, true, 4, 0x04),   // BQR
++    (1 << 18, false, 0, 0x60), // 242-tone RU in 20 MHz (2.4 or 5 GHz)
++    (1 << 6, false, 1, 0x20),  // LDPC in the payload
++    (1 << 13, false, 1, 0x40), // SU PPDU, 1x LTF and 0.8 µs GI
++    (1 << 17, false, 2, 0x02), // NDP, 4x LTF and 3.2 µs GI
++    (1 << 9, false, 2, 0x04),  // STBC TX up to 80 MHz
++    (1 << 10, false, 2, 0x08), // STBC RX up to 80 MHz
++    (1 << 8, false, 6, 0x20),  // partial bandwidth extended range
++    (1 << 14, false, 7, 0x04), // SU/MU PPDU, 4x LTF and 0.8 µs GI
++    (1 << 11, false, 7, 0x40), // STBC TX above 80 MHz
++    (1 << 12, false, 7, 0x80), // STBC RX above 80 MHz
++    (1 << 16, false, 8, 0x01), // ER SU PPDU, 4x LTF and 0.8 µs GI
++    (1 << 15, false, 8, 0x10), // ER SU PPDU, 1x LTF and 0.8 µs GI
++    (1 << 7, false, 9, 0x02),  // triggered CQI feedback
++    (1 << 19, false, 9, 0x04), // 1024-QAM TX in a RU under 242 tones
++    (1 << 20, false, 9, 0x08), // 1024-QAM RX in a RU under 242 tones
++];
++/// The HE capabilities Linux's `mt7921_init_he_caps` gives a station (the
++/// MT7922's PHY ones with 160 MHz), by band: MAC, then PHY.
++const HE_MAC: [u8; 6] = [0x01, 0x08, 0x00, 0x1a, 0x40, 0x00];
++const HE_PHY_2GHZ: [u8; 11] = [0x22, 0x70, 0xce, 0x12, 0x0d, 0xc0, 0xb3, 0x06, 0x42, 0x3f, 0x00];
++const HE_PHY_5GHZ: [u8; 11] = [0x44, 0x70, 0xce, 0x12, 0x0d, 0xc0, 0xb3, 0x06, 0x42, 0x3f, 0x00];
++const HE_PHY_2GHZ_7922: [u8; 11] = [0x2a, 0x70, 0xce, 0x12, 0x6d, 0xc0, 0xb3, 0x06, 0x4e, 0x3f, 0x00];
++const HE_PHY_5GHZ_7922: [u8; 11] = [0x4c, 0x70, 0xce, 0x12, 0x6d, 0xc0, 0xb3, 0x06, 0x4e, 0x3f, 0x00];
 +const DEV_INFO_ACTIVE: u16 = 0;
 +const ROC_ACQUIRE: u16 = 0;
 +const ROC_ABORT: u16 = 1;
@@ -1166,10 +1584,15 @@ index 0000000..48f8be3
 +const PHY_MODE_G: u8 = 1 << 2;
 +const PHY_MODE_GN: u8 = 1 << 3;
 +const PHY_MODE_AN: u8 = 1 << 4;
++const PHY_MODE_AC: u8 = 1 << 5;
++const PHY_MODE_AX_24G: u8 = 1 << 6;
++const PHY_MODE_AX_5G: u8 = 1 << 7;
 +const PHY_TYPE_BIT_HR_DSSS: u8 = 1 << 0;
 +const PHY_TYPE_BIT_ERP: u8 = 1 << 1;
 +const PHY_TYPE_BIT_OFDM: u8 = 1 << 3;
 +const PHY_TYPE_BIT_HT: u8 = 1 << 4;
++const PHY_TYPE_BIT_VHT: u8 = 1 << 5;
++const PHY_TYPE_BIT_HE: u8 = 1 << 6;
 +const MCU_CIPHER_AES_CCMP: u8 = 5;
 +const MCU_CIPHER_CCMP_256: u8 = 6;
 +const MCU_CIPHER_GCMP: u8 = 7;
@@ -1186,6 +1609,15 @@ index 0000000..48f8be3
 +/// own (`MT792x_WTBL_RESERVED` less the interface's index), for group keys.
 +pub(crate) const WCID_AP: u8 = 1;
 +pub(crate) const WCID_OWN: u8 = 19;
++/// As an access point: its stations' entries, from 1 (`MT792x_WTBL_STA`
++/// less the interfaces' and the one `mt76_wcid_alloc` keeps).
++pub(crate) const AP_STATIONS: u8 = 13;
++/// The beacon the firmware sends: its TXD and the frame in 512 bytes
++/// (`struct bcn_content_tlv`), as firmware packets on the beacon queue.
++const BEACON_ROOM: usize = 512;
++const TX_TYPE_FW: u32 = 3;
++const LMAC_BCN0: u32 = 0x12;
++const TXD3_REM_TX_COUNT: u32 = 0x1f << 11;
 +/// The interface's own MAC in the WTBL when an entry has no station.
 +const MUAR_NONE: u8 = 0x0e;
 +// TXD (`mt76_connac2_mac.h`) and TXP (`struct mt76_connac_hw_txp`).
@@ -1218,15 +1650,55 @@ index 0000000..48f8be3
 +const RATES_2GHZ: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
 +const RATES_5GHZ: [u8; 8] = [12, 18, 24, 36, 48, 72, 96, 108];
 +
-+/// The 5 GHz channels offered, and the ones that need radar detection
-+/// (passive here).
-+const CHANNELS_5GHZ: [u16; 25] = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165];
++/// The channel flags of the channel domain (`IEEE80211_CHAN_*`).
 +const IEEE80211_CHAN_NO_IR: u32 = 1 << 1;
 +const IEEE80211_CHAN_RADAR: u32 = 1 << 3;
 +
-+/// The HT capabilities this driver offers: 20 MHz with its short guard
-+/// interval, LDPC, one stream of STBC received, no SM power save.
-+const HT_INFO: u16 = 0x0001 | 0x000c | 0x0020 | 0x0100;
++/// The HT capabilities Linux's mt7921 offers: LDPC, 20/40 MHz, SM power
++/// save off, short guard intervals, STBC both ways (one stream received),
++/// A-MSDUs of 7935 bytes.
++const HT_INFO: u16 = chan::HT_CAP_LDPC | chan::HT_CAP_SUP_WIDTH_20_40 | 0x000c | chan::HT_CAP_SGI_20 | chan::HT_CAP_SGI_40 | 0x0080 | 0x0100 | chan::HT_CAP_MAX_AMSDU;
++/// The VHT capabilities (mt76's and mt7921's): MPDUs of 11454 bytes, RX
++/// LDPC, short GI at 80 MHz, STBC, SU/MU beamformee of 4 streams, the
++/// longest A-MPDU, the antenna patterns fixed; 160 MHz on the MT7922.
++const VHT_INFO: u32 = 2 | chan::VHT_CAP_RXLDPC | chan::VHT_CAP_SGI_80 | chan::VHT_CAP_TXSTBC | 0x0100 | chan::VHT_CAP_SU_BEAMFORMEE | (1 << 20) | (3 << 13) | (7 << chan::VHT_CAP_MAX_AMPDU_SHIFT) | 0x3000_0000;
++const VHT_INFO_160: u32 = 0x0000_0004 | chan::VHT_CAP_SGI_160;
++
++/// `mt76_connac_cbw`: the firmware's code of a width.
++pub(crate) fn cbw(width: Width) -> u8 {
++    match width {
++        Width::NoHt20 | Width::W20 => CMD_CBW_20MHZ,
++        Width::W40 => CMD_CBW_40MHZ,
++        Width::W80 => CMD_CBW_80MHZ,
++        Width::W160 => CMD_CBW_160MHZ,
++    }
++}
++
++/// The secondary channel's side as the RLM wants it: above (1, "SCA"),
++/// below (3, "SCB"), none.
++pub(crate) fn sco(chandef: &Chandef) -> u8 {
++    match chandef.control.cmp(&chandef.center) {
++        core::cmp::Ordering::Less => 1,
++        core::cmp::Ordering::Greater => 3,
++        core::cmp::Ordering::Equal => 0,
++    }
++}
++
++/// `mt76_connac_gen_ppe_thresh`: the PPE thresholds of `nss` streams on a
++/// band (all RUs up to 996 tones at 5 GHz, 484 at 2.4).
++pub(crate) fn connac_ppe(nss: u8, band: BandId) -> Vec<u8> {
++    const PATTERN: [u8; 3] = [0x1c, 0xc7, 0x71];
++    let ru_mask: u8 = if band == BandId::Ghz2 { 0x3 } else { 0xf };
++    let nss = nss.max(1);
++    let mut out = vec![(nss - 1) | (ru_mask << 3)];
++    let bits = 3 * nss as usize * ru_mask.count_ones() as usize * 2;
++    let size = bits.div_ceil(8);
++    for index in 0..size - 1 {
++        out.push(PATTERN[index % 3]);
++    }
++    out.push(PATTERN[(size - 1) % 3] & (0xff >> (8 - (bits - 1) % 8)));
++    out
++}
 +
 +/// A TLV: tag, length (with its four bytes), value.
 +fn tlv(tag: u16, value: &[u8]) -> Vec<u8> {
@@ -1255,12 +1727,41 @@ index 0000000..48f8be3
 +    (wifi::channel_of(freq).unwrap_or(0), if is_2ghz(freq) { 1 } else { 2 })
 +}
 +
++/// Rates (in 500 kbit/s, the basic ones flagged) as the band's bitmaps:
++/// all of them and the basic ones, the band's when none is given.
++pub(crate) fn rate_bitmaps(ghz2: bool, rates: impl Iterator<Item = u8>) -> (u16, u16) {
++    let table: &[u8] = if ghz2 { &RATES_2GHZ } else { &RATES_5GHZ };
++    let (mut all, mut basic) = (0u16, 0u16);
++    for rate in rates {
++        if let Some(index) = table.iter().position(|&known| known == rate & 0x7f) {
++            all |= 1 << index;
++            if rate & 0x80 != 0 {
++                basic |= 1 << index;
++            }
++        }
++    }
++    if all == 0 {
++        all = (1 << table.len()) - 1;
++    }
++    if basic == 0 {
++        basic = if ghz2 { 0x000f } else { 0x0015 };
++    }
++    (all, basic)
++}
++
++/// The rates of a frame's elements.
++pub(crate) fn element_rates(elements: &[u8]) -> Vec<u8> {
++    let elements = wifi::Elements(elements);
++    [wifi::IE_RATES, wifi::IE_EXT_RATES].iter().flat_map(|&id| elements.get(id).unwrap_or(&[]).iter().copied()).collect()
++}
++
 +/// The network being joined: what the station records need.
 +#[derive(Clone)]
 +struct Network {
 +    join: Join,
-+    /// The access point's HT capabilities (the element's value).
-+    ht: Option<[u8; 26]>,
++    /// What the access point and this station run (known once it took
++    /// the station: HT, VHT, HE, the width).
++    peer: radio::Peer,
 +    /// The access point's rates, as the band's bitmap, and its basic ones.
 +    rates: u16,
 +    basic: u16,
@@ -1270,37 +1771,70 @@ index 0000000..48f8be3
 +impl Network {
 +    fn new(join: &Join) -> Self {
 +        let elements = wifi::Elements(&join.elements);
-+        let ht = elements.get(wifi::IE_HT_CAP).filter(|value| value.len() >= 26).map(|value| {
-+            let mut cap = [0u8; 26];
-+            cap.copy_from_slice(&value[..26]);
-+            cap
-+        });
-+        let table: &[u8] = if is_2ghz(join.freq) { &RATES_2GHZ } else { &RATES_5GHZ };
-+        let (mut rates, mut basic) = (0u16, 0u16);
-+        for id in [wifi::IE_RATES, wifi::IE_EXT_RATES] {
-+            for &rate in elements.get(id).unwrap_or(&[]) {
-+                if let Some(index) = table.iter().position(|&known| known == rate & 0x7f) {
-+                    rates |= 1 << index;
-+                    if rate & 0x80 != 0 {
-+                        basic |= 1 << index;
-+                    }
-+                }
-+            }
-+        }
-+        if rates == 0 {
-+            rates = (1 << table.len()) - 1;
-+        }
-+        if basic == 0 {
-+            basic = if is_2ghz(join.freq) { 0x000f } else { 0x0015 };
-+        }
++        let (rates, basic) = rate_bitmaps(is_2ghz(join.freq), element_rates(&join.elements).into_iter());
 +        // The DTIM period, from the beacon's TIM (a probe response has none).
-+        let dtim = elements.get(5).and_then(|value| value.get(1).copied()).filter(|&period| period > 0).unwrap_or(1);
-+        Self { join: join.clone(), ht, rates, basic, dtim }
++        let dtim = elements.get(wifi::IE_TIM).and_then(|value| value.get(1).copied()).filter(|&period| period > 0).unwrap_or(1);
++        Self { join: join.clone(), peer: radio::Peer::default(), rates, basic, dtim }
 +    }
 +
 +    fn ghz2(&self) -> bool {
 +        is_2ghz(self.join.freq)
 +    }
++}
++
++/// The network this radio runs as an access point.
++struct Ap {
++    config: ApConfig,
++    /// Its beacon's: WMM, HE, the HE operation's first bytes.
++    qos: bool,
++    he: bool,
++    he_operation: Option<Vec<u8>>,
++    basic: u16,
++    stations: BTreeMap<Address, ApStation>,
++}
++
++impl Ap {
++    fn new(config: &ApConfig) -> Self {
++        let mut ap = Self { config: config.clone(), qos: false, he: false, he_operation: None, basic: 0, stations: BTreeMap::new() };
++        ap.read_beacon(&config.beacon);
++        ap
++    }
++
++    fn read_beacon(&mut self, beacon: &BeaconTemplate) {
++        let elements = beacon.elements();
++        let list = wifi::Elements(&elements);
++        self.qos = list.vendor(wifi::WMM_OUI_TYPE).is_some();
++        self.he = list.extension(wifi::EXT_HE_CAP).is_some();
++        self.he_operation = list.extension(wifi::EXT_HE_OPERATION).map(<[u8]>::to_vec);
++        self.basic = rate_bitmaps(self.ghz2(), element_rates(&elements).into_iter()).1;
++        self.config.beacon = beacon.clone();
++    }
++
++    fn ghz2(&self) -> bool {
++        is_2ghz(self.config.chandef.control)
++    }
++}
++
++/// A station that joined the access point: its WTBL entry.
++struct ApStation {
++    wcid: u8,
++    qos: bool,
++    key: bool,
++}
++
++/// A peer's station record: the access point's (this radio a station) or
++/// a station's (this radio its access point).
++struct PeerRecord<'a> {
++    wcid: u8,
++    address: Address,
++    aid: u16,
++    qos: bool,
++    peer: &'a radio::Peer,
++    chandef: Chandef,
++    rates: u16,
++    basic: u16,
++    /// This radio is the access point.
++    ap: bool,
 +}
 +
 +/// The card's state for its task and the Wi-Fi component.
@@ -1310,12 +1844,15 @@ index 0000000..48f8be3
 +    pub(crate) address: Address,
 +    /// Spatial streams (the firmware's PHY capability).
 +    nss: u8,
++    /// An MT7922: 160 MHz channels too.
++    wide160: bool,
 +    pub(crate) device: Option<Arc<Device>>,
 +    tokens: DmaCoherent,
 +    /// When each token was handed to the chip (0: free).
 +    token_busy: Vec<u64>,
 +    next_token: usize,
 +    network: Option<Network>,
++    ap: Option<Ap>,
 +    associated: bool,
 +    aid: u16,
 +    qos: bool,
@@ -1340,11 +1877,13 @@ index 0000000..48f8be3
 +            name,
 +            address: [0; 6],
 +            nss: 2,
++            wide160: false,
 +            device: None,
 +            tokens,
 +            token_busy: vec![0; TOKENS],
 +            next_token: 0,
 +            network: None,
++            ap: None,
 +            associated: false,
 +            aid: 0,
 +            qos: false,
@@ -1371,6 +1910,8 @@ index 0000000..48f8be3
 +        ostd::info!("{}: ROM patch loaded", self.name);
 +        self.chip.load_ram(&ram_file).map_err(|error| format!("RAM code: {error}"))?;
 +        ostd::notice!("{}: the firmware runs", self.name);
++        // `is_mt7922`.
++        self.wide160 = self.chip.chip_id == 0x7922;
 +        self.capabilities()?;
 +        self.chip.mcu(Cmd::Ext(EXT_EFUSE_BUFFER_MODE), &[0, 1, 0, 0], true)?;
 +        self.chip.mac_init();
@@ -1417,9 +1958,9 @@ index 0000000..48f8be3
 +    fn channel_domain(&mut self) -> Result<(), String> {
 +        let channels: Vec<(u16, u32)> = (1..=13u16)
 +            .map(|channel| (channel, 0))
-+            .chain(CHANNELS_5GHZ.iter().map(|&channel| (channel, if (52..=144).contains(&channel) { IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR } else { 0 })))
++            .chain(chan::CHANNELS_5GHZ.iter().map(|&channel| (channel as u16, if chan::radar_channel(channel) { IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR } else { 0 })))
 +            .collect();
-+        let mut out = vec![b'0', b'0', 0, 0, 0, 3, 3, 0, 13, CHANNELS_5GHZ.len() as u8, 0, 0];
++        let mut out = vec![b'0', b'0', 0, 0, 0, 3, 3, 0, 13, chan::CHANNELS_5GHZ.len() as u8, 0, 0];
 +        for (channel, flags) in channels {
 +            out.extend_from_slice(&channel.to_le_bytes());
 +            out.extend_from_slice(&[0, 0]);
@@ -1431,13 +1972,21 @@ index 0000000..48f8be3
 +    /// The receive path on the first channel (`mt7921_mcu_set_chan_info`
 +    /// with `SET_RX_PATH`).
 +    fn rx_path(&mut self) -> Result<(), String> {
++        self.chan_info(EXT_SET_RX_PATH, &Chandef::simple(chan::freq_of(BandId::Ghz2, 1)))
++    }
++
++    /// `mt7921_mcu_set_chan_info`: the channel, its centre and width, the
++    /// streams (a mask for the receive path, a count when switching).
++    fn chan_info(&mut self, command: u8, chandef: &Chandef) -> Result<(), String> {
 +        let mut out = vec![0u8; 76];
 +        let mask = (1u8 << self.nss) - 1;
-+        out[0] = 1;
-+        out[1] = 1;
++        out[0] = wifi::channel_of(chandef.control).unwrap_or(1);
++        out[1] = wifi::channel_of(chandef.center).unwrap_or(out[0]);
++        out[2] = cbw(chandef.width);
 +        out[3] = self.nss;
-+        out[4] = mask;
-+        self.chip.mcu(Cmd::Ext(EXT_SET_RX_PATH), &out, true).map(|_| ())
++        out[4] = if command == EXT_CHANNEL_SWITCH { self.nss } else { mask };
++        out[10] = if is_2ghz(chandef.control) { 0 } else { 1 };
++        self.chip.mcu(Cmd::Ext(command), &out, true).map(|_| ())
 +    }
 +
 +    /// Linux's `mt76_connac_mcu_uni_add_dev`: the interface's MAC
@@ -1466,37 +2015,149 @@ index 0000000..48f8be3
 +    /// `struct mt76_connac_bss_basic_tlv`'s value: the interface's BSS,
 +    /// `conn_state` 1 when not connected, the network when there is one.
 +    fn bss_basic(&self, conn_state: u8, network: Option<&Network>) -> Vec<u8> {
-+        let ghz2 = network.is_none_or(Network::ghz2);
-+        let phymode = if ghz2 { PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN } else { PHY_MODE_A | PHY_MODE_AN };
-+        let basic_phy = if ghz2 { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP | PHY_TYPE_BIT_HT } else { PHY_TYPE_BIT_OFDM | PHY_TYPE_BIT_HT };
-+        let (bssid, interval, dtim) = network.map_or(([0; 6], 0, 0), |network| (network.join.bssid, network.join.beacon_interval, network.dtim));
++        let bss = network.map(|network| (network.ghz2(), network.join.bssid, network.join.beacon_interval, network.dtim));
++        Self::basic_value(true, CONNECTION_INFRA_STA, conn_state, bss)
++    }
++
++    /// The BSS basics: active, the connection's type and state, the
++    /// network's band, BSSID, beacon interval and DTIM period when there is
++    /// one, with the interface's own modes (`mt76_connac_get_phy_mode` and
++    /// `_v2` without a station: HT and HE on both bands, VHT at 5 GHz).
++    fn basic_value(active: bool, conn_type: u32, conn_state: u8, bss: Option<(bool, Address, u16, u8)>) -> Vec<u8> {
++        let ghz2 = bss.is_none_or(|(ghz2, ..)| ghz2);
++        let phymode = if ghz2 { PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN | PHY_MODE_AX_24G } else { PHY_MODE_A | PHY_MODE_AN | PHY_MODE_AC | PHY_MODE_AX_5G };
++        let basic_phy = if ghz2 { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP | PHY_TYPE_BIT_HT | PHY_TYPE_BIT_HE } else { PHY_TYPE_BIT_OFDM | PHY_TYPE_BIT_HT | PHY_TYPE_BIT_VHT | PHY_TYPE_BIT_HE };
++        let (bssid, interval, dtim) = bss.map_or(([0; 6], 0, 0), |(_, bssid, interval, dtim)| (bssid, interval, dtim));
 +        let mut value = Vec::with_capacity(28);
-+        value.extend_from_slice(&[1, 0, 0, 0]);
-+        value.extend_from_slice(&CONNECTION_INFRA_STA.to_le_bytes());
++        value.extend_from_slice(&[active as u8, 0, 0, 0]);
++        value.extend_from_slice(&conn_type.to_le_bytes());
 +        value.extend_from_slice(&[conn_state, 0]);
 +        value.extend_from_slice(&bssid);
 +        value.extend_from_slice(&(WCID_OWN as u16).to_le_bytes());
 +        value.extend_from_slice(&interval.to_le_bytes());
-+        value.extend_from_slice(&[dtim, if network.is_some() { phymode } else { 0 }]);
++        value.extend_from_slice(&[dtim, if bss.is_some() { phymode } else { 0 }]);
 +        value.extend_from_slice(&(WCID_OWN as u16).to_le_bytes());
-+        value.extend_from_slice(&(if network.is_some() { basic_phy as u16 } else { 0 }).to_le_bytes());
++        value.extend_from_slice(&(if bss.is_some() { basic_phy as u16 } else { 0 }).to_le_bytes());
 +        value.extend_from_slice(&[0, 0]);
 +        value
 +    }
 +
++    /// `mt76_connac_mcu_uni_bss_he_tlv` and the BSS colour: the RTS
++    /// threshold of the HE operation (1023: none), the PE duration, this
++    /// radio's highest MCS at 80, 160 and 80+80 MHz; the colour when it is
++    /// on.
++    fn he_bss(&mut self, operation: Option<&[u8]>, ghz2: bool, connected: bool) -> Result<(), String> {
++        let rts = operation.filter(|value| value.len() >= 3).map_or(0, |value| (u16::from_le_bytes([value[0], value[1]]) >> 4) & 0x3ff);
++        let own = self.mcs_map();
++        let mut he = vec![0u8; 4];
++        let mut value = Vec::with_capacity(12);
++        value.extend_from_slice(&(if rts == 0 { 1023 } else { rts }).to_le_bytes());
++        value.extend_from_slice(&[4, 0]);
++        value.extend_from_slice(&own.to_le_bytes());
++        value.extend_from_slice(&(if ghz2 || !self.wide160 { 0xffff } else { own }).to_le_bytes());
++        value.extend_from_slice(&0xffffu16.to_le_bytes());
++        value.extend_from_slice(&[0, 0]);
++        he.extend(tlv(UNI_BSS_INFO_HE_BASIC, &value));
++        let color = operation.and_then(|value| value.get(3).copied()).unwrap_or(0);
++        let enabled = connected && color & 0x80 == 0 && color & 0x3f != 0;
++        he.extend(tlv(UNI_BSS_INFO_BSS_COLOR, &[enabled as u8, if connected { color & 0x3f } else { 0 }, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &he)
++    }
++
++    /// `mt76_connac_mcu_uni_set_chctx`: the BSS's channel, centre, width.
++    fn rlm(&mut self, chandef: &Chandef) -> Result<(), String> {
++        let channel = wifi::channel_of(chandef.control).unwrap_or(0);
++        let center = wifi::channel_of(chandef.center).unwrap_or(channel);
++        let bw = cbw(chandef.width);
++        let ht_op = if bw == CMD_CBW_20MHZ { 0 } else { 4 };
++        let mut rlm = vec![0u8; 4];
++        let band = if is_2ghz(chandef.control) { 0 } else { 1 };
++        rlm.extend(tlv(UNI_BSS_INFO_RLM, &[channel, center, 0, bw, self.nss, (1 << self.nss) - 1, 1, ht_op, sco(chandef), band, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &rlm)
++    }
++
++    /// The station's own HE MCS map: MCS 0-11 on each stream.
++    fn mcs_map(&self) -> u16 {
++        (0..8).fold(0u16, |map, stream| map | (if stream < self.nss as usize { 2 } else { 3 }) << (stream * 2))
++    }
++
 +    /// Linux's `mt76_connac_mcu_uni_add_bss` and `_set_chctx`: the BSS with
-+    /// its network (connected or not), its QoS, its channel at 20 MHz.
++    /// its network (connected or not), its QoS, HE's basics with an HE
++    /// access point, its channel as wide as the link.
 +    fn add_bss(&mut self, connected: bool) -> Result<(), String> {
 +        let Some(network) = self.network.clone() else { return Ok(()) };
 +        let mut out = vec![0u8; 4];
 +        out.extend(tlv(UNI_BSS_INFO_BASIC, &self.bss_basic(!connected as u8, Some(&network))));
 +        out.extend(tlv(UNI_BSS_INFO_QBSS, &[self.qos as u8, 0, 0, 0]));
 +        self.uni(UNI_BSS_INFO_UPDATE, &out)?;
-+        let channel = wifi::channel_of(network.join.freq).unwrap_or(0);
-+        let mut rlm = vec![0u8; 4];
-+        let band = if network.ghz2() { 0 } else { 1 };
-+        rlm.extend(tlv(UNI_BSS_INFO_RLM, &[channel, channel, 0, 0, self.nss, (1 << self.nss) - 1, 1, 0, 0, band, 0, 0]));
-+        self.uni(UNI_BSS_INFO_UPDATE, &rlm)
++        if network.peer.he.is_some() {
++            let elements = wifi::Elements(&network.join.elements);
++            self.he_bss(elements.extension(wifi::EXT_HE_OPERATION), network.ghz2(), connected)?;
++        }
++        self.rlm(&network.join.chandef)
++    }
++
++    /// `mt76_connac_mcu_uni_add_bss` for the access point: the BSS active
++    /// (or not any more) with its QoS, HE's basics and its channel.
++    fn add_bss_ap(&mut self, enable: bool) -> Result<(), String> {
++        let Some(ap) = &self.ap else { return Ok(()) };
++        let (ghz2, chandef, qos, he) = (ap.ghz2(), ap.config.chandef, ap.qos, ap.he);
++        let operation = ap.he_operation.clone();
++        let bss = Some((ghz2, self.address, ap.config.beacon_interval, ap.config.dtim_period.max(1)));
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(UNI_BSS_INFO_BASIC, &Self::basic_value(enable, CONNECTION_INFRA_AP, !enable as u8, bss)));
++        out.extend(tlv(UNI_BSS_INFO_QBSS, &[qos as u8, 0, 0, 0]));
++        self.uni(UNI_BSS_INFO_UPDATE, &out)?;
++        if he {
++            self.he_bss(operation.as_deref(), ghz2, enable)?;
++        }
++        self.rlm(&chandef)
++    }
++
++    /// `mt7921_mcu_set_bss_pm`: the firmware's BSS ended, then connected
++    /// with its DTIM period and beacon interval.
++    fn bss_pm(&mut self, enable: bool) -> Result<(), String> {
++        self.chip.mcu(Cmd::Ce(CE_SET_BSS_ABORT), &[0, 0, 0, 0], false)?;
++        let Some(ap) = &self.ap else { return Ok(()) };
++        if !enable {
++            return Ok(());
++        }
++        let mut out = vec![0u8, ap.config.dtim_period.max(1), 0, 0];
++        out.extend_from_slice(&ap.config.beacon_interval.to_le_bytes());
++        out.extend_from_slice(&[0; 6]);
++        self.chip.mcu(Cmd::Ce(CE_SET_BSS_CONNECTED), &out, false).map(|_| ())
++    }
++
++    /// `mt7921_mcu_uni_add_beacon_offload`: the beacon behind its TXD
++    /// (`mt76_connac2_mac_write_txwi` for a beacon: firmware packet, beacon
++    /// queue, the band's lowest rate), where its TIM is.
++    fn beacon_offload(&mut self) -> Result<(), String> {
++        let Some(ap) = &self.ap else { return Ok(()) };
++        let frame = ap.config.beacon.frame(ap.config.dtim_period);
++        if frame.len() < wifi::HEADER || frame.len() > BEACON_ROOM - TXD_SIZE {
++            return Err(format!("a beacon of {} bytes does not fit", frame.len()));
++        }
++        let rate: u32 = if ap.ghz2() { 0 } else { (1 << 6) | 11 };
++        let (kind, subtype) = (((frame[0] >> 2) & 3) as u32, ((frame[0] >> 4) & 0xf) as u32);
++        let mut txd = [0u32; 8];
++        txd[0] = ((frame.len() + TXD_SIZE) as u32 & 0xffff) | (TX_TYPE_FW << 23) | (LMAC_BCN0 << 25);
++        txd[1] = (1 << 31) | WCID_OWN as u32 | (HDR_FORMAT_802_11 << 16) | (((wifi::HEADER / 2) as u32) << 11);
++        txd[2] = (kind << 4) | subtype | TXD2_MULTICAST | TXD2_FIX_RATE | TXD2_HTC_VLD;
++        txd[3] = TXD3_REM_TX_COUNT | TXD3_BA_DISABLE;
++        txd[6] = TXD6_FIXED_BW | (rate << 16);
++        txd[7] = (kind << 20) | (subtype << 16);
++        let mut packet = [0u8; BEACON_ROOM];
++        for (index, word) in txd.iter().enumerate() {
++            packet[4 * index..4 * index + 4].copy_from_slice(&word.to_le_bytes());
++        }
++        packet[TXD_SIZE..TXD_SIZE + frame.len()].copy_from_slice(&frame);
++        let mut value = ((TXD_SIZE + ap.config.beacon.tim_offset()) as u16).to_le_bytes().to_vec();
++        value.extend_from_slice(&[0, 0, 0, 0, 1, 0]);
++        value.extend_from_slice(&((TXD_SIZE + frame.len()) as u16).to_le_bytes());
++        value.extend_from_slice(&packet);
++        let mut out = vec![0u8; 4];
++        out.extend(tlv(UNI_BSS_INFO_BCN_CONTENT, &value));
++        self.uni(UNI_BSS_INFO_UPDATE, &out)
 +    }
 +
 +    /// `struct sta_req_hdr` and its TLVs.
@@ -1521,61 +2182,110 @@ index 0000000..48f8be3
 +        tlv(STA_REC_WTBL, &value)
 +    }
 +
-+    /// The WTBL's generic, RX and header translation entries.
-+    fn wtbl_common(peer: &Address, muar: u8, qos: bool, aid: u16, rca1: bool) -> Vec<Vec<u8>> {
++    /// The WTBL's generic, RX and header translation entries: a station's
++    /// frames go to the distribution system, an access point's come from
++    /// it; frames come in as 802.11.
++    fn wtbl_common(peer: &Address, muar: u8, qos: bool, aid: u16, rca1: bool, ap: bool) -> Vec<Vec<u8>> {
 +        let mut generic = peer.to_vec();
 +        generic.extend_from_slice(&[muar, 0, 0, qos as u8, 0, 0]);
 +        generic.extend_from_slice(&aid.to_le_bytes());
 +        generic.extend_from_slice(&[0, 0]);
-+        vec![
-+            tlv(WTBL_GENERIC, &generic),
-+            tlv(WTBL_RX, &[0, rca1 as u8, 1, 1, 0, 0, 0, 0]),
-+            // To the distribution system; frames come in as 802.11.
-+            tlv(WTBL_HDR_TRANS, &[1, 0, 1, 0]),
-+        ]
++        vec![tlv(WTBL_GENERIC, &generic), tlv(WTBL_RX, &[0, rca1 as u8, 1, 1, 0, 0, 0, 0]), tlv(WTBL_HDR_TRANS, &[!ap as u8, ap as u8, 1, 0])]
 +    }
 +
 +    /// The access point's station record (`mt7921_mcu_sta_update` for the
 +    /// station of the AP), enabled in `state` or disabled.
 +    fn station_record(&mut self, enable: bool, state: u8) -> Result<(), String> {
 +        let Some(network) = self.network.clone() else { return Ok(()) };
-+        let rcpi = self.signal.map_or(0, |signal| (2 * signal as i16 + 220).clamp(0, 220) as u8);
++        // What the AP runs is known once it accepted the station.
++        let peer = if state == STATE_ASSOC { network.peer.clone() } else { radio::Peer::default() };
++        let record = PeerRecord {
++            wcid: WCID_AP,
++            address: network.join.bssid,
++            aid: self.aid,
++            qos: self.qos,
++            peer: &peer,
++            chandef: network.join.chandef,
++            rates: network.rates,
++            basic: network.basic,
++            ap: false,
++        };
++        self.peer_record(&record, enable, state)
++    }
++
++    /// `mt7921_mcu_sta_update` for a peer (`mt76_connac_mcu_sta_cmd`): its
++    /// basics, then once associated its HT, VHT, HE, PHY, rates and state,
++    /// and its WTBL entry; or the entry reset.
++    fn peer_record(&mut self, record: &PeerRecord<'_>, enable: bool, state: u8) -> Result<(), String> {
++        let rcpi = if record.ap { 0 } else { self.signal.map_or(0, |signal| (2 * signal as i16 + 220).clamp(0, 220) as u8) };
++        let ghz2 = is_2ghz(record.chandef.control);
 +        let mut tlvs = Vec::new();
 +        let conn_state = if enable { CONN_STATE_PORT_SECURE } else { CONN_STATE_DISCONNECT };
 +        let newly = state != STATE_ASSOC && enable;
-+        let mut basic = CONNECTION_INFRA_AP.to_le_bytes().to_vec();
-+        basic.extend_from_slice(&[conn_state, self.qos as u8]);
-+        basic.extend_from_slice(&self.aid.to_le_bytes());
-+        basic.extend_from_slice(&network.join.bssid);
++        let conn_type = if record.ap { CONNECTION_INFRA_STA } else { CONNECTION_INFRA_AP };
++        let mut basic = conn_type.to_le_bytes().to_vec();
++        basic.extend_from_slice(&[conn_state, record.qos as u8]);
++        basic.extend_from_slice(&record.aid.to_le_bytes());
++        basic.extend_from_slice(&record.address);
 +        basic.extend_from_slice(&(EXTRA_INFO_VER | if newly { EXTRA_INFO_NEW } else { 0 }).to_le_bytes());
 +        tlvs.push(tlv(STA_REC_BASIC, &basic));
-+        // The AP's HT is known once it accepted the station.
-+        let ht = network.ht.filter(|_| state == STATE_ASSOC);
 +        if !enable {
-+            tlvs.push(Self::wtbl(WCID_AP, &[]));
-+            return self.sta_rec(WCID_AP, 0, &tlvs);
++            tlvs.push(Self::wtbl(record.wcid, &[]));
++            return self.sta_rec(record.wcid, 0, &tlvs);
 +        }
-+        if let Some(cap) = ht {
-+            // 20 MHz: the AP's 40 MHz abilities do not apply.
-+            let info = u16::from_le_bytes([cap[0], cap[1]]) & !(0x0002 | 0x0040);
-+            let mut value = info.to_le_bytes().to_vec();
++        let peer = record.peer;
++        let width = record.chandef.width;
++        let ht = peer.ht.map(|ht| {
++            let mut ht = ht;
++            if width < Width::W40 {
++                // 20 MHz: the AP's 40 MHz abilities do not apply.
++                ht.info &= !(chan::HT_CAP_SUP_WIDTH_20_40 | chan::HT_CAP_SGI_40);
++            }
++            ht
++        });
++        if let Some(ht) = &ht {
++            let mut value = ht.info.to_le_bytes().to_vec();
 +            value.extend_from_slice(&[0, 0]);
 +            tlvs.push(tlv(STA_REC_HT, &value));
 +        }
-+        let mut phy_type = if network.ghz2() { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP } else { PHY_TYPE_BIT_OFDM };
-+        let mut ampdu = 0u8;
-+        if let Some(cap) = ht {
-+            phy_type |= PHY_TYPE_BIT_HT;
-+            ampdu = cap[2] & 0x1f;
++        if let Some(vht) = &peer.vht {
++            // `struct sta_rec_vht` (the MT7921's has its four last bytes).
++            let mut value = vht.info.to_le_bytes().to_vec();
++            value.extend_from_slice(&vht.mcs[0..2]);
++            value.extend_from_slice(&vht.mcs[4..6]);
++            value.extend_from_slice(&[0; 4]);
++            tlvs.push(tlv(STA_REC_VHT, &value));
 +        }
-+        let mut phy = network.basic.to_le_bytes().to_vec();
++        // `mt76_connac_mcu_sta_amsdu_tlv`: A-MSDUs of up to eight frames to
++        // an HT or HE access point, long ones when it takes 7991 bytes.
++        if ht.is_some() || peer.he.is_some() {
++            let long = peer.vht.is_some_and(|vht| vht.info & chan::VHT_CAP_MAX_MPDU_MASK != 0);
++            tlvs.push(tlv(STA_REC_HW_AMSDU, &[8, long as u8, 1, 0]));
++        }
++        if let Some(he) = &peer.he {
++            tlvs.push(tlv(STA_REC_HE, &Self::he_record(he, width)));
++            tlvs.push(tlv(STA_REC_HE_V2, &Self::he_record_v2(he, width)));
++        }
++        let mut phy_type = if ghz2 { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP } else { PHY_TYPE_BIT_OFDM };
++        let mut ampdu = 0u8;
++        if let Some(ht) = &ht {
++            phy_type |= PHY_TYPE_BIT_HT;
++            ampdu = (ht.ampdu_factor & 3) | ((ht.ampdu_density & 7) << 2);
++        }
++        if peer.vht.is_some() {
++            phy_type |= PHY_TYPE_BIT_VHT;
++        }
++        if peer.he.is_some() {
++            phy_type |= PHY_TYPE_BIT_HE;
++        }
++        let mut phy = record.basic.to_le_bytes().to_vec();
 +        phy.extend_from_slice(&[phy_type, ampdu, 0, rcpi, 0, 0]);
 +        tlvs.push(tlv(STA_REC_PHY, &phy));
-+        let legacy = if network.ghz2() { ((network.rates >> 4) & 0xff) << 6 | (network.rates & 0xf) } else { (network.rates & 0xff) << 6 };
++        let legacy = if ghz2 { ((record.rates >> 4) & 0xff) << 6 | (record.rates & 0xf) } else { (record.rates & 0xff) << 6 };
 +        let mut ra = legacy.to_le_bytes().to_vec();
 +        let mut mcs = [0u8; 10];
-+        if let Some(cap) = ht {
-+            mcs.copy_from_slice(&cap[3..13]);
++        if let Some(ht) = &ht {
++            mcs.copy_from_slice(&ht.mcs[..10]);
 +            for (stream, byte) in mcs.iter_mut().enumerate().take(4) {
 +                if stream >= self.nss as usize {
 +                    *byte = 0;
@@ -1585,22 +2295,96 @@ index 0000000..48f8be3
 +        }
 +        ra.extend_from_slice(&mcs);
 +        tlvs.push(tlv(STA_REC_RA, &ra));
-+        tlvs.push(tlv(STA_REC_STATE, &[0, 0, 0, 0, state, 0, 0, 0]));
-+        let mut wtbl = Self::wtbl_common(&network.join.bssid, 0, self.qos, self.aid, true);
-+        if let Some(cap) = ht {
-+            let ldpc = u16::from_le_bytes([cap[0], cap[1]]) & 0x0001 != 0;
-+            wtbl.push(tlv(WTBL_HT, &[1, ldpc as u8, cap[2] & 3, (cap[2] >> 2) & 7, 0, 0, 0, 0]));
++        // The state, and VHT's operating mode: the width and the streams.
++        let opmode = if peer.vht.is_some() { cbw(width).min(3) | ((peer.nss.max(1) - 1) << 4) } else { 0 };
++        tlvs.push(tlv(STA_REC_STATE, &[0, 0, 0, 0, state, opmode, 0, 0]));
++        let mut wtbl = Self::wtbl_common(&record.address, 0, record.qos, record.aid, !record.ap, record.ap);
++        if let Some(ht) = &ht {
++            // `mt76_connac_mcu_wtbl_ht_tlv`: the A-MPDU factor the larger of
++            // HT's and VHT's.
++            let ldpc = ht.info & chan::HT_CAP_LDPC != 0;
++            let vht_factor = peer.vht.map_or(0, |vht| ((vht.info >> chan::VHT_CAP_MAX_AMPDU_SHIFT) & 7) as u8);
++            wtbl.push(tlv(WTBL_HT, &[1, ldpc as u8, ht.ampdu_factor.max(vht_factor), ht.ampdu_density & 7, 0, 0, 0, 0]));
++            if let Some(vht) = &peer.vht {
++                let ldpc = vht.info & chan::VHT_CAP_RXLDPC != 0;
++                wtbl.push(tlv(WTBL_VHT, &[ldpc as u8, 0, 1, 0, 0, 0, 0, 0]));
++            }
 +            wtbl.push(tlv(WTBL_SMPS, &[0, 0, 0, 0]));
 +        }
-+        tlvs.push(Self::wtbl(WCID_AP, &wtbl));
-+        self.sta_rec(WCID_AP, 0, &tlvs)
++        tlvs.push(Self::wtbl(record.wcid, &wtbl));
++        self.sta_rec(record.wcid, 0, &tlvs)
++    }
++
++    /// The access point's highest HE MCS by width (`max_nss_mcs`: 80, 160,
++    /// 80+80 MHz), its receive maps, only those of the link's width.
++    fn he_mcs(he: &HeCap, width: Width) -> [u16; 3] {
++        let map = |at: usize| he.mcs.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
++        let mut out = [map(0), 0, 0];
++        if width == Width::W160 {
++            out[1] = map(4);
++            if he.phy[0] & chan::HE_PHY_80P80_IN_5G != 0 {
++                out[2] = map(8);
++            }
++        }
++        out
++    }
++
++    /// `mt76_connac_mcu_sta_he_tlv`: `struct sta_rec_he`'s value.
++    fn he_record(he: &HeCap, width: Width) -> Vec<u8> {
++        let mut cap = 0u32;
++        for (bit, mac, byte, mask) in HE_CAP_MAP {
++            let field = if mac { he.mac[byte] } else { he.phy[byte] };
++            if field & mask != 0 {
++                cap |= bit;
++            }
++        }
++        let bits = |value: u8, mask: u8| (value & mask) >> mask.trailing_zeros();
++        let mut value = cap.to_le_bytes().to_vec();
++        value.extend_from_slice(&[
++            bits(he.mac[1], 0x0c),
++            bits(he.mac[3], 0x18),
++            bits(he.phy[0], 0xfe),
++            bits(he.phy[1], 0x10),
++            bits(he.phy[3], 0x03),
++            bits(he.phy[3], 0x04),
++            bits(he.phy[3], 0x18),
++            // Linux writes the DCM's largest RU where the receive streams go.
++            bits(he.phy[8], 0xc0),
++            0,
++            bits(he.phy[1], 0x0f),
++            2,
++            0,
++        ]);
++        for mcs in Self::he_mcs(he, width) {
++            value.extend_from_slice(&mcs.to_le_bytes());
++        }
++        value.extend_from_slice(&[0, 0]);
++        value
++    }
++
++    /// `mt76_connac_mcu_sta_he_tlv_v2`: the elements' MAC and PHY
++    /// capabilities as they are, the packet extension of 16 µs.
++    fn he_record_v2(he: &HeCap, width: Width) -> Vec<u8> {
++        let mut value = Vec::with_capacity(24);
++        value.extend_from_slice(&he.mac);
++        value.extend_from_slice(&he.phy);
++        value.push(2);
++        for mcs in Self::he_mcs(he, width) {
++            value.extend_from_slice(&mcs.to_le_bytes());
++        }
++        value
 +    }
 +
 +    /// The interface's own WTBL entry, for group frames of the network
 +    /// (`mt7921_mcu_sta_update` without a station).
 +    fn own_record(&mut self) -> Result<(), String> {
-+        let Some(network) = self.network.clone() else { return Ok(()) };
-+        let wtbl = Self::wtbl_common(&network.join.bssid, MUAR_NONE, false, 0, true);
++        // As an access point, its group frames go to everyone.
++        let (peer, ap) = match (&self.ap, &self.network) {
++            (Some(_), _) => (wifi::BROADCAST, true),
++            (None, Some(network)) => (network.join.bssid, false),
++            (None, None) => return Ok(()),
++        };
++        let wtbl = Self::wtbl_common(&peer, MUAR_NONE, false, 0, true, ap);
 +        self.sta_rec(WCID_OWN, MUAR_NONE, &[Self::wtbl(WCID_OWN, &wtbl)])
 +    }
 +
@@ -1679,7 +2463,7 @@ index 0000000..48f8be3
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
-+        if self.scanning {
++        if self.scanning || self.ap.is_some() {
 +            return Err(radio::Error::Busy);
 +        }
 +        self.scan_seq = (self.scan_seq + 1) & 0x7f;
@@ -1752,6 +2536,9 @@ index 0000000..48f8be3
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
++        if self.ap.is_some() {
++            return Err(radio::Error::Busy);
++        }
 +        self.leave();
 +        self.network = Some(Network::new(join));
 +        self.aid = 0;
@@ -1768,9 +2555,9 @@ index 0000000..48f8be3
 +    /// Linux's `mt7921_mac_sta_event` (ASSOC), `bss_info_changed` (ASSOC,
 +    /// QOS) and `mgd_complete_tx`.
 +    pub(crate) fn associated(&mut self, association: &Association) -> radio::Result<()> {
-+        if self.network.is_none() {
-+            return Err(radio::Error::Invalid);
-+        }
++        let Some(network) = self.network.as_mut() else { return Err(radio::Error::Invalid) };
++        network.peer = association.peer.clone();
++        network.join.chandef = association.chandef;
 +        self.aid = association.aid & 0x3fff;
 +        self.qos = association.qos;
 +        let result = self.add_bss(true).and_then(|()| self.station_record(true, STATE_ASSOC)).and_then(|()| self.own_record());
@@ -1803,8 +2590,109 @@ index 0000000..48f8be3
 +        self.signal = None;
 +    }
 +
++    // ---- As an access point (`mt7921_start_ap`, `_bss_info_changed`,
++    // `_mac_sta_add`, `_mac_sta_assoc`, `_mac_sta_remove`). ----
++
++    /// The channel, the BSS active with its beacon offloaded, the
++    /// interface's entry for group frames, the access classes' parameters.
++    pub(crate) fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.stop_ap();
++        self.leave();
++        self.abort_scan();
++        self.ap = Some(Ap::new(config));
++        let result = self
++            .chan_info(EXT_CHANNEL_SWITCH, &config.chandef)
++            .and_then(|()| self.add_bss_ap(true))
++            .and_then(|()| self.bss_pm(true))
++            .and_then(|()| self.own_record())
++            .and_then(|()| self.beacon_offload());
++        if let Err(error) = result {
++            ostd::warn!("{}: the access point: {}", self.name, error);
++            self.stop_ap();
++            return Err(radio::Error::Failed);
++        }
++        self.qos = self.ap.as_ref().is_some_and(|ap| ap.qos);
++        let elements = config.beacon.elements();
++        self.set_tx(&elements);
++        Ok(())
++    }
++
++    pub(crate) fn set_beacon(&mut self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        ap.read_beacon(beacon);
++        self.beacon_offload().map_err(|error| {
++            ostd::warn!("{}: beacon: {}", self.name, error);
++            radio::Error::Failed
++        })
++    }
++
++    /// The stations' entries reset, the firmware's BSS ended and
++    /// inactive, the interface a station's again.
++    pub(crate) fn stop_ap(&mut self) {
++        let Some(ap) = &self.ap else { return };
++        let addresses: Vec<Address> = ap.stations.keys().copied().collect();
++        if !self.dead {
++            for address in &addresses {
++                self.remove_station(address);
++            }
++            let _ = self.bss_pm(false);
++            let _ = self.add_bss_ap(false);
++        }
++        self.ap = None;
++        self.qos = false;
++        if !self.dead {
++            let _ = self.add_interface();
++        }
++    }
++
++    /// A station's entry: its basics first, then everything it runs once
++    /// associated (as mac80211's NONE and ASSOC states).
++    pub(crate) fn add_station(&mut self, station: &StationEntry) -> radio::Result<()> {
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        if ap.stations.contains_key(&station.address) {
++            self.remove_station(&station.address);
++        }
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        let used: Vec<u8> = ap.stations.values().map(|station| station.wcid).collect();
++        let Some(wcid) = (1..=AP_STATIONS).find(|wcid| !used.contains(wcid)) else { return Err(radio::Error::Busy) };
++        ap.stations.insert(station.address, ApStation { wcid, qos: station.peer.qos, key: false });
++        let (rates, _) = rate_bitmaps(ap.ghz2(), station.peer.rates.iter().copied());
++        let record = PeerRecord {
++            wcid,
++            address: station.address,
++            aid: station.aid & 0x3fff,
++            qos: station.peer.qos,
++            peer: &station.peer,
++            chandef: ap.config.chandef,
++            rates,
++            basic: ap.basic,
++            ap: true,
++        };
++        let result = self.peer_record(&record, true, STATE_NONE).and_then(|()| self.peer_record(&record, true, STATE_ASSOC));
++        if let Err(error) = result {
++            ostd::warn!("{}: station {:02x?}: {}", self.name, station.address, error);
++            self.remove_station(&station.address);
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn remove_station(&mut self, address: &Address) {
++        let Some(ap) = &mut self.ap else { return };
++        let Some(station) = ap.stations.remove(address) else { return };
++        let none = radio::Peer::default();
++        let record = PeerRecord { wcid: station.wcid, address: *address, aid: 0, qos: false, peer: &none, chandef: ap.config.chandef, rates: 0, basic: 0, ap: true };
++        if !self.dead {
++            let _ = self.peer_record(&record, false, STATE_NONE);
++        }
++    }
++
 +    /// `mt76_connac_mcu_add_key`: pairwise keys on the AP's entry, group
-+    /// keys on the interface's.
++    /// keys on the interface's; as an access point, pairwise keys on the
++    /// station's.
 +    pub(crate) fn set_key(&mut self, key: &Key, remove: bool) -> radio::Result<()> {
 +        let cipher = match key.cipher {
 +            radio::CIPHER_CCMP => MCU_CIPHER_AES_CCMP,
@@ -1817,7 +2705,17 @@ index 0000000..48f8be3
 +        if key.key.len() > 32 {
 +            return Err(radio::Error::Invalid);
 +        }
-+        let (wcid, muar) = if key.pairwise { (WCID_AP, 0) } else { (WCID_OWN, MUAR_NONE) };
++        let (wcid, muar) = match (&self.ap, key.pairwise) {
++            (_, false) => (WCID_OWN, MUAR_NONE),
++            (None, true) => (WCID_AP, 0),
++            (Some(ap), true) => {
++                // A station's key goes with its entry when it leaves.
++                let Some(station) = key.address.and_then(|address| ap.stations.get(&address)) else {
++                    return if remove { Ok(()) } else { Err(radio::Error::Invalid) };
++                };
++                (station.wcid, 0)
++            }
++        };
 +        // `struct sta_rec_sec`: add (0: set, 1: remove), the count, then
 +        // two `sec_key`s; the length says how many count.
 +        let mut value = vec![remove as u8, !remove as u8, 0, 0];
@@ -1838,7 +2736,11 @@ index 0000000..48f8be3
 +            ostd::warn!("{}: key: {}", self.name, error);
 +            return Err(radio::Error::Failed);
 +        }
-+        if key.pairwise {
++        if let Some(ap) = &mut self.ap {
++            if let Some(station) = key.address.and_then(|address| ap.stations.get_mut(&address)).filter(|_| key.pairwise) {
++                station.key = !remove;
++            }
++        } else if key.pairwise {
 +            self.pairwise = if remove { None } else { Some((key.index, 1)) };
 +        }
 +        Ok(())
@@ -1872,7 +2774,13 @@ index 0000000..48f8be3
 +            return Err(radio::Error::Invalid);
 +        }
 +        let data = wifi::is_data(&frame);
-+        if frame[1] & wifi::PROTECTED != 0 {
++        if frame[1] & wifi::PROTECTED != 0 && self.ap.is_some() {
++            // As an access point: data with the receiver's key, no
++            // protected management frames.
++            if !data {
++                frame[1] &= !wifi::PROTECTED;
++            }
++        } else if frame[1] & wifi::PROTECTED != 0 {
 +            match self.pairwise.as_mut() {
 +                Some((index, pn)) if !data => {
 +                    let value = *pn;
@@ -1893,7 +2801,13 @@ index 0000000..48f8be3
 +        let tid = if qos_data { (frame[24] & 7) as u32 } else { 0 };
 +        let multicast = frame[4] & 1 != 0;
 +        let (kind, subtype) = (((frame[0] >> 2) & 3) as u32, ((frame[0] >> 4) & 0xf) as u32);
-+        let wcid = if self.network.is_some() { WCID_AP } else { WCID_OWN } as u32;
++        let wcid = match &self.ap {
++            // A station's entry by the receiver, the interface's for group
++            // frames and stations not yet associated.
++            Some(ap) => frame.get(4..10).and_then(|b| <Address>::try_from(b).ok()).and_then(|address| ap.stations.get(&address)).map_or(WCID_OWN, |station| station.wcid),
++            None if self.network.is_some() => WCID_AP,
++            None => WCID_OWN,
++        } as u32;
 +        if frame.len() > BUFFER {
 +            return Err(radio::Error::Invalid);
 +        }
@@ -1912,7 +2826,10 @@ index 0000000..48f8be3
 +        txd[3] = (15 << 11) | if protected { TXD3_PROTECT_FRAME } else { 0 };
 +        if !data || multicast {
 +            // The band's lowest rate: CCK 1 Mbit/s, or OFDM 6 Mbit/s.
-+            let ghz2 = self.network.as_ref().is_none_or(Network::ghz2);
++            let ghz2 = match &self.ap {
++                Some(ap) => ap.ghz2(),
++                None => self.network.as_ref().is_none_or(Network::ghz2),
++            };
 +            let rate: u32 = if ghz2 { 0 } else { (1 << 6) | 11 };
 +            txd[2] |= TXD2_FIX_RATE | TXD2_HTC_VLD;
 +            txd[3] |= TXD3_BA_DISABLE;
@@ -1936,6 +2853,19 @@ index 0000000..48f8be3
 +    }
 +
 +    pub(crate) fn send(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        if let Some(ap) = &self.ap {
++            // To the station the destination names (QoS data when it runs
++            // WMM), or to all of them as plain data with the group's key.
++            let destination: Address = ethernet.get(..6).and_then(|b| b.try_into().ok()).ok_or(radio::Error::Invalid)?;
++            let (tid, keyed) = if wifi::is_multicast(&destination) {
++                (None, true)
++            } else {
++                let station = ap.stations.get(&destination).ok_or(radio::Error::Invalid)?;
++                (station.qos.then(|| wifi::tid_of(ethernet)), station.key)
++            };
++            let frame = wifi::data_from_ethernet_ap(ethernet, &self.address, tid, !plain && keyed).ok_or(radio::Error::Invalid)?;
++            return self.transmit(frame);
++        }
 +        let Some(network) = &self.network else { return Err(radio::Error::Down) };
 +        let tid = self.qos.then(|| wifi::tid_of(ethernet));
 +        let protected = !plain && self.pairwise.is_some();
@@ -2129,28 +3059,43 @@ index 0000000..48f8be3
 +        }
 +    }
 +
++    /// What the radio runs (Linux's mt7921 bands): HT up to 40 MHz on both,
++    /// VHT at 5 GHz up to 80 MHz (160 on the MT7922), HE on both.
 +    pub(crate) fn info(&self) -> Info {
 +        let mut mcs = [0u8; 16];
 +        for stream in 0..self.nss as usize {
 +            mcs[stream] = 0xff;
 +        }
 +        mcs[12] = 1;
-+        let ht = HtCap { info: HT_INFO, ampdu_factor: 3, ampdu_density: 5, mcs };
-+        let band = |id: BandId| {
-+            let channels: Vec<Channel> = match id {
-+                BandId::Ghz2 => (1..=13u16).map(|channel| Channel::new(2407 + 5 * channel)).collect(),
-+                _ => CHANNELS_5GHZ
-+                    .iter()
-+                    .map(|&channel| {
-+                        let mut entry = Channel::new(5000 + 5 * channel);
-+                        entry.radar = (52..=144).contains(&channel);
-+                        entry.passive = entry.radar;
-+                        entry
-+                    })
-+                    .collect(),
++        let mut ht_info = HT_INFO;
++        if self.nss < 2 {
++            ht_info &= !0x0080;
++        }
++        let ht = HtCap { info: ht_info, ampdu_factor: 3, ampdu_density: 5, mcs };
++        let map = self.mcs_map();
++        let mut vht_mcs = [0u8; 8];
++        vht_mcs[0..2].copy_from_slice(&map.to_le_bytes());
++        vht_mcs[4..6].copy_from_slice(&map.to_le_bytes());
++        let mut vht_info = VHT_INFO | if self.wide160 { VHT_INFO_160 } else { 0 };
++        if self.nss < 2 {
++            vht_info &= !chan::VHT_CAP_TXSTBC;
++        }
++        let vht = VhtCap { info: vht_info, mcs: vht_mcs };
++        let he = |id: BandId| {
++            let phy = match (id, self.wide160) {
++                (BandId::Ghz2, false) => HE_PHY_2GHZ,
++                (BandId::Ghz2, true) => HE_PHY_2GHZ_7922,
++                (_, false) => HE_PHY_5GHZ,
++                (_, true) => HE_PHY_5GHZ_7922,
 +            };
-+            Band { id, channels, ht: Some(ht.clone()), vht: None, he: None }
++            let bytes = map.to_le_bytes();
++            let mut mcs = vec![bytes[0], bytes[1], bytes[0], bytes[1]];
++            if id != BandId::Ghz2 && self.wide160 {
++                mcs.extend_from_slice(&[bytes[0], bytes[1], bytes[0], bytes[1]]);
++            }
++            HeCap { mac: HE_MAC, phy, mcs, ppe: connac_ppe(self.nss, id) }
 +        };
++        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: Some(he(id)) };
 +        Info {
 +            driver: String::from("mt7921"),
 +            address: self.address,
@@ -2158,6 +3103,1540 @@ index 0000000..48f8be3
 +            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
 +            max_scan_ssids: 4,
 +            max_scan_ie_len: 600,
++            ap: true,
++        }
++    }
++}
+diff --git a/kernel/comps/mt7921/src/mt7925.rs b/kernel/comps/mt7921/src/mt7925.rs
+new file mode 100644
+index 0000000..c18f5c2
+--- /dev/null
++++ b/kernel/comps/mt7921/src/mt7925.rs
+@@ -0,0 +1,1527 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The MT7925 (Wi-Fi 7, "connac3") as a station or an access point, as
++//! Linux's mt7925 drives it: every command is a unified one with TLVs.
++//! The interface (`DEV_INFO_UPDATE`, `BSS_INFO_UPDATE` with its basic,
++//! security, rate, QoS, MLD, slot time, HE and channel parts, and as an
++//! access point its beacon timing and content), scans (`SCAN_REQ`), the
++//! channel held for joining (`ROC`), the peers' station records
++//! (`STA_REC_UPDATE`: basic, PHY, HT, VHT, HE, rates, state, header
++//! translation off), keys (`STA_REC_KEY_V3`), EDCA (`EDCA_UPDATE`); frames
++//! out with the connac3 TXD and the same TXP as the MT7921's, frames in
++//! after the connac3 RXD. The chip's rings and firmware are [`hw`]'s.
++
++use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
++
++use aster_wlan::{
++    Device, chan,
++    ieee80211::{self as wifi, Address},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, Chandef, HeCap, HtCap, Info, Join, Key, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
++};
++use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
++
++use crate::{
++    hw::{self, BUFFER, Chip, Cmd},
++    mac::{AP_STATIONS, element_rates, rate_bitmaps},
++};
++
++// Unified commands (`mt76_connac_mcu.h`).
++const UNI_DEV_INFO_UPDATE: u16 = 0x01;
++const UNI_BSS_INFO_UPDATE: u16 = 0x02;
++const UNI_STA_REC_UPDATE: u16 = 0x03;
++const UNI_EDCA_UPDATE: u16 = 0x04;
++const UNI_BAND_CONFIG: u16 = 0x08;
++const UNI_CHIP_CONFIG: u16 = 0x0e;
++const UNI_SET_DOMAIN_INFO: u16 = 0x15;
++const UNI_SCAN_REQ: u16 = 0x16;
++const UNI_ROC: u16 = 0x27;
++const UNI_EFUSE_CTRL: u16 = 0x2d;
++// Their TLVs.
++const DEV_INFO_ACTIVE: u16 = 0;
++const UNI_BSS_INFO_BASIC: u16 = 0;
++const UNI_BSS_INFO_RLM: u16 = 2;
++const UNI_BSS_INFO_BSS_COLOR: u16 = 4;
++const UNI_BSS_INFO_HE_BASIC: u16 = 5;
++const UNI_BSS_INFO_BCN_CONTENT: u16 = 7;
++const UNI_BSS_INFO_RATE: u16 = 11;
++const UNI_BSS_INFO_QBSS: u16 = 15;
++const UNI_BSS_INFO_SEC: u16 = 16;
++const UNI_BSS_INFO_BCNFT: u16 = 22;
++const UNI_BSS_INFO_IFS_TIME: u16 = 23;
++const UNI_BSS_INFO_MLD: u16 = 26;
++const UNI_BSS_INFO_PM_DISABLE: u16 = 27;
++/// The beacon's room in `struct bcn_content_tlv`, from its capabilities
++/// on (the firmware's "only cap field IE" format).
++const BEACON_ROOM: usize = 512;
++const UNI_CHIP_CONFIG_NIC_CAPA: u16 = 3;
++const UNI_BAND_CONFIG_RADIO_ENABLE: u16 = 0;
++const UNI_BAND_CONFIG_RTS_THRESHOLD: u16 = 8;
++const UNI_EFUSE_BUFFER_MODE: u16 = 2;
++const UNI_SCAN_REQ_TLV: u16 = 1;
++const UNI_SCAN_CANCEL: u16 = 2;
++const UNI_SCAN_SSID: u16 = 10;
++const UNI_SCAN_BSSID: u16 = 11;
++const UNI_SCAN_CHANNEL: u16 = 12;
++const UNI_SCAN_IE: u16 = 13;
++const UNI_SCAN_MISC: u16 = 14;
++const UNI_ROC_ACQUIRE: u16 = 0;
++const UNI_ROC_ABORT: u16 = 1;
++const STA_REC_BASIC: u16 = 0x00;
++const STA_REC_RA: u16 = 0x01;
++const STA_REC_STATE: u16 = 0x07;
++const STA_REC_HT: u16 = 0x09;
++const STA_REC_VHT: u16 = 0x0a;
++const STA_REC_PHY: u16 = 0x15;
++const STA_REC_HE_V2: u16 = 0x19;
++const STA_REC_MLD_OFF: u16 = 0x23;
++const STA_REC_REMOVE: u16 = 0x25;
++const STA_REC_KEY_V3: u16 = 0x27;
++const STA_REC_HDR_TRANS: u16 = 0x2b;
++const EDCA_AC_PARAM: u16 = 0;
++// Events (`MCU_UNI_EVENT_*`) and their TLVs.
++const UNI_EVENT_BSS_BEACON_LOSS: u8 = 0x0c;
++const UNI_EVENT_SCAN_DONE: u8 = 0x0e;
++const UNI_EVENT_ROC: u8 = 0x27;
++const UNI_EVENT_SCAN_DONE_BASIC: u16 = 0;
++const UNI_EVENT_ROC_GRANT: u16 = 0;
++const UNSOLICITED: u8 = 1 << 2;
++const NIC_CAP_MAC_ADDR: u16 = 7;
++const NIC_CAP_PHY: u16 = 8;
++// RXD packet types and the frames that came through the MCU.
++const PKT_TYPE_NORMAL: u32 = 2;
++const PKT_TYPE_TXRX_NOTIFY: u32 = 6;
++const PKT_TYPE_RX_EVENT: u32 = 7;
++const CONNECTION_INFRA_STA: u32 = 0x0001_0001;
++const CONNECTION_INFRA_AP: u32 = 0x0001_0002;
++const CONNECTION_INFRA_BC: u32 = 0x0001_0020;
++const CONN_STATE_PORT_SECURE: u8 = 2;
++const STATE_NONE: u8 = 0;
++const STATE_ASSOC: u8 = 2;
++const EXTRA_INFO_VER: u16 = 1 << 0;
++const EXTRA_INFO_NEW: u16 = 1 << 1;
++const ROC_REQ_JOIN: u8 = 0;
++/// PHY modes of the BSS (`PHY_MODE_*`) and types of the station
++/// (`PHY_TYPE_BIT_*`).
++const PHY_MODE_A: u8 = 1 << 0;
++const PHY_MODE_B: u8 = 1 << 1;
++const PHY_MODE_G: u8 = 1 << 2;
++const PHY_MODE_GN: u8 = 1 << 3;
++const PHY_MODE_AN: u8 = 1 << 4;
++const PHY_MODE_AC: u8 = 1 << 5;
++const PHY_MODE_AX_24G: u8 = 1 << 6;
++const PHY_MODE_AX_5G: u8 = 1 << 7;
++const PHY_TYPE_BIT_HR_DSSS: u8 = 1 << 0;
++const PHY_TYPE_BIT_ERP: u8 = 1 << 1;
++const PHY_TYPE_BIT_OFDM: u8 = 1 << 3;
++const PHY_TYPE_BIT_HT: u8 = 1 << 4;
++const PHY_TYPE_BIT_VHT: u8 = 1 << 5;
++const PHY_TYPE_BIT_HE: u8 = 1 << 6;
++const PHY_TYPE_ERP_INDEX: u16 = 1;
++const PHY_TYPE_OFDM_INDEX: u16 = 3;
++/// Channel widths of the firmware (`CMD_CBW_*`).
++const CMD_CBW_20MHZ: u8 = 0;
++const CMD_CBW_40MHZ: u8 = 1;
++const CMD_CBW_80MHZ: u8 = 2;
++const CMD_CBW_160MHZ: u8 = 3;
++/// Ciphers (`enum connac3_mcu_cipher_type`).
++const CIPHER_AES_CCMP: u8 = 4;
++const CIPHER_CCMP_256: u8 = 10;
++const CIPHER_GCMP: u8 = 11;
++const CIPHER_GCMP_256: u8 = 12;
++/// BSS security modes (`MODE_*` in mt7925's security TLV).
++const MODE_OPEN: u8 = 0;
++const MODE_WPA2_PSK: u8 = 8;
++const MODE_WPA3_SAE: u8 = 11;
++/// The MCU's "the firmware asked the DMA to stop".
++const MCU_CMD_STOP_DMA: u32 = 1 << 2;
++/// WTBL entries: the access point's station, and the interface's own
++/// (`MT792x_WTBL_RESERVED` less its index).
++const WCID_AP: u16 = 1;
++const WCID_OWN: u16 = 19;
++const MUAR_NONE: u8 = 0x0e;
++// The connac3 TXD and the TXP.
++const TXD_SIZE: usize = 32;
++const TXP_SIZE: usize = 32;
++const LMAC_ALTX0: u32 = 0x10;
++const HDR_FORMAT_802_11: u32 = 2;
++const TXD1_FIXED_RATE: u32 = 1 << 31;
++const TXD3_PROTECT_FRAME: u32 = 1 << 1;
++const TXD3_BCM: u32 = 1 << 4;
++const TXD3_BA_DISABLE: u32 = 1 << 28;
++const TXD6_DAS: u32 = 1 << 2;
++const TXD6_DIS_MAT: u32 = 1 << 3;
++const MSDU_ID_VALID: u16 = 1 << 15;
++const TXD_LEN_LAST: u16 = 1 << 15;
++const TXFREE_INFO_PAIR: u32 = 1 << 31;
++const TXFREE_INFO_HEADER: u32 = 1 << 30;
++const TXFREE_MSDU_NONE: u32 = 0x7fff;
++pub(crate) const TOKENS: usize = 128;
++const TOKEN_STALE_MS: u64 = 2_000;
++const ROC_MS: u32 = 3_000;
++const ROC_GRANT_MS: u64 = 1_000;
++const SCAN_LIMIT_MS: u64 = 30_000;
++const IEEE80211_CHAN_NO_IR: u32 = 1 << 1;
++const IEEE80211_CHAN_RADAR: u32 = 1 << 3;
++/// HE capabilities offered as a station: HTC, OM control, A-MSDU in
++/// A-MPDU; LDPC, NDP and STBC below 80 MHz, SU beamformee; 16 µs of
++/// nominal packet padding (there are no PPE thresholds).
++const HE_MAC: [u8; 6] = [0x01, 0x00, 0x00, 0x02, 0x40, 0x00];
++const HE_PHY: [u8; 11] = [0x00, 0x20, 0x0a, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00];
++
++fn tlv(tag: u16, value: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(4 + value.len());
++    out.extend_from_slice(&tag.to_le_bytes());
++    out.extend_from_slice(&((4 + value.len()) as u16).to_le_bytes());
++    out.extend_from_slice(value);
++    out
++}
++
++fn le32(data: &[u8], at: usize) -> u32 {
++    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++}
++
++fn le16(data: &[u8], at: usize) -> u16 {
++    data.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
++}
++
++fn is_2ghz(freq: u16) -> bool {
++    BandId::of(freq) == BandId::Ghz2
++}
++
++/// The firmware's band number (1: 2.4 GHz, 2: 5 GHz, 3: 6 GHz).
++fn band_number(freq: u16) -> u8 {
++    match BandId::of(freq) {
++        BandId::Ghz2 => 1,
++        BandId::Ghz5 => 2,
++        BandId::Ghz6 => 3,
++    }
++}
++
++fn cbw(width: Width) -> u8 {
++    match width {
++        Width::NoHt20 | Width::W20 => CMD_CBW_20MHZ,
++        Width::W40 => CMD_CBW_40MHZ,
++        Width::W80 => CMD_CBW_80MHZ,
++        Width::W160 => CMD_CBW_160MHZ,
++    }
++}
++
++/// The secondary channel's side: above (1, "SCA"), below (3, "SCB"), none.
++fn sco(chandef: &Chandef) -> u8 {
++    match chandef.control.cmp(&chandef.center) {
++        core::cmp::Ordering::Less => 1,
++        core::cmp::Ordering::Greater => 3,
++        core::cmp::Ordering::Equal => 0,
++    }
++}
++
++#[derive(Clone)]
++struct Network {
++    join: Join,
++    peer: radio::Peer,
++    /// The access point's rates as the band's bitmap, and its basic ones.
++    rates: u16,
++    basic: u16,
++    dtim: u8,
++    /// The cipher of the pairwise key, for the BSS's security part.
++    cipher: u8,
++}
++
++impl Network {
++    fn new(join: &Join) -> Self {
++        let elements = wifi::Elements(&join.elements);
++        let (rates, basic) = rate_bitmaps(is_2ghz(join.freq), element_rates(&join.elements).into_iter());
++        let dtim = elements.get(wifi::IE_TIM).and_then(|value| value.get(1).copied()).filter(|&period| period > 0).unwrap_or(1);
++        Self { join: join.clone(), peer: radio::Peer::default(), rates, basic, dtim, cipher: 0 }
++    }
++}
++
++/// The network this radio runs as an access point.
++struct Ap {
++    config: ApConfig,
++    /// Its beacon's: WMM, HE, the HE operation, the basic rates.
++    qos: bool,
++    he: bool,
++    he_operation: Option<Vec<u8>>,
++    basic: u16,
++    /// The cipher of its keys, for the BSS's security part.
++    cipher: u8,
++    stations: BTreeMap<Address, ApStation>,
++}
++
++impl Ap {
++    fn new(config: &ApConfig) -> Self {
++        let mut ap = Self { config: config.clone(), qos: false, he: false, he_operation: None, basic: 0, cipher: 0, stations: BTreeMap::new() };
++        ap.read_beacon(&config.beacon);
++        ap
++    }
++
++    fn read_beacon(&mut self, beacon: &BeaconTemplate) {
++        let elements = beacon.elements();
++        let list = wifi::Elements(&elements);
++        self.qos = list.vendor(wifi::WMM_OUI_TYPE).is_some();
++        self.he = list.extension(wifi::EXT_HE_CAP).is_some();
++        self.he_operation = list.extension(wifi::EXT_HE_OPERATION).map(<[u8]>::to_vec);
++        self.basic = rate_bitmaps(is_2ghz(self.config.chandef.control), element_rates(&elements).into_iter()).1;
++        self.config.beacon = beacon.clone();
++    }
++}
++
++struct ApStation {
++    wcid: u16,
++    qos: bool,
++    key: bool,
++}
++
++/// A peer's station record: the access point's, or a station's of this
++/// radio's network.
++struct PeerRecord<'a> {
++    wcid: u16,
++    address: Address,
++    aid: u16,
++    qos: bool,
++    peer: &'a radio::Peer,
++    freq: u16,
++    rates: u16,
++    basic: u16,
++    ap: bool,
++}
++
++/// What the BSS's basic TLV says (`struct mt76_connac_bss_basic_tlv`).
++struct BssBasic {
++    active: bool,
++    conn_type: u32,
++    conn_state: u8,
++    bssid: Address,
++    freq: u16,
++    interval: u16,
++    dtim: u8,
++    phymode: u8,
++    /// The station its frames go through.
++    sta: u16,
++}
++
++pub(crate) struct Mt7925 {
++    pub(crate) chip: Chip,
++    pub(crate) name: String,
++    pub(crate) address: Address,
++    nss: u8,
++    pub(crate) device: Option<Arc<Device>>,
++    tokens: DmaCoherent,
++    token_busy: Vec<u64>,
++    next_token: usize,
++    network: Option<Network>,
++    ap: Option<Ap>,
++    associated: bool,
++    aid: u16,
++    qos: bool,
++    pairwise: Option<(u8, u64)>,
++    scanning: bool,
++    scan_started: u64,
++    scan_seq: u8,
++    roc_token: u8,
++    roc_active: bool,
++    roc_granted: bool,
++    /// The DBDC band the firmware put the interface on.
++    band_idx: u8,
++    sequence: u16,
++    pub(crate) signal: Option<i8>,
++    pub(crate) dead: bool,
++}
++
++impl Mt7925 {
++    pub(crate) fn new(chip: Chip, name: String, tokens: DmaCoherent) -> Self {
++        Self {
++            chip,
++            name,
++            address: [0; 6],
++            nss: 2,
++            device: None,
++            tokens,
++            token_busy: vec![0; TOKENS],
++            next_token: 0,
++            network: None,
++            ap: None,
++            associated: false,
++            aid: 0,
++            qos: false,
++            pairwise: None,
++            scanning: false,
++            scan_started: 0,
++            scan_seq: 0,
++            roc_token: 0,
++            roc_active: false,
++            roc_granted: false,
++            band_idx: 0,
++            sequence: 0,
++            signal: None,
++            dead: false,
++        }
++    }
++
++    fn uni(&mut self, id: u16, payload: &[u8]) -> Result<Vec<u8>, String> {
++        self.chip.mcu(Cmd::Uni(id), payload, true)
++    }
++
++    /// Linux's `mt7925_init_hardware`, `__mt7925_start` and the interface's
++    /// `mt76_connac_mcu_uni_add_dev`.
++    pub(crate) fn bring_up(&mut self, patch: &str, ram: &str) -> Result<(), String> {
++        let (_, patch_file) = aster_firmware::load_first([patch]).ok_or_else(|| format!("{patch} is not in /lib/firmware"))?;
++        let (_, ram_file) = aster_firmware::load_first([ram]).ok_or_else(|| format!("{ram} is not in /lib/firmware"))?;
++        self.chip.before_firmware();
++        self.chip.load_patch(&patch_file).map_err(|error| format!("ROM patch: {error}"))?;
++        ostd::info!("{}: ROM patch loaded", self.name);
++        self.chip.load_ram(&ram_file).map_err(|error| format!("RAM code: {error}"))?;
++        ostd::notice!("{}: the firmware runs", self.name);
++        self.capabilities()?;
++        // The calibration from the chip's eFuse, whole.
++        let mut efuse = vec![0u8; 4];
++        efuse.extend_from_slice(&tlv(UNI_EFUSE_BUFFER_MODE, &[0, 1, 0, 0]));
++        self.uni(UNI_EFUSE_CTRL, &efuse)?;
++        self.chip.mac_init_7925();
++        self.channel_domain()?;
++        // The RTS threshold and the radio on.
++        let mut rts = vec![0u8; 4];
++        let mut value = Vec::with_capacity(8);
++        value.extend_from_slice(&0x92bu32.to_le_bytes());
++        value.extend_from_slice(&2u32.to_le_bytes());
++        rts.extend_from_slice(&tlv(UNI_BAND_CONFIG_RTS_THRESHOLD, &value));
++        self.uni(UNI_BAND_CONFIG, &rts)?;
++        let mut radio_on = vec![0u8; 4];
++        radio_on.extend_from_slice(&tlv(UNI_BAND_CONFIG_RADIO_ENABLE, &[1, 0, 0, 0]));
++        if let Err(error) = self.uni(UNI_BAND_CONFIG, &radio_on) {
++            ostd::info!("{}: radio on: {}", self.name, error);
++        }
++        self.add_interface()
++    }
++
++    /// The chip's facts (`mt7925_mcu_get_nic_capability`): its MAC address
++    /// and spatial streams.
++    fn capabilities(&mut self) -> Result<(), String> {
++        let mut request = vec![0u8; 4];
++        request.extend_from_slice(&tlv(UNI_CHIP_CONFIG_NIC_CAPA, &[]));
++        let answer = self.chip.mcu(Cmd::Uni(UNI_CHIP_CONFIG), &request, true)?;
++        let count = le16(&answer, 0) as usize;
++        let mut at = 4;
++        for _ in 0..count {
++            let (tag, length) = (le16(&answer, at), le16(&answer, at + 2) as usize);
++            if length < 4 || at + length > answer.len() {
++                break;
++            }
++            let value = &answer[at + 4..at + length];
++            match tag {
++                NIC_CAP_MAC_ADDR if value.len() >= 6 => self.address.copy_from_slice(&value[..6]),
++                // `struct mt76_connac_phy_cap`: the streams are its fifth byte.
++                NIC_CAP_PHY if value.len() >= 5 => self.nss = value[4].clamp(1, 2),
++                _ => {}
++            }
++            at += length;
++        }
++        if self.address == [0; 6] || self.address[0] & 1 != 0 {
++            return Err(String::from("the firmware gave no MAC address"));
++        }
++        Ok(())
++    }
++
++    /// `mt7925_mcu_set_channel_domain`: the channels the station may use,
++    /// as the world allows them until a network says where it is.
++    fn channel_domain(&mut self) -> Result<(), String> {
++        let mut channels = Vec::new();
++        let (mut n2, mut n5) = (0u8, 0u8);
++        for number in 1..=13u16 {
++            channels.extend_from_slice(&number.to_le_bytes());
++            channels.extend_from_slice(&[0, 0]);
++            channels.extend_from_slice(&0u32.to_le_bytes());
++            n2 += 1;
++        }
++        for number in chan::CHANNELS_5GHZ {
++            let flags = if chan::radar_channel(number) { IEEE80211_CHAN_RADAR | IEEE80211_CHAN_NO_IR } else { 0 };
++            channels.extend_from_slice(&(number as u16).to_le_bytes());
++            channels.extend_from_slice(&[0, 0]);
++            channels.extend_from_slice(&flags.to_le_bytes());
++            n5 += 1;
++        }
++        // The world's code, 2.4 GHz up to 40 MHz, 5 and 6 GHz up to 160.
++        let mut out = vec![0u8, 0, 0, 0, 0, 3, 3, 0];
++        out.extend_from_slice(&2u16.to_le_bytes());
++        out.extend_from_slice(&((8 + channels.len()) as u16).to_le_bytes());
++        out.extend_from_slice(&[n2, n5, 0, 0]);
++        out.extend_from_slice(&channels);
++        self.uni(UNI_SET_DOMAIN_INFO, &out).map(|_| ())
++    }
++
++    /// The interface: its device entry, then its BSS (not connected).
++    fn add_interface(&mut self) -> Result<(), String> {
++        let mut device = vec![0u8, 0, 0, 0];
++        let mut value = vec![1u8, 0];
++        value.extend_from_slice(&self.address);
++        device.extend_from_slice(&tlv(DEV_INFO_ACTIVE, &value));
++        self.uni(UNI_DEV_INFO_UPDATE, &device)?;
++        let mut bss = vec![0u8; 4];
++        bss.extend_from_slice(&self.bss_basic(true, 1, WCID_OWN));
++        self.uni(UNI_BSS_INFO_UPDATE, &bss).map(|_| ())
++    }
++
++    /// `struct mt76_connac_bss_basic_tlv` (32 bytes) of the station's BSS:
++    /// the network's when there is one, its PHY modes as the access point
++    /// runs them.
++    fn bss_basic(&self, active: bool, conn_state: u8, sta: u16) -> Vec<u8> {
++        let network = self.network.as_ref();
++        let freq = network.map_or(2412, |network| network.join.freq);
++        let peer = network.map(|network| &network.peer);
++        let mut phymode = if is_2ghz(freq) { PHY_MODE_B | PHY_MODE_G } else { PHY_MODE_A };
++        if let Some(peer) = peer {
++            if peer.ht.is_some() {
++                phymode |= if is_2ghz(freq) { PHY_MODE_GN } else { PHY_MODE_AN };
++            }
++            if peer.vht.is_some() && !is_2ghz(freq) {
++                phymode |= PHY_MODE_AC;
++            }
++            if peer.he.is_some() {
++                phymode |= if is_2ghz(freq) { PHY_MODE_AX_24G } else { PHY_MODE_AX_5G };
++            }
++        }
++        self.basic_tlv(&BssBasic {
++            active,
++            conn_type: CONNECTION_INFRA_STA,
++            conn_state,
++            bssid: network.map_or([0; 6], |network| network.join.bssid),
++            freq,
++            interval: network.map_or(0, |network| network.join.beacon_interval),
++            dtim: network.map_or(0, |network| network.dtim),
++            phymode,
++            sta,
++        })
++    }
++
++    fn basic_tlv(&self, basic: &BssBasic) -> Vec<u8> {
++        let mut value = Vec::with_capacity(28);
++        value.extend_from_slice(&[basic.active as u8, 0, 0, self.band_idx]);
++        value.extend_from_slice(&basic.conn_type.to_le_bytes());
++        value.extend_from_slice(&[basic.conn_state, 0]);
++        value.extend_from_slice(&basic.bssid);
++        value.extend_from_slice(&basic.sta.to_le_bytes());
++        value.extend_from_slice(&basic.interval.to_le_bytes());
++        value.push(basic.dtim);
++        value.push(basic.phymode);
++        value.extend_from_slice(&basic.sta.to_le_bytes());
++        value.extend_from_slice(&(if is_2ghz(basic.freq) { PHY_TYPE_ERP_INDEX } else { PHY_TYPE_OFDM_INDEX }).to_le_bytes());
++        value.extend_from_slice(&[0, 0]);
++        tlv(UNI_BSS_INFO_BASIC, &value)
++    }
++
++    /// The BSS's parts after its basics (`mt7925_mcu_add_bss_info`):
++    /// security, broadcast rates, QoS, MLD, slot time, HE with the colour,
++    /// and with `enable` the channel.
++    #[allow(clippy::too_many_arguments)]
++    fn bss_parts(&self, out: &mut Vec<u8>, cipher: u8, qos: bool, short_slot: bool, he_operation: Option<&[u8]>, chandef: Option<Chandef>, freq: u16, enable: bool) {
++        let mode = match cipher {
++            CIPHER_GCMP | CIPHER_GCMP_256 => (MODE_WPA3_SAE, 8),
++            CIPHER_AES_CCMP | CIPHER_CCMP_256 => (MODE_WPA2_PSK, 6),
++            _ => (MODE_OPEN, 1),
++        };
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_SEC, &[mode.0, mode.1, cipher, 0]));
++        // Broadcast and multicast rates: the band's basic ones, the fixed
++        // table's entry for them.
++        let basic_rate: u16 = if is_2ghz(freq) { 0x000f } else { 0x0150 };
++        let rate_index = hw::BASIC_RATES_TBL + if is_2ghz(freq) { 0 } else { 4 };
++        let mut rate = vec![0u8, 0];
++        rate.extend_from_slice(&basic_rate.to_le_bytes());
++        rate.extend_from_slice(&[0, 0, 0, 0, is_2ghz(freq) as u8, rate_index, rate_index, 0]);
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_RATE, &rate));
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_QBSS, &[qos as u8, 0, 0, 0]));
++        // Not a multi-link device: link 0xff, its own index 32.
++        let mut mld = vec![0xffu8, 32];
++        mld.extend_from_slice(&self.address);
++        mld.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0, 0, 0]);
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_MLD, &mld));
++        let mut ifs = vec![1u8, 0, 0, 0];
++        ifs.extend_from_slice(&(if short_slot { 9u16 } else { 20 }).to_le_bytes());
++        ifs.extend_from_slice(&[0; 10]);
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_IFS_TIME, &ifs));
++        if let Some(operation) = he_operation {
++            let rts = Some(operation).filter(|value| value.len() >= 3).map_or(0, |value| (u16::from_le_bytes([value[0], value[1]]) >> 4) & 0x3ff);
++            let mut value = Vec::with_capacity(12);
++            value.extend_from_slice(&(if rts == 0 { 1023 } else { rts }).to_le_bytes());
++            value.extend_from_slice(&[4, 0]);
++            // The highest MCS each width takes: this radio's own, at 80
++            // and 160 MHz (not 80+80).
++            let own = self.mcs_map();
++            value.extend_from_slice(&own.to_le_bytes());
++            value.extend_from_slice(&(if is_2ghz(freq) { 0xffff } else { own }).to_le_bytes());
++            value.extend_from_slice(&0xffffu16.to_le_bytes());
++            value.extend_from_slice(&[0, 0]);
++            out.extend_from_slice(&tlv(UNI_BSS_INFO_HE_BASIC, &value));
++            let color = operation.get(3).copied().unwrap_or(0);
++            let enabled = enable && color & 0x80 == 0 && color & 0x3f != 0;
++            out.extend_from_slice(&tlv(UNI_BSS_INFO_BSS_COLOR, &[enabled as u8, if enable { color & 0x3f } else { 0 }, 0, 0]));
++        }
++        if let Some(chandef) = chandef.filter(|_| enable) {
++            let center = wifi::channel_of(chandef.center).unwrap_or(0);
++            let streams = self.nss;
++            let ht_op = if chandef.width >= Width::W40 { 4 } else { 0 };
++            out.extend_from_slice(&tlv(
++                UNI_BSS_INFO_RLM,
++                &[wifi::channel_of(chandef.control).unwrap_or(0), center, 0, cbw(chandef.width), streams, streams, ht_op, sco(&chandef), band_number(chandef.control), 0, 0, 0],
++            ));
++        }
++    }
++
++    /// `mt7925_mcu_add_bss_info`: the BSS of the network joined, with its
++    /// channel when `enable`.
++    fn add_bss(&mut self, enable: bool) -> Result<(), String> {
++        let Some(network) = self.network.clone() else { return Ok(()) };
++        let freq = network.join.freq;
++        let mut out = vec![0u8; 4];
++        // Basic first, with the access point's station.
++        out.extend_from_slice(&self.bss_basic(true, !enable as u8, WCID_AP));
++        // The slot time: short except on 2.4 GHz without the AP's bit.
++        let short = !is_2ghz(freq) || network.join.capability & wifi::CAP_SHORT_SLOT != 0;
++        let elements = wifi::Elements(&network.join.elements);
++        let operation = network.peer.he.is_some().then(|| elements.extension(wifi::EXT_HE_OPERATION).unwrap_or(&[]));
++        self.bss_parts(&mut out, network.cipher, self.qos, short, operation, Some(network.join.chandef), freq, enable);
++        self.uni(UNI_BSS_INFO_UPDATE, &out).map(|_| ())
++    }
++
++    /// The access point's BSS: active (or not any more), its own modes,
++    /// beacon timing, the parts of `bss_parts` and its channel.
++    fn add_bss_ap(&mut self, enable: bool) -> Result<(), String> {
++        let Some(ap) = &self.ap else { return Ok(()) };
++        let chandef = ap.config.chandef;
++        let freq = chandef.control;
++        let phymode = if is_2ghz(freq) { PHY_MODE_B | PHY_MODE_G | PHY_MODE_GN | PHY_MODE_AX_24G } else { PHY_MODE_A | PHY_MODE_AN | PHY_MODE_AC | PHY_MODE_AX_5G };
++        let basic = BssBasic {
++            active: enable,
++            conn_type: CONNECTION_INFRA_AP,
++            conn_state: !enable as u8,
++            bssid: self.address,
++            freq,
++            interval: ap.config.beacon_interval,
++            dtim: ap.config.dtim_period.max(1),
++            phymode,
++            sta: WCID_OWN,
++        };
++        let short = !is_2ghz(freq) || ap.config.beacon.capability() & wifi::CAP_SHORT_SLOT != 0;
++        let operation = ap.he.then(|| ap.he_operation.clone().unwrap_or_default());
++        let (cipher, qos) = (ap.cipher, ap.qos);
++        let mut out = vec![0u8; 4];
++        out.extend_from_slice(&self.basic_tlv(&basic));
++        self.bss_parts(&mut out, cipher, qos, short, operation.as_deref(), Some(chandef), freq, enable);
++        self.uni(UNI_BSS_INFO_UPDATE, &out).map(|_| ())
++    }
++
++    /// `mt7925_mcu_set_bss_pm`: power save of the BSS off, then its beacon
++    /// interval and DTIM period.
++    fn bss_pm(&mut self, enable: bool) -> Result<(), String> {
++        let mut out = vec![0u8; 4];
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_PM_DISABLE, &[]));
++        self.uni(UNI_BSS_INFO_UPDATE, &out)?;
++        let Some(ap) = &self.ap else { return Ok(()) };
++        if !enable {
++            return Ok(());
++        }
++        let mut value = ap.config.beacon_interval.to_le_bytes().to_vec();
++        value.extend_from_slice(&[ap.config.dtim_period.max(1), 0, 0, 0, 0, 0]);
++        let mut out = vec![0u8; 4];
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_BCNFT, &value));
++        self.uni(UNI_BSS_INFO_UPDATE, &out).map(|_| ())
++    }
++
++    /// `mt7925_mcu_uni_add_beacon_offload`: the beacon from its
++    /// capabilities on, where its TIM is.
++    fn beacon_offload(&mut self) -> Result<(), String> {
++        let Some(ap) = &self.ap else { return Ok(()) };
++        let frame = ap.config.beacon.frame(ap.config.dtim_period);
++        let tim = ap.config.beacon.tim_offset();
++        let Some(body) = frame.get(wifi::BEACON_CAPABILITY..).filter(|body| body.len() <= BEACON_ROOM && tim >= wifi::BEACON_CAPABILITY) else {
++            return Err(format!("a beacon of {} bytes does not fit", frame.len()));
++        };
++        let mut value = ((tim - wifi::BEACON_CAPABILITY) as u16).to_le_bytes().to_vec();
++        value.extend_from_slice(&[0, 0, 0, 0, 1, 1]);
++        value.extend_from_slice(&(body.len() as u16).to_le_bytes());
++        let mut packet = [0u8; BEACON_ROOM];
++        packet[..body.len()].copy_from_slice(body);
++        value.extend_from_slice(&packet);
++        let mut out = vec![0u8; 4];
++        out.extend_from_slice(&tlv(UNI_BSS_INFO_BCN_CONTENT, &value));
++        self.uni(UNI_BSS_INFO_UPDATE, &out).map(|_| ())
++    }
++
++    /// The interface's entry as an access point (`mt7925_mcu_sta_update`
++    /// without a station): group frames to everyone, from the DS.
++    fn own_record_ap(&mut self) -> Result<(), String> {
++        let mut basic = CONNECTION_INFRA_BC.to_le_bytes().to_vec();
++        basic.extend_from_slice(&[CONN_STATE_PORT_SECURE, 0, 0, 0]);
++        basic.extend_from_slice(&wifi::BROADCAST);
++        basic.extend_from_slice(&(EXTRA_INFO_VER | EXTRA_INFO_NEW).to_le_bytes());
++        self.sta_rec(WCID_OWN, MUAR_NONE, &[tlv(STA_REC_BASIC, &basic), tlv(STA_REC_HDR_TRANS, &[1, 0, 1, 0])])
++    }
++
++    /// A station record (`STA_REC_UPDATE`): the header (`struct
++    /// sta_req_hdr`: BSS, WTBL index, TLV count, MUAR) and TLVs.
++    fn sta_rec(&mut self, wcid: u16, muar: u8, tlvs: &[Vec<u8>]) -> Result<(), String> {
++        let mut out = vec![0u8, (wcid & 0xff) as u8];
++        out.extend_from_slice(&(tlvs.len() as u16).to_le_bytes());
++        out.extend_from_slice(&[1, muar, (wcid >> 8) as u8, 0]);
++        for entry in tlvs {
++            out.extend_from_slice(entry);
++        }
++        self.uni(UNI_STA_REC_UPDATE, &out).map(|_| ())
++    }
++
++    /// `mt7925_mcu_sta_update`: the access point's station, `enable`d at
++    /// `state` (none before association, associated after), or removed.
++    fn station_record(&mut self, enable: bool, state: u8) -> Result<(), String> {
++        let Some(network) = self.network.clone() else { return Ok(()) };
++        let record = PeerRecord {
++            wcid: WCID_AP,
++            address: network.join.bssid,
++            aid: self.aid,
++            qos: self.qos,
++            peer: &network.peer,
++            freq: network.join.freq,
++            rates: network.rates,
++            basic: network.basic,
++            ap: false,
++        };
++        self.peer_record(&record, enable, state)
++    }
++
++    /// A peer's station record: its basics, PHY, HT, VHT, HE, rates and
++    /// state, header translation off; or the entry removed.
++    fn peer_record(&mut self, record: &PeerRecord<'_>, enable: bool, state: u8) -> Result<(), String> {
++        let peer = record.peer;
++        let mut tlvs = Vec::new();
++        if !enable {
++            tlvs.push(tlv(STA_REC_REMOVE, &[0, 0, 0, 0]));
++            tlvs.push(tlv(STA_REC_MLD_OFF, &[]));
++            return self.sta_rec(record.wcid, 0, &tlvs);
++        }
++        let newly = state != STATE_ASSOC;
++        let mut basic = Vec::with_capacity(16);
++        basic.extend_from_slice(&(if record.ap { CONNECTION_INFRA_STA } else { CONNECTION_INFRA_AP }).to_le_bytes());
++        basic.extend_from_slice(&[CONN_STATE_PORT_SECURE, record.qos as u8]);
++        basic.extend_from_slice(&record.aid.to_le_bytes());
++        basic.extend_from_slice(&record.address);
++        basic.extend_from_slice(&(EXTRA_INFO_VER | if newly { EXTRA_INFO_NEW } else { 0 }).to_le_bytes());
++        tlvs.push(tlv(STA_REC_BASIC, &basic));
++        // PHY: its types, the basic rates, A-MPDU factor and spacing.
++        let freq = record.freq;
++        let mut phy_type = if is_2ghz(freq) { PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP } else { PHY_TYPE_BIT_OFDM };
++        if peer.ht.is_some() {
++            phy_type |= PHY_TYPE_BIT_HT;
++        }
++        if peer.vht.is_some() {
++            phy_type |= PHY_TYPE_BIT_VHT;
++        }
++        if peer.he.is_some() {
++            phy_type |= PHY_TYPE_BIT_HE;
++        }
++        let factor = peer.vht.map_or(peer.ht.map_or(0, |ht| ht.ampdu_factor as u32), |vht| (vht.info >> chan::VHT_CAP_MAX_AMPDU_SHIFT) & 7) as u8;
++        let density = peer.ht.map_or(0, |ht| ht.ampdu_density);
++        let mut phy = Vec::with_capacity(8);
++        phy.extend_from_slice(&record.basic.to_le_bytes());
++        phy.extend_from_slice(&[phy_type, (factor & 3) | ((density & 7) << 2), 0, 0, factor, 0]);
++        tlvs.push(tlv(STA_REC_PHY, &phy));
++        if let Some(ht) = &peer.ht {
++            let mut value = ht.info.to_le_bytes().to_vec();
++            value.extend_from_slice(&[0, 0]);
++            tlvs.push(tlv(STA_REC_HT, &value));
++        }
++        if let Some(vht) = &peer.vht {
++            let mut value = vht.info.to_le_bytes().to_vec();
++            value.extend_from_slice(&vht.mcs[0..2]);
++            value.extend_from_slice(&vht.mcs[4..6]);
++            value.extend_from_slice(&[0; 4]);
++            tlvs.push(tlv(STA_REC_VHT, &value));
++        }
++        if let Some(he) = &peer.he {
++            // `struct sta_rec_he_v2`: its MAC and PHY capabilities, then the
++            // highest MCS at 80, 160 and 80+80 MHz.
++            let mut value = Vec::with_capacity(24);
++            value.extend_from_slice(&he.mac);
++            value.extend_from_slice(&he.phy);
++            // The packet extension: 16 µs.
++            value.push(2);
++            value.extend_from_slice(&le16(&he.mcs, 0).to_le_bytes());
++            value.extend_from_slice(&(if he.mcs.len() >= 6 { le16(&he.mcs, 4) } else { 0xffff }).to_le_bytes());
++            value.extend_from_slice(&0xffffu16.to_le_bytes());
++            tlvs.push(tlv(STA_REC_HE_V2, &value));
++        }
++        // Rates: legacy OFDM and CCK, and HT's MCS.
++        let legacy = if is_2ghz(freq) { ((record.rates >> 4) << 6) | (record.rates & 0xf) } else { (record.rates & 0xff) << 6 };
++        let mut ra = legacy.to_le_bytes().to_vec();
++        let mut mcs = [0u8; 10];
++        if let Some(ht) = &peer.ht {
++            mcs.copy_from_slice(&ht.mcs[..10]);
++        }
++        ra.extend_from_slice(&mcs);
++        tlvs.push(tlv(STA_REC_RA, &ra));
++        // State, and the operating mode VHT announces.
++        let opmode = if peer.vht.is_some() { cbw(peer.width).min(3) | (peer.nss.max(1) << 4) } else { 0 };
++        let mut value = vec![state, 0, 0, 0];
++        value.extend_from_slice(&0u32.to_le_bytes());
++        value.extend_from_slice(&[opmode, 0, 0, 0]);
++        tlvs.push(tlv(STA_REC_STATE, &value));
++        // Header translation off: frames come as 802.11; from the DS to a
++        // station, to it from an access point's stations.
++        tlvs.push(tlv(STA_REC_HDR_TRANS, &[record.ap as u8, !record.ap as u8, 1, 0]));
++        self.sta_rec(record.wcid, 0, &tlvs)
++    }
++
++    /// The network's EDCA parameters (`mt7925_mcu_set_tx`): from its WMM
++    /// element, else the defaults.
++    fn set_tx(&mut self, elements: &[u8]) {
++        let wmm = wifi::Elements(elements).vendor(wifi::WMM_OUI_TYPE).filter(|value| value.len() >= 20 && value[0] == 1);
++        let mut out = vec![0u8; 4];
++        // The firmware's order: BE, BK, VI, VO (mac80211's queue order).
++        let defaults = [(3u8, 4u8, 10u8, 0u16), (7, 4, 10, 0), (2, 3, 4, 94), (2, 2, 3, 47)];
++        let wmm_index = [0usize, 1, 2, 3];
++        for (queue, (aifs, cw_min, cw_max, txop)) in defaults.into_iter().enumerate() {
++            let (aifs, cw_min, cw_max, txop) = match wmm {
++                Some(value) => {
++                    let at = 4 + wmm_index[queue] * 4;
++                    let param = &value[at..at + 4];
++                    (param[0] & 0x0f, param[1] & 0x0f, param[1] >> 4, u16::from_le_bytes([param[2], param[3]]))
++                }
++                None => (aifs, cw_min, cw_max, txop),
++            };
++            let mut value = vec![queue as u8, 0x0f, cw_min, cw_max];
++            value.extend_from_slice(&txop.to_le_bytes());
++            value.extend_from_slice(&[aifs, 0]);
++            out.extend_from_slice(&tlv(EDCA_AC_PARAM, &value));
++        }
++        if let Err(error) = self.uni(UNI_EDCA_UPDATE, &out) {
++            ostd::info!("{}: EDCA: {}", self.name, error);
++        }
++    }
++
++    fn roc_acquire(&mut self) {
++        let Some(network) = &self.network else { return };
++        let freq = network.join.freq;
++        self.roc_token = self.roc_token.wrapping_add(1);
++        let channel = wifi::channel_of(freq).unwrap_or(0);
++        let mut value = vec![0u8, self.roc_token, channel, 0, band_number(freq), CMD_CBW_20MHZ, channel, 0, CMD_CBW_20MHZ, channel, 0, ROC_REQ_JOIN];
++        value.extend_from_slice(&ROC_MS.to_le_bytes());
++        // The DBDC band: the firmware's choice, told in the grant.
++        value.extend_from_slice(&[0xff, 0, 0, 0]);
++        let mut out = vec![0u8; 4];
++        out.extend_from_slice(&tlv(UNI_ROC_ACQUIRE, &value));
++        self.roc_granted = false;
++        if let Err(error) = self.chip.mcu(Cmd::Uni(UNI_ROC), &out, false) {
++            ostd::warn!("{}: channel for joining: {}", self.name, error);
++            return;
++        }
++        self.roc_active = true;
++        // The grant comes as an event: frames to the network wait for it.
++        let deadline = crate::now_ms() + ROC_GRANT_MS;
++        while !self.roc_granted && crate::now_ms() < deadline {
++            self.poll();
++            if !self.roc_granted {
++                crate::sleep();
++            }
++        }
++        if !self.roc_granted {
++            ostd::info!("{}: no grant for the channel; joining anyway", self.name);
++        }
++    }
++
++    fn roc_abort(&mut self) {
++        if !self.roc_active {
++            return;
++        }
++        self.roc_active = false;
++        let mut out = vec![0u8; 4];
++        out.extend_from_slice(&tlv(UNI_ROC_ABORT, &[0, self.roc_token, self.band_idx, 0, 0, 0, 0, 0]));
++        let _ = self.chip.mcu(Cmd::Uni(UNI_ROC), &out, false);
++    }
++
++    // ---- The radio's operations. ----
++
++    /// `mt7925_mcu_hw_scan`: the header, then the request, names, BSSID,
++    /// channels, other settings and the probe requests' elements.
++    pub(crate) fn scan(&mut self, request: &ScanRequest) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.scanning || self.ap.is_some() {
++            return Err(radio::Error::Busy);
++        }
++        self.scan_seq = (self.scan_seq + 1) & 0x7f;
++        let active = !request.ssids.is_empty();
++        let ssids: Vec<&Vec<u8>> = request.ssids.iter().filter(|ssid| !ssid.is_empty()).take(10).collect();
++        let freqs: Vec<u16> = request.freqs.iter().copied().filter(|&freq| wifi::channel_of(freq).is_some() && BandId::of(freq) != BandId::Ghz6).take(64).collect();
++        let mut out = vec![self.scan_seq | (self.band_idx << 7), 0, 0, 0];
++        let mut req = vec![active as u8, if active { 2 } else { 0 }, 1 << 5, 0];
++        req.extend_from_slice(&[0; 12]);
++        out.extend_from_slice(&tlv(UNI_SCAN_REQ_TLV, &req));
++        let mut ssid = vec![if ssids.is_empty() { 1 << 0 } else { 1 << 2 }, ssids.len() as u8, 0, 0];
++        for index in 0..10 {
++            let mut entry = [0u8; 36];
++            if let Some(name) = ssids.get(index) {
++                let length = name.len().min(32);
++                entry[0..4].copy_from_slice(&(length as u32).to_le_bytes());
++                entry[4..4 + length].copy_from_slice(&name[..length]);
++            }
++            ssid.extend_from_slice(&entry);
++        }
++        out.extend_from_slice(&tlv(UNI_SCAN_SSID, &ssid));
++        let mut bssid = wifi::BROADCAST.to_vec();
++        bssid.extend_from_slice(&[0; 6]);
++        out.extend_from_slice(&tlv(UNI_SCAN_BSSID, &bssid));
++        let mut channels = vec![if freqs.is_empty() { 0 } else { 4 }, freqs.len() as u8, 0, 0];
++        for index in 0..64 {
++            match freqs.get(index) {
++                Some(&freq) => channels.extend_from_slice(&[band_number(freq), wifi::channel_of(freq).unwrap_or(0)]),
++                None => channels.extend_from_slice(&[0, 0]),
++            }
++        }
++        out.extend_from_slice(&tlv(UNI_SCAN_CHANNEL, &channels));
++        out.extend_from_slice(&tlv(UNI_SCAN_MISC, &[0; 8]));
++        // The elements last, one TLV a band: its rates and capabilities,
++        // then the supplicant's.
++        let info = self.info();
++        let extra = &request.elements[..request.elements.len().min(300)];
++        for band in &info.bands {
++            let mut elements = Vec::new();
++            let rates = band.id.rates();
++            wifi::put_element(&mut elements, wifi::IE_RATES, &rates[..rates.len().min(8)]);
++            if rates.len() > 8 {
++                wifi::put_element(&mut elements, wifi::IE_EXT_RATES, &rates[8..]);
++            }
++            if let Some(ht) = &band.ht {
++                wifi::put_element(&mut elements, wifi::IE_HT_CAP, &ht.element());
++            }
++            if let Some(vht) = &band.vht {
++                wifi::put_element(&mut elements, wifi::IE_VHT_CAP, &vht.element());
++            }
++            if let Some(he) = &band.he {
++                let mut value = vec![wifi::EXT_HE_CAP];
++                value.extend_from_slice(&he.element());
++                wifi::put_element(&mut elements, wifi::IE_EXTENSION, &value);
++            }
++            elements.extend_from_slice(extra);
++            let mut ie = (elements.len() as u16).to_le_bytes().to_vec();
++            ie.extend_from_slice(&[if band.id == BandId::Ghz2 { 1 } else { 2 }, 0]);
++            ie.extend_from_slice(&elements);
++            ie.resize(ie.len().next_multiple_of(4), 0);
++            out.extend_from_slice(&tlv(UNI_SCAN_IE, &ie));
++        }
++        if let Err(error) = self.chip.mcu(Cmd::Uni(UNI_SCAN_REQ), &out, false) {
++            ostd::warn!("{}: scan: {}", self.name, error);
++            return Err(radio::Error::Failed);
++        }
++        self.scanning = true;
++        self.scan_started = crate::now_ms();
++        Ok(())
++    }
++
++    pub(crate) fn abort_scan(&mut self) {
++        if !self.scanning {
++            return;
++        }
++        self.scanning = false;
++        let mut out = vec![self.scan_seq, 0, 0, 0];
++        out.extend_from_slice(&tlv(UNI_SCAN_CANCEL, &[0, 0, 0, 0]));
++        let _ = self.chip.mcu(Cmd::Uni(UNI_SCAN_REQ), &out, false);
++        if let Some(device) = &self.device {
++            device.scan_done(true);
++        }
++    }
++
++    /// Linux's station add (`mt7925_mac_link_sta_add`) and
++    /// `mgd_prepare_tx`: the BSS and the access point's station, then the
++    /// channel.
++    pub(crate) fn join(&mut self, join: &Join) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if self.ap.is_some() {
++            return Err(radio::Error::Busy);
++        }
++        self.leave();
++        self.network = Some(Network::new(join));
++        self.aid = 0;
++        self.qos = false;
++        let result = self.add_bss(true).and_then(|()| self.station_record(true, STATE_NONE));
++        if let Err(error) = result {
++            ostd::warn!("{}: joining: {}", self.name, error);
++            self.network = None;
++            return Err(radio::Error::Failed);
++        }
++        self.roc_acquire();
++        Ok(())
++    }
++
++    pub(crate) fn associated(&mut self, association: &Association) -> radio::Result<()> {
++        let Some(network) = self.network.as_mut() else { return Err(radio::Error::Invalid) };
++        network.peer = association.peer.clone();
++        network.join.chandef = association.chandef;
++        self.aid = association.aid & 0x3fff;
++        self.qos = association.qos;
++        let result = self.add_bss(true).and_then(|()| self.station_record(true, STATE_ASSOC));
++        if let Err(error) = result {
++            ostd::warn!("{}: association: {}", self.name, error);
++            self.roc_abort();
++            return Err(radio::Error::Failed);
++        }
++        self.set_tx(&association.elements);
++        self.roc_abort();
++        self.associated = true;
++        Ok(())
++    }
++
++    pub(crate) fn leave(&mut self) {
++        if self.network.is_none() {
++            return;
++        }
++        if !self.dead {
++            self.roc_abort();
++            let _ = self.station_record(false, STATE_NONE);
++            let _ = self.add_bss(false);
++        }
++        self.network = None;
++        self.associated = false;
++        self.aid = 0;
++        self.pairwise = None;
++        self.signal = None;
++    }
++
++    // ---- As an access point (`mt7925_start_ap`, `_stop_ap`, the beacon
++    // offload, `mt7925_mac_link_sta_add`/`_assoc`/`_remove`). ----
++
++    pub(crate) fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.stop_ap();
++        self.leave();
++        self.abort_scan();
++        self.ap = Some(Ap::new(config));
++        let result = self.add_bss_ap(true).and_then(|()| self.bss_pm(true)).and_then(|()| self.own_record_ap()).and_then(|()| self.beacon_offload());
++        if let Err(error) = result {
++            ostd::warn!("{}: the access point: {}", self.name, error);
++            self.stop_ap();
++            return Err(radio::Error::Failed);
++        }
++        self.qos = self.ap.as_ref().is_some_and(|ap| ap.qos);
++        let elements = config.beacon.elements();
++        self.set_tx(&elements);
++        Ok(())
++    }
++
++    pub(crate) fn set_beacon(&mut self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        ap.read_beacon(beacon);
++        self.beacon_offload().map_err(|error| {
++            ostd::warn!("{}: beacon: {}", self.name, error);
++            radio::Error::Failed
++        })
++    }
++
++    pub(crate) fn stop_ap(&mut self) {
++        let Some(ap) = &self.ap else { return };
++        let addresses: Vec<Address> = ap.stations.keys().copied().collect();
++        if !self.dead {
++            for address in &addresses {
++                self.remove_station(address);
++            }
++            let _ = self.bss_pm(false);
++            let _ = self.add_bss_ap(false);
++        }
++        self.ap = None;
++        self.qos = false;
++        if !self.dead {
++            let _ = self.add_interface();
++        }
++    }
++
++    pub(crate) fn add_station(&mut self, station: &StationEntry) -> radio::Result<()> {
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        if ap.stations.contains_key(&station.address) {
++            self.remove_station(&station.address);
++        }
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        let used: Vec<u16> = ap.stations.values().map(|station| station.wcid).collect();
++        let Some(wcid) = (1..=AP_STATIONS as u16).find(|wcid| !used.contains(wcid)) else { return Err(radio::Error::Busy) };
++        ap.stations.insert(station.address, ApStation { wcid, qos: station.peer.qos, key: false });
++        let freq = ap.config.chandef.control;
++        let (rates, _) = rate_bitmaps(is_2ghz(freq), station.peer.rates.iter().copied());
++        let record = PeerRecord { wcid, address: station.address, aid: station.aid & 0x3fff, qos: station.peer.qos, peer: &station.peer, freq, rates, basic: ap.basic, ap: true };
++        let result = self.peer_record(&record, true, STATE_NONE).and_then(|()| self.peer_record(&record, true, STATE_ASSOC));
++        if let Err(error) = result {
++            ostd::warn!("{}: station {:02x?}: {}", self.name, station.address, error);
++            self.remove_station(&station.address);
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn remove_station(&mut self, address: &Address) {
++        let Some(ap) = &mut self.ap else { return };
++        let Some(station) = ap.stations.remove(address) else { return };
++        let none = radio::Peer::default();
++        let record = PeerRecord { wcid: station.wcid, address: *address, aid: 0, qos: false, peer: &none, freq: ap.config.chandef.control, rates: 0, basic: 0, ap: true };
++        if !self.dead {
++            let _ = self.peer_record(&record, false, STATE_NONE);
++        }
++    }
++
++    /// `mt7925_mcu_add_key`: pairwise keys on the access point's entry (as
++    /// an access point, the station's), group keys on the interface's, both
++    /// naming the network.
++    pub(crate) fn set_key(&mut self, key: &Key, remove: bool) -> radio::Result<()> {
++        let cipher = match key.cipher {
++            radio::CIPHER_CCMP => CIPHER_AES_CCMP,
++            radio::CIPHER_CCMP_256 => CIPHER_CCMP_256,
++            radio::CIPHER_GCMP => CIPHER_GCMP,
++            radio::CIPHER_GCMP_256 => CIPHER_GCMP_256,
++            _ if remove => CIPHER_AES_CCMP,
++            _ => return Err(radio::Error::Unsupported),
++        };
++        if key.key.len() > 32 {
++            return Err(radio::Error::Invalid);
++        }
++        // The peer the key is for, its entry.
++        let (bssid, wcid, muar) = if let Some(ap) = self.ap.as_mut() {
++            if !remove {
++                ap.cipher = cipher;
++            }
++            if key.pairwise {
++                let Some((address, station)) = key.address.and_then(|address| ap.stations.get(&address).map(|station| (address, station))) else {
++                    return if remove { Ok(()) } else { Err(radio::Error::Invalid) };
++                };
++                (address, station.wcid, 0)
++            } else {
++                (self.address, WCID_OWN, MUAR_NONE)
++            }
++        } else {
++            let Some(network) = self.network.as_mut() else { return Err(radio::Error::Down) };
++            if key.pairwise && !remove {
++                network.cipher = cipher;
++            }
++            let (wcid, muar) = if key.pairwise { (WCID_AP, 0) } else { (WCID_OWN, MUAR_NONE) };
++            (network.join.bssid, wcid, muar)
++        };
++        // `struct sta_rec_sec_uni`: add, transmit with it, its kind, not
++        // the authenticator; the peer, BSS, cipher, index, length, entry,
++        // management protection; the key and its counter.
++        let mut value = vec![!remove as u8, key.pairwise as u8, key.pairwise as u8, 0];
++        value.extend_from_slice(&bssid);
++        value.extend_from_slice(&[0, cipher, key.index, key.key.len() as u8, wcid as u8, 1]);
++        let mut material = [0u8; 32];
++        material[..key.key.len()].copy_from_slice(&key.key);
++        value.extend_from_slice(&material);
++        let mut rsc = [0u8; 16];
++        rsc[..key.seq.len().min(16)].copy_from_slice(&key.seq[..key.seq.len().min(16)]);
++        value.extend_from_slice(&rsc);
++        if let Err(error) = self.sta_rec(wcid, muar, &[tlv(STA_REC_KEY_V3, &value)]) {
++            ostd::warn!("{}: key: {}", self.name, error);
++            return Err(radio::Error::Failed);
++        }
++        if let Some(ap) = &mut self.ap {
++            if let Some(station) = ap.stations.get_mut(&bssid).filter(|_| key.pairwise) {
++                station.key = !remove;
++            }
++            // The BSS's security part names the cipher in force.
++            if !remove && !key.pairwise {
++                let _ = self.add_bss_ap(true);
++            }
++        } else if key.pairwise {
++            self.pairwise = if remove { None } else { Some((key.index, 1)) };
++            // The BSS's security part names the cipher now in force.
++            if !remove && self.associated {
++                let _ = self.add_bss(true);
++            }
++        }
++        Ok(())
++    }
++
++    // ---- Frames. ----
++
++    fn token(&mut self) -> Option<usize> {
++        let now = crate::now_ms().max(1);
++        for step in 0..TOKENS {
++            let token = (self.next_token + step) % TOKENS;
++            let busy = self.token_busy[token];
++            if busy == 0 || now >= busy + TOKEN_STALE_MS {
++                self.next_token = (token + 1) % TOKENS;
++                self.token_busy[token] = now;
++                return Some(token);
++            }
++        }
++        None
++    }
++
++    /// An 802.11 frame out (`mt7925_mac_write_txwi`): the connac3 TXD and
++    /// the TXP on the data ring, the frame in a token's buffer.
++    pub(crate) fn transmit(&mut self, mut frame: Vec<u8>) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        if frame.len() < wifi::HEADER {
++            return Err(radio::Error::Invalid);
++        }
++        let data = wifi::is_data(&frame);
++        if frame[1] & wifi::PROTECTED != 0 && self.ap.is_some() {
++            // As an access point: data with the receiver's key, no
++            // protected management frames.
++            if !data {
++                frame[1] &= !wifi::PROTECTED;
++            }
++        } else if frame[1] & wifi::PROTECTED != 0 {
++            match self.pairwise.as_mut() {
++                Some((index, pn)) if !data => {
++                    let value = *pn;
++                    *pn += 1;
++                    let header = [value as u8, (value >> 8) as u8, 0, 0x20 | (*index << 6), (value >> 16) as u8, (value >> 24) as u8, (value >> 32) as u8, (value >> 40) as u8];
++                    drop(frame.splice(wifi::HEADER..wifi::HEADER, header));
++                }
++                Some(_) => {}
++                None => frame[1] &= !wifi::PROTECTED,
++            }
++        }
++        let protected = frame[1] & wifi::PROTECTED != 0;
++        let sequence = self.sequence;
++        self.sequence = (sequence + 1) & 0x0fff;
++        frame[22..24].copy_from_slice(&(sequence << 4).to_le_bytes());
++        let qos_data = data && frame[0] & 0x80 != 0;
++        let header = if qos_data { 26 } else { 24 };
++        let tid = if qos_data { (frame[24] & 7) as u32 } else { 0 };
++        let multicast = frame[4] & 1 != 0;
++        let (kind, subtype) = (((frame[0] >> 2) & 3) as u32, ((frame[0] >> 4) & 0xf) as u32);
++        let wcid = match &self.ap {
++            Some(ap) => frame.get(4..10).and_then(|b| <Address>::try_from(b).ok()).and_then(|address| ap.stations.get(&address)).map_or(WCID_OWN, |station| station.wcid),
++            None if self.network.is_some() => WCID_AP,
++            None => WCID_OWN,
++        } as u32;
++        if frame.len() > BUFFER {
++            return Err(radio::Error::Invalid);
++        }
++        let Some(token) = self.token() else { return Err(radio::Error::Busy) };
++        if self.tokens.write_bytes(token * BUFFER, &frame).is_err() {
++            self.token_busy[token] = 0;
++            return Err(radio::Error::Memory);
++        }
++        let queue = if data { [1u32, 0, 0, 1, 2, 2, 3, 3][tid as usize] } else { LMAC_ALTX0 };
++        let mut txd = [0u32; 8];
++        txd[0] = ((frame.len() + TXD_SIZE) as u32 & 0xffff) | (queue << 25);
++        txd[1] = (wcid & 0xfff) | ((self.band_idx as u32) << 12) | (HDR_FORMAT_802_11 << 14) | (((header / 2) as u32) << 16) | (tid << 21);
++        txd[2] = (kind << 4) | subtype;
++        txd[3] = (15 << 11) | if protected { TXD3_PROTECT_FRAME } else { 0 } | if multicast { TXD3_BCM } else { 0 };
++        txd[6] = TXD6_DAS | (1 << 4) | TXD6_DIS_MAT;
++        if !data || multicast {
++            // The band's lowest rate, from the fixed table.
++            let ghz2 = match &self.ap {
++                Some(ap) => is_2ghz(ap.config.chandef.control),
++                None => self.network.as_ref().is_none_or(|network| is_2ghz(network.join.freq)),
++            };
++            let index = hw::BASIC_RATES_TBL as u32 + if ghz2 { 0 } else { 4 };
++            txd[1] |= TXD1_FIXED_RATE;
++            txd[3] |= TXD3_BA_DISABLE;
++            txd[6] |= index << 16;
++        }
++        let mut txwi = Vec::with_capacity(TXD_SIZE + TXP_SIZE);
++        for word in txd {
++            txwi.extend_from_slice(&word.to_le_bytes());
++        }
++        let mut txp = [0u8; TXP_SIZE];
++        txp[0..2].copy_from_slice(&(token as u16 | MSDU_ID_VALID).to_le_bytes());
++        let address = (self.tokens.daddr() + token * BUFFER) as u32;
++        txp[8..12].copy_from_slice(&address.to_le_bytes());
++        txp[12..14].copy_from_slice(&((frame.len() as u16 & 0x0fff) | TXD_LEN_LAST).to_le_bytes());
++        txwi.extend_from_slice(&txp);
++        self.chip.data_send(&txwi).map_err(|()| {
++            self.token_busy[token] = 0;
++            radio::Error::Busy
++        })
++    }
++
++    pub(crate) fn send(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        if let Some(ap) = &self.ap {
++            let destination: Address = ethernet.get(..6).and_then(|b| b.try_into().ok()).ok_or(radio::Error::Invalid)?;
++            let (tid, keyed) = if wifi::is_multicast(&destination) {
++                (None, true)
++            } else {
++                let station = ap.stations.get(&destination).ok_or(radio::Error::Invalid)?;
++                (station.qos.then(|| wifi::tid_of(ethernet)), station.key)
++            };
++            let frame = wifi::data_from_ethernet_ap(ethernet, &self.address, tid, !plain && keyed).ok_or(radio::Error::Invalid)?;
++            return self.transmit(frame);
++        }
++        let Some(network) = &self.network else { return Err(radio::Error::Down) };
++        let tid = self.qos.then(|| wifi::tid_of(ethernet));
++        let protected = !plain && self.pairwise.is_some();
++        let frame = wifi::data_from_ethernet(ethernet, &network.join.bssid, tid, protected).ok_or(radio::Error::Invalid)?;
++        self.transmit(frame)
++    }
++
++    // ---- What the chip says. ----
++
++    pub(crate) fn poll(&mut self) {
++        if self.dead {
++            return;
++        }
++        let status = self.chip.rr(hw::HOST_INT_STA);
++        if status == u32::MAX {
++            ostd::warn!("{}: the card is gone", self.name);
++            self.died();
++            return;
++        }
++        if status != 0 {
++            self.chip.wr(hw::HOST_INT_STA, status);
++        }
++        if status & hw::INT_MCU_CMD != 0 {
++            let command = self.chip.rr(hw::MCU_CMD);
++            self.chip.wr(hw::MCU_CMD, command);
++            if command & MCU_CMD_STOP_DMA != 0 {
++                ostd::warn!("{}: the firmware stopped ({:#x}); the card stays off until the next boot", self.name, command);
++                self.died();
++                return;
++            }
++        }
++        let mut packets = core::mem::take(&mut self.chip.pending);
++        for which in [hw::RXQ_MCU, hw::RXQ_DATA] {
++            packets.extend(self.chip.ring_receive(which));
++        }
++        for packet in packets {
++            self.handle(&packet);
++        }
++        if self.scanning && crate::now_ms() >= self.scan_started + SCAN_LIMIT_MS {
++            ostd::warn!("{}: the scan did not end; ended here", self.name);
++            self.scanning = false;
++            if let Some(device) = &self.device {
++                device.scan_done(true);
++            }
++        }
++    }
++
++    fn died(&mut self) {
++        self.dead = true;
++        if let Some(device) = &self.device {
++            if self.scanning {
++                device.scan_done(true);
++            }
++            device.connection_lost();
++        }
++        self.scanning = false;
++    }
++
++    fn handle(&mut self, packet: &[u8]) {
++        let rxd0 = le32(packet, 0);
++        let (kind, flag) = (rxd0 >> 27, (rxd0 >> 16) & 0xf);
++        // A frame through the MCU (its software type says so).
++        let sw_frame = ((rxd0 >> 16) & 0x380f) == 0x3801;
++        match kind {
++            PKT_TYPE_NORMAL => self.rx_frame(packet),
++            _ if sw_frame => self.rx_frame(packet),
++            PKT_TYPE_RX_EVENT if flag == 1 => self.rx_frame(packet),
++            PKT_TYPE_TXRX_NOTIFY => self.tx_free(packet),
++            PKT_TYPE_RX_EVENT if packet.len() >= hw::MCU_RXD_7925 => self.event(packet),
++            _ => {}
++        }
++    }
++
++    /// The connac3 TX-free report (`mt7925_mac_tx_free`): the count, then
++    /// words of a station ("pair"), of statistics ("header"), or of two
++    /// frames' tokens each.
++    fn tx_free(&mut self, packet: &[u8]) {
++        let count = ((le32(packet, 0) >> 16) & 0x3ff) as usize;
++        let mut freed = 0;
++        let mut at = 8;
++        while freed < count && at + 4 <= packet.len() {
++            let info = le32(packet, at);
++            at += 4;
++            if info & (TXFREE_INFO_PAIR | TXFREE_INFO_HEADER) != 0 {
++                continue;
++            }
++            for half in 0..2 {
++                let token = (info >> (15 * half)) & 0x7fff;
++                if token == TXFREE_MSDU_NONE {
++                    continue;
++                }
++                freed += 1;
++                if let Some(busy) = self.token_busy.get_mut(token as usize) {
++                    *busy = 0;
++                }
++            }
++        }
++        if let Some(device) = &self.device {
++            device.ready_to_send();
++        }
++    }
++
++    /// Unsolicited events (`mt7925_mcu_uni_rx_unsolicited_event`): the
++    /// channel's grant, a scan's end, the access point's beacons lost.
++    fn event(&mut self, packet: &[u8]) {
++        let (eid, option) = (packet[36], packet[38]);
++        if option & UNSOLICITED == 0 {
++            return;
++        }
++        let body = hw::MCU_RXD_7925 + 4;
++        match eid {
++            UNI_EVENT_ROC if le16(packet, body) == UNI_EVENT_ROC_GRANT => {
++                // `struct mt7925_roc_grant_tlv`: the band is its 15th byte.
++                if let Some(&band) = packet.get(body + 14) {
++                    self.band_idx = band & 1;
++                }
++                self.roc_granted = true;
++            }
++            UNI_EVENT_SCAN_DONE => {
++                // The TLVs after the event's header: the basic one ends it.
++                let mut at = body;
++                while at + 4 <= packet.len() {
++                    let (tag, length) = (le16(packet, at), le16(packet, at + 2) as usize);
++                    if tag == UNI_EVENT_SCAN_DONE_BASIC && self.scanning {
++                        self.scanning = false;
++                        if let Some(device) = &self.device {
++                            device.scan_done(false);
++                        }
++                    }
++                    if length < 4 {
++                        break;
++                    }
++                    at += length;
++                }
++            }
++            UNI_EVENT_BSS_BEACON_LOSS => {
++                if self.associated
++                    && let Some(device) = &self.device
++                {
++                    ostd::info!("{}: the firmware lost the access point's beacons", self.name);
++                    device.connection_lost();
++                }
++            }
++            _ => {}
++        }
++    }
++
++    /// A frame after its connac3 RXD (`mt7925_mac_fill_rx`): eight words,
++    /// the groups it says are there (4, 1, 2, 3 and 5), the padding.
++    fn rx_frame(&mut self, packet: &[u8]) {
++        let (rxd0, rxd1, rxd2, rxd3, rxd4) = (le32(packet, 0), le32(packet, 4), le32(packet, 8), le32(packet, 12), le32(packet, 16));
++        let length = (rxd0 & 0xffff) as usize;
++        // A broken A-MSDU, too long, an ICV error, a bad FCS.
++        if rxd2 & ((1 << 23) | (1 << 24)) != 0 || rxd1 & (1 << 25) != 0 || rxd3 & (1 << 24) != 0 {
++            return;
++        }
++        // Header translation is off: 802.11 only.
++        if rxd2 & (1 << 7) != 0 {
++            return;
++        }
++        let mut at = 32;
++        let mut signal: Option<i16> = None;
++        if rxd1 & (1 << 19) != 0 {
++            at += 16;
++        }
++        if rxd1 & (1 << 16) != 0 {
++            at += 16;
++        }
++        if rxd1 & (1 << 17) != 0 {
++            at += 16;
++        }
++        if rxd1 & (1 << 18) != 0 {
++            let v3 = le32(packet, at + 12);
++            at += 16;
++            if rxd1 & (1 << 20) != 0 {
++                at += 96;
++            }
++            for chain in 0..self.nss as u32 {
++                let rssi = (((v3 >> (8 * chain)) & 0xff) as i16 - 220) / 2;
++                if rssi < 0 {
++                    signal = Some(signal.map_or(rssi, |best| best.max(rssi)));
++                }
++            }
++        }
++        at += 2 * ((rxd2 >> 13) & 7) as usize;
++        let Some(frame) = packet.get(at..length.min(packet.len())) else { return };
++        if frame.len() < wifi::HEADER {
++            return;
++        }
++        let mut frame = frame.to_vec();
++        if rxd4 & 3 != 0 {
++            let header = if wifi::is_data(&frame) && frame[0] & 0x80 != 0 { 26 } else { 24 };
++            if frame.len() < header + 2 {
++                return;
++            }
++            drop(frame.drain(header..header + 2));
++        }
++        let channel = ((rxd3 >> 8) & 0xff) as u16;
++        let freq = match channel {
++            1..=13 => 2407 + 5 * channel,
++            14 => 2484,
++            15..=180 => 5000 + 5 * channel,
++            _ => return,
++        };
++        let decrypted = (rxd2 >> 16) & 0x1f != 0 && rxd1 & ((1 << 23) | (1 << 24)) == 0;
++        let signal = signal.unwrap_or(-100).clamp(-127, -1) as i8;
++        if let Some(network) = &self.network
++            && wifi::addresses(&frame).is_some_and(|(_, transmitter, _)| transmitter == network.join.bssid)
++        {
++            self.signal = Some(signal);
++        }
++        if let Some(device) = &self.device {
++            device.received(&frame, RxInfo { freq, signal, decrypted, security_header: 0 });
++        }
++    }
++
++    /// The station's own VHT and HE MCS map: MCS 0-9 (VHT) or 0-11 (HE)
++    /// on each stream it has.
++    fn mcs_map(&self) -> u16 {
++        (0..8).fold(0u16, |map, stream| map | (if stream < self.nss as usize { 2 } else { 3 }) << (stream * 2))
++    }
++
++    pub(crate) fn info(&self) -> Info {
++        let streams = self.nss as usize;
++        let mut mcs = [0u8; 16];
++        for stream in 0..streams {
++            mcs[stream] = 0xff;
++        }
++        mcs[12] = 1;
++        // LDPC, 40 MHz, SM power save off, short GI at 20 and 40 MHz, STBC
++        // both ways.
++        let ht = HtCap {
++            info: chan::HT_CAP_LDPC | chan::HT_CAP_SUP_WIDTH_20_40 | 0x000c | chan::HT_CAP_SGI_20 | chan::HT_CAP_SGI_40 | 0x0080 | 0x0100,
++            ampdu_factor: 3,
++            ampdu_density: 5,
++            mcs,
++        };
++        let map = self.mcs_map();
++        let mut vht_mcs = [0u8; 8];
++        vht_mcs[0..2].copy_from_slice(&map.to_le_bytes());
++        vht_mcs[4..6].copy_from_slice(&map.to_le_bytes());
++        let vht = VhtCap {
++            info: chan::VHT_CAP_RXLDPC
++                | chan::VHT_CAP_SGI_80
++                | chan::VHT_CAP_SGI_160
++                | 0x0000_0004
++                | chan::VHT_CAP_TXSTBC
++                | 0x0100
++                | chan::VHT_CAP_SU_BEAMFORMEE
++                | (3 << 13)
++                | (7 << chan::VHT_CAP_MAX_AMPDU_SHIFT)
++                | 0x3000_0000,
++            mcs: vht_mcs,
++        };
++        let he = |id: BandId| {
++            let mut phy = HE_PHY;
++            phy[0] = if id == BandId::Ghz2 { chan::HE_PHY_40_IN_2G } else { chan::HE_PHY_40_80_IN_5G | chan::HE_PHY_160_IN_5G };
++            let bytes = map.to_le_bytes();
++            let mut mcs = vec![bytes[0], bytes[1], bytes[0], bytes[1]];
++            if id != BandId::Ghz2 {
++                mcs.extend_from_slice(&[bytes[0], bytes[1], bytes[0], bytes[1]]);
++            }
++            HeCap { mac: HE_MAC, phy, mcs, ppe: Vec::new() }
++        };
++        let band = |id: BandId| Band { id, channels: chan::default_channels(id), ht: Some(ht), vht: (id == BandId::Ghz5).then_some(vht), he: Some(he(id)) };
++        Info {
++            driver: String::from("mt7925"),
++            address: self.address,
++            bands: vec![band(BandId::Ghz2), band(BandId::Ghz5)],
++            ciphers: vec![radio::CIPHER_CCMP, radio::CIPHER_GCMP, radio::CIPHER_GCMP_256, radio::CIPHER_CCMP_256],
++            max_scan_ssids: 10,
++            max_scan_ie_len: 600,
++            ap: true,
 +        }
 +    }
 +}

@@ -46,6 +46,20 @@ iwlwifi-7265-17.ucode
 iwlwifi-7265D-29.ucode
 iwlwifi-3160-17.ucode
 iwlwifi-3168-29.ucode
+# BE200, BE201, BE202 and the CNVi radios of Core Ultra (the BZ family's
+# MAC types: bz, gl, sc): the releases the MLD commands were written for
+# (97, 98, 100, 101) and the ones named by their core (c101 to c103), the
+# platform NVM data.
+intel/iwlwifi/iwlwifi-bz-b0-*-9[78].ucode
+intel/iwlwifi/iwlwifi-bz-b0-*-10[01].ucode
+intel/iwlwifi/iwlwifi-bz-b0-*-c10[1-3].ucode
+intel/iwlwifi/iwlwifi-bz-b0-*.pnvm
+intel/iwlwifi/iwlwifi-gl-c0-*-9[78].ucode
+intel/iwlwifi/iwlwifi-gl-c0-*-10[01].ucode
+intel/iwlwifi/iwlwifi-gl-c0-*-c10[1-3].ucode
+intel/iwlwifi/iwlwifi-gl-c0-*.pnvm
+intel/iwlwifi/iwlwifi-sc-a0-*-10[01].ucode
+intel/iwlwifi/iwlwifi-sc-a0-*-c10[1-3].ucode
 
 # MediaTek Wi-Fi (kernel/comps/mt7921): the patch and the RAM code of the
 # MT7921 (and its AMD RZ608/RZ616 names), the MT7920 (1a) and the MT7922.
@@ -56,6 +70,9 @@ mediatek/WIFI_MT7961_patch_mcu_1a_2_hdr.bin
 mediatek/WIFI_RAM_CODE_MT7961_1a.bin
 mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin
 mediatek/WIFI_RAM_CODE_MT7922_1.bin
+# The MT7925 (Wi-Fi 7, the connac3 commands).
+mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin
+mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin
 
 # Realtek Wi-Fi (kernel/comps/rtw88): the RTL8821CE's, RTL8822BE's,
 # RTL8822CE's and RTL8723DE's firmware (its licence is the Realtek one
@@ -64,6 +81,16 @@ rtw88/rtw8821c_fw.bin
 rtw88/rtw8822b_fw.bin
 rtw88/rtw8822c_fw.bin
 rtw88/rtw8723d_fw.bin
+
+# Realtek 802.11ax and 802.11be Wi-Fi (kernel/comps/rtw89): each chip's
+# newest firmware format the driver reads (the BB tables, TX power and, on
+# the RTL8922A, its baseband MCU's firmware are elements in the same file).
+rtw89/rtw8852a_fw-1.bin
+rtw89/rtw8852b_fw-2.bin
+rtw89/rtw8852bt_fw.bin
+rtw89/rtw8851b_fw-1.bin
+rtw89/rtw8852c_fw-2.bin
+rtw89/rtw8922a_fw-4.bin
 
 # Qualcomm Atheros Wi-Fi (kernel/comps/ath10k): each chip revision's
 # firmware over PCIe (firmware-N.bin, the newest interface the driver tries
@@ -75,6 +102,46 @@ ath10k/QCA6174/hw*/notice_ath10k_firmware-[0-9].txt
 ath10k/QCA9377/hw1.0/firmware-[0-9].bin
 ath10k/QCA9377/hw1.0/board*.bin
 ath10k/QCA9377/hw1.0/notice_ath10k_firmware-[0-9].txt
+
+# Qualcomm 802.11ax Wi-Fi over PCIe (kernel/comps/ath11k): the QCA6390,
+# WCN6855 (both steps; Qualcomm's FastConnect 6800/6900), QCA2066,
+# QCA6698AQ and QCN9074 firmware (amss), its M3 processor's, the board
+# data, WCN6855's regulatory database, the notices. Their licence is the
+# ath10k one above.
+ath11k/QCA6390/hw2.0/amss.bin
+ath11k/QCA6390/hw2.0/m3.bin
+ath11k/QCA6390/hw2.0/board-2.bin
+ath11k/QCA6390/hw2.0/Notice.txt
+ath11k/WCN6855/hw2.0/amss.bin
+ath11k/WCN6855/hw2.0/m3.bin
+ath11k/WCN6855/hw2.0/board-2.bin
+ath11k/WCN6855/hw2.0/regdb.bin
+ath11k/WCN6855/hw2.0/Notice.txt
+ath11k/WCN6855/hw2.1/amss.bin
+ath11k/WCN6855/hw2.1/m3.bin
+ath11k/WCN6855/hw2.1/board-2.bin
+ath11k/WCN6855/hw2.1/regdb.bin
+ath11k/QCA2066/hw2.1/amss.bin
+ath11k/QCA2066/hw2.1/m3.bin
+ath11k/QCA2066/hw2.1/board-2.bin
+ath11k/QCA2066/hw2.1/Notice.txt
+ath11k/QCA6698AQ/hw2.1/amss.bin
+ath11k/QCA6698AQ/hw2.1/m3.bin
+ath11k/QCA6698AQ/hw2.1/board-2.bin
+ath11k/QCA6698AQ/hw2.1/Notice.txt
+ath11k/QCN9074/hw1.0/amss.bin
+ath11k/QCN9074/hw1.0/m3.bin
+ath11k/QCN9074/hw1.0/board-2.bin
+ath11k/QCN9074/hw1.0/Notice.txt
+
+# Broadcom FullMAC Wi-Fi over PCIe (kernel/comps/brcmfmac): every chip's
+# firmware linux-firmware has and the regulatory (CLM) data of the chips
+# that need it (the boards' NVRAM files, named after each board, are left
+# out: a board whose NVRAM lives in its EFI variables needs it as
+# brcm/brcmfmac<chip>-pcie.txt).
+licence LICENCE.broadcom_bcm43xx 03f3rrzhh6wgsgl37g9wvjlil84qmhnnry78ilz0wamqj7y5cq5i
+brcm/brcmfmac*-pcie.bin
+brcm/brcmfmac*-pcie.clm_blob
 
 # Intel Bluetooth on USB (kernel/comps/bluetooth, intel.rs): the firmware the
 # boot loader takes and its configuration (.ddc), for every controller from

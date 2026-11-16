@@ -1289,10 +1289,10 @@ index 0000000..69e0fb4
 +}
 diff --git a/kernel/comps/ath10k/src/lib.rs b/kernel/comps/ath10k/src/lib.rs
 new file mode 100644
-index 0000000..2b614bb
+index 0000000..398cc17
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/lib.rs
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,330 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Qualcomm Atheros Wi-Fi of Linux's ath10k family on PCIe: the QCA6174
@@ -1337,7 +1337,10 @@ index 0000000..2b614bb
 +};
 +pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms, udelay as delay_us};
 +use aster_pci::common_device::PciCommonDevice;
-+use aster_wlan::radio::{self, Association, Join, Key, LinkStats, Radio, ScanRequest};
++use aster_wlan::{
++    ieee80211::Address,
++    radio::{self, ApConfig, Association, BeaconTemplate, Join, Key, LinkStats, Radio, ScanRequest, StationEntry},
++};
 +use component::{ComponentInitError, init_component};
 +use ostd::sync::Mutex;
 +
@@ -1442,6 +1445,7 @@ index 0000000..2b614bb
 +    fn stop(&self) {
 +        let mut state = self.card.state.lock();
 +        state.abort_scan();
++        state.stop_ap();
 +        state.leave();
 +    }
 +
@@ -1488,6 +1492,30 @@ index 0000000..2b614bb
 +
 +    fn link_stats(&self) -> LinkStats {
 +        LinkStats { signal: self.card.state.lock().signal, tx_rate: None }
++    }
++
++    fn start_ap(&self, config: &ApConfig) -> radio::Result<()> {
++        self.card.state.lock().start_ap(config)
++    }
++
++    fn set_beacon(&self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        self.card.state.lock().set_beacon(beacon)
++    }
++
++    fn stop_ap(&self) {
++        self.card.state.lock().stop_ap();
++    }
++
++    fn add_station(&self, station: &StationEntry) -> radio::Result<()> {
++        self.card.state.lock().add_station(station)
++    }
++
++    fn remove_station(&self, address: &Address) {
++        self.card.state.lock().remove_station(address);
++    }
++
++    fn authorize_station(&self, address: &Address, authorized: bool) {
++        self.card.state.lock().authorize_station(address, authorized);
 +    }
 +}
 +
@@ -2258,25 +2286,28 @@ index 0000000..fd049bb
 +}
 diff --git a/kernel/comps/ath10k/src/sta.rs b/kernel/comps/ath10k/src/sta.rs
 new file mode 100644
-index 0000000..b0d2c9e
+index 0000000..d91ace9
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/sta.rs
-@@ -0,0 +1,876 @@
+@@ -0,0 +1,1306 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
-+//! The station as Linux's ath10k `mac.c` runs it on the TLV firmware: HTC
-+//! up, WMI's service ready and init, HTT's RX ring, one STA vdev; scans by
-+//! the firmware, a vdev started on the network's channel and a peer for the
-+//! access point, the peer's rates at association, keys in the firmware,
-+//! management frames received through WMI and sent through HTT, data
-+//! through HTT as native Wi-Fi frames (the chip encrypts).
++//! The interface as Linux's ath10k `mac.c` runs it on the TLV firmware:
++//! HTC up, WMI's service ready and init, HTT's RX ring, one vdev; as a
++//! station, scans by the firmware, a vdev started on the network's channel
++//! and a peer for the access point with its rates at association; as an
++//! access point, a vdev of its own with its peer, the beacon (and probe
++//! response) as the firmware's templates, a peer per station; keys in the
++//! firmware, management frames received through WMI and sent through HTT,
++//! data through HTT as native Wi-Fi frames (the chip encrypts).
 +
-+use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
++use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec, vec::Vec};
 +
 +use aster_wlan::{
 +    Device,
++    chan,
 +    ieee80211::{self as wifi, Address},
-+    radio::{self, Association, Band, BandId, Channel, HtCap, Info, Join, Key, RxInfo, ScanRequest},
++    radio::{self, ApConfig, Association, Band, BandId, BeaconTemplate, Channel, Chandef, HtCap, Info, Join, Key, Peer, RxInfo, ScanRequest, StationEntry, VhtCap, Width},
 +};
 +use ostd::mm::{HasDaddr, dma::DmaCoherent};
 +
@@ -2292,30 +2323,25 @@ index 0000000..b0d2c9e
 +const WAIT_MS: u64 = 3000;
 +/// How long a scan may run before it is taken for ended.
 +const SCAN_TIMEOUT_MS: u64 = 30_000;
-+const RATES_2GHZ: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
-+const RATES_5GHZ: [u8; 8] = [12, 18, 24, 36, 48, 72, 96, 108];
 +const CCK_RATES: [u8; 4] = [2, 4, 11, 22];
-+const CHANNELS_5GHZ: [u16; 25] = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165];
-+/// 802.11 HT capabilities: RX STBC of one stream, SM power save off; the
-+/// short guard interval when the firmware has it.
-+const HT_INFO: u16 = 0x0100 | 0x000c;
-+const HT_SGI_20: u16 = 0x0020;
++/// 802.11's HT capability bits this driver sets or reads.
++const HT_CAP_SM_PS_DISABLED: u16 = 3 << 2;
++const HT_SGI_20: u16 = 1 << 5;
++const HT_SGI_40: u16 = 1 << 6;
++const HT_CAP_TX_STBC: u16 = 1 << 7;
++const HT_CAP_RX_STBC: u16 = 3 << 8;
++const HT_CAP_LSIG_TXOP: u16 = 1 << 15;
++/// 802.11's VHT capability fields (`ath10k_create_vht_cap`'s).
++const VHT_CAP_SU_BEAMFORMER: u32 = 1 << 11;
++const VHT_CAP_SU_BEAMFORMEE: u32 = 1 << 12;
++const VHT_CAP_MU_BEAMFORMER: u32 = 1 << 19;
++const VHT_CAP_MU_BEAMFORMEE: u32 = 1 << 20;
++const VHT_CAP_STS_SHIFT: u32 = 13;
++const VHT_CAP_SOUND_SHIFT: u32 = 16;
 +/// The most power a channel is given, in dBm.
 +const MAX_POWER: u8 = 20;
 +/// The WPA element's OUI and type.
 +const WPA_OUI_TYPE: [u8; 4] = [0x00, 0x50, 0xf2, 0x01];
-+
-+fn channel_freq(channel: u16) -> u16 {
-+    match channel {
-+        1..=13 => 2407 + 5 * channel,
-+        14 => 2484,
-+        _ => 5000 + 5 * channel,
-+    }
-+}
-+
-+fn radar(channel: u16) -> bool {
-+    (52..=144).contains(&channel)
-+}
 +
 +fn le32(data: &[u8], at: usize) -> u32 {
 +    data.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -2340,6 +2366,35 @@ index 0000000..b0d2c9e
 +    ht: bool,
 +}
 +
++/// The network this radio runs as an access point: what its beacon says,
++/// its stations (whether each runs WMM and has its pairwise key).
++struct Ap {
++    config: ApConfig,
++    rsn: bool,
++    wpa: bool,
++    started: bool,
++    up: bool,
++    stations: BTreeMap<Address, (bool, bool)>,
++    group_key: bool,
++}
++
++/// `ath10k_peer_assoc_prepare`'s view of a peer.
++struct PeerParams<'a> {
++    address: Address,
++    aid: u16,
++    capability: u16,
++    listen_interval: u32,
++    qos: bool,
++    rsn: bool,
++    wpa: bool,
++    peer: &'a Peer,
++    chandef: Chandef,
++    /// The rates the peer and this radio share (in 500 kbit/s).
++    rates: Vec<u8>,
++    /// HT is on in the BSS.
++    ht: bool,
++}
++
 +/// A scan: one band at a time (mac80211 splits them for ath10k), each
 +/// with its probe requests' rates.
 +struct Scan {
@@ -2361,6 +2416,7 @@ index 0000000..b0d2c9e
 +    services: Vec<u32>,
 +    rf_chains: u32,
 +    ht_cap_info: u32,
++    vht_cap_info: u32,
 +    mem_reqs: Option<Vec<(u32, u32, u32, u32)>>,
 +    _chunks: Vec<DmaCoherent>,
 +    ready: bool,
@@ -2368,6 +2424,9 @@ index 0000000..b0d2c9e
 +    vdev_started: bool,
 +    vdev_stopped: bool,
 +    network: Option<Network>,
++    /// The vdev is an access point's.
++    ap_vdev: bool,
++    ap: Option<Ap>,
 +    peer: bool,
 +    associated: bool,
 +    qos: bool,
@@ -2395,6 +2454,7 @@ index 0000000..b0d2c9e
 +            services: Vec::new(),
 +            rf_chains: 1,
 +            ht_cap_info: 0,
++            vht_cap_info: 0,
 +            mem_reqs: None,
 +            _chunks: Vec::new(),
 +            ready: false,
@@ -2402,6 +2462,8 @@ index 0000000..b0d2c9e
 +            vdev_started: false,
 +            vdev_stopped: false,
 +            network: None,
++            ap_vdev: false,
++            ap: None,
 +            peer: false,
 +            associated: false,
 +            qos: false,
@@ -2463,14 +2525,81 @@ index 0000000..b0d2c9e
 +        let channels: Vec<(u16, u8, u32, u8)> = card.channels().iter().map(|&(freq, flags)| (freq, if freq < 3000 { wmi::MODE_11NG_HT20 } else { wmi::MODE_11NA_HT20 }, flags, MAX_POWER * 2)).collect();
 +        card.wmi_command(wmi::scan_chan_list(&channels))?;
 +        // The station's vdev.
-+        let address = card.address;
-+        card.wmi_command(wmi::vdev_create(VDEV, &address))?;
-+        card.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_DEF_KEYID, 0))?;
-+        card.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_TX_ENCAP_TYPE, htt::TX_MODE_NATIVE_WIFI as u32))?;
-+        card.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_RTS_THRESHOLD, 2347))?;
-+        card.wmi_command(wmi::sta_ps_off(VDEV))?;
++        card.add_interface(false)?;
 +        ostd::notice!("{}: HTT {}.{}, {} RF chain(s){}", card.name, major, minor, card.rf_chains, if reorder { ", RX reordered by the firmware" } else { "" });
 +        Ok(card)
++    }
++
++    /// `ath10k_add_interface`: the vdev, its key and encapsulation
++    /// settings; a station's power save off, or an access point's own peer
++    /// and its stations' time-outs (`ath10k_mac_set_kickout`).
++    fn add_interface(&mut self, ap: bool) -> Result<(), String> {
++        let address = self.address;
++        self.wmi_command(wmi::vdev_create(VDEV, if ap { wmi::VDEV_TYPE_AP } else { wmi::VDEV_TYPE_STA }, &address))?;
++        self.ap_vdev = ap;
++        self.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_DEF_KEYID, 0))?;
++        self.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_TX_ENCAP_TYPE, htt::TX_MODE_NATIVE_WIFI as u32))?;
++        self.wmi_command(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_RTS_THRESHOLD, 2347))?;
++        if !ap {
++            return self.wmi_command(wmi::sta_ps_off(VDEV));
++        }
++        self.create_peer(address).map_err(|_| String::from("the firmware did not map the access point's own peer"))?;
++        self.wmi_command(wmi::pdev_set_param(wmi::PDEV_PARAM_STA_KICKOUT_TH, wmi::KICKOUT_THRESHOLD))?;
++        for (param, value) in [
++            (wmi::VDEV_PARAM_AP_KEEPALIVE_MIN_IDLE, wmi::KEEPALIVE_MIN_IDLE),
++            (wmi::VDEV_PARAM_AP_KEEPALIVE_MAX_IDLE, wmi::KEEPALIVE_MAX_IDLE),
++            (wmi::VDEV_PARAM_AP_KEEPALIVE_MAX_UNRESPONSIVE, wmi::KEEPALIVE_MAX_UNRESPONSIVE),
++        ] {
++            self.wmi_command(wmi::vdev_set_param(VDEV, param, value))?;
++        }
++        Ok(())
++    }
++
++    /// `ath10k_remove_interface`: an access point's own peer, then the
++    /// vdev.
++    fn remove_interface(&mut self) {
++        if self.ap_vdev {
++            let address = self.address;
++            self.delete_peer(address);
++        }
++        let _ = self.wmi_send(wmi::vdev_delete(VDEV));
++        // The TLV firmware does not answer the deletion: give it a moment.
++        let _ = self.wait(|_| false, 50);
++    }
++
++    /// The vdev made again as a station's or an access point's.
++    fn change_interface(&mut self, ap: bool) -> radio::Result<()> {
++        if self.ap_vdev == ap {
++            return Ok(());
++        }
++        self.remove_interface();
++        if let Err(why) = self.add_interface(ap) {
++            ostd::warn!("{}: {}", self.name, why);
++            if ap {
++                self.remove_interface();
++                let _ = self.add_interface(false);
++            }
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    /// `ath10k_peer_create`, its map awaited.
++    fn create_peer(&mut self, address: Address) -> radio::Result<()> {
++        self.wmi_send(wmi::peer_create(VDEV, &address)).map_err(|()| radio::Error::Failed)?;
++        if self.wait(|card| card.htt.peers.iter().any(|&(_, known)| known == address), WAIT_MS).is_err() {
++            ostd::warn!("{}: the firmware did not map the peer {:02x?}", self.name, address);
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    /// `ath10k_peer_delete`, its unmap awaited.
++    fn delete_peer(&mut self, address: Address) {
++        if !self.dead && self.wmi_send(wmi::peer_delete(VDEV, &address)).is_ok() {
++            let _ = self.wait(|card| !card.htt.peers.iter().any(|&(_, known)| known == address), 1000);
++        }
++        self.htt.peers.retain(|&(_, known)| known != address);
 +    }
 +
 +    /// Whether the firmware has a service (four to a word, as Linux reads
@@ -2502,14 +2631,17 @@ index 0000000..b0d2c9e
 +        Ok(chunks)
 +    }
 +
++    /// `ath10k_update_channel_list`: every channel allows HT and VHT; the
++    /// radar ones passive.
 +    fn channels(&self) -> Vec<(u16, u32)> {
-+        let mut out: Vec<(u16, u32)> = (1..=13).map(|channel| (channel_freq(channel), wmi::CHAN_FLAG_ALLOW_HT)).collect();
-+        for &channel in &CHANNELS_5GHZ {
-+            let mut flags = wmi::CHAN_FLAG_ALLOW_HT;
-+            if radar(channel) {
++        let allow = wmi::CHAN_FLAG_ALLOW_HT | wmi::CHAN_FLAG_ALLOW_VHT;
++        let mut out: Vec<(u16, u32)> = (1..=13).map(|channel| (chan::freq_of(BandId::Ghz2, channel), allow)).collect();
++        for &channel in &chan::CHANNELS_5GHZ {
++            let mut flags = allow;
++            if chan::radar_channel(channel) {
 +                flags |= wmi::CHAN_FLAG_PASSIVE | wmi::CHAN_FLAG_DFS;
 +            }
-+            out.push((channel_freq(channel), flags));
++            out.push((chan::freq_of(BandId::Ghz5, channel), flags));
 +        }
 +        out
 +    }
@@ -2614,6 +2746,7 @@ index 0000000..b0d2c9e
 +                let Some(event) = find(wmi::TAG_SERVICE_READY_EVENT) else { return };
 +                self.rf_chains = le32(event, 36).max(1);
 +                self.ht_cap_info = le32(event, 40);
++                self.vht_cap_info = le32(event, 44);
 +                if let Some(bitmap) = find(wmi::TAG_ARRAY_UINT32) {
 +                    self.services = bitmap.chunks_exact(4).map(|word| le32(word, 0)).collect();
 +                }
@@ -2688,7 +2821,8 @@ index 0000000..b0d2c9e
 +        }
 +        let mut frame = frame[..length].to_vec();
 +        let freq = match channel {
-+            1..=14 | 36..=177 => channel_freq(channel as u16),
++            1..=14 => chan::freq_of(BandId::Ghz2, channel as u8),
++            36..=177 => chan::freq_of(BandId::Ghz5, channel as u8),
 +            _ => self.current_freq(),
 +        };
 +        let signal = (-95 + snr as i32).clamp(-127, -1) as i8;
@@ -2713,7 +2847,9 @@ index 0000000..b0d2c9e
 +    }
 +
 +    fn current_freq(&self) -> u16 {
-+        if self.scan.is_some() && self.scan_freq != 0 {
++        if let Some(ap) = &self.ap {
++            ap.config.chandef.control
++        } else if self.scan.is_some() && self.scan_freq != 0 {
 +            self.scan_freq
 +        } else {
 +            self.network.as_ref().map_or(self.scan_freq, |network| network.freq)
@@ -2751,7 +2887,7 @@ index 0000000..b0d2c9e
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
-+        if self.scan.is_some() {
++        if self.scan.is_some() || self.ap.is_some() {
 +            return Err(radio::Error::Busy);
 +        }
 +        let known = self.channels();
@@ -2760,13 +2896,13 @@ index 0000000..b0d2c9e
 +            freqs = known.iter().map(|&(freq, _)| freq).collect();
 +        }
 +        let mut parts = Vec::new();
-+        for (band, rates) in [(BandId::Ghz2, &RATES_2GHZ[..]), (BandId::Ghz5, &RATES_5GHZ[..])] {
++        for band in [BandId::Ghz2, BandId::Ghz5] {
 +            let band_freqs: Vec<u16> = freqs.iter().copied().filter(|&freq| BandId::of(freq) == band).collect();
 +            if band_freqs.is_empty() {
 +                continue;
 +            }
 +            let mut ies = Vec::new();
-+            wifi::put_rates(&mut ies, rates);
++            wifi::put_rates(&mut ies, band.rates());
 +            ies.extend_from_slice(&request.elements);
 +            parts.push((band_freqs, ies));
 +        }
@@ -2838,37 +2974,189 @@ index 0000000..b0d2c9e
 +        if self.dead {
 +            return Err(radio::Error::Down);
 +        }
++        if self.ap.is_some() {
++            return Err(radio::Error::Busy);
++        }
 +        self.leave();
 +        self.end_scan();
-+        let Some(&(_, flags)) = self.channels().iter().find(|&&(freq, _)| freq == join.freq) else { return Err(radio::Error::Invalid) };
++        self.change_interface(false)?;
 +        let ht = wifi::Elements(&join.elements).get(wifi::IE_HT_CAP).is_some_and(|value| value.len() >= 26);
-+        let ghz2 = join.freq < 3000;
-+        let mode = match (ghz2, ht) {
-+            (true, true) => wmi::MODE_11NG_HT20,
-+            (true, false) => wmi::MODE_11G,
-+            (false, true) => wmi::MODE_11NA_HT20,
-+            (false, false) => wmi::MODE_11A,
-+        };
-+        let flags = if ht { flags } else { flags & !wmi::CHAN_FLAG_ALLOW_HT };
-+        self.vdev_start = None;
-+        self.vdev_stopped = false;
-+        let words = wmi::channel_words(join.freq, mode, flags, MAX_POWER * 2);
-+        self.wmi_send(wmi::vdev_start(VDEV, join.beacon_interval.max(1), 1, words)).map_err(|()| radio::Error::Failed)?;
-+        if self.wait(|card| card.vdev_start.is_some(), WAIT_MS).is_err() || self.vdev_start != Some(0) {
-+            ostd::warn!("{}: the firmware did not start the vdev on {} MHz ({:?})", self.name, join.freq, self.vdev_start);
-+            return Err(radio::Error::Failed);
-+        }
-+        self.vdev_started = true;
++        self.start_vdev(&join.chandef, ht, join.beacon_interval, 1, &[], false)?;
 +        self.network = Some(Network { join: join.clone(), freq: join.freq, ht });
 +        let bssid = join.bssid;
-+        self.wmi_send(wmi::peer_create(VDEV, &bssid)).map_err(|()| radio::Error::Failed)?;
 +        self.peer = true;
-+        if self.wait(|card| card.htt.peers.iter().any(|&(_, address)| address == bssid), WAIT_MS).is_err() {
-+            ostd::warn!("{}: the firmware did not map the access point's peer", self.name);
++        if self.create_peer(bssid).is_err() {
 +            self.leave();
 +            return Err(radio::Error::Failed);
 +        }
 +        Ok(())
++    }
++
++    /// `ath10k_vdev_start` on a channel: its mode by the band and width
++    /// (`chan_to_phymode`: VHT's at 5 GHz; a peer's own mode comes with
++    /// its association), HT only when the network runs it.
++    fn start_vdev(&mut self, chandef: &Chandef, ht: bool, beacon_interval: u16, dtim: u8, ssid: &[u8], hidden: bool) -> radio::Result<()> {
++        let freq = chandef.control;
++        let Some(&(_, flags)) = self.channels().iter().find(|&&(known, _)| known == freq) else { return Err(radio::Error::Invalid) };
++        let ghz2 = freq < 3000;
++        let mode = match (ghz2, chandef.width) {
++            (true, Width::NoHt20) => wmi::MODE_11G,
++            (true, Width::W20) => wmi::MODE_11NG_HT20,
++            (true, _) => wmi::MODE_11NG_HT40,
++            (false, Width::NoHt20) => wmi::MODE_11A,
++            (false, Width::W20) => wmi::MODE_11AC_VHT20,
++            (false, Width::W40) => wmi::MODE_11AC_VHT40,
++            (false, _) => wmi::MODE_11AC_VHT80,
++        };
++        let center = if chandef.width > Width::W80 { chandef.center_80() } else { chandef.center };
++        let mut flags = if ht { flags } else { flags & !(wmi::CHAN_FLAG_ALLOW_HT | wmi::CHAN_FLAG_ALLOW_VHT) };
++        if chandef.width >= Width::W40 && chandef.secondary_above() {
++            flags |= wmi::CHAN_FLAG_HT40_PLUS;
++        }
++        self.vdev_start = None;
++        self.vdev_stopped = false;
++        let words = wmi::channel_words(freq, center, mode, flags, MAX_POWER * 2);
++        self.wmi_send(wmi::vdev_start(VDEV, beacon_interval.max(1), dtim.max(1), ssid, hidden, words)).map_err(|()| radio::Error::Failed)?;
++        if self.wait(|card| card.vdev_start.is_some(), WAIT_MS).is_err() || self.vdev_start != Some(0) {
++            ostd::warn!("{}: the firmware did not start the vdev on {} MHz ({:?})", self.name, freq, self.vdev_start);
++            return Err(radio::Error::Failed);
++        }
++        self.vdev_started = true;
++        Ok(())
++    }
++
++    // ---- As an access point (`ath10k_add_interface` for an AP,
++    // `ath10k_bss_info_changed`, `ath10k_sta_state`). ----
++
++    /// The vdev an access point's, started on the channel, its beacon (and
++    /// probe response) templates, up.
++    pub(crate) fn start_ap(&mut self, config: &ApConfig) -> radio::Result<()> {
++        if self.dead {
++            return Err(radio::Error::Down);
++        }
++        self.stop_ap();
++        self.leave();
++        self.end_scan();
++        self.change_interface(true)?;
++        let elements = config.beacon.elements();
++        let list = wifi::Elements(&elements);
++        let (rsn, wpa) = (list.get(wifi::IE_RSN).is_some(), list.vendor(WPA_OUI_TYPE).is_some());
++        let ht = list.get(wifi::IE_HT_CAP).is_some();
++        self.ap = Some(Ap { config: config.clone(), rsn, wpa, started: false, up: false, stations: BTreeMap::new(), group_key: false });
++        let result = self.ap_up(config, ht);
++        if result.is_err() {
++            self.stop_ap();
++        }
++        result
++    }
++
++    fn ap_up(&mut self, config: &ApConfig, ht: bool) -> radio::Result<()> {
++        self.start_vdev(&config.chandef, ht, config.beacon_interval, config.dtim_period, &config.ssid, config.hidden)?;
++        if let Some(ap) = &mut self.ap {
++            ap.started = true;
++        }
++        let fail = |()| radio::Error::Failed;
++        self.wmi_send(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_BEACON_INTERVAL, config.beacon_interval.max(1) as u32)).map_err(fail)?;
++        self.wmi_send(wmi::vdev_set_param(VDEV, wmi::VDEV_PARAM_DTIM_PERIOD, config.dtim_period.max(1) as u32)).map_err(fail)?;
++        self.templates(&config.beacon)?;
++        let address = self.address;
++        self.wmi_send(wmi::vdev_up(VDEV, 0, &address)).map_err(fail)?;
++        if let Some(ap) = &mut self.ap {
++            ap.up = true;
++        }
++        Ok(())
++    }
++
++    /// `ath10k_mac_setup_bcn_tmpl` and `_prb_tmpl`, with the ERP settings
++    /// of the beacon's capabilities.
++    fn templates(&mut self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        let frame = beacon.frame(ap.config.dtim_period);
++        let ghz2 = ap.config.chandef.control < 3000;
++        let capability = beacon.capability();
++        self.erp(!ghz2 || capability & wifi::CAP_SHORT_SLOT != 0, capability & wifi::CAP_SHORT_PREAMBLE != 0);
++        let fail = |()| radio::Error::Failed;
++        self.wmi_send(wmi::pdev_set_param(wmi::PDEV_PARAM_BEACON_TX_MODE, wmi::BEACON_STAGGERED_MODE)).map_err(fail)?;
++        self.wmi_send(wmi::bcn_tmpl(VDEV, beacon.tim_offset() as u32, &frame)).map_err(fail)?;
++        if let Some(response) = &beacon.probe_response {
++            self.wmi_send(wmi::prb_tmpl(VDEV, response)).map_err(fail)?;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn set_beacon(&mut self, beacon: &BeaconTemplate) -> radio::Result<()> {
++        let Some(ap) = &mut self.ap else { return Err(radio::Error::Down) };
++        ap.config.beacon = beacon.clone();
++        self.templates(beacon)
++    }
++
++    /// The stations' peers gone, the vdev down and stopped, a station's
++    /// vdev again.
++    pub(crate) fn stop_ap(&mut self) {
++        let Some(ap) = self.ap.take() else { return };
++        if !self.dead && ap.up {
++            let _ = self.wmi_send(wmi::vdev_down(VDEV));
++        }
++        for address in ap.stations.keys() {
++            self.delete_peer(*address);
++        }
++        if !self.dead && ap.started {
++            self.vdev_stopped = false;
++            if self.wmi_send(wmi::vdev_stop(VDEV)).is_ok() {
++                let _ = self.wait(|card| card.vdev_stopped, 1000);
++            }
++        }
++        self.vdev_started = false;
++        if !self.dead {
++            let _ = self.change_interface(false);
++        }
++    }
++
++    /// A station's peer, then its capabilities and rates.
++    pub(crate) fn add_station(&mut self, station: &StationEntry) -> radio::Result<()> {
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        if ap.stations.contains_key(&station.address) {
++            self.remove_station(&station.address);
++        }
++        let Some(ap) = &self.ap else { return Err(radio::Error::Down) };
++        let elements = ap.config.beacon.elements();
++        let ht = wifi::Elements(&elements).get(wifi::IE_HT_CAP).is_some();
++        let params = PeerParams {
++            address: station.address,
++            aid: station.aid,
++            capability: station.capability,
++            listen_interval: station.listen_interval as u32,
++            qos: station.peer.qos,
++            rsn: ap.rsn,
++            wpa: ap.wpa,
++            peer: &station.peer,
++            chandef: ap.config.chandef,
++            rates: station.peer.rates.clone(),
++            ht,
++        };
++        let assoc = self.peer_assoc(&params);
++        self.create_peer(station.address)?;
++        if let Some(ap) = &mut self.ap {
++            ap.stations.insert(station.address, (station.peer.qos, false));
++        }
++        if self.wmi_send(wmi::peer_assoc(&assoc)).is_err() {
++            self.remove_station(&station.address);
++            return Err(radio::Error::Failed);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn remove_station(&mut self, address: &Address) {
++        let Some(ap) = &mut self.ap else { return };
++        if ap.stations.remove(address).is_some() {
++            self.delete_peer(*address);
++        }
++    }
++
++    pub(crate) fn authorize_station(&mut self, address: &Address, authorized: bool) {
++        if self.ap.as_ref().is_some_and(|ap| ap.stations.contains_key(address)) {
++            let _ = self.wmi_send(wmi::peer_set_param(VDEV, address, wmi::PEER_PARAM_AUTHORIZE, authorized as u32));
++        }
 +    }
 +
 +    /// `ath10k_bss_assoc`: the access point's rates and capabilities
@@ -2879,60 +3167,124 @@ index 0000000..b0d2c9e
 +        let ghz2 = network.freq < 3000;
 +        let beacon = wifi::Elements(&network.join.elements);
 +        let response = wifi::Elements(&association.elements);
-+        let mut legacy = Vec::new();
++        let mut rates = Vec::new();
 +        for elements in [&response, &beacon] {
 +            for id in [wifi::IE_RATES, wifi::IE_EXT_RATES] {
-+                for &rate in elements.get(id).unwrap_or(&[]) {
-+                    let rate = rate & 0x7f;
-+                    if (ghz2 || !CCK_RATES.contains(&rate)) && !legacy.iter().any(|&known: &u8| known & 0x7f == rate) {
-+                        legacy.push(if CCK_RATES.contains(&rate) { rate | 0x80 } else { rate });
-+                    }
-+                }
++                rates.extend_from_slice(elements.get(id).unwrap_or(&[]));
 +            }
-+            if !legacy.is_empty() {
++            if !rates.is_empty() {
 +                break;
 +            }
 +        }
-+        let ht_cap = response.get(wifi::IE_HT_CAP).or_else(|| beacon.get(wifi::IE_HT_CAP)).filter(|value| value.len() >= 26 && network.ht);
++        let params = PeerParams {
++            address: bssid,
++            aid: association.aid,
++            capability: association.capability,
++            listen_interval: 1,
++            qos: association.qos,
++            rsn: beacon.get(wifi::IE_RSN).is_some(),
++            wpa: beacon.vendor(WPA_OUI_TYPE).is_some(),
++            peer: &association.peer,
++            chandef: association.chandef,
++            rates,
++            ht: network.ht,
++        };
++        let peer = self.peer_assoc(&params);
++        self.wmi_send(wmi::peer_assoc(&peer)).map_err(|()| radio::Error::Failed)?;
++        // The ERP settings (`ath10k_bss_info_changed`).
++        let short_slot = !ghz2 || association.capability & wifi::CAP_SHORT_SLOT != 0;
++        let short_preamble = association.capability & wifi::CAP_SHORT_PREAMBLE != 0;
++        self.erp(short_slot, short_preamble);
++        self.wmi_send(wmi::vdev_up(VDEV, association.aid & 0x3fff, &bssid)).map_err(|()| radio::Error::Failed)?;
++        self.associated = true;
++        self.qos = association.qos;
++        Ok(())
++    }
++
++    fn erp(&mut self, short_slot: bool, short_preamble: bool) {
++        for (param, short) in [(wmi::VDEV_PARAM_SLOT_TIME, short_slot), (wmi::VDEV_PARAM_PREAMBLE, short_preamble)] {
++            let _ = self.wmi_send(wmi::vdev_set_param(VDEV, param, if short { wmi::SHORT } else { wmi::LONG }));
++        }
++    }
++
++    /// `ath10k_peer_assoc_prepare`: the peer's legacy rates (CCK ones
++    /// flagged, none at 5 GHz), HT, VHT, QoS, the keys it needs, the mode.
++    fn peer_assoc(&self, params: &PeerParams<'_>) -> wmi::PeerAssoc {
++        let ghz2 = params.chandef.control < 3000;
++        let mut legacy = Vec::new();
++        for &rate in &params.rates {
++            let rate = rate & 0x7f;
++            if (ghz2 || !CCK_RATES.contains(&rate)) && !legacy.iter().any(|&known: &u8| known & 0x7f == rate) {
++                legacy.push(if CCK_RATES.contains(&rate) { rate | 0x80 } else { rate });
++            }
++        }
++        // `ath10k_peer_assoc_h_basic` and `_h_crypto`.
 +        let mut flags = wmi::PEER_AUTH;
-+        if association.qos {
++        if params.qos {
 +            flags |= wmi::PEER_QOS;
 +        }
-+        if beacon.get(wifi::IE_RSN).is_some() {
++        if params.rsn {
 +            flags |= wmi::PEER_NEED_PTK_4_WAY;
 +        }
-+        if beacon.vendor(WPA_OUI_TYPE).is_some() {
++        if params.wpa {
 +            flags |= wmi::PEER_NEED_PTK_4_WAY | wmi::PEER_NEED_GTK_2_WAY;
 +        }
 +        let mut peer = wmi::PeerAssoc {
-+            address: bssid,
++            address: params.address,
 +            vdev: VDEV,
-+            aid: association.aid & 0x3fff,
++            aid: params.aid & 0x3fff,
 +            flags,
-+            caps: association.capability,
++            caps: params.capability,
++            listen_interval: params.listen_interval,
 +            ht_caps: 0,
 +            max_mpdu: 0,
 +            mpdu_density: 0,
 +            rate_caps: 0,
 +            nss: 1,
++            vht_caps: 0,
 +            phy_mode: 0,
 +            legacy,
 +            ht: Vec::new(),
++            vht_rx: (0, 0),
++            vht_tx: (0, 0),
 +        };
-+        if let Some(cap) = ht_cap {
-+            let info = u16::from_le_bytes([cap[0], cap[1]]);
++        let link = params.peer;
++        let width = params.chandef.width;
++        let ht_cap = link.ht.filter(|_| params.ht);
++        if let Some(cap) = &ht_cap {
++            // `ath10k_peer_assoc_h_ht`.
 +            peer.flags |= wmi::PEER_HT;
-+            peer.ht_caps = info;
-+            peer.max_mpdu = (1 << (13 + (cap[2] & 3) as u32)) - 1;
-+            peer.mpdu_density = mpdu_density(cap[2] >> 2);
++            peer.ht_caps = cap.info;
++            peer.max_mpdu = (1 << (13 + (cap.ampdu_factor & 3) as u32)) - 1;
++            peer.mpdu_density = mpdu_density(cap.ampdu_density);
 +            peer.rate_caps = wmi::RC_HT_FLAG;
-+            if info & HT_SGI_20 != 0 && self.ht_cap_info & wmi::HT_CAP_HT20_SGI != 0 {
++            if cap.info & chan::HT_CAP_LDPC != 0 {
++                peer.flags |= wmi::PEER_LDPC;
++            }
++            if width >= Width::W40 {
++                peer.flags |= wmi::PEER_40MHZ;
++                peer.rate_caps |= wmi::RC_CW40_FLAG;
++            }
++            if cap.info & (HT_SGI_20 | HT_SGI_40) != 0 {
 +                peer.rate_caps |= wmi::RC_SGI_FLAG;
++            }
++            if cap.info & HT_CAP_TX_STBC != 0 {
++                peer.rate_caps |= wmi::RC_TX_STBC_FLAG;
++                peer.flags |= wmi::PEER_STBC;
++            }
++            if cap.info & HT_CAP_RX_STBC != 0 {
++                peer.rate_caps |= (((cap.info & HT_CAP_RX_STBC) >> 8) as u32) << wmi::RC_RX_STBC_FLAG_S;
++                peer.flags |= wmi::PEER_STBC;
++            }
++            if cap.mcs[1] != 0 && cap.mcs[2] != 0 {
++                peer.rate_caps |= wmi::RC_TS_FLAG;
++            } else if cap.mcs[1] != 0 {
++                peer.rate_caps |= wmi::RC_DS_FLAG;
 +            }
 +            let streams = self.rf_chains.clamp(1, 4) as usize;
 +            let mut nss = 0;
 +            for stream in 0..streams {
-+                let mask = cap[3 + stream];
++                let mask = cap.mcs[stream];
 +                if mask != 0 {
 +                    nss = stream + 1;
 +                }
@@ -2944,31 +3296,45 @@ index 0000000..b0d2c9e
 +            }
 +            peer.nss = nss.max(1) as u32;
 +        }
-+        let cck_only = peer.legacy.iter().all(|&rate| rate & 0x80 != 0);
-+        peer.phy_mode = match (ghz2, ht_cap.is_some()) {
-+            (true, true) => wmi::MODE_11NG_HT20,
-+            (true, false) if cck_only => wmi::MODE_11B,
-+            (true, false) => wmi::MODE_11G,
-+            (false, true) => wmi::MODE_11NA_HT20,
-+            (false, false) => wmi::MODE_11A,
-+        };
-+        self.wmi_send(wmi::peer_assoc(&peer)).map_err(|()| radio::Error::Failed)?;
-+        // The ERP settings (`ath10k_bss_info_changed`).
-+        let short_slot = !ghz2 || association.capability & wifi::CAP_SHORT_SLOT != 0;
-+        let short_preamble = association.capability & wifi::CAP_SHORT_PREAMBLE != 0;
-+        for (param, short) in [(wmi::VDEV_PARAM_SLOT_TIME, short_slot), (wmi::VDEV_PARAM_PREAMBLE, short_preamble)] {
-+            let _ = self.wmi_send(wmi::vdev_set_param(VDEV, param, if short { wmi::SHORT } else { wmi::LONG }));
++        let vht = link.vht.filter(|_| ht_cap.is_some() && !ghz2);
++        if let Some(vht) = &vht {
++            // `ath10k_peer_assoc_h_vht`.
++            peer.flags |= wmi::PEER_VHT;
++            if width == Width::W80 {
++                peer.flags |= wmi::PEER_80MHZ;
++            }
++            peer.vht_caps = vht.info;
++            let factor = (vht.info >> chan::VHT_CAP_MAX_AMPDU_SHIFT) & 7;
++            peer.max_mpdu = peer.max_mpdu.max((1 << (13 + factor)) - 1);
++            let rx_map = u16::from_le_bytes([vht.mcs[0], vht.mcs[1]]);
++            let tx_map = u16::from_le_bytes([vht.mcs[4], vht.mcs[5]]);
++            let highest = |at: usize| (u16::from_le_bytes([vht.mcs[at], vht.mcs[at + 1]]) & 0x1fff) as u32;
++            let streams = (0..8u32).rev().find(|stream| (rx_map >> (2 * stream)) & 3 != 3).map_or(1, |stream| stream + 1);
++            peer.nss = streams.min(self.rf_chains.clamp(1, 4)).max(1);
++            peer.vht_rx = (highest(2), rx_map as u32);
++            peer.vht_tx = (highest(6), tx_map as u32);
 +        }
-+        self.wmi_send(wmi::vdev_up(VDEV, association.aid & 0x3fff, &bssid)).map_err(|()| radio::Error::Failed)?;
-+        self.associated = true;
-+        self.qos = association.qos;
-+        Ok(())
++        let cck_only = peer.legacy.iter().all(|&rate| rate & 0x80 != 0);
++        // `ath10k_peer_assoc_h_phymode`.
++        peer.phy_mode = match (ghz2, vht.is_some(), ht_cap.is_some(), width) {
++            (false, true, _, Width::W80 | Width::W160) => wmi::MODE_11AC_VHT80,
++            (false, true, _, Width::W40) => wmi::MODE_11AC_VHT40,
++            (false, true, _, _) => wmi::MODE_11AC_VHT20,
++            (false, false, true, Width::W40 | Width::W80 | Width::W160) => wmi::MODE_11NA_HT40,
++            (false, false, true, _) => wmi::MODE_11NA_HT20,
++            (false, false, false, _) => wmi::MODE_11A,
++            (true, _, true, Width::W40) => wmi::MODE_11NG_HT40,
++            (true, _, true, _) => wmi::MODE_11NG_HT20,
++            (true, _, false, _) if cck_only => wmi::MODE_11B,
++            (true, _, false, _) => wmi::MODE_11G,
++        };
++        peer
 +    }
 +
 +    /// The vdev down, the peer gone, the vdev stopped (`ath10k_bss_disassoc`,
 +    /// `ath10k_peer_delete`, `ath10k_vdev_stop`).
 +    pub(crate) fn leave(&mut self) {
-+        if self.network.is_none() && !self.vdev_started {
++        if self.ap.is_some() || (self.network.is_none() && !self.vdev_started) {
 +            return;
 +        }
 +        let bssid = self.network.as_ref().map(|network| network.join.bssid);
@@ -3006,17 +3372,40 @@ index 0000000..b0d2c9e
 +        if key.cipher != radio::CIPHER_CCMP || key.key.len() != 16 {
 +            return Err(radio::Error::Unsupported);
 +        }
-+        let Some(network) = &self.network else { return Err(radio::Error::Invalid) };
-+        let bssid = network.join.bssid;
++        // As an access point: a station's pairwise key, the group's on its
++        // own peer.
++        let address = match (&self.ap, key.pairwise) {
++            (Some(_), true) => key.address.ok_or(radio::Error::Invalid)?,
++            (Some(_), false) => self.address,
++            (None, _) => self.network.as_ref().ok_or(radio::Error::Invalid)?.join.bssid,
++        };
 +        let flags = if key.pairwise { wmi::KEY_PAIRWISE } else { wmi::KEY_GROUP };
-+        self.wmi_send(wmi::install_key(VDEV, &bssid, key.index, flags, wmi::CIPHER_AES_CCM, &key.key)).map_err(|()| radio::Error::Failed)?;
-+        if key.pairwise {
-+            self.pairwise = true;
++        self.wmi_send(wmi::install_key(VDEV, &address, key.index, flags, wmi::CIPHER_AES_CCM, &key.key)).map_err(|()| radio::Error::Failed)?;
++        match &mut self.ap {
++            Some(ap) if key.pairwise => {
++                if let Some(station) = ap.stations.get_mut(&address) {
++                    station.1 = true;
++                }
++            }
++            Some(ap) => ap.group_key = true,
++            None if key.pairwise => self.pairwise = true,
++            None => {}
 +        }
 +        Ok(())
 +    }
 +
 +    pub(crate) fn remove_key(&mut self, index: u8, pairwise: bool) {
++        if self.ap.is_some() {
++            // A station's pairwise key goes with its peer.
++            if !pairwise {
++                if let Some(ap) = &mut self.ap {
++                    ap.group_key = false;
++                }
++                let address = self.address;
++                let _ = self.wmi_send(wmi::install_key(VDEV, &address, index, wmi::KEY_GROUP, wmi::CIPHER_NONE, &[]));
++            }
++            return;
++        }
 +        let Some(network) = &self.network else { return };
 +        let bssid = network.join.bssid;
 +        let flags = if pairwise { wmi::KEY_PAIRWISE } else { wmi::KEY_GROUP };
@@ -3066,6 +3455,22 @@ index 0000000..b0d2c9e
 +    /// descriptor), encrypted by the chip with the pairwise key unless
 +    /// plain.
 +    pub(crate) fn send(&mut self, ethernet: &[u8], plain: bool) -> radio::Result<()> {
++        if let Some(ap) = &self.ap {
++            // From the access point to the station the destination names
++            // (the firmware finds its peer), or to all of them.
++            let destination: Address = ethernet.get(..6).and_then(|b| b.try_into().ok()).ok_or(radio::Error::Invalid)?;
++            let (keyed, qos) = if wifi::is_multicast(&destination) {
++                (ap.group_key, false)
++            } else {
++                let &(qos, key) = ap.stations.get(&destination).ok_or(radio::Error::Invalid)?;
++                (key, qos)
++            };
++            let protected = !plain && keyed;
++            let address = self.address;
++            let frame = wifi::data_from_ethernet_ap(ethernet, &address, None, protected).ok_or(radio::Error::Invalid)?;
++            let tid = if qos { wifi::tid_of(ethernet) } else { htt::TID_NON_QOS };
++            return self.transmit(&frame, htt::TX_MODE_NATIVE_WIFI, tid, !protected);
++        }
 +        let Some(network) = &self.network else { return Err(radio::Error::Down) };
 +        let protected = !plain && self.pairwise;
 +        let frame = wifi::data_from_ethernet(ethernet, &network.join.bssid, None, protected).ok_or(radio::Error::Invalid)?;
@@ -3106,20 +3511,72 @@ index 0000000..b0d2c9e
 +        }
 +    }
 +
-+    pub(crate) fn info(&self) -> Info {
++    /// `ath10k_get_ht_cap`: 20/40 MHz, SM power save off, the firmware's
++    /// guard intervals, STBC, LDPC and L-SIG; A-MPDUs up to 64 KiB, 8 µs
++    /// apart.
++    fn ht_cap(&self) -> Option<HtCap> {
++        let caps = self.ht_cap_info;
++        if caps & wmi::HT_CAP_ENABLED == 0 {
++            return None;
++        }
 +        let streams = self.rf_chains.clamp(1, 2) as usize;
++        let mut info = chan::HT_CAP_SUP_WIDTH_20_40 | chan::HT_CAP_DSSS_CCK_40 | HT_CAP_SM_PS_DISABLED;
++        if caps & wmi::HT_CAP_HT20_SGI != 0 {
++            info |= HT_SGI_20;
++        }
++        if caps & wmi::HT_CAP_HT40_SGI != 0 {
++            info |= HT_SGI_40;
++        }
++        if caps & wmi::HT_CAP_TX_STBC != 0 && streams > 1 {
++            info |= HT_CAP_TX_STBC;
++        }
++        if caps & wmi::HT_CAP_RX_STBC != 0 {
++            info |= ((((caps & wmi::HT_CAP_RX_STBC) >> wmi::HT_CAP_RX_STBC_MASK_SHIFT) as u16) << 8) & HT_CAP_RX_STBC;
++        }
++        if caps & wmi::HT_CAP_LDPC != 0 || (caps & wmi::HT_CAP_RX_LDPC != 0 && caps & wmi::HT_CAP_TX_LDPC != 0) {
++            info |= chan::HT_CAP_LDPC;
++        }
++        if caps & wmi::HT_CAP_L_SIG_TXOP_PROT != 0 {
++            info |= HT_CAP_LSIG_TXOP;
++        }
++        if self.vht_cap_info & wmi::VHT_CAP_MAX_MPDU_LEN_MASK != 0 {
++            info |= chan::HT_CAP_MAX_AMSDU;
++        }
 +        let mut mcs = [0u8; 16];
 +        for byte in mcs.iter_mut().take(streams) {
 +            *byte = 0xff;
 +        }
 +        mcs[12] = 1;
-+        let mut info = HT_INFO;
-+        if self.ht_cap_info & wmi::HT_CAP_HT20_SGI != 0 {
-+            info |= HT_SGI_20;
++        Some(HtCap { info, ampdu_factor: 3, ampdu_density: 6, mcs })
++    }
++
++    /// `ath10k_create_vht_cap`: the firmware's VHT capabilities, the
++    /// beamforming fields it left out filled in, MCS 0-9 on each chain.
++    fn vht_cap(&self) -> VhtCap {
++        let mut info = self.vht_cap_info;
++        if info & (VHT_CAP_SU_BEAMFORMEE | VHT_CAP_MU_BEAMFORMEE) != 0 {
++            let sts = (info >> VHT_CAP_STS_SHIFT) & 7;
++            info |= (if sts == 0 { 3 } else { sts }) << VHT_CAP_STS_SHIFT;
 +        }
-+        // A-MPDUs up to 64 KiB, 8 µs apart (Linux's `ath10k_get_ht_cap`).
-+        let ht = HtCap { info, ampdu_factor: 3, ampdu_density: 6, mcs };
-+        let mut bands = vec![Band { id: BandId::Ghz2, channels: Vec::new(), ht: Some(ht), vht: None, he: None }, Band { id: BandId::Ghz5, channels: Vec::new(), ht: Some(ht), vht: None, he: None }];
++        if info & (VHT_CAP_SU_BEAMFORMER | VHT_CAP_MU_BEAMFORMER) != 0 {
++            let sound = (info >> VHT_CAP_SOUND_SHIFT) & 7;
++            info |= (if sound == 0 { 1 } else { sound }) << VHT_CAP_SOUND_SHIFT;
++        }
++        let streams = self.rf_chains.clamp(1, 8);
++        if streams <= 1 {
++            info &= !chan::VHT_CAP_TXSTBC;
++        }
++        let map = (0..8).fold(0u16, |map, stream| map | (if stream < streams { 2 } else { 3 }) << (2 * stream));
++        let mut mcs = [0u8; 8];
++        mcs[0..2].copy_from_slice(&map.to_le_bytes());
++        mcs[4..6].copy_from_slice(&map.to_le_bytes());
++        VhtCap { info, mcs }
++    }
++
++    pub(crate) fn info(&self) -> Info {
++        let ht = self.ht_cap();
++        let vht = (ht.is_some() && self.vht_cap_info != 0).then(|| self.vht_cap());
++        let mut bands = vec![Band { id: BandId::Ghz2, channels: Vec::new(), ht, vht: None, he: None }, Band { id: BandId::Ghz5, channels: Vec::new(), ht, vht, he: None }];
 +        for (freq, flags) in self.channels() {
 +            let mut channel = Channel::new(freq);
 +            channel.radar = flags & wmi::CHAN_FLAG_DFS != 0;
@@ -3135,15 +3592,16 @@ index 0000000..b0d2c9e
 +            ciphers: vec![radio::CIPHER_CCMP],
 +            max_scan_ssids: 16,
 +            max_scan_ie_len: 200,
++            ap: true,
 +        }
 +    }
 +}
 diff --git a/kernel/comps/ath10k/src/wmi.rs b/kernel/comps/ath10k/src/wmi.rs
 new file mode 100644
-index 0000000..3c7dd82
+index 0000000..44d6fa8
 --- /dev/null
 +++ b/kernel/comps/ath10k/src/wmi.rs
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,504 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! WMI over TLVs, the QCA6174/QCA9377 firmware's control interface as
@@ -3158,6 +3616,7 @@ index 0000000..3c7dd82
 +pub(crate) const SCAN_CHAN_LIST: u32 = 0x3003;
 +pub(crate) const PDEV_SET_PARAM: u32 = 0x4003;
 +pub(crate) const VDEV_CREATE: u32 = 0x5001;
++pub(crate) const VDEV_DELETE: u32 = 0x5002;
 +pub(crate) const VDEV_START_REQUEST: u32 = 0x5003;
 +pub(crate) const VDEV_UP: u32 = 0x5005;
 +pub(crate) const VDEV_STOP: u32 = 0x5006;
@@ -3168,6 +3627,8 @@ index 0000000..3c7dd82
 +pub(crate) const PEER_DELETE: u32 = 0x6002;
 +pub(crate) const PEER_SET_PARAM: u32 = 0x6004;
 +pub(crate) const PEER_ASSOC: u32 = 0x6005;
++pub(crate) const BCN_TMPL: u32 = 0x7003;
++pub(crate) const PRB_TMPL: u32 = 0x7007;
 +pub(crate) const STA_POWERSAVE_MODE: u32 = 0x9001;
 +// Events.
 +pub(crate) const EV_SERVICE_READY: u32 = 0x1;
@@ -3199,6 +3660,7 @@ index 0000000..3c7dd82
 +const TAG_CHANNEL: u16 = 0x50;
 +const TAG_PDEV_SET_PARAM: u16 = 0x52;
 +const TAG_VDEV_CREATE: u16 = 0x56;
++const TAG_VDEV_DELETE: u16 = 0x57;
 +const TAG_VDEV_START_REQUEST: u16 = 0x58;
 +const TAG_VDEV_UP: u16 = 0x5c;
 +const TAG_VDEV_STOP: u16 = 0x5d;
@@ -3210,6 +3672,9 @@ index 0000000..3c7dd82
 +const TAG_PEER_SET_PARAM: u16 = 0x64;
 +const TAG_PEER_ASSOC: u16 = 0x65;
 +const TAG_VHT_RATE_SET: u16 = 0x66;
++const TAG_BCN_TMPL: u16 = 0x67;
++const TAG_PRB_TMPL: u16 = 0x68;
++const TAG_BCN_PRB_INFO: u16 = 0x69;
 +const TAG_STA_POWERSAVE_MODE: u16 = 0x6c;
 +// ABI (`wmi-tlv.c`).
 +const ABI: [u32; 6] = [0x0100_0000, 53, 0x5f41_4351, 0x0000_4c4d, 0, 0];
@@ -3227,12 +3692,19 @@ index 0000000..3c7dd82
 +const SCAN_FILTER_PROBE_REQ: u32 = 0x20;
 +pub(crate) const CHAN_FLAG_PASSIVE: u32 = 0x80;
 +pub(crate) const CHAN_FLAG_DFS: u32 = 0x400;
++pub(crate) const CHAN_FLAG_HT40_PLUS: u32 = 0x40;
 +pub(crate) const CHAN_FLAG_ALLOW_HT: u32 = 0x800;
++pub(crate) const CHAN_FLAG_ALLOW_VHT: u32 = 0x1000;
 +pub(crate) const MODE_11A: u8 = 0;
 +pub(crate) const MODE_11G: u8 = 1;
 +pub(crate) const MODE_11B: u8 = 2;
 +pub(crate) const MODE_11NA_HT20: u8 = 4;
 +pub(crate) const MODE_11NG_HT20: u8 = 5;
++pub(crate) const MODE_11NA_HT40: u8 = 6;
++pub(crate) const MODE_11NG_HT40: u8 = 7;
++pub(crate) const MODE_11AC_VHT20: u8 = 8;
++pub(crate) const MODE_11AC_VHT40: u8 = 9;
++pub(crate) const MODE_11AC_VHT80: u8 = 10;
 +// The resources Linux asks the TLV firmware for (`TARGET_TLV_NUM_*`).
 +pub(crate) const NUM_VDEVS: u32 = 4;
 +pub(crate) const NUM_PEERS: u32 = 33;
@@ -3245,12 +3717,30 @@ index 0000000..3c7dd82
 +// Parameters (`enum wmi_tlv_pdev_param`, `_vdev_param`, `_peer_param`).
 +pub(crate) const PDEV_PARAM_TX_CHAIN_MASK: u32 = 0x1;
 +pub(crate) const PDEV_PARAM_RX_CHAIN_MASK: u32 = 0x2;
++pub(crate) const PDEV_PARAM_BEACON_TX_MODE: u32 = 0x7;
 +pub(crate) const PDEV_PARAM_DYNAMIC_BW: u32 = 0xa;
++pub(crate) const PDEV_PARAM_STA_KICKOUT_TH: u32 = 0xd;
 +pub(crate) const PDEV_PARAM_PMF_QOS: u32 = 0x22;
 +pub(crate) const PDEV_PARAM_ANI_ENABLE: u32 = 0x25;
 +pub(crate) const VDEV_PARAM_RTS_THRESHOLD: u32 = 0x1;
++pub(crate) const VDEV_PARAM_BEACON_INTERVAL: u32 = 0x3;
 +pub(crate) const VDEV_PARAM_SLOT_TIME: u32 = 0x7;
 +pub(crate) const VDEV_PARAM_PREAMBLE: u32 = 0x8;
++pub(crate) const VDEV_PARAM_DTIM_PERIOD: u32 = 0xd;
++pub(crate) const VDEV_PARAM_AP_KEEPALIVE_MIN_IDLE: u32 = 0x28;
++pub(crate) const VDEV_PARAM_AP_KEEPALIVE_MAX_IDLE: u32 = 0x29;
++pub(crate) const VDEV_PARAM_AP_KEEPALIVE_MAX_UNRESPONSIVE: u32 = 0x2a;
++/// `ATH10K_KICKOUT_THRESHOLD`, `ATH10K_KEEPALIVE_*` (seconds).
++pub(crate) const KICKOUT_THRESHOLD: u32 = 20 * 16;
++pub(crate) const KEEPALIVE_MIN_IDLE: u32 = 3747;
++pub(crate) const KEEPALIVE_MAX_IDLE: u32 = 3895;
++pub(crate) const KEEPALIVE_MAX_UNRESPONSIVE: u32 = 3900;
++/// `WMI_BEACON_STAGGERED_MODE`.
++pub(crate) const BEACON_STAGGERED_MODE: u32 = 0;
++/// `WMI_VDEV_TYPE_*`, `WMI_VDEV_START_HIDDEN_SSID`.
++pub(crate) const VDEV_TYPE_AP: u32 = 1;
++pub(crate) const VDEV_TYPE_STA: u32 = 2;
++const VDEV_START_HIDDEN_SSID: u32 = 1 << 0;
 +// `WMI_VDEV_SLOT_TIME_*`, `WMI_VDEV_PREAMBLE_*`.
 +pub(crate) const LONG: u32 = 1;
 +pub(crate) const SHORT: u32 = 2;
@@ -3263,8 +3753,18 @@ index 0000000..3c7dd82
 +pub(crate) const PEER_NEED_PTK_4_WAY: u32 = 0x4;
 +pub(crate) const PEER_NEED_GTK_2_WAY: u32 = 0x10;
 +pub(crate) const PEER_HT: u32 = 0x1000;
-+pub(crate) const RC_HT_FLAG: u32 = 0x8;
++pub(crate) const PEER_40MHZ: u32 = 0x2000;
++pub(crate) const PEER_STBC: u32 = 0x8000;
++pub(crate) const PEER_LDPC: u32 = 0x1_0000;
++pub(crate) const PEER_VHT: u32 = 0x200_0000;
++pub(crate) const PEER_80MHZ: u32 = 0x400_0000;
++pub(crate) const RC_DS_FLAG: u32 = 0x1;
++pub(crate) const RC_CW40_FLAG: u32 = 0x2;
 +pub(crate) const RC_SGI_FLAG: u32 = 0x4;
++pub(crate) const RC_HT_FLAG: u32 = 0x8;
++pub(crate) const RC_TX_STBC_FLAG: u32 = 0x20;
++pub(crate) const RC_RX_STBC_FLAG_S: u32 = 6;
++pub(crate) const RC_TS_FLAG: u32 = 0x200;
 +// Keys.
 +pub(crate) const KEY_PAIRWISE: u32 = 0x0;
 +pub(crate) const KEY_GROUP: u32 = 0x1;
@@ -3274,7 +3774,18 @@ index 0000000..3c7dd82
 +pub(crate) const RX_STATUS_ERRORS: u32 = 0x01 | 0x08 | 0x10;
 +pub(crate) const ROAM_REASON_BEACON_MISS: u32 = 2;
 +// `WMI_HT_CAP_*` of the service ready event.
++/// The firmware's HT capability bits (`WMI_HT_CAP_*`).
++pub(crate) const HT_CAP_ENABLED: u32 = 0x0001;
 +pub(crate) const HT_CAP_HT20_SGI: u32 = 0x0002;
++pub(crate) const HT_CAP_TX_STBC: u32 = 0x0008;
++pub(crate) const HT_CAP_RX_STBC: u32 = 0x0030;
++pub(crate) const HT_CAP_RX_STBC_MASK_SHIFT: u32 = 4;
++pub(crate) const HT_CAP_LDPC: u32 = 0x0040;
++pub(crate) const HT_CAP_L_SIG_TXOP_PROT: u32 = 0x0080;
++pub(crate) const HT_CAP_HT40_SGI: u32 = 0x0800;
++pub(crate) const HT_CAP_RX_LDPC: u32 = 0x1000;
++pub(crate) const HT_CAP_TX_LDPC: u32 = 0x2000;
++pub(crate) const VHT_CAP_MAX_MPDU_LEN_MASK: u32 = 0x0000_0003;
 +
 +/// A command being built: the header, then TLVs.
 +pub(crate) struct Cmd {
@@ -3391,17 +3902,17 @@ index 0000000..3c7dd82
 +    }
 +}
 +
-+/// A channel (`ath10k_wmi_put_wmi_channel`): frequency, mode, flags,
-+/// powers in half dBm.
-+pub(crate) fn channel_words(freq: u16, mode: u8, flags: u32, max_power: u8) -> [u32; 6] {
-+    [freq as u32, freq as u32, 0, (mode as u32) | flags, (max_power as u32) << 8 | (max_power as u32) << 16, (max_power as u32) << 8]
++/// A channel (`ath10k_wmi_put_wmi_channel`): frequency, the centre of the
++/// span, mode, flags, powers in half dBm.
++pub(crate) fn channel_words(freq: u16, center: u16, mode: u8, flags: u32, max_power: u8) -> [u32; 6] {
++    [freq as u32, center as u32, 0, (mode as u32) | flags, (max_power as u32) << 8 | (max_power as u32) << 16, (max_power as u32) << 8]
 +}
 +
 +/// Linux's `gen_scan_chan_list`.
 +pub(crate) fn scan_chan_list(channels: &[(u16, u8, u32, u8)]) -> Cmd {
 +    let mut array = Vec::new();
 +    for &(freq, mode, flags, power) in channels {
-+        let inner = Cmd::new(0).tlv(TAG_CHANNEL, &channel_words(freq, mode, flags, power));
++        let inner = Cmd::new(0).tlv(TAG_CHANNEL, &channel_words(freq, freq, mode, flags, power));
 +        array.extend_from_slice(&inner.body);
 +    }
 +    Cmd::new(SCAN_CHAN_LIST).tlv(TAG_SCAN_CHAN_LIST_CMD, &[channels.len() as u32]).raw(TAG_ARRAY_STRUCT, &array)
@@ -3446,10 +3957,14 @@ index 0000000..3c7dd82
 +    Cmd::new(PDEV_SET_PARAM).tlv(TAG_PDEV_SET_PARAM, &[0, param, value])
 +}
 +
-+pub(crate) fn vdev_create(vdev: u32, address: &[u8; 6]) -> Cmd {
++/// A vdev of `vdev_type` (`VDEV_TYPE_STA` or `_AP`), no subtype.
++pub(crate) fn vdev_create(vdev: u32, vdev_type: u32, address: &[u8; 6]) -> Cmd {
 +    let [lo, hi] = mac(address);
-+    // Type STA (2), subtype none.
-+    Cmd::new(VDEV_CREATE).tlv(TAG_VDEV_CREATE, &[vdev, 2, 0, lo, hi])
++    Cmd::new(VDEV_CREATE).tlv(TAG_VDEV_CREATE, &[vdev, vdev_type, 0, lo, hi])
++}
++
++pub(crate) fn vdev_delete(vdev: u32) -> Cmd {
++    Cmd::new(VDEV_DELETE).tlv(TAG_VDEV_DELETE, &[vdev])
 +}
 +
 +pub(crate) fn vdev_set_param(vdev: u32, param: u32, value: u32) -> Cmd {
@@ -3457,13 +3972,28 @@ index 0000000..3c7dd82
 +}
 +
 +/// Linux's `gen_vdev_start`: the vdev's channel, its beacon interval and
-+/// DTIM, no SSID (a station), no NoA.
-+pub(crate) fn vdev_start(vdev: u32, beacon_interval: u16, dtim: u8, channel: [u32; 6]) -> Cmd {
++/// DTIM, an access point's name (and whether beacons hide it), no NoA.
++pub(crate) fn vdev_start(vdev: u32, beacon_interval: u16, dtim: u8, ssid: &[u8], hidden: bool, channel: [u32; 6]) -> Cmd {
 +    let mut head = Vec::with_capacity(18);
-+    head.extend_from_slice(&[vdev, 0, beacon_interval as u32, dtim as u32, 0]);
-+    head.extend_from_slice(&[0u32; 9]);
++    head.extend_from_slice(&[vdev, 0, beacon_interval as u32, dtim as u32, if hidden { VDEV_START_HIDDEN_SSID } else { 0 }]);
++    // `struct wmi_ssid`: its length, then 32 bytes.
++    let mut name = [0u8; 32];
++    let length = ssid.len().min(32);
++    name[..length].copy_from_slice(&ssid[..length]);
++    head.push(length as u32);
++    head.extend(name.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])));
 +    head.extend_from_slice(&[0, 0, 0, 0]);
 +    Cmd::new(VDEV_START_REQUEST).tlv(TAG_VDEV_START_REQUEST, &head).tlv(TAG_CHANNEL, &channel).raw(TAG_ARRAY_STRUCT, &[])
++}
++
++/// `gen_bcn_tmpl`: the beacon the firmware sends, where its TIM is.
++pub(crate) fn bcn_tmpl(vdev: u32, tim_offset: u32, beacon: &[u8]) -> Cmd {
++    Cmd::new(BCN_TMPL).tlv(TAG_BCN_TMPL, &[vdev, tim_offset, beacon.len() as u32]).tlv(TAG_BCN_PRB_INFO, &[0, 0]).bytes(TAG_ARRAY_BYTE, beacon)
++}
++
++/// `gen_prb_tmpl`: the probe response the firmware answers with.
++pub(crate) fn prb_tmpl(vdev: u32, response: &[u8]) -> Cmd {
++    Cmd::new(PRB_TMPL).tlv(TAG_PRB_TMPL, &[vdev, response.len() as u32]).tlv(TAG_BCN_PRB_INFO, &[0, 0]).bytes(TAG_ARRAY_BYTE, response)
 +}
 +
 +pub(crate) fn vdev_up(vdev: u32, aid: u16, bssid: &[u8; 6]) -> Cmd {
@@ -3499,21 +4029,26 @@ index 0000000..3c7dd82
 +    Cmd::new(PEER_SET_PARAM).tlv(TAG_PEER_SET_PARAM, &[vdev, lo, hi, param, value])
 +}
 +
-+/// The access point's capabilities and rates (`gen_peer_assoc`).
++/// A peer's capabilities and rates (`gen_peer_assoc`).
 +pub(crate) struct PeerAssoc {
 +    pub(crate) address: [u8; 6],
 +    pub(crate) vdev: u32,
 +    pub(crate) aid: u16,
 +    pub(crate) flags: u32,
 +    pub(crate) caps: u16,
++    pub(crate) listen_interval: u32,
 +    pub(crate) ht_caps: u16,
 +    pub(crate) max_mpdu: u32,
 +    pub(crate) mpdu_density: u32,
 +    pub(crate) rate_caps: u32,
 +    pub(crate) nss: u32,
++    pub(crate) vht_caps: u32,
 +    pub(crate) phy_mode: u8,
 +    pub(crate) legacy: Vec<u8>,
 +    pub(crate) ht: Vec<u8>,
++    /// The access point's VHT rates: (highest, map) it takes and sends.
++    pub(crate) vht_rx: (u32, u32),
++    pub(crate) vht_tx: (u32, u32),
 +}
 +
 +pub(crate) fn peer_assoc(peer: &PeerAssoc) -> Cmd {
@@ -3526,20 +4061,21 @@ index 0000000..3c7dd82
 +        peer.aid as u32,
 +        peer.flags,
 +        peer.caps as u32,
-+        1,
++        peer.listen_interval,
 +        peer.ht_caps as u32,
 +        peer.max_mpdu,
 +        peer.mpdu_density,
 +        peer.rate_caps,
 +        peer.nss,
-+        0,
++        peer.vht_caps,
 +        peer.phy_mode as u32,
 +        0,
 +        0,
 +        peer.legacy.len() as u32,
 +        peer.ht.len() as u32,
 +    ];
-+    Cmd::new(PEER_ASSOC).tlv(TAG_PEER_ASSOC, &head).bytes(TAG_ARRAY_BYTE, &peer.legacy).bytes(TAG_ARRAY_BYTE, &peer.ht).tlv(TAG_VHT_RATE_SET, &[0, 0, 0, 0])
++    let vht = [peer.vht_rx.0, peer.vht_rx.1, peer.vht_tx.0, peer.vht_tx.1];
++    Cmd::new(PEER_ASSOC).tlv(TAG_PEER_ASSOC, &head).bytes(TAG_ARRAY_BYTE, &peer.legacy).bytes(TAG_ARRAY_BYTE, &peer.ht).tlv(TAG_VHT_RATE_SET, &vht)
 +}
 +
 +/// A key (`gen_vdev_install_key`, `struct wmi_vdev_install_key_cmd`).

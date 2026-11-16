@@ -1,0 +1,3559 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fb22f10..1b5e2bb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -175,6 +175,20 @@ dependencies = [
+  "p256",
+ ]
+ 
++[[package]]
++name = "aster-brcmfmac"
++version = "0.1.0"
++dependencies = [
++ "aster-cmdline",
++ "aster-core",
++ "aster-firmware",
++ "aster-linuxkpi",
++ "aster-pci",
++ "aster-wlan",
++ "component",
++ "ostd",
++]
++
+ [[package]]
+ name = "aster-cmdline"
+ version = "0.1.0"
+@@ -701,6 +715,7 @@ dependencies = [
+  "aster-ath11k",
+  "aster-backlight",
+  "aster-bluetooth",
++ "aster-brcmfmac",
+  "aster-core",
+  "aster-drm",
+  "aster-ethernet",
+diff --git a/Cargo.toml b/Cargo.toml
+index 5e54706..889a225 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -44,6 +44,7 @@ members = [
+     "kernel/comps/rtw88",
+     "kernel/comps/ath10k",
+     "kernel/comps/ath11k",
++    "kernel/comps/brcmfmac",
+     "kernel/comps/rtw89",
+     "kernel/comps/linuxkpi",
+     "kernel/core",
+@@ -115,6 +116,7 @@ default-members = [
+     "kernel/comps/rtw88",
+     "kernel/comps/ath10k",
+     "kernel/comps/ath11k",
++    "kernel/comps/brcmfmac",
+     "kernel/comps/rtw89",
+     "kernel/comps/linuxkpi",
+     "kernel/core",
+@@ -213,6 +215,7 @@ aster-mt7921 = { path = "kernel/comps/mt7921" }
+ aster-rtw88 = { path = "kernel/comps/rtw88" }
+ aster-ath10k = { path = "kernel/comps/ath10k" }
+ aster-ath11k = { path = "kernel/comps/ath11k" }
++aster-brcmfmac = { path = "kernel/comps/brcmfmac" }
+ aster-rtw89 = { path = "kernel/comps/rtw89" }
+ aster-linuxkpi = { path = "kernel/comps/linuxkpi" }
+ aster-ethernet = { path = "kernel/comps/ethernet" }
+diff --git a/Components.toml b/Components.toml
+index e2e9339..011434b 100644
+--- a/Components.toml
++++ b/Components.toml
+@@ -31,6 +31,7 @@ mt7921 = { name = "aster-mt7921" }
+ rtw88 = { name = "aster-rtw88" }
+ ath10k = { name = "aster-ath10k" }
+ ath11k = { name = "aster-ath11k" }
++brcmfmac = { name = "aster-brcmfmac" }
+ rtw89 = { name = "aster-rtw89" }
+ ethernet = { name = "aster-ethernet" }
+ virtio = { name = "aster-virtio" }
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index fccd2a8..665235d 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -23,6 +23,7 @@ aster-mt7921.workspace = true
+ aster-rtw88.workspace = true
+ aster-ath10k.workspace = true
+ aster-ath11k.workspace = true
++aster-brcmfmac.workspace = true
+ aster-rtw89.workspace = true
+ aster-ethernet.workspace = true
+ 
+diff --git a/kernel/comps/brcmfmac/Cargo.toml b/kernel/comps/brcmfmac/Cargo.toml
+new file mode 100644
+index 0000000..e609094
+--- /dev/null
++++ b/kernel/comps/brcmfmac/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "aster-brcmfmac"
++version = "0.1.0"
++edition.workspace = true
++
++[dependencies]
++aster-cmdline.workspace = true
++aster-core.workspace = true
++aster-firmware.workspace = true
++aster-linuxkpi.workspace = true
++aster-pci.workspace = true
++aster-wlan.workspace = true
++component.workspace = true
++ostd.workspace = true
++
++[lints]
++workspace = true
+diff --git a/kernel/comps/brcmfmac/NOTICE b/kernel/comps/brcmfmac/NOTICE
+new file mode 100644
+index 0000000..07727a8
+--- /dev/null
++++ b/kernel/comps/brcmfmac/NOTICE
+@@ -0,0 +1,27 @@
++aster-brcmfmac is a Rust port of parts of Linux's brcmfmac driver
++(drivers/net/wireless/broadcom/brcm80211, Linux 6.18): the backplane's
++cores and their resets (chip.c), the PCIe transport and the firmware's
++download (pcie.c), the message rings (msgbuf.c, commonring.c), the NVRAM
++parser (firmware.c), the firmware's commands and events (fwil.c, fweh.c,
++fwil_types.h) and the station's sequence (cfg80211.c, common.c). Linux
++licenses those files under the ISC licence, reproduced below. The port's
++own code is under the MPL-2.0, like the rest of this kernel.
++
++Copyright (c) 2010-2014 Broadcom Corporation
++
++Permission to use, copy, modify, and/or distribute this software for any
++purpose with or without fee is hereby granted, provided that the above
++copyright notice and this permission notice appear in all copies.
++
++THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
++SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
++OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
++CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++The firmware the driver loads (brcm/brcmfmac*-pcie.bin, its .clm_blob and
++NVRAM .txt files) is Broadcom's and Cypress's (Infineon's), from
++linux-firmware, redistributed under its LICENCE.broadcom_bcm43xx and
++LICENCE.cypress files, which the image ships beside the files.
+diff --git a/kernel/comps/brcmfmac/src/chip.rs b/kernel/comps/brcmfmac/src/chip.rs
+new file mode 100644
+index 0000000..e9a095d
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/chip.rs
+@@ -0,0 +1,379 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The chip's backplane as Linux's brcmfmac `chip.c` sees it through PCIe:
++//! a 4 KiB window of BAR 0 moved over the backplane's addresses, the cores
++//! found in the enumeration ROM (AXI chips), their resets, the ARM core
++//! halted for the firmware's download and started after it, and the size
++//! of the RAM the firmware runs in.
++
++use alloc::vec::Vec;
++
++use aster_linuxkpi::io::Mmio;
++use aster_pci::PciDeviceLocation;
++
++use crate::{consts::*, delay_us};
++
++/// A core on the backplane: its registers and its wrapper's (the AXI
++/// agent that resets and clocks it).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Core {
++    pub(crate) id: u16,
++    pub(crate) rev: u8,
++    pub(crate) base: u32,
++    pub(crate) wrap: u32,
++}
++
++/// BAR 0 and the configuration register that moves its window.
++pub(crate) struct Backplane {
++    pub(crate) location: PciDeviceLocation,
++    pub(crate) regs: Mmio,
++}
++
++impl Backplane {
++    /// `brcmf_pcie_buscore_prep_addr`: the window over `addr`'s 4 KiB.
++    fn window(&self, addr: u32) -> usize {
++        self.location.write32(PCIE_BAR0_WINDOW, addr & !(PCIE_BAR0_REG_SIZE - 1));
++        (addr & (PCIE_BAR0_REG_SIZE - 1)) as usize
++    }
++
++    pub(crate) fn read32(&self, addr: u32) -> u32 {
++        let at = self.window(addr);
++        self.regs.ioread32(at)
++    }
++
++    pub(crate) fn write32(&self, addr: u32, value: u32) {
++        let at = self.window(addr);
++        self.regs.iowrite32(at, value);
++    }
++
++    /// `brcmf_pcie_select_core`: the window over a core's registers, which
++    /// BAR 0's first 4 KiB then show.
++    pub(crate) fn select(&self, core: &Core) {
++        self.location.write32(PCIE_BAR0_WINDOW, core.base);
++        if self.location.read32(PCIE_BAR0_WINDOW) != core.base {
++            self.location.write32(PCIE_BAR0_WINDOW, core.base);
++        }
++    }
++}
++
++/// The chip: its number and revision, its cores, its RAM.
++pub(crate) struct Chip {
++    pub(crate) id: u32,
++    pub(crate) rev: u32,
++    pub(crate) cores: Vec<Core>,
++    pub(crate) rambase: u32,
++    pub(crate) ramsize: u32,
++}
++
++impl Chip {
++    /// `brcmf_chip_recognition`: the chip's identity and, from the
++    /// enumeration ROM, its cores.
++    pub(crate) fn recognize(bp: &Backplane) -> Result<Self, &'static str> {
++        let id = bp.read32(SI_ENUM_BASE + CC_CHIPID);
++        if id == u32::MAX {
++            return Err("the chip does not answer");
++        }
++        if (id >> CID_TYPE_SHIFT) & 0xf != SOCI_AI {
++            return Err("an SSB backplane (not driven over PCIe)");
++        }
++        let mut chip = Self { id: id & CID_ID_MASK, rev: (id >> CID_REV_SHIFT) & 0xf, cores: Vec::new(), rambase: 0, ramsize: 0 };
++        chip.scan_erom(bp);
++        let cpu = [CORE_ARM_CR4, CORE_ARM_CA7, CORE_ARM_CM3].iter().any(|id| chip.core(*id).is_some());
++        if !cpu {
++            return Err("no ARM core");
++        }
++        if chip.core(CORE_PCIE2).is_none() {
++            return Err("no PCIe Gen2 core");
++        }
++        Ok(chip)
++    }
++
++    pub(crate) fn core(&self, id: u16) -> Option<Core> {
++        self.cores.iter().find(|core| core.id == id).copied()
++    }
++
++    /// The chip's name as Linux prints it (`BCM4356/2`).
++    pub(crate) fn name(&self) -> alloc::string::String {
++        if self.id > 0xa000 || self.id < 0x4000 {
++            alloc::format!("BCM{}/{}", self.id, self.rev)
++        } else {
++            alloc::format!("BCM{:x}/{}", self.id, self.rev)
++        }
++    }
++
++    /// `brcmf_chip_dmp_erom_scan`.
++    fn scan_erom(&mut self, bp: &Backplane) {
++        let mut at = bp.read32(SI_ENUM_BASE + CC_EROMPTR);
++        // The ROM is a few hundred words; a broken one must not loop.
++        for _ in 0..4096 {
++            let (value, kind) = desc(bp, &mut at);
++            if kind == DMP_DESC_EOT {
++                break;
++            }
++            if value & DMP_DESC_VALID == 0 || kind != DMP_DESC_COMPONENT {
++                continue;
++            }
++            let id = ((value & DMP_COMP_PARTNUM) >> DMP_COMP_PARTNUM_S) as u16;
++            // The second word of a component descriptor.
++            let (value, _) = desc(bp, &mut at);
++            if value & DMP_DESC_TYPE_MSK != DMP_DESC_COMPONENT {
++                break;
++            }
++            let nmw = (value & DMP_COMP_NUM_MWRAP) >> DMP_COMP_NUM_MWRAP_S;
++            let nsw = (value & DMP_COMP_NUM_SWRAP) >> DMP_COMP_NUM_SWRAP_S;
++            let rev = ((value & DMP_COMP_REVISION) >> DMP_COMP_REVISION_S) as u8;
++            if nmw + nsw == 0 && id != CORE_PMU && id != CORE_GCI {
++                continue;
++            }
++            if let Some((base, wrap)) = regaddr(bp, &mut at) {
++                self.cores.push(Core { id, rev, base, wrap });
++            }
++        }
++    }
++
++    // ---- The AXI cores' resets (`brcmf_chip_ai_*`). ----
++
++    pub(crate) fn is_up(&self, bp: &Backplane, core: &Core) -> bool {
++        let ioctl = bp.read32(core.wrap + BCMA_IOCTL);
++        let reset = bp.read32(core.wrap + BCMA_RESET_CTL);
++        ioctl & (BCMA_IOCTL_FGC | BCMA_IOCTL_CLK) == BCMA_IOCTL_CLK && reset & BCMA_RESET_CTL_RESET == 0
++    }
++
++    pub(crate) fn disable(&self, bp: &Backplane, core: &Core, prereset: u32, reset: u32) {
++        if bp.read32(core.wrap + BCMA_RESET_CTL) & BCMA_RESET_CTL_RESET == 0 {
++            bp.write32(core.wrap + BCMA_IOCTL, prereset | BCMA_IOCTL_FGC | BCMA_IOCTL_CLK);
++            bp.read32(core.wrap + BCMA_IOCTL);
++            bp.write32(core.wrap + BCMA_RESET_CTL, BCMA_RESET_CTL_RESET);
++            delay_us(20);
++            for _ in 0..300 {
++                if bp.read32(core.wrap + BCMA_RESET_CTL) == BCMA_RESET_CTL_RESET {
++                    break;
++                }
++                delay_us(1);
++            }
++        }
++        bp.write32(core.wrap + BCMA_IOCTL, reset | BCMA_IOCTL_FGC | BCMA_IOCTL_CLK);
++        bp.read32(core.wrap + BCMA_IOCTL);
++    }
++
++    fn release(&self, bp: &Backplane, core: &Core) {
++        for _ in 0..50 {
++            if bp.read32(core.wrap + BCMA_RESET_CTL) & BCMA_RESET_CTL_RESET == 0 {
++                break;
++            }
++            bp.write32(core.wrap + BCMA_RESET_CTL, 0);
++            delay_us(60);
++        }
++    }
++
++    /// `brcmf_chip_ai_resetcore`: both 802.11 cores together when there
++    /// are two.
++    pub(crate) fn reset_core(&self, bp: &Backplane, core: &Core, prereset: u32, reset: u32, postreset: u32) {
++        let second = (core.id == CORE_80211).then(|| self.cores.iter().filter(|other| other.id == CORE_80211).nth(1).copied()).flatten();
++        self.disable(bp, core, prereset, reset);
++        if let Some(second) = &second {
++            self.disable(bp, second, prereset, reset);
++        }
++        self.release(bp, core);
++        if let Some(second) = &second {
++            self.release(bp, second);
++        }
++        bp.write32(core.wrap + BCMA_IOCTL, postreset | BCMA_IOCTL_CLK);
++        bp.read32(core.wrap + BCMA_IOCTL);
++        if let Some(second) = &second {
++            bp.write32(second.wrap + BCMA_IOCTL, postreset | BCMA_IOCTL_CLK);
++            bp.read32(second.wrap + BCMA_IOCTL);
++        }
++    }
++
++    fn arm(&self) -> Option<Core> {
++        self.core(CORE_ARM_CR4).or_else(|| self.core(CORE_ARM_CA7)).or_else(|| self.core(CORE_ARM_CM3))
++    }
++
++    /// `brcmf_chip_set_passive`: the ARM halted, the 802.11 cores held,
++    /// for the firmware's download.
++    pub(crate) fn set_passive(&self, bp: &Backplane) {
++        let Some(arm) = self.arm() else { return };
++        if arm.id == CORE_ARM_CM3 {
++            self.disable(bp, &arm, 0, 0);
++            if let Some(d11) = self.core(CORE_80211) {
++                self.reset_core(bp, &d11, D11_IOCTL_PHYRESET | D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN);
++            }
++            if let Some(ram) = self.core(CORE_INTERNAL_MEM) {
++                self.reset_core(bp, &ram, 0, 0, 0);
++            }
++            return;
++        }
++        // All IOCTL bits but the halt cleared, the CPU held halted.
++        let halt = bp.read32(arm.wrap + BCMA_IOCTL) & ARMCR4_IOCTL_CPUHALT;
++        self.reset_core(bp, &arm, halt, ARMCR4_IOCTL_CPUHALT, ARMCR4_IOCTL_CPUHALT);
++        if arm.id == CORE_ARM_CR4 {
++            // Disabled only: the firmware enables them (releasing them
++            // here breaks the BCM4387).
++            for d11 in self.cores.iter().filter(|core| core.id == CORE_80211) {
++                self.disable(bp, d11, D11_IOCTL_PHYRESET | D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN);
++            }
++        } else if let Some(d11) = self.core(CORE_80211) {
++            self.reset_core(bp, &d11, D11_IOCTL_PHYRESET | D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN, D11_IOCTL_PHYCLOCKEN);
++        }
++    }
++
++    /// `brcmf_chip_set_active` after the bus wrote the reset vector: the
++    /// ARM released.
++    pub(crate) fn set_active(&self, bp: &Backplane) -> bool {
++        let Some(arm) = self.arm() else { return false };
++        if arm.id == CORE_ARM_CM3 {
++            let Some(ram) = self.core(CORE_INTERNAL_MEM) else { return false };
++            if !self.is_up(bp, &ram) {
++                return false;
++            }
++            self.reset_core(bp, &arm, 0, 0, 0);
++        } else {
++            self.reset_core(bp, &arm, ARMCR4_IOCTL_CPUHALT, 0, 0);
++        }
++        true
++    }
++
++    /// `brcmf_chip_get_raminfo`: where the firmware's RAM is on the
++    /// backplane and how large.
++    pub(crate) fn read_raminfo(&mut self, bp: &Backplane) -> Result<(), &'static str> {
++        if let Some(cr4) = self.core(CORE_ARM_CR4) {
++            let cap = bp.read32(cr4.base + ARMCR4_CAP);
++            let banks = (cap & ARMCR4_TCBANB_MASK) + ((cap & ARMCR4_TCBBNB_MASK) >> ARMCR4_TCBBNB_SHIFT);
++            let mut size = 0;
++            for index in 0..banks {
++                bp.write32(cr4.base + ARMCR4_BANKIDX, index);
++                let info = bp.read32(cr4.base + ARMCR4_BANKINFO);
++                let block = if info & ARMCR4_BLK_1K_MASK != 0 { ARMCR4_BSZ_MULT >> 3 } else { ARMCR4_BSZ_MULT };
++                size += ((info & ARMCR4_BSZ_MASK) + 1) * block;
++            }
++            self.ramsize = size;
++            self.rambase = tcm_rambase(self.id, self.rev).ok_or("RAM base unknown for this ARM CR4 chip")?;
++        } else if let Some(sysmem) = self.core(CORE_SYS_MEM) {
++            if !self.is_up(bp, &sysmem) {
++                self.reset_core(bp, &sysmem, 0, 0, 0);
++            }
++            let info = bp.read32(sysmem.base + SOCRAM_COREINFO);
++            let banks = (info & SRCI_SRNB_MASK) >> SRCI_SRNB_SHIFT;
++            let mut size = 0;
++            for index in 0..banks {
++                size += socram_banksize(bp, &sysmem, index);
++            }
++            self.ramsize = size;
++            self.rambase = tcm_rambase(self.id, self.rev).ok_or("RAM base unknown for this ARM CA7 chip")?;
++        } else {
++            let ram = self.core(CORE_INTERNAL_MEM).ok_or("no memory core")?;
++            if !self.is_up(bp, &ram) {
++                self.reset_core(bp, &ram, 0, 0, 0);
++            }
++            let info = bp.read32(ram.base + SOCRAM_COREINFO);
++            let banks = (info & (SRCI_SRNB_MASK | SRCI_SRNB_MASK_EXT)) >> SRCI_SRNB_SHIFT;
++            let mut size = 0;
++            for index in 0..banks {
++                size += socram_banksize(bp, &ram, index);
++            }
++            self.ramsize = size;
++            self.rambase = 0;
++        }
++        if self.ramsize == 0 || self.ramsize > CHIP_MAX_MEMSIZE {
++            return Err("the RAM's size makes no sense");
++        }
++        Ok(())
++    }
++}
++
++/// `brcmf_chip_socram_banksize`.
++fn socram_banksize(bp: &Backplane, core: &Core, index: u32) -> u32 {
++    bp.write32(core.base + SOCRAM_BANKIDX, (SOCRAM_MEMTYPE_RAM << SOCRAM_BANKIDX_MEMTYPE_SHIFT) | index);
++    let info = bp.read32(core.base + SOCRAM_BANKINFO);
++    ((info & SOCRAM_BANKINFO_SZMASK) + 1) * SOCRAM_BANKINFO_SZBASE
++}
++
++/// `brcmf_chip_tcm_rambase`.
++fn tcm_rambase(chip: u32, rev: u32) -> Option<u32> {
++    Some(match chip {
++        CC_4345 | CC_43454 => 0x198000,
++        CC_4335 | CC_4339 | CC_4350 | CC_4354 | CC_4356 | CC_43567 | CC_43569 | CC_43570 | CC_4358 | CC_43602 | CC_4371 => 0x180000,
++        CC_43465 | CC_43525 | CC_4365 | CC_4366 | CC_43664 | CC_43666 => 0x200000,
++        CC_4355 | CC_4359 => {
++            if rev < 9 {
++                0x180000
++            } else {
++                0x160000
++            }
++        }
++        CC_4364 | CC_4373 => 0x160000,
++        CC_43751 | CC_43752 | CC_4377 => 0x170000,
++        CC_4378 => 0x352000,
++        CC_4387 => 0x740000,
++        _ => return None,
++    })
++}
++
++/// `brcmf_chip_dmp_get_desc`: a descriptor and its type.
++fn desc(bp: &Backplane, at: &mut u32) -> (u32, u32) {
++    let value = bp.read32(*at);
++    *at += 4;
++    let mut kind = value & DMP_DESC_TYPE_MSK;
++    if kind & !DMP_DESC_ADDRSIZE_GT32 == DMP_DESC_ADDRESS {
++        kind = DMP_DESC_ADDRESS;
++    }
++    (value, kind)
++}
++
++/// `brcmf_chip_dmp_get_regaddr`: a core's registers and its wrapper.
++fn regaddr(bp: &Backplane, at: &mut u32) -> Option<(u32, u32)> {
++    let (_, kind) = desc(bp, at);
++    let wraptype = if kind == DMP_DESC_MASTER_PORT {
++        DMP_SLAVE_TYPE_MWRAP
++    } else if kind == DMP_DESC_ADDRESS {
++        *at -= 4;
++        DMP_SLAVE_TYPE_SWRAP
++    } else {
++        *at -= 4;
++        return None;
++    };
++    let (mut base, mut wrap) = (0, 0);
++    for _ in 0..64 {
++        // The next address descriptor.
++        let (value, kind) = loop {
++            let (value, kind) = desc(bp, at);
++            if kind == DMP_DESC_EOT {
++                *at -= 4;
++                return None;
++            }
++            if kind == DMP_DESC_ADDRESS || kind == DMP_DESC_COMPONENT {
++                break (value, kind);
++            }
++        };
++        // The next component's border.
++        if kind == DMP_DESC_COMPONENT {
++            *at -= 4;
++            return Some((base, wrap));
++        }
++        if value & DMP_DESC_ADDRSIZE_GT32 != 0 {
++            desc(bp, at);
++        }
++        let sztype = (value & DMP_SLAVE_SIZE_TYPE) >> DMP_SLAVE_SIZE_TYPE_S;
++        if sztype == DMP_SLAVE_SIZE_DESC {
++            let (size, _) = desc(bp, at);
++            if size & DMP_DESC_ADDRSIZE_GT32 != 0 {
++                desc(bp, at);
++            }
++        }
++        if sztype != DMP_SLAVE_SIZE_4K && sztype != DMP_SLAVE_SIZE_8K {
++            continue;
++        }
++        let stype = (value & DMP_SLAVE_TYPE) >> DMP_SLAVE_TYPE_S;
++        if base == 0 && stype == DMP_SLAVE_TYPE_SLAVE {
++            base = value & DMP_SLAVE_ADDR_BASE;
++        }
++        if wrap == 0 && stype == wraptype {
++            wrap = value & DMP_SLAVE_ADDR_BASE;
++        }
++        if base != 0 && wrap != 0 {
++            return Some((base, wrap));
++        }
++    }
++    None
++}
+diff --git a/kernel/comps/brcmfmac/src/consts.rs b/kernel/comps/brcmfmac/src/consts.rs
+new file mode 100644
+index 0000000..37fa0f8
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/consts.rs
+@@ -0,0 +1,401 @@
++// SPDX-License-Identifier: ISC
++// Copyright (c) 2010-2014 Broadcom Corporation
++
++//! The numbers of Linux's brcmfmac headers (`chip.c`, `pcie.c`,
++//! `msgbuf.[ch]`, `bus.h`, `fwil.h`, `fwil_types.h`, `fweh.h`,
++//! `brcmu_wifi.h`, `brcmu_d11.h`, `brcm_hw_ids.h`, `soc.h`,
++//! `chipcommon.h`) and of `linux/bcma`, under their names.
++
++#![allow(dead_code)]
++
++// ---- The backplane (`soc.h`, `chipcommon.h`, `linux/bcma`). ----
++
++pub(crate) const SI_ENUM_BASE: u32 = 0x1800_0000;
++pub(crate) const CC_CHIPID: u32 = 0x00;
++pub(crate) const CC_WATCHDOG: u32 = 0x80;
++pub(crate) const CC_EROMPTR: u32 = 0xfc;
++pub(crate) const CID_ID_MASK: u32 = 0x0000_ffff;
++pub(crate) const CID_REV_SHIFT: u32 = 16;
++pub(crate) const CID_TYPE_SHIFT: u32 = 28;
++pub(crate) const SOCI_AI: u32 = 1;
++
++pub(crate) const CORE_CHIPCOMMON: u16 = 0x800;
++pub(crate) const CORE_INTERNAL_MEM: u16 = 0x80e;
++pub(crate) const CORE_80211: u16 = 0x812;
++pub(crate) const CORE_PMU: u16 = 0x827;
++pub(crate) const CORE_ARM_CM3: u16 = 0x82a;
++pub(crate) const CORE_PCIE2: u16 = 0x83c;
++pub(crate) const CORE_ARM_CR4: u16 = 0x83e;
++pub(crate) const CORE_GCI: u16 = 0x840;
++pub(crate) const CORE_ARM_CA7: u16 = 0x847;
++pub(crate) const CORE_SYS_MEM: u16 = 0x849;
++
++pub(crate) const BCMA_IOCTL: u32 = 0x0408;
++pub(crate) const BCMA_IOCTL_CLK: u32 = 0x0001;
++pub(crate) const BCMA_IOCTL_FGC: u32 = 0x0002;
++pub(crate) const BCMA_RESET_CTL: u32 = 0x0800;
++pub(crate) const BCMA_RESET_CTL_RESET: u32 = 0x0001;
++pub(crate) const ARMCR4_IOCTL_CPUHALT: u32 = 0x0020;
++pub(crate) const D11_IOCTL_PHYCLOCKEN: u32 = 0x0004;
++pub(crate) const D11_IOCTL_PHYRESET: u32 = 0x0008;
++
++pub(crate) const DMP_DESC_TYPE_MSK: u32 = 0x0000_000f;
++pub(crate) const DMP_DESC_VALID: u32 = 0x0000_0001;
++pub(crate) const DMP_DESC_COMPONENT: u32 = 0x0000_0001;
++pub(crate) const DMP_DESC_MASTER_PORT: u32 = 0x0000_0003;
++pub(crate) const DMP_DESC_ADDRESS: u32 = 0x0000_0005;
++pub(crate) const DMP_DESC_ADDRSIZE_GT32: u32 = 0x0000_0008;
++pub(crate) const DMP_DESC_EOT: u32 = 0x0000_000f;
++pub(crate) const DMP_COMP_PARTNUM: u32 = 0x000f_ff00;
++pub(crate) const DMP_COMP_PARTNUM_S: u32 = 8;
++pub(crate) const DMP_COMP_REVISION: u32 = 0xff00_0000;
++pub(crate) const DMP_COMP_REVISION_S: u32 = 24;
++pub(crate) const DMP_COMP_NUM_SWRAP: u32 = 0x00f8_0000;
++pub(crate) const DMP_COMP_NUM_SWRAP_S: u32 = 19;
++pub(crate) const DMP_COMP_NUM_MWRAP: u32 = 0x0007_c000;
++pub(crate) const DMP_COMP_NUM_MWRAP_S: u32 = 14;
++pub(crate) const DMP_SLAVE_ADDR_BASE: u32 = 0xffff_f000;
++pub(crate) const DMP_SLAVE_TYPE: u32 = 0x0000_00c0;
++pub(crate) const DMP_SLAVE_TYPE_S: u32 = 6;
++pub(crate) const DMP_SLAVE_TYPE_SLAVE: u32 = 0;
++pub(crate) const DMP_SLAVE_TYPE_SWRAP: u32 = 2;
++pub(crate) const DMP_SLAVE_TYPE_MWRAP: u32 = 3;
++pub(crate) const DMP_SLAVE_SIZE_TYPE: u32 = 0x0000_0030;
++pub(crate) const DMP_SLAVE_SIZE_TYPE_S: u32 = 4;
++pub(crate) const DMP_SLAVE_SIZE_4K: u32 = 0;
++pub(crate) const DMP_SLAVE_SIZE_8K: u32 = 1;
++pub(crate) const DMP_SLAVE_SIZE_DESC: u32 = 3;
++
++pub(crate) const CHIP_MAX_MEMSIZE: u32 = 4 * 1024 * 1024;
++pub(crate) const SOCRAM_COREINFO: u32 = 0x00;
++pub(crate) const SOCRAM_BANKIDX: u32 = 0x10;
++pub(crate) const SOCRAM_BANKINFO: u32 = 0x40;
++pub(crate) const SOCRAM_BANKPDA: u32 = 0x44;
++pub(crate) const SOCRAM_BANKINFO_SZMASK: u32 = 0x7f;
++pub(crate) const SOCRAM_BANKIDX_MEMTYPE_SHIFT: u32 = 8;
++pub(crate) const SOCRAM_MEMTYPE_RAM: u32 = 0;
++pub(crate) const SOCRAM_BANKINFO_SZBASE: u32 = 8192;
++pub(crate) const SRCI_SRNB_MASK: u32 = 0xf0;
++pub(crate) const SRCI_SRNB_MASK_EXT: u32 = 0x100;
++pub(crate) const SRCI_SRNB_SHIFT: u32 = 4;
++pub(crate) const ARMCR4_CAP: u32 = 0x04;
++pub(crate) const ARMCR4_BANKIDX: u32 = 0x40;
++pub(crate) const ARMCR4_BANKINFO: u32 = 0x44;
++pub(crate) const ARMCR4_BANKPDA: u32 = 0x4c;
++pub(crate) const ARMCR4_TCBBNB_MASK: u32 = 0xf0;
++pub(crate) const ARMCR4_TCBBNB_SHIFT: u32 = 4;
++pub(crate) const ARMCR4_TCBANB_MASK: u32 = 0xf;
++pub(crate) const ARMCR4_BSZ_MASK: u32 = 0x7f;
++pub(crate) const ARMCR4_BSZ_MULT: u32 = 8192;
++pub(crate) const ARMCR4_BLK_1K_MASK: u32 = 0x200;
++
++// ---- The chips (`brcm_hw_ids.h`). ----
++
++pub(crate) const CC_4335: u32 = 0x4335;
++pub(crate) const CC_4339: u32 = 0x4339;
++pub(crate) const CC_4345: u32 = 0x4345;
++pub(crate) const CC_43454: u32 = 43454;
++pub(crate) const CC_43465: u32 = 43465;
++pub(crate) const CC_4350: u32 = 0x4350;
++pub(crate) const CC_43525: u32 = 43525;
++pub(crate) const CC_4354: u32 = 0x4354;
++pub(crate) const CC_4355: u32 = 0x4355;
++pub(crate) const CC_4356: u32 = 0x4356;
++pub(crate) const CC_43567: u32 = 43567;
++pub(crate) const CC_43569: u32 = 43569;
++pub(crate) const CC_43570: u32 = 43570;
++pub(crate) const CC_4358: u32 = 0x4358;
++pub(crate) const CC_4359: u32 = 0x4359;
++pub(crate) const CC_43602: u32 = 43602;
++pub(crate) const CC_4364: u32 = 0x4364;
++pub(crate) const CC_4365: u32 = 0x4365;
++pub(crate) const CC_4366: u32 = 0x4366;
++pub(crate) const CC_43664: u32 = 43664;
++pub(crate) const CC_43666: u32 = 43666;
++pub(crate) const CC_4371: u32 = 0x4371;
++pub(crate) const CC_4373: u32 = 0x4373;
++pub(crate) const CC_43751: u32 = 43751;
++pub(crate) const CC_43752: u32 = 43752;
++pub(crate) const CC_4377: u32 = 0x4377;
++pub(crate) const CC_4378: u32 = 0x4378;
++pub(crate) const CC_4387: u32 = 0x4387;
++
++// ---- PCIe (`pcie.c`). ----
++
++pub(crate) const PCIE_BAR0_WINDOW: u16 = 0x80;
++pub(crate) const PCIE_BAR0_REG_SIZE: u32 = 0x1000;
++pub(crate) const PCIE_REG_SBMBX: u16 = 0x98;
++pub(crate) const PCIE_REG_LINK_STATUS_CTRL: u16 = 0xbc;
++pub(crate) const PCIE_LINK_STATUS_CTRL_ASPM_ENAB: u32 = 3;
++pub(crate) const PCIE2REG_CONFIGADDR: usize = 0x120;
++pub(crate) const PCIE2REG_CONFIGDATA: usize = 0x124;
++pub(crate) const PCIE2REG_INTMASK: usize = 0x24;
++pub(crate) const PCIE2REG_MAILBOXINT: usize = 0x48;
++pub(crate) const PCIE2REG_MAILBOXMASK: usize = 0x4c;
++pub(crate) const PCIE2REG_H2D_MAILBOX_0: usize = 0x140;
++pub(crate) const PCIE2REG_H2D_MAILBOX_1: usize = 0x144;
++pub(crate) const PCIE64_INTMASK: usize = 0xc14;
++pub(crate) const PCIE64_MAILBOXINT: usize = 0xc30;
++pub(crate) const PCIE64_MAILBOXMASK: usize = 0xc34;
++pub(crate) const PCIE64_H2D_MAILBOX_0: usize = 0xa20;
++pub(crate) const PCIE64_H2D_MAILBOX_1: usize = 0xa24;
++pub(crate) const PCIE_MB_INT_FN0: u32 = 0x0100 | 0x0200;
++pub(crate) const PCIE_MB_INT_D2H_DB: u32 = 0x10000 | 0x20000 | 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x400000 | 0x800000;
++pub(crate) const PCIE64_MB_INT_D2H_DB: u32 = 0xffff;
++/// The configuration registers a PCIe Gen2 core of revision 13 or less
++/// loses on a watchdog reset (`brcmf_pcie_reset_device`).
++pub(crate) const PCIE_CFG_RESTORE: [u32; 11] = [0x4, 0x4c, 0x58, 0x5c, 0x60, 0x64, 0xdc, 0x228, 0x248, 0x4e0, 0x4f4];
++pub(crate) const PCIE_CFGREG_REG_BAR2_CONFIG: u32 = 0x4e0;
++
++pub(crate) const PCIE_SHARED_VERSION_7: u8 = 7;
++pub(crate) const PCIE_MIN_SHARED_VERSION: u8 = 5;
++pub(crate) const PCIE_MAX_SHARED_VERSION: u8 = 7;
++pub(crate) const PCIE_SHARED_VERSION_MASK: u32 = 0x00ff;
++pub(crate) const PCIE_SHARED_HOSTRDY_DB1: u32 = 0x1000_0000;
++pub(crate) const SHARED_MAX_RXBUFPOST_OFFSET: u32 = 34;
++pub(crate) const SHARED_RX_DATAOFFSET_OFFSET: u32 = 36;
++pub(crate) const SHARED_CONSOLE_ADDR_OFFSET: u32 = 20;
++pub(crate) const SHARED_HTOD_MB_DATA_ADDR_OFFSET: u32 = 40;
++pub(crate) const SHARED_DTOH_MB_DATA_ADDR_OFFSET: u32 = 44;
++pub(crate) const SHARED_RING_INFO_ADDR_OFFSET: u32 = 48;
++pub(crate) const SHARED_DMA_SCRATCH_LEN_OFFSET: u32 = 52;
++pub(crate) const SHARED_DMA_SCRATCH_ADDR_OFFSET: u32 = 56;
++pub(crate) const SHARED_DMA_RINGUPD_LEN_OFFSET: u32 = 64;
++pub(crate) const SHARED_DMA_RINGUPD_ADDR_OFFSET: u32 = 68;
++pub(crate) const RING_MEM_BASE_ADDR_OFFSET: u32 = 8;
++pub(crate) const RING_MAX_ITEM_OFFSET: u32 = 4;
++pub(crate) const RING_LEN_ITEMS_OFFSET: u32 = 6;
++pub(crate) const RING_MEM_SZ: u32 = 16;
++pub(crate) const DEF_MAX_RXBUFPOST: u16 = 255;
++pub(crate) const CONSOLE_BUFADDR_OFFSET: u32 = 8;
++pub(crate) const CONSOLE_BUFSIZE_OFFSET: u32 = 12;
++pub(crate) const CONSOLE_WRITEIDX_OFFSET: u32 = 16;
++pub(crate) const DMA_D2H_SCRATCH_BUF_LEN: u32 = 8;
++pub(crate) const DMA_D2H_RINGUPD_BUF_LEN: u32 = 1024;
++pub(crate) const D2H_DEV_DS_ENTER_REQ: u32 = 0x0000_0002;
++pub(crate) const D2H_DEV_FWHALT: u32 = 0x1000_0000;
++pub(crate) const H2D_HOST_DS_ACK: u32 = 0x0000_0002;
++pub(crate) const RAMSIZE_MAGIC: u32 = 0x534d_4152;
++pub(crate) const RAMSIZE_OFFSET: usize = 0x6c;
++pub(crate) const RANDOM_SEED_MAGIC: u32 = 0xfeed_c0de;
++pub(crate) const RANDOM_SEED_LENGTH: usize = 0x100;
++pub(crate) const PCIE_FW_UP_TIMEOUT_MS: u64 = 5000;
++
++// ---- The message rings (`bus.h`, `msgbuf.[ch]`). ----
++
++pub(crate) const H2D_MSGRING_CONTROL_SUBMIT: usize = 0;
++pub(crate) const H2D_MSGRING_RXPOST_SUBMIT: usize = 1;
++pub(crate) const H2D_MSGRING_FLOWRING_IDSTART: u16 = 2;
++pub(crate) const D2H_MSGRING_CONTROL_COMPLETE: usize = 2;
++pub(crate) const D2H_MSGRING_TX_COMPLETE: usize = 3;
++pub(crate) const D2H_MSGRING_RX_COMPLETE: usize = 4;
++pub(crate) const NROF_H2D_COMMON_MSGRINGS: usize = 2;
++pub(crate) const NROF_COMMON_MSGRINGS: usize = 5;
++pub(crate) const RING_MAX_ITEM: [u16; NROF_COMMON_MSGRINGS] = [64, 1024, 64, 1024, 1024];
++pub(crate) const RING_ITEMSIZE: [u16; NROF_COMMON_MSGRINGS] = [40, 32, 24, 24, 40];
++pub(crate) const RING_ITEMSIZE_PRE_V7: [u16; NROF_COMMON_MSGRINGS] = [40, 32, 24, 16, 32];
++pub(crate) const H2D_TXFLOWRING_MAX_ITEM: u16 = 512;
++pub(crate) const H2D_TXFLOWRING_ITEMSIZE: u16 = 48;
++
++pub(crate) const MSGBUF_TYPE_GEN_STATUS: u8 = 0x1;
++pub(crate) const MSGBUF_TYPE_RING_STATUS: u8 = 0x2;
++pub(crate) const MSGBUF_TYPE_FLOW_RING_CREATE: u8 = 0x3;
++pub(crate) const MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT: u8 = 0x4;
++pub(crate) const MSGBUF_TYPE_FLOW_RING_DELETE: u8 = 0x5;
++pub(crate) const MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT: u8 = 0x6;
++pub(crate) const MSGBUF_TYPE_IOCTLPTR_REQ: u8 = 0x9;
++pub(crate) const MSGBUF_TYPE_IOCTLPTR_REQ_ACK: u8 = 0xa;
++pub(crate) const MSGBUF_TYPE_IOCTLRESP_BUF_POST: u8 = 0xb;
++pub(crate) const MSGBUF_TYPE_IOCTL_CMPLT: u8 = 0xc;
++pub(crate) const MSGBUF_TYPE_EVENT_BUF_POST: u8 = 0xd;
++pub(crate) const MSGBUF_TYPE_WL_EVENT: u8 = 0xe;
++pub(crate) const MSGBUF_TYPE_TX_POST: u8 = 0xf;
++pub(crate) const MSGBUF_TYPE_TX_STATUS: u8 = 0x10;
++pub(crate) const MSGBUF_TYPE_RXBUF_POST: u8 = 0x11;
++pub(crate) const MSGBUF_TYPE_RX_CMPLT: u8 = 0x12;
++
++pub(crate) const IOCTL_REQ_PKTID: u32 = 0xfffe;
++pub(crate) const MSGBUF_MAX_PKT_SIZE: usize = 2048;
++pub(crate) const MSGBUF_MAX_CTL_PKT_SIZE: usize = 8192;
++pub(crate) const MSGBUF_RXBUFPOST_THRESHOLD: u32 = 32;
++pub(crate) const MSGBUF_MAX_IOCTLRESPBUF_POST: u32 = 8;
++pub(crate) const MSGBUF_MAX_EVENTBUF_POST: u32 = 8;
++pub(crate) const MSGBUF_PKT_FLAGS_FRAME_802_3: u8 = 0x01;
++pub(crate) const MSGBUF_PKT_FLAGS_FRAME_MASK: u16 = 0x07;
++pub(crate) const MSGBUF_PKT_FLAGS_FRAME_802_11: u16 = 0x02;
++pub(crate) const MSGBUF_PKT_FLAGS_PRIO_SHIFT: u8 = 5;
++pub(crate) const MSGBUF_IOCTL_RESP_TIMEOUT_MS: u64 = 2000;
++/// `BRCMF_TX_IOCTL_MAX_MSG_SIZE` (an Ethernet frame and its FCS).
++pub(crate) const TX_IOCTL_MAX_MSG_SIZE: usize = 1518;
++pub(crate) const DCMD_SMLEN: usize = 256;
++pub(crate) const DCMD_MEDLEN: usize = 1536;
++pub(crate) const DCMD_MAXLEN: usize = 8192;
++
++// ---- The firmware's commands (`fwil.h`). ----
++
++pub(crate) const C_GET_VERSION: u32 = 1;
++pub(crate) const C_UP: u32 = 2;
++pub(crate) const C_DOWN: u32 = 3;
++pub(crate) const C_GET_RATE: u32 = 12;
++pub(crate) const C_SET_INFRA: u32 = 20;
++pub(crate) const C_GET_BSSID: u32 = 23;
++pub(crate) const C_SET_SSID: u32 = 26;
++pub(crate) const C_SCAN: u32 = 50;
++pub(crate) const C_DISASSOC: u32 = 52;
++pub(crate) const C_SET_ROAM_TRIGGER: u32 = 55;
++pub(crate) const C_SET_ROAM_DELTA: u32 = 57;
++pub(crate) const C_SET_PM: u32 = 86;
++pub(crate) const C_GET_REVINFO: u32 = 98;
++pub(crate) const C_GET_RSSI: u32 = 127;
++pub(crate) const C_GET_BSS_INFO: u32 = 136;
++pub(crate) const C_SET_SCAN_CHANNEL_TIME: u32 = 185;
++pub(crate) const C_SET_SCAN_UNASSOC_TIME: u32 = 187;
++pub(crate) const C_SET_FAKEFRAG: u32 = 219;
++pub(crate) const C_SET_SCAN_PASSIVE_TIME: u32 = 258;
++pub(crate) const C_GET_VAR: u32 = 262;
++pub(crate) const C_SET_VAR: u32 = 263;
++
++/// The firmware's "unsupported" error (`BCME_UNSUPPORTED`).
++pub(crate) const FW_UNSUPPORTED: i16 = -23;
++
++// ---- Its events (`fweh.h`). ----
++
++pub(crate) const ETH_P_LINK_CTL: u16 = 0x886c;
++pub(crate) const BRCM_OUI: [u8; 3] = [0x00, 0x10, 0x18];
++pub(crate) const BCMILCP_BCM_SUBTYPE_EVENT: u16 = 1;
++/// The Ethernet header, Broadcom's and the event message's.
++pub(crate) const EVENT_HEADER: usize = 14 + 10 + 48;
++pub(crate) const EVENTING_MASK_LEN: usize = 16;
++
++pub(crate) const E_SET_SSID: u32 = 0;
++pub(crate) const E_DEAUTH: u32 = 5;
++pub(crate) const E_DEAUTH_IND: u32 = 6;
++pub(crate) const E_DISASSOC: u32 = 11;
++pub(crate) const E_DISASSOC_IND: u32 = 12;
++pub(crate) const E_LINK: u32 = 16;
++pub(crate) const E_MIC_ERROR: u32 = 17;
++pub(crate) const E_ROAM: u32 = 19;
++pub(crate) const E_PSK_SUP: u32 = 46;
++pub(crate) const E_IF: u32 = 54;
++pub(crate) const E_ESCAN_RESULT: u32 = 69;
++
++pub(crate) const EVENT_MSG_LINK: u16 = 0x01;
++pub(crate) const E_STATUS_SUCCESS: u32 = 0;
++pub(crate) const E_STATUS_NO_NETWORKS: u32 = 3;
++pub(crate) const E_STATUS_ABORT: u32 = 4;
++pub(crate) const E_STATUS_PARTIAL: u32 = 8;
++
++// ---- Security (`brcmu_wifi.h`, `fwil_types.h`). ----
++
++pub(crate) const WEP_ENABLED: u32 = 0x0001;
++pub(crate) const TKIP_ENABLED: u32 = 0x0002;
++pub(crate) const AES_ENABLED: u32 = 0x0004;
++pub(crate) const WPA_AUTH_DISABLED: u32 = 0x0000;
++pub(crate) const WPA_AUTH_UNSPECIFIED: u32 = 0x0002;
++pub(crate) const WPA_AUTH_PSK: u32 = 0x0004;
++pub(crate) const WPA2_AUTH_UNSPECIFIED: u32 = 0x0040;
++pub(crate) const WPA2_AUTH_PSK: u32 = 0x0080;
++pub(crate) const WPA2_AUTH_1X_SHA256: u32 = 0x1000;
++pub(crate) const WPA2_AUTH_FT: u32 = 0x4000;
++pub(crate) const WPA2_AUTH_PSK_SHA256: u32 = 0x8000;
++pub(crate) const WPA3_AUTH_SAE_PSK: u32 = 0x40000;
++pub(crate) const CRYPTO_ALGO_OFF: u32 = 0;
++pub(crate) const CRYPTO_ALGO_WEP1: u32 = 1;
++pub(crate) const CRYPTO_ALGO_TKIP: u32 = 2;
++pub(crate) const CRYPTO_ALGO_WEP128: u32 = 3;
++pub(crate) const CRYPTO_ALGO_AES_CCM: u32 = 4;
++pub(crate) const PRIMARY_KEY: u32 = 1 << 1;
++pub(crate) const MFP_NONE: u32 = 0;
++pub(crate) const MFP_CAPABLE: u32 = 1;
++pub(crate) const MFP_REQUIRED: u32 = 2;
++/// `sizeof(struct brcmf_wsec_key_le)`.
++pub(crate) const WSEC_KEY_LEN: usize = 164;
++
++// ---- Scans and joins (`fwil_types.h`, `cfg80211.[ch]`). ----
++
++pub(crate) const SCAN_PARAMS_FIXED_SIZE: usize = 64;
++pub(crate) const SCAN_PARAMS_V2_FIXED_SIZE: usize = 72;
++pub(crate) const SCAN_PARAMS_VERSION_V2: u16 = 2;
++pub(crate) const SCAN_PARAMS_NSSID_SHIFT: u32 = 16;
++pub(crate) const SCANTYPE_ACTIVE: u8 = 0;
++pub(crate) const SCANTYPE_PASSIVE: u8 = 1;
++pub(crate) const DOT11_BSSTYPE_ANY: u8 = 2;
++pub(crate) const ESCAN_REQ_VERSION: u32 = 1;
++pub(crate) const ESCAN_REQ_VERSION_V2: u32 = 2;
++pub(crate) const WL_ESCAN_ACTION_START: u16 = 1;
++pub(crate) const ESCAN_SYNC_ID: u16 = 0x1234;
++/// `WL_ESCAN_RESULTS_FIXED_SIZE`.
++pub(crate) const ESCAN_RESULT_FIXED: usize = 12;
++/// `sizeof(struct brcmf_ssid_le)`.
++pub(crate) const SSID_LE: usize = 36;
++pub(crate) const SCAN_JOIN_ACTIVE_DWELL_TIME_MS: u32 = 320;
++pub(crate) const SCAN_JOIN_PASSIVE_DWELL_TIME_MS: u32 = 400;
++pub(crate) const SCAN_JOIN_PROBE_INTERVAL_MS: u32 = 20;
++pub(crate) const SCAN_CHANNEL_TIME: u32 = 40;
++pub(crate) const SCAN_UNASSOC_TIME: u32 = 40;
++pub(crate) const SCAN_PASSIVE_TIME: u32 = 120;
++pub(crate) const WL_NUM_SCAN_MAX: u8 = 10;
++pub(crate) const SCAN_IE_LEN_MAX: u16 = 2048;
++pub(crate) const WL_BSS_INFO_MAX: usize = 2048;
++pub(crate) const WL_ASSOC_INFO_MAX: usize = 512;
++pub(crate) const WL_ROAM_TRIGGER_LEVEL: i32 = -75;
++pub(crate) const WL_ROAM_DELTA: u32 = 20;
++pub(crate) const BRCM_BAND_ALL: u32 = 3;
++pub(crate) const DEFAULT_BCN_TIMEOUT_ROAM_OFF: u32 = 4;
++pub(crate) const MAX_DEFAULT_KEYS: u8 = 6;
++pub(crate) const PM_OFF: u32 = 0;
++
++// ---- Channels (`brcmu_d11.h`, `brcmu_wifi.h`). ----
++
++pub(crate) const D11N_IOTYPE: u32 = 1;
++pub(crate) const D11AC_IOTYPE: u32 = 2;
++pub(crate) const CHSPEC_CH_MASK: u16 = 0x00ff;
++pub(crate) const D11N_SB_MASK: u16 = 0x0300;
++pub(crate) const D11N_SB_L: u16 = 0x0100;
++pub(crate) const D11N_SB_U: u16 = 0x0200;
++pub(crate) const D11N_SB_N: u16 = 0x0300;
++pub(crate) const D11N_BW_MASK: u16 = 0x0c00;
++pub(crate) const D11N_BW_20: u16 = 0x0800;
++pub(crate) const D11N_BW_40: u16 = 0x0c00;
++pub(crate) const D11N_BND_MASK: u16 = 0x3000;
++pub(crate) const D11N_BND_5G: u16 = 0x1000;
++pub(crate) const D11N_BND_2G: u16 = 0x2000;
++pub(crate) const D11AC_SB_MASK: u16 = 0x0700;
++pub(crate) const D11AC_SB_SHIFT: u16 = 8;
++pub(crate) const D11AC_BW_MASK: u16 = 0x3800;
++pub(crate) const D11AC_BW_20: u16 = 0x1000;
++pub(crate) const D11AC_BW_40: u16 = 0x1800;
++pub(crate) const D11AC_BW_80: u16 = 0x2000;
++pub(crate) const D11AC_BW_160: u16 = 0x2800;
++pub(crate) const D11AC_BND_MASK: u16 = 0xc000;
++pub(crate) const D11AC_BND_2G: u16 = 0x0000;
++pub(crate) const D11AC_BND_5G: u16 = 0xc000;
++pub(crate) const CH_MAX_2G_CHANNEL: u8 = 14;
++pub(crate) const WL_CHAN_RADAR: u32 = 1 << 3;
++pub(crate) const WL_CHAN_PASSIVE: u32 = 1 << 5;
++pub(crate) const WLC_BAND_5G: u32 = 1;
++pub(crate) const WLC_BAND_2G: u32 = 2;
++pub(crate) const WLC_BW_20MHZ_BIT: u32 = 1 << 0;
++pub(crate) const WLC_BW_40MHZ_BIT: u32 = 1 << 1;
++pub(crate) const WLC_BW_80MHZ_BIT: u32 = 1 << 2;
++pub(crate) const WLC_BW_160MHZ_BIT: u32 = 1 << 3;
++pub(crate) const WLC_N_BW_40ALL: u32 = 1;
++pub(crate) const WLC_N_BW_20IN2G_40IN5G: u32 = 2;
++pub(crate) const TXBF_SU_BFE_CAP: u32 = 1 << 0;
++pub(crate) const TXBF_MU_BFE_CAP: u32 = 1 << 1;
++pub(crate) const TXBF_SU_BFR_CAP: u32 = 1 << 0;
++pub(crate) const TXBF_MU_BFR_CAP: u32 = 1 << 1;
++
++// ---- The CLM blob's download (`fwil_types.h`). ----
++
++pub(crate) const MAX_CHUNK_LEN: usize = 1400;
++pub(crate) const DLOAD_HANDLER_VER: u16 = 1;
++pub(crate) const DLOAD_FLAG_VER_SHIFT: u16 = 12;
++pub(crate) const DL_BEGIN: u16 = 0x0002;
++pub(crate) const DL_END: u16 = 0x0004;
++pub(crate) const DL_TYPE_CLM: u16 = 2;
++
++// ---- NVRAM (`firmware.c`). ----
++
++pub(crate) const FW_MAX_NVRAM_SIZE: usize = 64000;
++pub(crate) const FW_DEFAULT_BOARDREV: &[u8] = b"boardrev=0xff";
+diff --git a/kernel/comps/brcmfmac/src/fwil.rs b/kernel/comps/brcmfmac/src/fwil.rs
+new file mode 100644
+index 0000000..2d8183d
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/fwil.rs
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The firmware's commands as Linux's brcmfmac `fwil.c` writes them:
++//! numbered commands with their data, and named variables ("iovars": the
++//! name, a NUL, the data) read with `GET_VAR` and written with `SET_VAR`.
++
++use alloc::vec;
++use core::fmt;
++
++use crate::{
++    consts::{C_GET_VAR, C_SET_VAR, DCMD_MAXLEN},
++    msgbuf::Msgbuf,
++};
++
++/// Why a command failed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum FwError {
++    /// The rings: no answer, no room.
++    Bus(&'static str),
++    /// The firmware's own error (`BCME_*`, negative).
++    Firmware(i16),
++}
++
++impl fmt::Display for FwError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            FwError::Bus(error) => f.write_str(error),
++            FwError::Firmware(code) => write!(f, "firmware error {}", code),
++        }
++    }
++}
++
++pub(crate) type FwResult<T> = Result<T, FwError>;
++
++impl Msgbuf {
++    /// `brcmf_fil_cmd_data`: `buf` is sent and overwritten by the answer.
++    pub(crate) fn cmd(&mut self, cmd: u32, buf: &mut [u8]) -> FwResult<()> {
++        let len = buf.len().min(DCMD_MAXLEN);
++        match self.ioctl(cmd, &mut buf[..len]) {
++            Err(error) => Err(FwError::Bus(error)),
++            Ok(status) if status < 0 => Err(FwError::Firmware(status)),
++            Ok(_) => Ok(()),
++        }
++    }
++
++    pub(crate) fn cmd_set(&mut self, cmd: u32, data: &[u8]) -> FwResult<()> {
++        let mut buf = data.to_vec();
++        if buf.is_empty() {
++            buf.push(0);
++        }
++        self.cmd(cmd, &mut buf)
++    }
++
++    pub(crate) fn cmd_int_set(&mut self, cmd: u32, value: u32) -> FwResult<()> {
++        self.cmd_set(cmd, &value.to_le_bytes())
++    }
++
++    pub(crate) fn cmd_int_get(&mut self, cmd: u32) -> FwResult<u32> {
++        let mut buf = [0u8; 4];
++        self.cmd(cmd, &mut buf)?;
++        Ok(u32::from_le_bytes(buf))
++    }
++
++    /// `brcmf_fil_iovar_data_get`: `data` goes with the name (a query's
++    /// argument) and is overwritten by the value.
++    pub(crate) fn iovar_get(&mut self, name: &str, data: &mut [u8]) -> FwResult<()> {
++        let mut buf = vec![0u8; (name.len() + 1 + data.len()).min(DCMD_MAXLEN)];
++        buf[..name.len()].copy_from_slice(name.as_bytes());
++        let at = name.len() + 1;
++        let fit = data.len().min(buf.len() - at);
++        buf[at..at + fit].copy_from_slice(&data[..fit]);
++        self.cmd(C_GET_VAR, &mut buf)?;
++        let out = data.len().min(buf.len());
++        data[..out].copy_from_slice(&buf[..out]);
++        Ok(())
++    }
++
++    /// `brcmf_fil_iovar_data_set`.
++    pub(crate) fn iovar_set(&mut self, name: &str, data: &[u8]) -> FwResult<()> {
++        let mut buf = vec![0u8; name.len() + 1 + data.len()];
++        buf[..name.len()].copy_from_slice(name.as_bytes());
++        buf[name.len() + 1..].copy_from_slice(data);
++        self.cmd(C_SET_VAR, &mut buf)
++    }
++
++    pub(crate) fn iovar_int_set(&mut self, name: &str, value: u32) -> FwResult<()> {
++        self.iovar_set(name, &value.to_le_bytes())
++    }
++
++    pub(crate) fn iovar_int_get(&mut self, name: &str) -> FwResult<u32> {
++        self.iovar_int_query(name, 0)
++    }
++
++    /// `brcmf_fil_iovar_int_query`: a value read for an argument.
++    pub(crate) fn iovar_int_query(&mut self, name: &str, argument: u32) -> FwResult<u32> {
++        let mut buf = argument.to_le_bytes();
++        self.iovar_get(name, &mut buf)?;
++        Ok(u32::from_le_bytes(buf))
++    }
++}
+diff --git a/kernel/comps/brcmfmac/src/lib.rs b/kernel/comps/brcmfmac/src/lib.rs
+new file mode 100644
+index 0000000..f6ca63f
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/lib.rs
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Broadcom's and Cypress's FullMAC Wi-Fi on PCIe, as Linux's brcmfmac
++//! runs it: the BCM4350, 4356, 43570, 4358, 4359, 4371, 43602, 4365,
++//! 4366, 4355/54591 and the chips of Apple's machines (4364, 4377, 4378,
++//! 4387, 43752), whose firmware makes the link itself.
++//!
++//! The chip ([`chip`]) is found on its backplane through BAR 0, halted,
++//! reset, and given its firmware and NVRAM ([`nvram`]) in its RAM through
++//! BAR 2 ([`pcie`]); then the firmware and the driver talk over message
++//! rings ([`msgbuf`]): commands ([`fwil`]), events, frames as Ethernet.
++//! The station ([`sta`]) is what Linux's cfg80211 layer asks of it: scans
++//! reported network by network, the link made by the firmware from the
++//! supplicant's request (wpa_supplicant runs the handshake), keys.
++//!
++//! linux-firmware has the BCM4350, 4356, 43570, 4358, 4366, 4371, 43602
++//! and 54591 files; Apple's chips need the firmware of their machine, and
++//! boards whose NVRAM lives in the system's EFI variables or device tree
++//! need it as `brcm/brcmfmac<chip>-pcie.txt`. Not yet: an access point,
++//! the firmware's own handshake (SAE through it, WPA3), power save, the
++//! SDIO and USB chips. `dmesg | grep brcmfmac` says how far a card gets;
++//! `brcmfmac.off` leaves the cards alone.
++
++#![no_std]
++#![deny(unsafe_code)]
++
++extern crate alloc;
++
++macro_rules! __log_prefix {
++    () => {
++        "brcmfmac: "
++    };
++}
++
++mod chip;
++mod consts;
++mod fwil;
++mod msgbuf;
++mod nvram;
++mod pcie;
++mod sta;
++
++use alloc::{format, sync::Arc};
++use core::sync::atomic::{AtomicBool, Ordering};
++
++pub(crate) use aster_linuxkpi::delay::{mdelay as delay_ms, now_ms, udelay as delay_us};
++use aster_linuxkpi::{
++    firmware::{request_firmware, request_firmware_nowarn},
++    io::Mmio,
++    pci::{self as kpi_pci, Devices},
++    wait::Waker,
++};
++use aster_pci::common_device::PciCommonDevice;
++use aster_wlan::radio::{self, Association, Connect, Join, Key, LinkStats, Radio, ScanRequest};
++use component::{ComponentInitError, init_component};
++use ostd::sync::Mutex;
++
++use crate::{consts::*, msgbuf::Msgbuf, pcie::Pcie, sta::Brcmf};
++
++/// The cards' tasks sleep here: woken by their interrupt, and by the timer
++/// every 5 ms (a card without MSI is looked at then).
++pub(crate) static WAKER: Waker = Waker::new(5);
++static DEVICES: Devices = Devices::new();
++
++const VENDOR_BROADCOM: u16 = 0x14e4;
++
++/// Linux's `brcmf_pcie_devid_table`: the device, and whether its firmware
++/// wants a random seed before the NVRAM (Apple's chips).
++fn card_of(vendor: u16, device: u16) -> Option<bool> {
++    if vendor != VENDOR_BROADCOM {
++        return None;
++    }
++    match device {
++        // 4350, 4355 (Broadcom's own subsystem), 4354, 4356, 43567,
++        // 43570, 4358, 4359, 43602 (and its 2.4/5 GHz and raw ids), 4365
++        // (Broadcom's own subsystem), 4365/4366 and their bands, 4371,
++        // 54591.
++        0x43a3 | 0x4355 | 0x4354 | 0x43ec | 0x43d3 | 0x43d9 | 0xaa31 | 0x43e9 | 0x43ef | 0x43ba | 0x43bb | 0x43bc | 0xaa52
++        | 0x43ca | 0x43cb | 0x43cc | 0x4365 | 0x43c3 | 0x43c4 | 0x43c5 | 0x440d | 0x4417 => Some(false),
++        // 4355 (Apple's), 4364, 4377, 4378, 4387, 43752.
++        0x43dc | 0x4464 | 0x4488 | 0x4425 | 0x4433 | 0x449d => Some(true),
++        _ => None,
++    }
++}
++
++fn claims(vendor: u16, device: u16) -> bool {
++    card_of(vendor, device).is_some()
++}
++
++/// `brcmf_pcie_fwnames`: the firmware's base name for a chip and its
++/// revision (each entry's mask holds the revisions it covers).
++fn firmware_of(chip: u32, rev: u32) -> Option<&'static str> {
++    const TABLE: &[(u32, u32, &str)] = &[
++        (CC_43602, 0xffff_ffff, "brcmfmac43602-pcie"),
++        (CC_43465, 0xffff_fff0, "brcmfmac4366c-pcie"),
++        (CC_4350, 0x0000_00ff, "brcmfmac4350c2-pcie"),
++        (CC_4350, 0xffff_ff00, "brcmfmac4350-pcie"),
++        (CC_43525, 0xffff_fff0, "brcmfmac4365c-pcie"),
++        (CC_4355, 0x0000_07ff, "brcmfmac4355-pcie"),
++        (CC_4355, 0x0000_2000, "brcmfmac54591-pcie"),
++        (CC_4355, 0xffff_f800, "brcmfmac4355c1-pcie"),
++        (CC_4356, 0xffff_ffff, "brcmfmac4356-pcie"),
++        (CC_43567, 0xffff_ffff, "brcmfmac43570-pcie"),
++        (CC_43569, 0xffff_ffff, "brcmfmac43570-pcie"),
++        (CC_43570, 0xffff_ffff, "brcmfmac43570-pcie"),
++        (CC_4358, 0xffff_ffff, "brcmfmac4358-pcie"),
++        (CC_4359, 0x0000_01ff, "brcmfmac4359-pcie"),
++        (CC_4359, 0xffff_fe00, "brcmfmac4359c-pcie"),
++        (CC_4364, 0x0000_000f, "brcmfmac4364b2-pcie"),
++        (CC_4364, 0xffff_fff0, "brcmfmac4364b3-pcie"),
++        (CC_4365, 0x0000_000f, "brcmfmac4365b-pcie"),
++        (CC_4365, 0xffff_fff0, "brcmfmac4365c-pcie"),
++        (CC_4366, 0x0000_000f, "brcmfmac4366b-pcie"),
++        (CC_4366, 0xffff_fff0, "brcmfmac4366c-pcie"),
++        (CC_43664, 0xffff_fff0, "brcmfmac4366c-pcie"),
++        (CC_43666, 0xffff_fff0, "brcmfmac4366c-pcie"),
++        (CC_4371, 0xffff_ffff, "brcmfmac4371-pcie"),
++        (CC_43752, 0xffff_ffff, "brcmfmac43752-pcie"),
++        (CC_4377, 0xffff_ffff, "brcmfmac4377b3-pcie"),
++        (CC_4378, 0x0000_000f, "brcmfmac4378b1-pcie"),
++        (CC_4378, 0xffff_ffe0, "brcmfmac4378b3-pcie"),
++        (CC_4387, 0xffff_ffff, "brcmfmac4387c2-pcie"),
++    ];
++    TABLE.iter().find(|(id, mask, _)| *id == chip && rev < 32 && mask & (1 << rev) != 0).map(|(_, _, name)| *name)
++}
++
++static DISABLED: AtomicBool = AtomicBool::new(false);
++aster_cmdline::define_flag_param!("brcmfmac.off", DISABLED);
++
++#[init_component]
++fn init() -> Result<(), ComponentInitError> {
++    if !DISABLED.load(Ordering::Relaxed) && DEVICES.register(claims) {
++        WAKER.start_timer();
++    }
++    Ok(())
++}
++
++#[init_component(kthread)]
++fn start() -> Result<(), ComponentInitError> {
++    DEVICES.spawn(run);
++    Ok(())
++}
++
++struct Card {
++    state: Mutex<Brcmf>,
++}
++
++struct BroadcomRadio {
++    card: Arc<Card>,
++}
++
++impl Radio for BroadcomRadio {
++    fn start(&self) -> radio::Result<()> {
++        if self.card.state.lock().dead { Err(radio::Error::Down) } else { Ok(()) }
++    }
++
++    fn stop(&self) {
++        let mut state = self.card.state.lock();
++        state.abort_scan();
++        state.leave();
++    }
++
++    fn scan(&self, request: &ScanRequest) -> radio::Result<()> {
++        self.card.state.lock().scan(request)
++    }
++
++    fn abort_scan(&self) {
++        self.card.state.lock().abort_scan();
++    }
++
++    fn join(&self, _network: &Join) -> radio::Result<()> {
++        Err(radio::Error::Unsupported)
++    }
++
++    fn associated(&self, _association: &Association) -> radio::Result<()> {
++        Err(radio::Error::Unsupported)
++    }
++
++    fn leave(&self) {
++        self.card.state.lock().leave();
++    }
++
++    fn set_key(&self, key: &Key) -> radio::Result<()> {
++        self.card.state.lock().set_key(key, false)
++    }
++
++    fn remove_key(&self, index: u8, pairwise: bool) {
++        let key = Key { index, cipher: radio::CIPHER_CCMP, pairwise, address: None, key: alloc::vec::Vec::new(), seq: alloc::vec::Vec::new() };
++        let _ = self.card.state.lock().set_key(&key, true);
++    }
++
++    fn authorize(&self, _authorized: bool) {}
++
++    fn send_management(&self, _frame: &[u8]) -> radio::Result<()> {
++        Err(radio::Error::Unsupported)
++    }
++
++    fn send(&self, ethernet: &[u8], _plain: bool) -> radio::Result<()> {
++        self.card.state.lock().send(ethernet)
++    }
++
++    fn link_stats(&self) -> LinkStats {
++        self.card.state.lock().link_stats()
++    }
++
++    fn makes_links(&self) -> bool {
++        true
++    }
++
++    fn connect(&self, request: &Connect) -> radio::Result<()> {
++        self.card.state.lock().connect(request)
++    }
++}
++
++/// A card's task: the chip up, its firmware running, the station
++/// registered, then what the firmware says.
++fn run(index: usize, mut device: PciCommonDevice) {
++    let id = *device.device_id();
++    let Some(seed) = card_of(id.vendor_id, id.device_id) else { return };
++    let location = *device.location();
++    let name = kpi_pci::device_name("brcmfmac", index, &location);
++    // Two ids are Broadcom's only on its own subsystem (others are other
++    // chips' or other drivers').
++    if matches!(id.device_id, 0x4355 | 0x4365) && kpi_pci::subsystem_ids(&location) != (VENDOR_BROADCOM, id.device_id) {
++        return;
++    }
++    kpi_pci::enable_device(&location);
++    let vectors = kpi_pci::alloc_irq_vector(&mut device, false, &name, || WAKER.wake());
++    let (Some(bar0), Some(bar2)) = (kpi_pci::iomap(&mut device, 0), kpi_pci::iomap(&mut device, 2)) else {
++        ostd::warn!("{}: BAR 0 or BAR 2 is not mapped", name);
++        return;
++    };
++    let mut pcie = match Pcie::new(location, Mmio::new(bar0), Mmio::new(bar2)) {
++        Ok(pcie) => pcie,
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    };
++    let chip = pcie.chip.name();
++    ostd::notice!("{}: Broadcom {} ({:04x}), RAM {} KiB at {:#x}", name, chip, id.device_id, pcie.chip.ramsize / 1024, pcie.chip.rambase);
++    let Some(base) = firmware_of(pcie.chip.id, pcie.chip.rev) else {
++        ostd::warn!("{}: no firmware is known for {}", name, chip);
++        return;
++    };
++    let Some(firmware) = request_firmware(&format!("brcm/{}.bin", base)) else {
++        ostd::warn!("{}: brcm/{}.bin is missing", name, base);
++        return;
++    };
++    // Broadcom's NVRAM files count PCI domains from one.
++    let nvram = request_firmware_nowarn(&format!("brcm/{}.txt", base)).and_then(|text| nvram::strip(&text, 1, location.bus));
++    if nvram.is_none() {
++        ostd::info!("{}: no NVRAM for {} (the chip's own calibration is used)", name, base);
++    }
++    let clm = request_firmware_nowarn(&format!("brcm/{}.clm_blob", base));
++    if let Err(error) = pcie.download(&firmware, nvram.as_deref(), seed) {
++        ostd::warn!("{}: {}", name, error);
++        pcie.console_read(true);
++        return;
++    }
++    drop(firmware);
++    let msg = match Msgbuf::new(pcie) {
++        Ok(msg) => msg,
++        Err(error) => {
++            ostd::warn!("{}: {}", name, error);
++            return;
++        }
++    };
++    let mut state = Brcmf::new(msg);
++    let info = match state.bring_up(clm.as_deref()) {
++        Ok(info) => info,
++        Err(error) => {
++            ostd::warn!("{}: the firmware's set-up failed: {}", name, error);
++            state.msg.pcie.console_read(true);
++            return;
++        }
++    };
++    ostd::notice!("{}: ready, MAC {:02x?}, firmware {}", name, state.address, state.firmware);
++    let card = Arc::new(Card { state: Mutex::new(state) });
++    let wlan = aster_wlan::register(info, Arc::new(BroadcomRadio { card: card.clone() }));
++    card.state.lock().device = Some(wlan);
++    loop {
++        WAKER.sleep();
++        let mut state = card.state.lock();
++        state.poll();
++        if state.dead {
++            ostd::warn!("{}: the firmware stopped", name);
++            break;
++        }
++    }
++    drop((vectors, device));
++}
+diff --git a/kernel/comps/brcmfmac/src/msgbuf.rs b/kernel/comps/brcmfmac/src/msgbuf.rs
+new file mode 100644
+index 0000000..c75dcba
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/msgbuf.rs
+@@ -0,0 +1,587 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The message protocol over the rings as Linux's brcmfmac `msgbuf.c`
++//! runs it: the firmware's commands (an IOCTL request pointing at a host
++//! buffer, the answer in a buffer posted for it), its events and received
++//! frames in buffers posted ahead, frames sent through a TX flow ring the
++//! firmware is asked to create, and their completions.
++
++use alloc::{collections::VecDeque, vec, vec::Vec};
++
++use aster_linuxkpi::{
++    bits::{get_le16, get_le32, put_le16, put_le32},
++    dma::alloc_coherent32,
++};
++use ostd::mm::{HasDaddr, PAGE_SIZE, VmIo, dma::DmaCoherent};
++
++use crate::{
++    consts::*,
++    now_ms,
++    pcie::{Pcie, Ring},
++};
++
++/// Buffers handed to the chip, by packet id: pages of host memory below
++/// 4 GiB split in equal slots.
++struct Pool {
++    chunks: Vec<DmaCoherent>,
++    size: usize,
++    per_chunk: usize,
++    count: usize,
++    free: Vec<u32>,
++}
++
++impl Pool {
++    fn new(count: usize, size: usize) -> Option<Self> {
++        let chunk = (16 * PAGE_SIZE).max(size.next_multiple_of(PAGE_SIZE));
++        let per_chunk = chunk / size;
++        let mut chunks = Vec::new();
++        for _ in 0..count.div_ceil(per_chunk) {
++            chunks.push(alloc_coherent32(chunk)?);
++        }
++        Some(Self { chunks, size, per_chunk, count, free: (0..count as u32).rev().collect() })
++    }
++
++    fn alloc(&mut self) -> Option<u32> {
++        self.free.pop()
++    }
++
++    fn release(&mut self, id: u32) {
++        if (id as usize) < self.count && !self.free.contains(&id) {
++            self.free.push(id);
++        }
++    }
++
++    fn reset(&mut self) {
++        self.free = (0..self.count as u32).rev().collect();
++    }
++
++    fn place(&self, id: u32) -> (&DmaCoherent, usize) {
++        let id = id as usize;
++        (&self.chunks[id / self.per_chunk], (id % self.per_chunk) * self.size)
++    }
++
++    fn daddr(&self, id: u32) -> u64 {
++        let (chunk, offset) = self.place(id);
++        (chunk.daddr() + offset) as u64
++    }
++
++    fn read(&self, id: u32, offset: usize, out: &mut [u8]) -> bool {
++        let (chunk, at) = self.place(id);
++        offset + out.len() <= self.size && chunk.read_bytes(at + offset, out).is_ok()
++    }
++
++    fn write(&self, id: u32, offset: usize, data: &[u8]) -> bool {
++        let (chunk, at) = self.place(id);
++        offset + data.len() <= self.size && chunk.write_bytes(at + offset, data).is_ok()
++    }
++}
++
++/// A firmware event (`struct brcmf_event_msg`).
++#[derive(Clone, Debug)]
++pub(crate) struct Event {
++    pub(crate) code: u32,
++    pub(crate) status: u32,
++    pub(crate) reason: u32,
++    pub(crate) flags: u16,
++    pub(crate) addr: [u8; 6],
++    pub(crate) ifidx: u8,
++    pub(crate) data: Vec<u8>,
++}
++
++/// `brcmf_fweh_process_skb` and `brcmf_fweh_process_event`: an event in an
++/// Ethernet frame of Broadcom's type.
++pub(crate) fn parse_event(frame: &[u8]) -> Option<Event> {
++    if frame.len() < EVENT_HEADER || u16::from_be_bytes([frame[12], frame[13]]) != ETH_P_LINK_CTL {
++        return None;
++    }
++    if frame[19..22] != BRCM_OUI || u16::from_be_bytes([frame[22], frame[23]]) != BCMILCP_BCM_SUBTYPE_EVENT {
++        return None;
++    }
++    let msg = &frame[24..];
++    let be32 = |at: usize| u32::from_be_bytes(msg[at..at + 4].try_into().unwrap());
++    let datalen = be32(20) as usize;
++    let data = frame.get(EVENT_HEADER..EVENT_HEADER + datalen)?;
++    Some(Event {
++        flags: u16::from_be_bytes([msg[2], msg[3]]),
++        code: be32(4),
++        status: be32(8),
++        reason: be32(12),
++        addr: msg[24..30].try_into().unwrap(),
++        ifidx: msg[46],
++        data: data.to_vec(),
++    })
++}
++
++/// The TX flow ring (one: a station's frames all go to its access point,
++/// as Linux's indirect address mode keys them by priority alone).
++enum Flow {
++    None,
++    Creating { ring: Ring, queue: VecDeque<(Vec<u8>, bool)> },
++    Open { ring: Ring },
++    Deleting { _ring: Ring },
++}
++
++/// What came back for an IOCTL.
++struct IoctlDone {
++    status: i16,
++    len: u16,
++    pktid: u32,
++    trans_id: u16,
++}
++
++/// The flow ring this driver uses: the first, at its priority's FIFO
++/// (`brcmf_flowring_prio2fifo[0]`, best effort).
++const FLOW_INDEX: u16 = 0;
++const FLOW_FIFO: u8 = 1;
++/// Frames held while the flow ring is created.
++const FLOW_QUEUE: usize = 64;
++const TX_BUFFERS: usize = 256;
++const RX_BUFFERS_MAX: u32 = 512;
++const CTL_BUFFERS: usize = (MSGBUF_MAX_IOCTLRESPBUF_POST + MSGBUF_MAX_EVENTBUF_POST) as usize + 4;
++/// Control buffers' packet ids follow the RX buffers'.
++const CTL_BASE: u32 = 0x4000;
++
++pub(crate) struct Msgbuf {
++    pub(crate) pcie: Pcie,
++    rings: Vec<Ring>,
++    rx: Pool,
++    rx_posted: u32,
++    max_rxbufpost: u32,
++    ctl: Pool,
++    ioctlresp_posted: u32,
++    event_posted: u32,
++    tx: Pool,
++    tx_eapol: Vec<bool>,
++    /// Handshake frames sent but not completed: a key waits for them
++    /// (`brcmf_netdev_wait_pend8021x`).
++    pub(crate) pend_8021x: u32,
++    outstanding: u32,
++    ioctbuf: DmaCoherent,
++    reqid: u16,
++    ioctl_done: Option<IoctlDone>,
++    flow: Flow,
++    pub(crate) own: [u8; 6],
++    pub(crate) events: VecDeque<Event>,
++    pub(crate) frames: VecDeque<Vec<u8>>,
++}
++
++impl Msgbuf {
++    /// `brcmf_proto_msgbuf_attach`: the buffers, the first ones posted.
++    pub(crate) fn new(mut pcie: Pcie) -> Result<Self, &'static str> {
++        let rings = pcie.init_rings()?;
++        let max_rxbufpost = (pcie.shared.max_rxbufpost as u32).min(RX_BUFFERS_MAX);
++        let rx = Pool::new(max_rxbufpost as usize, MSGBUF_MAX_PKT_SIZE).ok_or("no memory for RX buffers")?;
++        let ctl = Pool::new(CTL_BUFFERS, MSGBUF_MAX_CTL_PKT_SIZE).ok_or("no memory for control buffers")?;
++        let tx = Pool::new(TX_BUFFERS, MSGBUF_MAX_PKT_SIZE).ok_or("no memory for TX buffers")?;
++        let ioctbuf = alloc_coherent32(MSGBUF_MAX_CTL_PKT_SIZE).ok_or("no memory for the command buffer")?;
++        let mut msgbuf = Self {
++            pcie,
++            rings,
++            rx,
++            rx_posted: 0,
++            max_rxbufpost,
++            ctl,
++            ioctlresp_posted: 0,
++            event_posted: 0,
++            tx,
++            tx_eapol: vec![false; TX_BUFFERS],
++            pend_8021x: 0,
++            outstanding: 0,
++            ioctbuf,
++            reqid: 0,
++            ioctl_done: None,
++            flow: Flow::None,
++            own: [0; 6],
++            events: VecDeque::new(),
++            frames: VecDeque::new(),
++        };
++        msgbuf.fill_rx();
++        msgbuf.post_ctl(true);
++        msgbuf.post_ctl(false);
++        Ok(msgbuf)
++    }
++
++    /// `brcmf_msgbuf_rxbuf_data_fill`.
++    fn fill_rx(&mut self) {
++        while self.rx_posted < self.max_rxbufpost {
++            let want = (self.max_rxbufpost - self.rx_posted) as u16;
++            let ring = &mut self.rings[H2D_MSGRING_RXPOST_SUBMIT];
++            let Some((mut at, granted)) = self.pcie.reserve_many(ring, want) else { return };
++            let mut done = 0;
++            for _ in 0..granted {
++                let Some(id) = self.rx.alloc() else { break };
++                let mut item = [0u8; 32];
++                item[0] = MSGBUF_TYPE_RXBUF_POST;
++                put_le32(&mut item, 4, id);
++                put_le16(&mut item, 10, MSGBUF_MAX_PKT_SIZE as u16);
++                let address = self.rx.daddr(id);
++                put_le32(&mut item, 24, address as u32);
++                put_le32(&mut item, 28, (address >> 32) as u32);
++                Pcie::ring_write(ring, at, &item);
++                at += ring.item as usize;
++                done += 1;
++            }
++            if done < granted {
++                self.pcie.cancel(ring, granted - done);
++            }
++            if done > 0 {
++                self.pcie.write_complete(ring);
++            }
++            self.rx_posted += done as u32;
++            if done < granted {
++                return;
++            }
++        }
++    }
++
++    /// `brcmf_msgbuf_rxbuf_ctrl_post`: buffers for events or for IOCTL
++    /// answers, up to their number.
++    fn post_ctl(&mut self, event: bool) {
++        let (posted, max) = if event {
++            (self.event_posted, MSGBUF_MAX_EVENTBUF_POST)
++        } else {
++            (self.ioctlresp_posted, MSGBUF_MAX_IOCTLRESPBUF_POST)
++        };
++        if posted >= max {
++            return;
++        }
++        let ring = &mut self.rings[H2D_MSGRING_CONTROL_SUBMIT];
++        let Some((mut at, granted)) = self.pcie.reserve_many(ring, (max - posted) as u16) else { return };
++        let mut done = 0;
++        for _ in 0..granted {
++            let Some(index) = self.ctl.alloc() else { break };
++            let mut item = [0u8; 40];
++            item[0] = if event { MSGBUF_TYPE_EVENT_BUF_POST } else { MSGBUF_TYPE_IOCTLRESP_BUF_POST };
++            put_le32(&mut item, 4, CTL_BASE + index);
++            put_le16(&mut item, 8, MSGBUF_MAX_CTL_PKT_SIZE as u16);
++            let address = self.ctl.daddr(index);
++            put_le32(&mut item, 16, address as u32);
++            put_le32(&mut item, 20, (address >> 32) as u32);
++            Pcie::ring_write(ring, at, &item);
++            at += ring.item as usize;
++            done += 1;
++        }
++        if done < granted {
++            self.pcie.cancel(ring, granted - done);
++        }
++        if done > 0 {
++            self.pcie.write_complete(ring);
++        }
++        if event {
++            self.event_posted += done as u32;
++        } else {
++            self.ioctlresp_posted += done as u32;
++        }
++    }
++
++    /// One control message on the submission ring.
++    fn submit(&mut self, item: &[u8; 40]) -> Result<(), &'static str> {
++        let ring = &mut self.rings[H2D_MSGRING_CONTROL_SUBMIT];
++        let at = self.pcie.reserve(ring).ok_or("the control ring is full")?;
++        Pcie::ring_write(ring, at, item);
++        self.pcie.write_complete(ring);
++        Ok(())
++    }
++
++    // ---- What the firmware sent (`brcmf_proto_msgbuf_rx_trigger`). ----
++
++    /// The completion rings read. Whether anything came.
++    pub(crate) fn process(&mut self) -> bool {
++        let mut any = false;
++        for id in [D2H_MSGRING_RX_COMPLETE, D2H_MSGRING_TX_COMPLETE, D2H_MSGRING_CONTROL_COMPLETE] {
++            // A ring is read in two runs when its items wrap around.
++            for _ in 0..2 {
++                let ring = &mut self.rings[id];
++                let Some((at, count)) = self.pcie.read_ptr(ring) else { break };
++                let item = ring.item as usize;
++                let mut items = vec![0u8; count as usize * item];
++                let ok = Pcie::ring_read(ring, at, &mut items);
++                self.pcie.read_complete(ring, count);
++                if !ok {
++                    break;
++                }
++                any = true;
++                let offset = self.pcie.rx_dataoffset();
++                for message in items.chunks_exact(item) {
++                    if let Some(message) = message.get(offset..) {
++                        self.handle(message);
++                    }
++                }
++            }
++        }
++        any
++    }
++
++    fn handle(&mut self, msg: &[u8]) {
++        if msg.len() < 16 {
++            return;
++        }
++        let request_id = get_le32(msg, 4);
++        match msg[0] {
++            MSGBUF_TYPE_IOCTL_CMPLT => {
++                self.ioctlresp_posted = self.ioctlresp_posted.saturating_sub(1);
++                if let Some(old) = self.ioctl_done.replace(IoctlDone {
++                    status: get_le16(msg, 8) as i16,
++                    len: get_le16(msg, 12),
++                    pktid: request_id,
++                    trans_id: get_le16(msg, 14),
++                }) {
++                    self.release_ctl(old.pktid);
++                }
++                self.post_ctl(false);
++            }
++            MSGBUF_TYPE_WL_EVENT => {
++                self.event_posted = self.event_posted.saturating_sub(1);
++                let len = get_le16(msg, 12) as usize;
++                let mut frame = vec![0u8; len.min(MSGBUF_MAX_CTL_PKT_SIZE)];
++                let offset = self.pcie.rx_dataoffset();
++                let read = self.read_ctl(request_id, offset, &mut frame);
++                self.release_ctl(request_id);
++                self.post_ctl(true);
++                if read && let Some(event) = parse_event(&frame) {
++                    self.events.push_back(event);
++                }
++            }
++            MSGBUF_TYPE_RX_CMPLT if msg.len() >= 20 => {
++                let len = get_le16(msg, 14) as usize;
++                let data_offset = get_le16(msg, 16) as usize;
++                let flags = get_le16(msg, 18);
++                let offset = if data_offset != 0 { data_offset } else { self.pcie.rx_dataoffset() };
++                let mut frame = vec![0u8; len.min(MSGBUF_MAX_PKT_SIZE)];
++                let read = self.rx.read(request_id, offset, &mut frame);
++                self.rx.release(request_id);
++                self.rx_posted = self.rx_posted.saturating_sub(1);
++                if self.rx_posted + MSGBUF_RXBUFPOST_THRESHOLD <= self.max_rxbufpost {
++                    self.fill_rx();
++                }
++                if !read || flags & MSGBUF_PKT_FLAGS_FRAME_MASK == MSGBUF_PKT_FLAGS_FRAME_802_11 || frame.len() < 14 {
++                    return;
++                }
++                if let Some(event) = parse_event(&frame) {
++                    self.events.push_back(event);
++                } else if msg[1] == 0 {
++                    self.frames.push_back(frame);
++                }
++            }
++            MSGBUF_TYPE_TX_STATUS => {
++                let id = request_id.wrapping_sub(1);
++                if (id as usize) < TX_BUFFERS {
++                    self.tx.release(id);
++                    self.outstanding = self.outstanding.saturating_sub(1);
++                    if core::mem::take(&mut self.tx_eapol[id as usize]) {
++                        self.pend_8021x = self.pend_8021x.saturating_sub(1);
++                    }
++                }
++            }
++            MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT => {
++                let status = get_le16(msg, 8);
++                if get_le16(msg, 10) != H2D_MSGRING_FLOWRING_IDSTART + FLOW_INDEX {
++                    return;
++                }
++                if let Flow::Creating { ring, queue } = core::mem::replace(&mut self.flow, Flow::None) {
++                    if status != 0 {
++                        ostd::warn!("brcmfmac: the firmware did not create the TX flow ring ({})", status);
++                        return;
++                    }
++                    self.flow = Flow::Open { ring };
++                    for (frame, eapol) in queue {
++                        let _ = self.post(&frame, eapol);
++                    }
++                }
++            }
++            MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT => {
++                if matches!(self.flow, Flow::Deleting { .. }) {
++                    self.flow = Flow::None;
++                    // Frames the firmware dropped with the ring.
++                    self.tx.reset();
++                    self.tx_eapol.iter_mut().for_each(|eapol| *eapol = false);
++                    self.outstanding = 0;
++                    self.pend_8021x = 0;
++                }
++            }
++            MSGBUF_TYPE_GEN_STATUS | MSGBUF_TYPE_RING_STATUS => {
++                let status = get_le16(msg, 8);
++                if status != 0 {
++                    ostd::warn!("brcmfmac: the firmware reports error {} (ring {})", status as i16, get_le16(msg, 10));
++                }
++            }
++            _ => {}
++        }
++    }
++
++    fn read_ctl(&self, pktid: u32, offset: usize, out: &mut [u8]) -> bool {
++        pktid >= CTL_BASE && self.ctl.read(pktid - CTL_BASE, offset, out)
++    }
++
++    fn release_ctl(&mut self, pktid: u32) {
++        if pktid >= CTL_BASE {
++            self.ctl.release(pktid - CTL_BASE);
++        }
++    }
++
++    // ---- Commands (`brcmf_msgbuf_query_dcmd`). ----
++
++    /// A command and its answer, written over `buf`: the firmware's status
++    /// (negative: it refused).
++    pub(crate) fn ioctl(&mut self, cmd: u32, buf: &mut [u8]) -> Result<i16, &'static str> {
++        if self.pcie.halted {
++            return Err("the firmware halted");
++        }
++        let len = buf.len().min(DCMD_MAXLEN);
++        let input = len.min(TX_IOCTL_MAX_MSG_SIZE);
++        self.ioctbuf.write_bytes(0, &buf[..input]).map_err(|_| "command buffer")?;
++        self.reqid = self.reqid.wrapping_add(1);
++        let mut item = [0u8; 40];
++        item[0] = MSGBUF_TYPE_IOCTLPTR_REQ;
++        put_le32(&mut item, 4, IOCTL_REQ_PKTID);
++        put_le32(&mut item, 8, cmd);
++        put_le16(&mut item, 12, self.reqid);
++        put_le16(&mut item, 14, input as u16);
++        put_le16(&mut item, 16, len as u16);
++        let address = self.ioctbuf.daddr() as u64;
++        put_le32(&mut item, 24, address as u32);
++        put_le32(&mut item, 28, (address >> 32) as u32);
++        if let Some(stale) = self.ioctl_done.take() {
++            self.release_ctl(stale.pktid);
++        }
++        self.submit(&item)?;
++        let reqid = self.reqid;
++        let deadline = now_ms() + MSGBUF_IOCTL_RESP_TIMEOUT_MS;
++        let done = loop {
++            let answered = crate::WAKER.wait_event_timeout(
++                || {
++                    self.pcie.acknowledge();
++                    self.process();
++                    self.ioctl_done.is_some() || self.pcie.halted
++                },
++                deadline.saturating_sub(now_ms()),
++            );
++            if !answered || self.pcie.halted {
++                self.pcie.console_read(true);
++                return Err("the firmware did not answer a command");
++            }
++            let done = self.ioctl_done.take().unwrap();
++            // The answer to an earlier command that timed out.
++            if done.trans_id != reqid {
++                self.release_ctl(done.pktid);
++                continue;
++            }
++            break done;
++        };
++        let copy = (done.len as usize).min(len);
++        if copy > 0 {
++            let mut answer = vec![0u8; copy];
++            if self.read_ctl(done.pktid, 0, &mut answer) {
++                buf[..copy].copy_from_slice(&answer);
++            }
++        }
++        self.release_ctl(done.pktid);
++        Ok(done.status)
++    }
++
++    // ---- Frames to send (`brcmf_msgbuf_tx_queue_data`). ----
++
++    /// An Ethernet frame to the network; `eapol`: a handshake frame, which
++    /// keys wait for. `Err`: later (no room).
++    pub(crate) fn send(&mut self, frame: &[u8], eapol: bool) -> Result<(), ()> {
++        if frame.len() < 14 || frame.len() > MSGBUF_MAX_PKT_SIZE {
++            return Ok(());
++        }
++        match &mut self.flow {
++            Flow::Open { .. } => self.post(frame, eapol),
++            Flow::Creating { queue, .. } => {
++                if queue.len() >= FLOW_QUEUE {
++                    return Err(());
++                }
++                queue.push_back((frame.to_vec(), eapol));
++                Ok(())
++            }
++            Flow::Deleting { .. } => Err(()),
++            Flow::None => {
++                let da: [u8; 6] = frame[0..6].try_into().unwrap();
++                self.create_flow(&da).map_err(|error| ostd::warn!("brcmfmac: {}", error))?;
++                if let Flow::Creating { queue, .. } = &mut self.flow {
++                    queue.push_back((frame.to_vec(), eapol));
++                }
++                Ok(())
++            }
++        }
++    }
++
++    /// `brcmf_msgbuf_flowring_create_worker`.
++    fn create_flow(&mut self, da: &[u8; 6]) -> Result<(), &'static str> {
++        if self.pcie.shared.max_flowrings == 0 {
++            return Err("the firmware has no TX flow rings");
++        }
++        let ring = self.pcie.flow_ring(FLOW_INDEX, H2D_TXFLOWRING_MAX_ITEM, H2D_TXFLOWRING_ITEMSIZE).ok_or("no memory for the TX flow ring")?;
++        let mut item = [0u8; 40];
++        item[0] = MSGBUF_TYPE_FLOW_RING_CREATE;
++        item[8..14].copy_from_slice(da);
++        item[14..20].copy_from_slice(&self.own);
++        item[20] = FLOW_FIFO;
++        put_le16(&mut item, 22, H2D_MSGRING_FLOWRING_IDSTART + FLOW_INDEX);
++        put_le16(&mut item, 28, H2D_TXFLOWRING_MAX_ITEM);
++        put_le16(&mut item, 30, H2D_TXFLOWRING_ITEMSIZE);
++        let address = ring.daddr();
++        put_le32(&mut item, 32, address as u32);
++        put_le32(&mut item, 36, (address >> 32) as u32);
++        self.submit(&item)?;
++        self.flow = Flow::Creating { ring, queue: VecDeque::new() };
++        Ok(())
++    }
++
++    /// `brcmf_msgbuf_txflow` for one frame.
++    fn post(&mut self, frame: &[u8], eapol: bool) -> Result<(), ()> {
++        let Flow::Open { ring } = &mut self.flow else { return Err(()) };
++        if !self.pcie.write_available(ring) {
++            return Err(());
++        }
++        let Some(id) = self.tx.alloc() else { return Err(()) };
++        if !self.tx.write(id, 0, &frame[14..]) {
++            self.tx.release(id);
++            return Ok(());
++        }
++        let Some(at) = self.pcie.reserve(ring) else {
++            self.tx.release(id);
++            return Err(());
++        };
++        let mut item = [0u8; 48];
++        item[0] = MSGBUF_TYPE_TX_POST;
++        put_le32(&mut item, 4, id + 1);
++        item[8..22].copy_from_slice(&frame[..14]);
++        item[22] = MSGBUF_PKT_FLAGS_FRAME_802_3;
++        item[23] = 1;
++        let address = self.tx.daddr(id);
++        put_le32(&mut item, 32, address as u32);
++        put_le32(&mut item, 36, (address >> 32) as u32);
++        put_le16(&mut item, 42, (frame.len() - 14) as u16);
++        Pcie::ring_write(ring, at, &item);
++        self.pcie.write_complete(ring);
++        self.outstanding += 1;
++        self.tx_eapol[id as usize] = eapol;
++        if eapol {
++            self.pend_8021x += 1;
++        }
++        Ok(())
++    }
++
++    /// `brcmf_msgbuf_delete_flowring`: the link ended, its ring goes.
++    pub(crate) fn delete_flow(&mut self) {
++        match core::mem::replace(&mut self.flow, Flow::None) {
++            Flow::None => {}
++            Flow::Deleting { _ring } => self.flow = Flow::Deleting { _ring },
++            Flow::Creating { ring, .. } | Flow::Open { ring } => {
++                let mut item = [0u8; 40];
++                item[0] = MSGBUF_TYPE_FLOW_RING_DELETE;
++                put_le16(&mut item, 8, H2D_MSGRING_FLOWRING_IDSTART + FLOW_INDEX);
++                if self.submit(&item).is_ok() {
++                    self.flow = Flow::Deleting { _ring: ring };
++                } else {
++                    self.tx.reset();
++                    self.outstanding = 0;
++                    self.pend_8021x = 0;
++                }
++            }
++        }
++    }
++}
+diff --git a/kernel/comps/brcmfmac/src/nvram.rs b/kernel/comps/brcmfmac/src/nvram.rs
+new file mode 100644
+index 0000000..a302d1f
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/nvram.rs
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The board's NVRAM file as Linux's brcmfmac `firmware.c` hands it to the
++//! firmware: `key=value` lines without comments, each ended by a NUL,
++//! one device's part of a file written for several, `boardrev` when the
++//! file has none, padded to 4 bytes and closed by a word with the length.
++
++use alloc::{format, vec::Vec};
++
++use crate::consts::{FW_DEFAULT_BOARDREV, FW_MAX_NVRAM_SIZE};
++
++fn is_nvram_char(c: u8) -> bool {
++    c != b'#' && (0x20..0x7f).contains(&c)
++}
++
++/// The entries of the text, each without its line's end.
++fn entries(data: &[u8]) -> Vec<&[u8]> {
++    let mut out = Vec::new();
++    let mut size = 0;
++    for line in data.split(|c| *c == b'\n' || *c == 0) {
++        let line = line.strip_suffix(b"\r").unwrap_or(line);
++        // Leading blanks, then a key of readable characters, `=`.
++        let start = line.iter().position(|c| !matches!(c, b' ' | b'\t' | b'\r')).unwrap_or(line.len());
++        let line = &line[start..];
++        if line.first().is_none_or(|c| !is_nvram_char(*c)) {
++            continue;
++        }
++        let Some(equals) = line.iter().position(|c| *c == b'=') else { continue };
++        if line[..equals].iter().any(|c| !is_nvram_char(*c) || *c == b' ') {
++            continue;
++        }
++        if line.starts_with(b"RAW1") {
++            continue;
++        }
++        // The value ends at the first character that is not readable (a
++        // comment's `#` among them).
++        let end = line[equals + 1..].iter().position(|c| !is_nvram_char(*c)).map_or(line.len(), |at| equals + 1 + at);
++        size += end + 1;
++        if size >= FW_MAX_NVRAM_SIZE {
++            break;
++        }
++        out.push(&line[..end]);
++    }
++    out
++}
++
++/// `brcmf_fw_nvram_strip`: the NVRAM to download, for the device on PCI
++/// `bus` of `domain` (as Broadcom's files count them: Linux's domain plus
++/// one). `None`: nothing for this device in the file.
++pub(crate) fn strip(data: &[u8], domain: u16, bus: u8) -> Option<Vec<u8>> {
++    let all = entries(data);
++    let multi_v1 = all.iter().any(|entry| entry.starts_with(b"devpath"));
++    let multi_v2 = all.iter().any(|entry| entry.starts_with(b"pcie/"));
++    let mut kept: Vec<Vec<u8>> = Vec::new();
++    if multi_v1 {
++        // `devpathN=pci/D/B/` names the device whose entries are `N:key=…`.
++        let pci = format!("pci/{}/{}", domain, bus);
++        let pcie = format!("pcie/{}/{}", domain, bus);
++        let id = all.iter().find_map(|entry| {
++            let rest = entry.strip_prefix(b"devpath")?;
++            let (&id, value) = rest.split_first()?;
++            let value = value.strip_prefix(b"=")?;
++            (value.starts_with(pci.as_bytes()) || value.starts_with(pcie.as_bytes())).then_some(id)
++        })?;
++        for entry in &all {
++            if entry.len() > 2 && entry[0] == id && entry[1] == b':' {
++                kept.push(entry[2..].to_vec());
++            }
++        }
++    } else if multi_v2 {
++        let prefix = format!("pcie/{}/{}/", domain, bus);
++        for entry in &all {
++            if let Some(rest) = entry.strip_prefix(prefix.as_bytes()) {
++                kept.push(rest.to_vec());
++            }
++        }
++    } else {
++        kept = all.iter().map(|entry| entry.to_vec()).collect();
++    }
++    if kept.is_empty() {
++        return None;
++    }
++    if !kept.iter().any(|entry| entry.starts_with(b"boardrev")) {
++        kept.push(FW_DEFAULT_BOARDREV.to_vec());
++    }
++    let mut out = Vec::new();
++    for entry in kept {
++        out.extend_from_slice(&entry);
++        out.push(0);
++    }
++    // At least one NUL more, then to a word's end.
++    let length = (out.len() + 1).next_multiple_of(4);
++    out.resize(length, 0);
++    let words = (length / 4) as u32;
++    let token = (!words << 16) | (words & 0xffff);
++    out.extend_from_slice(&token.to_le_bytes());
++    Some(out)
++}
+diff --git a/kernel/comps/brcmfmac/src/pcie.rs b/kernel/comps/brcmfmac/src/pcie.rs
+new file mode 100644
+index 0000000..3230612
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/pcie.rs
+@@ -0,0 +1,608 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The PCIe transport as Linux's brcmfmac `pcie.c` and `commonring.c` run
++//! it: the chip reset by its watchdog, the firmware and the NVRAM copied
++//! into the ARM's RAM through BAR 2, the firmware's shared area found at
++//! the RAM's end, five message rings (control, RX buffers posted; control,
++//! TX and RX completions) and the TX flow rings in host memory with their
++//! indices in the chip's RAM, the doorbell and the mailbox interrupt.
++
++use alloc::{string::String, vec::Vec};
++
++use aster_linuxkpi::{
++    bits::{get_le32, put_le32},
++    dma::alloc_coherent32,
++    io::Mmio,
++};
++use aster_pci::PciDeviceLocation;
++use ostd::mm::{HasDaddr, VmIo, dma::DmaCoherent};
++
++use crate::{
++    chip::{Backplane, Chip, Core},
++    consts::*,
++    delay_ms,
++};
++
++/// The PCIe Gen2 core's interrupt registers: their places moved with its
++/// revision 64.
++#[derive(Clone, Copy)]
++struct RegInfo {
++    mailboxint: usize,
++    mailboxmask: usize,
++    h2d_mailbox_0: usize,
++    h2d_mailbox_1: usize,
++    int_d2h_db: u32,
++    int_fn0: u32,
++}
++
++const REGINFO_DEFAULT: RegInfo = RegInfo {
++    mailboxint: PCIE2REG_MAILBOXINT,
++    mailboxmask: PCIE2REG_MAILBOXMASK,
++    h2d_mailbox_0: PCIE2REG_H2D_MAILBOX_0,
++    h2d_mailbox_1: PCIE2REG_H2D_MAILBOX_1,
++    int_d2h_db: PCIE_MB_INT_D2H_DB,
++    int_fn0: PCIE_MB_INT_FN0,
++};
++
++const REGINFO_64: RegInfo = RegInfo {
++    mailboxint: PCIE64_MAILBOXINT,
++    mailboxmask: PCIE64_MAILBOXMASK,
++    h2d_mailbox_0: PCIE64_H2D_MAILBOX_0,
++    h2d_mailbox_1: PCIE64_H2D_MAILBOX_1,
++    int_d2h_db: PCIE64_MB_INT_D2H_DB,
++    int_fn0: 0,
++};
++
++/// A message ring (`struct brcmf_commonring`): items in host memory, the
++/// two indices in the chip's RAM.
++pub(crate) struct Ring {
++    pub(crate) mem: DmaCoherent,
++    pub(crate) depth: u16,
++    pub(crate) item: u16,
++    pub(crate) w_ptr: u16,
++    pub(crate) r_ptr: u16,
++    w_idx_addr: u32,
++    r_idx_addr: u32,
++    was_full: bool,
++}
++
++impl Ring {
++    pub(crate) fn daddr(&self) -> u64 {
++        self.mem.daddr() as u64
++    }
++}
++
++/// The firmware's console in its RAM (`struct brcmf_pcie_console`).
++#[derive(Default)]
++struct Console {
++    base: u32,
++    buf: u32,
++    size: u32,
++    read: u32,
++    line: Vec<u8>,
++}
++
++/// What the firmware's shared area says (`struct brcmf_pcie_shared_info`).
++#[derive(Default)]
++pub(crate) struct Shared {
++    pub(crate) tcm_base: u32,
++    pub(crate) flags: u32,
++    pub(crate) version: u8,
++    pub(crate) max_rxbufpost: u16,
++    pub(crate) rx_dataoffset: u32,
++    htod_mb_data: u32,
++    dtoh_mb_data: u32,
++    ring_info: u32,
++    pub(crate) max_flowrings: u16,
++}
++
++pub(crate) struct Pcie {
++    pub(crate) bp: Backplane,
++    pub(crate) tcm: Mmio,
++    pub(crate) chip: Chip,
++    pcie2: Core,
++    reg: RegInfo,
++    pub(crate) shared: Shared,
++    /// Where each flow ring's indices are in the chip's RAM.
++    flow_idx: Vec<(u32, u32)>,
++    _scratch: Option<(DmaCoherent, DmaCoherent)>,
++    console: Console,
++    /// The firmware said it halted.
++    pub(crate) halted: bool,
++}
++
++impl Pcie {
++    /// `brcmf_chip_attach` over PCIe: the chip recognized, its ARM halted,
++    /// the chip reset, its RAM measured.
++    pub(crate) fn new(location: PciDeviceLocation, regs: Mmio, tcm: Mmio) -> Result<Self, &'static str> {
++        let bp = Backplane { location, regs };
++        let chip = Chip::recognize(&bp)?;
++        let pcie2 = chip.core(CORE_PCIE2).ok_or("no PCIe Gen2 core")?;
++        let reg = if pcie2.rev >= 64 { REGINFO_64 } else { REGINFO_DEFAULT };
++        let mut pcie = Self {
++            bp,
++            tcm,
++            chip,
++            pcie2,
++            reg,
++            shared: Shared::default(),
++            flow_idx: Vec::new(),
++            _scratch: None,
++            console: Console::default(),
++            halted: false,
++        };
++        pcie.chip.set_passive(&pcie.bp);
++        // `brcmf_pcie_buscore_reset`.
++        pcie.reset_device();
++        let at = if pcie2.rev >= 64 { PCIE64_MAILBOXINT } else { PCIE2REG_MAILBOXINT };
++        pcie.bp.select(&pcie2);
++        let pending = pcie.bp.regs.ioread32(at);
++        if pending != u32::MAX {
++            pcie.bp.regs.iowrite32(at, pending);
++        }
++        pcie.chip.set_passive(&pcie.bp);
++        pcie.chip.read_raminfo(&pcie.bp)?;
++        Ok(pcie)
++    }
++
++    fn select(&self, id: u16) {
++        if let Some(core) = self.chip.core(id) {
++            self.bp.select(&core);
++        }
++    }
++
++    /// `brcmf_pcie_reset_device`: ASPM off, the chip's watchdog, the
++    /// configuration an old PCIe core loses written back.
++    fn reset_device(&self) {
++        self.select(CORE_PCIE2);
++        let lsc = self.bp.location.read32(PCIE_REG_LINK_STATUS_CTRL);
++        self.bp.location.write32(PCIE_REG_LINK_STATUS_CTRL, lsc & !PCIE_LINK_STATUS_CTRL_ASPM_ENAB);
++        self.select(CORE_CHIPCOMMON);
++        self.bp.regs.iowrite32(CC_WATCHDOG as usize, 4);
++        delay_ms(100);
++        self.select(CORE_PCIE2);
++        self.bp.location.write32(PCIE_REG_LINK_STATUS_CTRL, lsc);
++        if self.pcie2.rev <= 13 {
++            for offset in PCIE_CFG_RESTORE {
++                self.bp.regs.iowrite32(PCIE2REG_CONFIGADDR, offset);
++                let value = self.bp.regs.ioread32(PCIE2REG_CONFIGDATA);
++                self.bp.regs.iowrite32(PCIE2REG_CONFIGDATA, value);
++            }
++        }
++    }
++
++    // ---- The chip's RAM through BAR 2. ----
++
++    pub(crate) fn read_tcm32(&self, at: u32) -> u32 {
++        self.tcm.ioread32(at as usize)
++    }
++
++    pub(crate) fn write_tcm32(&self, at: u32, value: u32) {
++        self.tcm.iowrite32(at as usize, value);
++    }
++
++    fn read_tcm16(&self, at: u32) -> u16 {
++        self.tcm.ioread16(at as usize)
++    }
++
++    fn write_tcm16(&self, at: u32, value: u16) {
++        self.tcm.iowrite16(at as usize, value);
++    }
++
++    fn read_ram32(&self, offset: u32) -> u32 {
++        self.read_tcm32(self.chip.rambase + offset)
++    }
++
++    fn write_ram32(&self, offset: u32, value: u32) {
++        self.write_tcm32(self.chip.rambase + offset, value);
++    }
++
++    /// Bytes into the chip's RAM, a word at a time.
++    fn copy_to_tcm(&self, at: u32, data: &[u8]) {
++        let mut chunks = data.chunks_exact(4);
++        let mut offset = at;
++        for word in &mut chunks {
++            self.write_tcm32(offset, u32::from_le_bytes(word.try_into().unwrap()));
++            offset += 4;
++        }
++        let rest = chunks.remainder();
++        if !rest.is_empty() {
++            let mut word = [0u8; 4];
++            word[..rest.len()].copy_from_slice(rest);
++            self.write_tcm32(offset, u32::from_le_bytes(word));
++        }
++    }
++
++    // ---- The firmware's download (`brcmf_pcie_setup`). ----
++
++    /// The firmware and the NVRAM in the chip's RAM, the ARM started, the
++    /// shared area read. `seed`: the chip wants random bytes before the
++    /// NVRAM.
++    pub(crate) fn download(&mut self, firmware: &[u8], nvram: Option<&[u8]>, seed: bool) -> Result<(), &'static str> {
++        // `brcmf_pcie_attach`: BAR 1's window rewritten.
++        self.select(CORE_PCIE2);
++        self.bp.regs.iowrite32(PCIE2REG_CONFIGADDR, PCIE_CFGREG_REG_BAR2_CONFIG);
++        let config = self.bp.regs.ioread32(PCIE2REG_CONFIGDATA);
++        self.bp.regs.iowrite32(PCIE2REG_CONFIGDATA, config);
++        // Firmware that shares the RAM says how much of it is its own.
++        if firmware.len() >= RAMSIZE_OFFSET + 8 && get_le32(firmware, RAMSIZE_OFFSET) == RAMSIZE_MAGIC {
++            self.chip.ramsize = get_le32(firmware, RAMSIZE_OFFSET + 4);
++        }
++        if firmware.len() < 4 || firmware.len() as u32 > self.chip.ramsize {
++            return Err("the firmware does not fit the chip's RAM");
++        }
++        // `brcmf_pcie_enter_download_state`.
++        if self.chip.id == CC_43602 {
++            self.select(CORE_ARM_CR4);
++            self.bp.regs.iowrite32(ARMCR4_BANKIDX as usize, 5);
++            self.bp.regs.iowrite32(ARMCR4_BANKPDA as usize, 0);
++            self.bp.regs.iowrite32(ARMCR4_BANKIDX as usize, 7);
++            self.bp.regs.iowrite32(ARMCR4_BANKPDA as usize, 0);
++        }
++        self.copy_to_tcm(self.chip.rambase, firmware);
++        let resetintr = get_le32(firmware, 0);
++        // The RAM's last word: where the firmware writes its shared area's
++        // address once it runs.
++        self.write_ram32(self.chip.ramsize - 4, 0);
++        if let Some(nvram) = nvram {
++            let mut at = self.chip.rambase + self.chip.ramsize - nvram.len() as u32;
++            self.copy_to_tcm(at, nvram);
++            if seed {
++                let mut footer = [0u8; 8];
++                put_le32(&mut footer, 0, RANDOM_SEED_LENGTH as u32);
++                put_le32(&mut footer, 4, RANDOM_SEED_MAGIC);
++                at -= footer.len() as u32;
++                self.copy_to_tcm(at, &footer);
++                at -= RANDOM_SEED_LENGTH as u32;
++                self.copy_to_tcm(at, &random_bytes(RANDOM_SEED_LENGTH));
++            }
++        }
++        let written = self.read_ram32(self.chip.ramsize - 4);
++        // `brcmf_pcie_exit_download_state`.
++        if self.chip.id == CC_43602
++            && let Some(ram) = self.chip.core(CORE_INTERNAL_MEM)
++        {
++            self.chip.reset_core(&self.bp, &ram, 0, 0, 0);
++        }
++        // `brcmf_pcie_buscore_activate`: the reset vector at the RAM's
++        // start.
++        self.write_tcm32(0, resetintr);
++        if !self.chip.set_active(&self.bp) {
++            return Err("the ARM core did not start");
++        }
++        let mut shared = written;
++        for _ in 0..PCIE_FW_UP_TIMEOUT_MS / 50 {
++            delay_ms(50);
++            shared = self.read_ram32(self.chip.ramsize - 4);
++            if shared != written {
++                break;
++            }
++        }
++        if shared == written {
++            return Err("the firmware did not start");
++        }
++        if shared < self.chip.rambase || shared >= self.chip.rambase + self.chip.ramsize {
++            return Err("the firmware's shared area is outside its RAM");
++        }
++        self.read_shared(shared)
++    }
++
++    /// `brcmf_pcie_init_share_ram_info`.
++    fn read_shared(&mut self, at: u32) -> Result<(), &'static str> {
++        let flags = self.read_tcm32(at);
++        let version = (flags & PCIE_SHARED_VERSION_MASK) as u8;
++        if !(PCIE_MIN_SHARED_VERSION..=PCIE_MAX_SHARED_VERSION).contains(&version) {
++            ostd::warn!("brcmfmac: PCIe protocol version {} is not supported", version);
++            return Err("unsupported PCIe protocol version");
++        }
++        let mut max_rxbufpost = self.read_tcm16(at + SHARED_MAX_RXBUFPOST_OFFSET);
++        if max_rxbufpost == 0 {
++            max_rxbufpost = DEF_MAX_RXBUFPOST;
++        }
++        self.shared = Shared {
++            tcm_base: at,
++            flags,
++            version,
++            max_rxbufpost,
++            rx_dataoffset: self.read_tcm32(at + SHARED_RX_DATAOFFSET_OFFSET),
++            htod_mb_data: self.read_tcm32(at + SHARED_HTOD_MB_DATA_ADDR_OFFSET),
++            dtoh_mb_data: self.read_tcm32(at + SHARED_DTOH_MB_DATA_ADDR_OFFSET),
++            ring_info: self.read_tcm32(at + SHARED_RING_INFO_ADDR_OFFSET),
++            max_flowrings: 0,
++        };
++        let base = self.read_tcm32(at + SHARED_CONSOLE_ADDR_OFFSET);
++        self.console = Console {
++            base,
++            buf: self.read_tcm32(base + CONSOLE_BUFADDR_OFFSET),
++            size: self.read_tcm32(base + CONSOLE_BUFSIZE_OFFSET),
++            read: 0,
++            line: Vec::new(),
++        };
++        Ok(())
++    }
++
++    // ---- The rings (`brcmf_pcie_init_ringbuffers`). ----
++
++    /// The common rings in host memory, their indices in the chip's RAM
++    /// (the firmware may also take them in host memory; the chip's RAM
++    /// always works), and the flow rings' indices.
++    pub(crate) fn init_rings(&mut self) -> Result<Vec<Ring>, &'static str> {
++        let info = self.shared.ring_info;
++        let ringmem = self.read_tcm32(info);
++        let mut h2d_w = self.read_tcm32(info + 4);
++        let mut h2d_r = self.read_tcm32(info + 8);
++        let mut d2h_w = self.read_tcm32(info + 12);
++        let mut d2h_r = self.read_tcm32(info + 16);
++        let max_flowrings_field = self.read_tcm16(info + 52);
++        let max_flowrings = if self.shared.version >= 6 {
++            max_flowrings_field
++        } else {
++            max_flowrings_field.saturating_sub(NROF_H2D_COMMON_MSGRINGS as u16)
++        };
++        if max_flowrings > 512 {
++            return Err("the firmware asks for too many flow rings");
++        }
++        const IDX: u32 = 4;
++        let sizes = if self.shared.version < PCIE_SHARED_VERSION_7 { RING_ITEMSIZE_PRE_V7 } else { RING_ITEMSIZE };
++        let mut mem_ptr = ringmem;
++        let mut rings = Vec::with_capacity(NROF_COMMON_MSGRINGS);
++        for id in 0..NROF_COMMON_MSGRINGS {
++            let depth = RING_MAX_ITEM[id];
++            let item = sizes[id];
++            let mem = alloc_coherent32(depth as usize * item as usize).ok_or("no memory for the rings")?;
++            let daddr = mem.daddr() as u64;
++            self.write_tcm32(mem_ptr + RING_MEM_BASE_ADDR_OFFSET, daddr as u32);
++            self.write_tcm32(mem_ptr + RING_MEM_BASE_ADDR_OFFSET + 4, (daddr >> 32) as u32);
++            self.write_tcm16(mem_ptr + RING_MAX_ITEM_OFFSET, depth);
++            self.write_tcm16(mem_ptr + RING_LEN_ITEMS_OFFSET, item);
++            let (w, r) = if id < NROF_H2D_COMMON_MSGRINGS {
++                let pair = (h2d_w, h2d_r);
++                h2d_w += IDX;
++                h2d_r += IDX;
++                pair
++            } else {
++                let pair = (d2h_w, d2h_r);
++                d2h_w += IDX;
++                d2h_r += IDX;
++                pair
++            };
++            rings.push(Ring { mem, depth, item, w_ptr: 0, r_ptr: 0, w_idx_addr: w, r_idx_addr: r, was_full: false });
++            mem_ptr += RING_MEM_SZ;
++        }
++        self.flow_idx = (0..max_flowrings)
++            .map(|index| (h2d_w + index as u32 * IDX, h2d_r + index as u32 * IDX))
++            .collect();
++        self.shared.max_flowrings = max_flowrings;
++        // `brcmf_pcie_init_scratchbuffers`.
++        let scratch = alloc_coherent32(DMA_D2H_SCRATCH_BUF_LEN as usize).ok_or("no memory for the scratch buffer")?;
++        let ringupd = alloc_coherent32(DMA_D2H_RINGUPD_BUF_LEN as usize).ok_or("no memory for the scratch buffer")?;
++        let base = self.shared.tcm_base;
++        let address = scratch.daddr() as u64;
++        self.write_tcm32(base + SHARED_DMA_SCRATCH_ADDR_OFFSET, address as u32);
++        self.write_tcm32(base + SHARED_DMA_SCRATCH_ADDR_OFFSET + 4, (address >> 32) as u32);
++        self.write_tcm32(base + SHARED_DMA_SCRATCH_LEN_OFFSET, DMA_D2H_SCRATCH_BUF_LEN);
++        let address = ringupd.daddr() as u64;
++        self.write_tcm32(base + SHARED_DMA_RINGUPD_ADDR_OFFSET, address as u32);
++        self.write_tcm32(base + SHARED_DMA_RINGUPD_ADDR_OFFSET + 4, (address >> 32) as u32);
++        self.write_tcm32(base + SHARED_DMA_RINGUPD_LEN_OFFSET, DMA_D2H_RINGUPD_BUF_LEN);
++        self._scratch = Some((scratch, ringupd));
++        // From now on BAR 0 shows the PCIe core's registers.
++        self.select(CORE_PCIE2);
++        Ok(rings)
++    }
++
++    /// A flow ring of `depth` items for flow `index`: its memory and its
++    /// indices' places.
++    pub(crate) fn flow_ring(&self, index: u16, depth: u16, item: u16) -> Option<Ring> {
++        let (w, r) = *self.flow_idx.get(index as usize)?;
++        let mem = alloc_coherent32(depth as usize * item as usize)?;
++        // The firmware starts the ring empty; so must the indices.
++        self.write_tcm16(w, 0);
++        self.write_tcm16(r, 0);
++        Some(Ring { mem, depth, item, w_ptr: 0, r_ptr: 0, w_idx_addr: w, r_idx_addr: r, was_full: false })
++    }
++
++    // ---- `brcmf_commonring_*`. ----
++
++    /// Room for one item: its offset in the ring's memory.
++    pub(crate) fn reserve(&self, ring: &mut Ring) -> Option<usize> {
++        self.reserve_many(ring, 1).map(|(at, _)| at)
++    }
++
++    /// Room for up to `count` items in a row (not over the ring's end):
++    /// the first's offset and how many.
++    pub(crate) fn reserve_many(&self, ring: &mut Ring, count: u16) -> Option<(usize, u16)> {
++        for retry in [true, false] {
++            let available = if ring.r_ptr <= ring.w_ptr { ring.depth - ring.w_ptr + ring.r_ptr } else { ring.r_ptr - ring.w_ptr };
++            if available > 1 {
++                let at = ring.w_ptr as usize * ring.item as usize;
++                let mut granted = count.min(available - 1);
++                if granted + ring.w_ptr > ring.depth {
++                    granted = ring.depth - ring.w_ptr;
++                }
++                ring.w_ptr += granted;
++                if ring.w_ptr == ring.depth {
++                    ring.w_ptr = 0;
++                }
++                return Some((at, granted));
++            }
++            if retry {
++                ring.r_ptr = self.read_tcm16(ring.r_idx_addr);
++            }
++        }
++        ring.was_full = true;
++        None
++    }
++
++    /// Whether a TX ring takes more (`brcmf_commonring_write_available`).
++    pub(crate) fn write_available(&self, ring: &mut Ring) -> bool {
++        for retry in [true, false] {
++            let available = if ring.r_ptr <= ring.w_ptr { ring.depth - ring.w_ptr + ring.r_ptr } else { ring.r_ptr - ring.w_ptr };
++            if available > 1 && (!ring.was_full || available > ring.depth / 8) {
++                ring.was_full = false;
++                return true;
++            }
++            if retry {
++                ring.r_ptr = self.read_tcm16(ring.r_idx_addr);
++            }
++        }
++        ring.was_full = true;
++        false
++    }
++
++    /// Items written back out of a reservation.
++    pub(crate) fn cancel(&self, ring: &mut Ring, count: u16) {
++        ring.w_ptr = if ring.w_ptr == 0 { ring.depth - count } else { ring.w_ptr - count };
++    }
++
++    /// The items written: the write index to the chip, the doorbell.
++    pub(crate) fn write_complete(&self, ring: &Ring) {
++        self.write_tcm16(ring.w_idx_addr, ring.w_ptr);
++        self.bp.regs.iowrite32(self.reg.h2d_mailbox_0, 1);
++    }
++
++    /// The items to read: the first's offset and how many (up to the
++    /// ring's end).
++    pub(crate) fn read_ptr(&self, ring: &mut Ring) -> Option<(usize, u16)> {
++        ring.w_ptr = self.read_tcm16(ring.w_idx_addr);
++        let count = if ring.w_ptr >= ring.r_ptr { ring.w_ptr - ring.r_ptr } else { ring.depth - ring.r_ptr };
++        (count > 0).then_some((ring.r_ptr as usize * ring.item as usize, count))
++    }
++
++    pub(crate) fn read_complete(&self, ring: &mut Ring, count: u16) {
++        ring.r_ptr += count;
++        if ring.r_ptr >= ring.depth {
++            ring.r_ptr = 0;
++        }
++        self.write_tcm16(ring.r_idx_addr, ring.r_ptr);
++    }
++
++    // ---- Interrupts and the mailbox. ----
++
++    pub(crate) fn intr_enable(&self) {
++        self.bp.regs.iowrite32(self.reg.mailboxmask, self.reg.int_d2h_db | self.reg.int_fn0);
++    }
++
++    /// `brcmf_pcie_hostready`.
++    pub(crate) fn hostready(&self) {
++        if self.shared.flags & PCIE_SHARED_HOSTRDY_DB1 != 0 {
++            self.bp.regs.iowrite32(self.reg.h2d_mailbox_1, 1);
++        }
++    }
++
++    /// The interrupt's causes taken and cleared: whether the rings may
++    /// have something.
++    pub(crate) fn acknowledge(&mut self) -> bool {
++        let status = self.bp.regs.ioread32(self.reg.mailboxint);
++        if status == 0 || status == u32::MAX {
++            return false;
++        }
++        self.bp.regs.iowrite32(self.reg.mailboxint, status);
++        if status & self.reg.int_fn0 != 0 {
++            self.handle_mb_data();
++        }
++        status & self.reg.int_d2h_db != 0
++    }
++
++    /// `brcmf_pcie_handle_mb_data`: the firmware's word in the mailbox.
++    fn handle_mb_data(&mut self) {
++        let at = self.shared.dtoh_mb_data;
++        if at == 0 {
++            return;
++        }
++        let data = self.read_tcm32(at);
++        if data == 0 {
++            return;
++        }
++        self.write_tcm32(at, 0);
++        if data & D2H_DEV_DS_ENTER_REQ != 0 {
++            self.send_mb_data(H2D_HOST_DS_ACK);
++        }
++        if data & D2H_DEV_FWHALT != 0 {
++            ostd::warn!("brcmfmac: the firmware halted");
++            self.console_read(true);
++            self.halted = true;
++        }
++    }
++
++    /// `brcmf_pcie_send_mb_data`.
++    fn send_mb_data(&self, data: u32) {
++        let at = self.shared.htod_mb_data;
++        for _ in 0..100 {
++            if self.read_tcm32(at) == 0 {
++                break;
++            }
++            delay_ms(10);
++        }
++        self.write_tcm32(at, data);
++        self.bp.location.write32(PCIE_REG_SBMBX, 1);
++        // Twice on old cores, as Linux does for a hardware bug.
++        if self.pcie2.rev <= 13 {
++            self.bp.location.write32(PCIE_REG_SBMBX, 1);
++        }
++    }
++
++    /// The firmware's console: new lines to the log (the kernel's notice
++    /// level when `error`, else info).
++    pub(crate) fn console_read(&mut self, error: bool) {
++        let console = &mut self.console;
++        if console.base == 0 || console.size == 0 || console.size > 0x10000 {
++            return;
++        }
++        let write = self.tcm.ioread32((console.base + CONSOLE_WRITEIDX_OFFSET) as usize);
++        let mut budget = console.size;
++        while console.read != write && budget > 0 {
++            budget -= 1;
++            let c = self.tcm.ioread8((console.buf + console.read) as usize);
++            console.read += 1;
++            if console.read >= console.size {
++                console.read = 0;
++            }
++            if c == b'\r' {
++                continue;
++            }
++            if c != b'\n' && console.line.len() < 254 {
++                console.line.push(c);
++                continue;
++            }
++            let line = String::from_utf8_lossy(&console.line).into_owned();
++            if error {
++                ostd::notice!("brcmfmac: firmware: {}", line);
++            } else {
++                ostd::info!("brcmfmac: firmware: {}", line);
++            }
++            console.line.clear();
++        }
++    }
++
++    pub(crate) fn rx_dataoffset(&self) -> usize {
++        self.shared.rx_dataoffset as usize
++    }
++
++    /// Bytes from a ring's memory.
++    pub(crate) fn ring_read(ring: &Ring, at: usize, out: &mut [u8]) -> bool {
++        ring.mem.read_bytes(at, out).is_ok()
++    }
++
++    pub(crate) fn ring_write(ring: &Ring, at: usize, data: &[u8]) -> bool {
++        ring.mem.write_bytes(at, data).is_ok()
++    }
++}
++
++/// Random bytes for the firmware's seed: the CPU's generator, a counter
++/// mixed with the time where it has none.
++fn random_bytes(count: usize) -> Vec<u8> {
++    let mut state = crate::now_ms() ^ 0x9e37_79b9_7f4a_7c15;
++    let mut out = Vec::with_capacity(count);
++    while out.len() < count {
++        let word = ostd::arch::read_random().unwrap_or_else(|| {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state
++        });
++        out.extend_from_slice(&word.to_le_bytes());
++    }
++    out.truncate(count);
++    out
++}
+diff --git a/kernel/comps/brcmfmac/src/sta.rs b/kernel/comps/brcmfmac/src/sta.rs
+new file mode 100644
+index 0000000..1f329a4
+--- /dev/null
++++ b/kernel/comps/brcmfmac/src/sta.rs
+@@ -0,0 +1,893 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The station on a FullMAC chip as Linux's brcmfmac `cfg80211.c` and
++//! `common.c` run it: the firmware set up (its address, the regulatory
++//! blob, the events it reports, roaming left to the supplicant), the bands
++//! it allows, scans (escan: each network heard reported in an event,
++//! written here as a probe response for the shared layer), the link the
++//! firmware makes from the supplicant's request (security mode, its RSN
++//! element, `join`), the keys, the link's end.
++
++use alloc::{string::String, sync::Arc, vec, vec::Vec};
++
++use aster_linuxkpi::bits::{get_le16, get_le32, put_le16, put_le32};
++use aster_wlan::{
++    Device, chan,
++    ieee80211::{self as wifi, Elements},
++    radio::{self, AuthType, Band, BandId, Channel, Connect, Connected, HtCap, Info, Key, ScanRequest, VhtCap},
++};
++
++use crate::{
++    consts::*,
++    fwil::{FwError, FwResult},
++    msgbuf::{Event, Msgbuf},
++    now_ms,
++};
++
++/// nl80211's key management suites (`WLAN_AKM_SUITE_*`).
++const AKM_8021X: u32 = 0x000f_ac01;
++const AKM_FT_8021X: u32 = 0x000f_ac03;
++const AKM_FT_PSK: u32 = 0x000f_ac04;
++const AKM_8021X_SHA256: u32 = 0x000f_ac05;
++const AKM_PSK_SHA256: u32 = 0x000f_ac06;
++const AKM_SAE: u32 = 0x000f_ac08;
++/// nl80211's WPA versions.
++const WPA_VERSION_1: u32 = 1 << 0;
++const WPA_VERSION_2: u32 = 1 << 1;
++const WPA_VERSION_3: u32 = 1 << 2;
++/// The RSN capabilities' management frame protection bits.
++const RSN_CAP_MFPR: u16 = 1 << 6;
++const RSN_CAP_MFPC: u16 = 1 << 7;
++/// The address Broadcom's firmware has when nobody gave it one.
++const DEFAULT_MAC: [u8; 6] = [0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38];
++/// How long a key waits for the handshake's last frame to go out.
++const PEND_8021X_MS: u64 = 950;
++
++/// A chanspec decoded (`struct brcmu_chan`).
++#[derive(Clone, Copy, Debug)]
++struct Chan {
++    control: u8,
++    band_5g: bool,
++    width: u16,
++}
++
++pub(crate) struct Brcmf {
++    pub(crate) msg: Msgbuf,
++    pub(crate) address: [u8; 6],
++    pub(crate) device: Option<Arc<Device>>,
++    /// The firmware's chanspecs are 802.11ac's (else 802.11n's).
++    d11ac: bool,
++    scan_v2: bool,
++    mfp: bool,
++    fwsup: bool,
++    scanning: bool,
++    connecting: bool,
++    connected: bool,
++    bssid: [u8; 6],
++    /// A pairwise key is in place: frames from the network came encrypted.
++    pairwise: bool,
++    pub(crate) signal: Option<i8>,
++    pub(crate) dead: bool,
++    pub(crate) firmware: String,
++}
++
++/// 2.4 GHz channel 14 and the others, 5 GHz.
++fn freq_of(channel: u8, band_5g: bool) -> u16 {
++    chan::freq_of(if band_5g { BandId::Ghz5 } else { BandId::Ghz2 }, channel)
++}
++
++impl Brcmf {
++    pub(crate) fn new(msg: Msgbuf) -> Self {
++        Self {
++            msg,
++            address: [0; 6],
++            device: None,
++            d11ac: true,
++            scan_v2: false,
++            mfp: false,
++            fwsup: false,
++            scanning: false,
++            connecting: false,
++            connected: false,
++            bssid: [0; 6],
++            pairwise: false,
++            signal: None,
++            dead: false,
++            firmware: String::new(),
++        }
++    }
++
++    // ---- Chanspecs (`brcmutil/d11.c`). ----
++
++    fn decode(&self, spec: u16) -> Option<Chan> {
++        let mut control = (spec & CHSPEC_CH_MASK) as u8;
++        if self.d11ac {
++            let width = match spec & D11AC_BW_MASK {
++                D11AC_BW_20 => 20,
++                D11AC_BW_40 => 40,
++                D11AC_BW_80 => 80,
++                D11AC_BW_160 => 160,
++                _ => return None,
++            };
++            let sb = ((spec & D11AC_SB_MASK) >> D11AC_SB_SHIFT) as i16;
++            if width > 20 {
++                // The control channel's place among the 20 MHz ones.
++                let lowest = control as i16 - (width as i16 / 10 - 2);
++                control = (lowest + 4 * sb) as u8;
++            }
++            Some(Chan { control, band_5g: spec & D11AC_BND_MASK == D11AC_BND_5G, width })
++        } else {
++            let width = match spec & D11N_BW_MASK {
++                D11N_BW_20 => 20,
++                D11N_BW_40 => 40,
++                _ => return None,
++            };
++            if width == 40 {
++                control = if spec & D11N_SB_MASK == D11N_SB_L { control - 2 } else { control + 2 };
++            }
++            Some(Chan { control, band_5g: spec & D11N_BND_MASK == D11N_BND_5G, width })
++        }
++    }
++
++    /// A 20 MHz channel's chanspec.
++    fn encode20(&self, channel: u8) -> u16 {
++        let band_5g = channel > CH_MAX_2G_CHANNEL;
++        if self.d11ac {
++            channel as u16 | D11AC_BW_20 | if band_5g { D11AC_BND_5G } else { D11AC_BND_2G }
++        } else {
++            channel as u16 | D11N_SB_N | D11N_BW_20 | if band_5g { D11N_BND_5G } else { D11N_BND_2G }
++        }
++    }
++
++    // ---- Bring-up (`brcmf_c_preinit_dcmds`, `brcmf_config_dongle`). ----
++
++    pub(crate) fn bring_up(&mut self, clm: Option<&[u8]>) -> Result<Info, FwError> {
++        self.msg.pcie.intr_enable();
++        self.msg.pcie.hostready();
++        let mut mac = [0u8; 6];
++        self.msg.iovar_get("cur_etheraddr", &mut mac)?;
++        if mac == DEFAULT_MAC || mac == [0; 6] {
++            // A random, locally administered address instead of the one
++            // every unprogrammed chip has.
++            let random = ostd::arch::read_random().unwrap_or(now_ms() ^ 0x5a5a_a5a5_1234_5678).to_le_bytes();
++            mac.copy_from_slice(&random[..6]);
++            mac[0] = (mac[0] & 0xfe) | 0x02;
++            self.msg.iovar_set("cur_etheraddr", &mac)?;
++        }
++        self.address = mac;
++        self.msg.own = mac;
++        let mut revinfo = [0u8; 68];
++        if self.msg.cmd(C_GET_REVINFO, &mut revinfo).is_ok() {
++            ostd::info!(
++                "brcmfmac: chip {:x} rev {}, board {:x}/{:x}",
++                get_le32(&revinfo, 44),
++                get_le32(&revinfo, 12),
++                get_le32(&revinfo, 24),
++                get_le32(&revinfo, 28)
++            );
++        }
++        if let Some(clm) = clm {
++            self.download_clm(clm)?;
++        }
++        let mut version = [0u8; DCMD_SMLEN];
++        if self.msg.iovar_get("ver", &mut version).is_ok() {
++            let end = version.iter().position(|c| *c == 0 || *c == b'\n').unwrap_or(version.len());
++            self.firmware = String::from_utf8_lossy(&version[..end]).into_owned();
++        }
++        let _ = self.msg.iovar_int_set("mpc", 1);
++        self.set_events()?;
++        // What this firmware has (`brcmf_feat_attach`).
++        self.scan_v2 = self.msg.iovar_int_get("scan_ver").is_ok();
++        self.mfp = self.msg.iovar_int_get("mfp").is_ok();
++        self.fwsup = self.msg.iovar_int_get("sup_wpa").is_ok();
++        self.d11ac = self.msg.cmd_int_get(C_GET_VERSION).map_or(true, |io| io != D11N_IOTYPE);
++        // `brcmf_config_dongle`.
++        let _ = self.msg.cmd_int_set(C_UP, 0);
++        let _ = self.msg.cmd_int_set(C_SET_SCAN_CHANNEL_TIME, SCAN_CHANNEL_TIME);
++        let _ = self.msg.cmd_int_set(C_SET_SCAN_UNASSOC_TIME, SCAN_UNASSOC_TIME);
++        let _ = self.msg.cmd_int_set(C_SET_SCAN_PASSIVE_TIME, SCAN_PASSIVE_TIME);
++        self.msg.cmd_int_set(C_SET_PM, PM_OFF)?;
++        // The supplicant roams: the firmware keeps to the network it was
++        // given and says when it loses it.
++        let _ = self.msg.iovar_int_set("bcn_timeout", DEFAULT_BCN_TIMEOUT_ROAM_OFF);
++        let _ = self.msg.iovar_int_set("roam_off", 1);
++        self.msg.cmd_int_set(C_SET_INFRA, 1)?;
++        // No ARP or neighbour answers from the firmware: it would need the
++        // interface's addresses.
++        let _ = self.msg.iovar_int_set("arpoe", 0);
++        let _ = self.msg.iovar_int_set("ndoe", 0);
++        let _ = self.msg.cmd_int_set(C_SET_FAKEFRAG, 1);
++        let bands = self.bands()?;
++        let mut ciphers = vec![radio::CIPHER_CCMP, radio::CIPHER_TKIP];
++        if self.mfp {
++            ciphers.push(radio::CIPHER_BIP_CMAC);
++        }
++        Ok(Info {
++            driver: String::from("brcmfmac"),
++            address: self.address,
++            bands,
++            ciphers,
++            max_scan_ssids: WL_NUM_SCAN_MAX,
++            max_scan_ie_len: SCAN_IE_LEN_MAX,
++            ap: false,
++        })
++    }
++
++    /// `brcmf_c_download_blob`: the regulatory (CLM) blob in chunks.
++    fn download_clm(&mut self, blob: &[u8]) -> FwResult<()> {
++        let mut flag = DL_BEGIN;
++        let chunks: Vec<&[u8]> = blob.chunks(MAX_CHUNK_LEN).collect();
++        for (index, chunk) in chunks.iter().enumerate() {
++            if index + 1 == chunks.len() {
++                flag |= DL_END;
++            }
++            let mut data = vec![0u8; 12 + chunk.len()];
++            put_le16(&mut data, 0, flag | (DLOAD_HANDLER_VER << DLOAD_FLAG_VER_SHIFT));
++            put_le16(&mut data, 2, DL_TYPE_CLM);
++            put_le32(&mut data, 4, chunk.len() as u32);
++            data[12..].copy_from_slice(chunk);
++            if let Err(error) = self.msg.iovar_set("clmload", &data) {
++                let status = self.msg.iovar_int_get("clmload_status").unwrap_or(u32::MAX);
++                ostd::warn!("brcmfmac: the CLM blob was refused ({}, status {})", error, status);
++                return Err(error);
++            }
++            flag &= !DL_BEGIN;
++        }
++        Ok(())
++    }
++
++    /// The events this driver handles, and `E_IF`, on in the firmware's
++    /// mask.
++    fn set_events(&mut self) -> FwResult<()> {
++        let mut mask = [0u8; EVENTING_MASK_LEN];
++        self.msg.iovar_get("event_msgs", &mut mask)?;
++        for event in [E_SET_SSID, E_DEAUTH, E_DEAUTH_IND, E_DISASSOC, E_DISASSOC_IND, E_LINK, E_MIC_ERROR, E_ROAM, E_PSK_SUP, E_IF, E_ESCAN_RESULT] {
++            mask[event as usize / 8] |= 1 << (event % 8);
++        }
++        self.msg.iovar_set("event_msgs", &mask)
++    }
++
++    /// `brcmf_setup_wiphybands` and `brcmf_construct_chaninfo`.
++    fn bands(&mut self) -> FwResult<Vec<Band>> {
++        let vhtmode = self.msg.iovar_int_get("vhtmode").unwrap_or(0);
++        let nmode = self.msg.iovar_int_get("nmode").unwrap_or(0);
++        let mut bw_cap = [WLC_BW_20MHZ_BIT; 2];
++        if nmode != 0 {
++            match (self.msg.iovar_int_query("bw_cap", WLC_BAND_2G), self.msg.iovar_int_query("bw_cap", WLC_BAND_5G)) {
++                (Ok(two), Ok(five)) => bw_cap = [two, five],
++                _ => match self.msg.iovar_int_get("mimo_bw_cap").unwrap_or(0) {
++                    WLC_N_BW_40ALL => bw_cap = [WLC_BW_20MHZ_BIT | WLC_BW_40MHZ_BIT; 2],
++                    WLC_N_BW_20IN2G_40IN5G => bw_cap[1] |= WLC_BW_40MHZ_BIT,
++                    _ => {}
++                },
++            }
++        }
++        let nchain = self.msg.iovar_int_get("rxchain").map_or(1, |chains| chains.count_ones()).clamp(1, 4) as usize;
++        let mut list = vec![0u8; DCMD_MEDLEN];
++        self.msg.iovar_get("chanspecs", &mut list)?;
++        let count = (get_le32(&list, 0) as usize).min((DCMD_MEDLEN - 4) / 4);
++        let mut channels: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
++        for index in 0..count {
++            let Some(chan) = self.decode(get_le32(&list, 4 + index * 4) as u16) else { continue };
++            let band = chan.band_5g as usize;
++            if chan.width == 20 && !channels[band].contains(&chan.control) {
++                channels[band].push(chan.control);
++            }
++        }
++        let (txstreams, bfe, bfr) = if vhtmode != 0 {
++            (
++                self.msg.iovar_int_get("txstreams").unwrap_or(0),
++                self.msg.iovar_int_get("txbf_bfe_cap").unwrap_or(0),
++                self.msg.iovar_int_get("txbf_bfr_cap").unwrap_or(0),
++            )
++        } else {
++            (0, 0, 0)
++        };
++        let mut bands = Vec::new();
++        for (band, list) in channels.iter_mut().enumerate() {
++            if list.is_empty() {
++                continue;
++            }
++            list.sort_unstable();
++            let band_5g = band == 1;
++            let mut out = Vec::with_capacity(list.len());
++            for &channel in list.iter() {
++                let mut entry = Channel::new(freq_of(channel, band_5g));
++                if let Ok(info) = self.msg.iovar_int_query("per_chan_info", self.encode20(channel) as u32) {
++                    entry.radar = info & WL_CHAN_RADAR != 0;
++                    entry.passive = info & (WL_CHAN_RADAR | WL_CHAN_PASSIVE) != 0;
++                }
++                out.push(entry);
++            }
++            let ht = (nmode != 0).then(|| {
++                // `brcmf_update_ht_cap`.
++                let mut info = 0x0020 | 0x1000; // SGI 20 MHz, DSSS/CCK at 40 MHz.
++                if bw_cap[band] & WLC_BW_40MHZ_BIT != 0 {
++                    info |= 0x0002 | 0x0040; // 20/40 MHz, SGI 40 MHz.
++                }
++                let mut mcs = [0u8; 16];
++                mcs[..nchain].fill(0xff);
++                mcs[12] = 0x01;
++                HtCap { info, ampdu_factor: 3, ampdu_density: 7, mcs }
++            });
++            let vht = (vhtmode != 0 && band_5g).then(|| {
++                // `brcmf_update_vht_cap`.
++                let mut info: u32 = 1 << 5; // SGI 80 MHz.
++                if bw_cap[band] & WLC_BW_160MHZ_BIT != 0 {
++                    info |= (1 << 2) | (1 << 6);
++                }
++                if bfe & TXBF_SU_BFE_CAP != 0 {
++                    info |= 1 << 12;
++                }
++                if bfe & TXBF_MU_BFE_CAP != 0 {
++                    info |= 1 << 20;
++                }
++                if bfr & TXBF_SU_BFR_CAP != 0 {
++                    info |= 1 << 11;
++                }
++                if bfr & TXBF_MU_BFR_CAP != 0 {
++                    info |= 1 << 19;
++                }
++                if (bfe != 0 || bfr != 0) && txstreams > 1 {
++                    info |= (2 << 13) | ((txstreams - 1) << 16) | (3 << 26);
++                }
++                // MCS 0-9 on each chain.
++                let mut map: u16 = 0xffff;
++                for _ in 0..nchain {
++                    map = (map << 2) | 2;
++                }
++                let mut mcs = [0u8; 8];
++                mcs[0..2].copy_from_slice(&map.to_le_bytes());
++                mcs[4..6].copy_from_slice(&map.to_le_bytes());
++                VhtCap { info, mcs }
++            });
++            bands.push(Band { id: if band_5g { BandId::Ghz5 } else { BandId::Ghz2 }, channels: out, ht, vht, he: None });
++        }
++        if bands.is_empty() {
++            return Err(FwError::Bus("the firmware allows no channel"));
++        }
++        Ok(bands)
++    }
++
++    // ---- Scans (`brcmf_run_escan`). ----
++
++    /// The scan parameters (version 2's layout, or version 1's), from
++    /// `brcmf_escan_prep`.
++    fn scan_params(&self, channels: &[u16], ssids: &[Vec<u8>]) -> Vec<u8> {
++        let fixed = if self.scan_v2 { SCAN_PARAMS_V2_FIXED_SIZE } else { SCAN_PARAMS_FIXED_SIZE };
++        let list = (channels.len().max(1) * 2).next_multiple_of(4);
++        let mut params = vec![0u8; fixed + list + ssids.len() * SSID_LE];
++        // Where the fields after the SSID are in each version.
++        let (bssid_at, type_at, rest_at) = if self.scan_v2 { (40, 46, 48) } else { (36, 42, 43) };
++        if self.scan_v2 {
++            put_le16(&mut params, 0, SCAN_PARAMS_VERSION_V2);
++            put_le16(&mut params, 2, (fixed + list + ssids.len() * SSID_LE) as u16);
++        }
++        params[bssid_at..bssid_at + 6].fill(0xff);
++        params[type_at] = DOT11_BSSTYPE_ANY;
++        let passive = ssids.is_empty() && !channels.is_empty();
++        // Scan type, then the probes and dwell times (-1: the firmware's).
++        let times_at = if self.scan_v2 {
++            put_le32(&mut params, rest_at, if passive { SCANTYPE_PASSIVE as u32 } else { SCANTYPE_ACTIVE as u32 });
++            rest_at + 4
++        } else {
++            params[rest_at] = if passive { SCANTYPE_PASSIVE } else { SCANTYPE_ACTIVE };
++            rest_at + 1
++        };
++        for field in 0..4 {
++            put_le32(&mut params, times_at + field * 4, u32::MAX);
++        }
++        let channel_num_at = times_at + 16;
++        if channels.is_empty() {
++            // Abort: one channel, -1.
++            put_le32(&mut params, channel_num_at, 1);
++            put_le16(&mut params, fixed, 0xffff);
++            params.truncate(fixed + 4);
++            if self.scan_v2 {
++                put_le16(&mut params, 2, (fixed + 2) as u16);
++            }
++            return params;
++        }
++        put_le32(&mut params, channel_num_at, ((ssids.len() as u32) << SCAN_PARAMS_NSSID_SHIFT) | channels.len() as u32);
++        for (index, spec) in channels.iter().enumerate() {
++            put_le16(&mut params, fixed + index * 2, *spec);
++        }
++        for (index, ssid) in ssids.iter().enumerate() {
++            let at = fixed + list + index * SSID_LE;
++            let len = ssid.len().min(32);
++            put_le32(&mut params, at, len as u32);
++            params[at + 4..at + 4 + len].copy_from_slice(&ssid[..len]);
++        }
++        params
++    }
++
++    pub(crate) fn scan(&mut self, request: &ScanRequest) -> radio::Result<()> {
++        if self.scanning {
++            return Err(radio::Error::Busy);
++        }
++        let channels: Vec<u16> = request
++            .freqs
++            .iter()
++            .filter_map(|freq| wifi::channel_of(*freq))
++            .map(|channel| self.encode20(channel))
++            .collect();
++        let ssids: Vec<Vec<u8>> = request.ssids.iter().take(WL_NUM_SCAN_MAX as usize).cloned().collect();
++        let params = self.scan_params(&channels, &ssids);
++        let mut escan = vec![0u8; 8 + params.len()];
++        put_le32(&mut escan, 0, if self.scan_v2 { ESCAN_REQ_VERSION_V2 } else { ESCAN_REQ_VERSION });
++        put_le16(&mut escan, 4, WL_ESCAN_ACTION_START);
++        put_le16(&mut escan, 6, ESCAN_SYNC_ID);
++        escan[8..].copy_from_slice(&params);
++        match self.msg.iovar_set("escan", &escan) {
++            Ok(()) => {
++                self.scanning = true;
++                Ok(())
++            }
++            Err(FwError::Firmware(_)) => Err(radio::Error::Busy),
++            Err(FwError::Bus(_)) => Err(radio::Error::Failed),
++        }
++    }
++
++    /// `brcmf_notify_escan_complete` with the firmware's scan stopped.
++    pub(crate) fn abort_scan(&mut self) {
++        if !self.scanning {
++            return;
++        }
++        let params = self.scan_params(&[], &[]);
++        let _ = self.msg.cmd_set(C_SCAN, &params);
++        self.scan_done(true);
++    }
++
++    fn scan_done(&mut self, aborted: bool) {
++        if core::mem::take(&mut self.scanning)
++            && let Some(device) = &self.device
++        {
++            device.scan_done(aborted);
++        }
++    }
++
++    /// A network the firmware describes (`struct brcmf_bss_info_le`),
++    /// told to the shared layer as the probe response it answered.
++    fn report_bss(&self, bi: &[u8]) {
++        if bi.len() < 128 {
++            return;
++        }
++        let length = (get_le32(bi, 4) as usize).min(bi.len());
++        let capability = get_le16(bi, 16);
++        if capability & wifi::CAP_IBSS != 0 {
++            return;
++        }
++        let Some(chan) = self.decode(get_le16(bi, 72)) else { return };
++        let control = if bi[88] != 0 { bi[88] } else { chan.control };
++        let freq = freq_of(control, chan.band_5g);
++        let ie_offset = get_le16(bi, 116) as usize;
++        let ie_length = get_le32(bi, 120) as usize;
++        let Some(elements) = bi.get(ie_offset..(ie_offset + ie_length).min(length)) else { return };
++        let mut frame = Vec::with_capacity(36 + elements.len());
++        frame.extend_from_slice(&[wifi::PROBE_RESPONSE, 0, 0, 0]);
++        frame.extend_from_slice(&self.address);
++        frame.extend_from_slice(&bi[8..14]);
++        frame.extend_from_slice(&bi[8..14]);
++        frame.extend_from_slice(&[0, 0]);
++        frame.extend_from_slice(&[0; 8]);
++        frame.extend_from_slice(&bi[14..16]);
++        frame.extend_from_slice(&bi[16..18]);
++        frame.extend_from_slice(elements);
++        let rssi = get_le16(bi, 78) as i16;
++        let info = radio::RxInfo { freq, signal: rssi.clamp(-127, 0) as i8, decrypted: false, security_header: 0 };
++        if let Some(device) = &self.device {
++            device.received(&frame, info);
++        }
++    }
++
++    // ---- The link (`brcmf_cfg80211_connect`). ----
++
++    pub(crate) fn connect(&mut self, request: &Connect) -> radio::Result<()> {
++        self.try_connect(request).map_err(|error| {
++            ostd::warn!("brcmfmac: the connection was not started: {}", error);
++            radio::Error::Failed
++        })
++    }
++
++    fn try_connect(&mut self, request: &Connect) -> FwResult<()> {
++        if self.scanning {
++            self.abort_scan();
++        }
++        let elements = Elements(&request.elements);
++        // The supplicant's WPA element, else its RSN one, for the
++        // association request.
++        let wpa = elements.iter().find(|(id, value)| *id == wifi::IE_VENDOR && value.starts_with(&[0x00, 0x50, 0xf2, 0x01]));
++        let rsn = elements.iter().find(|(id, _)| *id == wifi::IE_RSN);
++        let ie: Vec<u8> = match wpa.or(rsn) {
++            Some((id, value)) => {
++                let mut ie = vec![id, value.len() as u8];
++                ie.extend_from_slice(value);
++                ie
++            }
++            None => Vec::new(),
++        };
++        self.msg.iovar_set("wpaie", &ie)?;
++        // `brcmf_set_wpa_version`.
++        let akm = request.akms.first().copied().unwrap_or(0);
++        let mut wpa_auth = if request.wpa_versions & WPA_VERSION_1 != 0 {
++            WPA_AUTH_PSK | WPA_AUTH_UNSPECIFIED
++        } else if request.wpa_versions & WPA_VERSION_2 != 0 {
++            WPA2_AUTH_PSK | WPA2_AUTH_UNSPECIFIED
++        } else if request.wpa_versions & WPA_VERSION_3 != 0 {
++            WPA3_AUTH_SAE_PSK
++        } else {
++            WPA_AUTH_DISABLED
++        };
++        self.msg.iovar_int_set("wpa_auth", wpa_auth)?;
++        // `brcmf_set_auth_type`.
++        let auth = match request.auth {
++            AuthType::Open => 0,
++            AuthType::SharedKey => 1,
++            AuthType::Sae => 3,
++            AuthType::Automatic => 2,
++        };
++        self.msg.iovar_int_set("auth", auth)?;
++        // `brcmf_set_wsec_mode`.
++        let wsec_of = |cipher: u32| match cipher {
++            radio::CIPHER_WEP40 | radio::CIPHER_WEP104 => WEP_ENABLED,
++            radio::CIPHER_TKIP => TKIP_ENABLED,
++            _ => AES_ENABLED,
++        };
++        let pairwise = request.pairwise.first().map_or(0, |cipher| wsec_of(*cipher));
++        let group = request.group.map_or(0, wsec_of);
++        self.msg.iovar_int_set("wsec", pairwise | group)?;
++        // `brcmf_set_key_mgmt`.
++        if !request.akms.is_empty() {
++            wpa_auth = if wpa_auth & (WPA_AUTH_PSK | WPA_AUTH_UNSPECIFIED) != 0 {
++                match akm {
++                    AKM_8021X => WPA_AUTH_UNSPECIFIED,
++                    _ => WPA_AUTH_PSK,
++                }
++            } else if wpa_auth & (WPA2_AUTH_PSK | WPA2_AUTH_UNSPECIFIED) != 0 {
++                match akm {
++                    AKM_8021X => WPA2_AUTH_UNSPECIFIED,
++                    AKM_8021X_SHA256 => WPA2_AUTH_1X_SHA256,
++                    AKM_PSK_SHA256 => WPA2_AUTH_PSK_SHA256,
++                    AKM_FT_8021X => WPA2_AUTH_UNSPECIFIED | WPA2_AUTH_FT,
++                    AKM_FT_PSK => WPA2_AUTH_PSK | WPA2_AUTH_FT,
++                    AKM_SAE => WPA3_AUTH_SAE_PSK,
++                    // `AKM_PSK`, and what Linux turns away.
++                    _ => WPA2_AUTH_PSK,
++                }
++            } else {
++                wpa_auth
++            };
++            if self.mfp
++                && let Some((_, rsn)) = rsn
++            {
++                let capabilities = rsn_capabilities(rsn).unwrap_or(0);
++                let mfp = if capabilities & RSN_CAP_MFPR != 0 {
++                    MFP_REQUIRED
++                } else if capabilities & RSN_CAP_MFPC != 0 {
++                    MFP_CAPABLE
++                } else {
++                    MFP_NONE
++                };
++                let _ = self.msg.iovar_int_set("mfp", mfp);
++            }
++            self.msg.iovar_int_set("wpa_auth", wpa_auth)?;
++        }
++        // The supplicant runs the handshake; the firmware's own stays off.
++        if self.fwsup {
++            let _ = self.msg.iovar_int_set("sup_wpa", 0);
++        }
++        // `join`: the name, the scan for it, the network and its channel.
++        let chanspec = request.freq.and_then(wifi::channel_of).map(|channel| self.encode20(channel));
++        let mut join = vec![0u8; 68 + if chanspec.is_some() { 2 } else { 0 }];
++        let ssid_len = request.ssid.len().min(32);
++        put_le32(&mut join, 0, ssid_len as u32);
++        join[4..4 + ssid_len].copy_from_slice(&request.ssid[..ssid_len]);
++        join[36] = 0xff;
++        let (active, passive, probes) = match chanspec {
++            Some(_) => (
++                SCAN_JOIN_ACTIVE_DWELL_TIME_MS,
++                SCAN_JOIN_PASSIVE_DWELL_TIME_MS,
++                SCAN_JOIN_ACTIVE_DWELL_TIME_MS / SCAN_JOIN_PROBE_INTERVAL_MS,
++            ),
++            None => (u32::MAX, u32::MAX, u32::MAX),
++        };
++        put_le32(&mut join, 40, probes);
++        put_le32(&mut join, 44, active);
++        put_le32(&mut join, 48, passive);
++        put_le32(&mut join, 52, u32::MAX);
++        join[56..62].copy_from_slice(&request.bssid.unwrap_or(wifi::BROADCAST));
++        if let Some(spec) = chanspec {
++            put_le32(&mut join, 64, 1);
++            put_le16(&mut join, 68, spec);
++        }
++        self.bssid = request.bssid.unwrap_or([0; 6]);
++        self.connecting = true;
++        self.connected = false;
++        self.pairwise = false;
++        if let Err(error) = self.msg.iovar_set("join", &join) {
++            // Older firmware: `SET_SSID` with the network and channel.
++            ostd::info!("brcmfmac: join refused ({}), trying SET_SSID", error);
++            let mut params = vec![0u8; SSID_LE + if chanspec.is_some() { 16 } else { 0 }];
++            params[..SSID_LE].copy_from_slice(&join[..SSID_LE]);
++            if let Some(spec) = chanspec {
++                params[SSID_LE..SSID_LE + 6].copy_from_slice(&join[56..62]);
++                put_le32(&mut params, SSID_LE + 8, 1);
++                put_le16(&mut params, SSID_LE + 12, spec);
++            }
++            if let Err(error) = self.msg.cmd_set(C_SET_SSID, &params) {
++                self.connecting = false;
++                return Err(error);
++            }
++        }
++        Ok(())
++    }
++
++    /// `brcmf_cfg80211_disconnect`, the flow ring with it.
++    pub(crate) fn leave(&mut self) {
++        if !self.connecting && !self.connected {
++            return;
++        }
++        self.connecting = false;
++        self.connected = false;
++        self.pairwise = false;
++        let mut scb = [0u8; 12];
++        put_le32(&mut scb, 0, wifi::REASON_DEAUTH_LEAVING as u32);
++        scb[4..10].copy_from_slice(&self.bssid);
++        let _ = self.msg.cmd_set(C_DISASSOC, &scb);
++        self.msg.delete_flow();
++        self.signal = None;
++    }
++
++    /// `brcmf_cfg80211_add_key` (`remove`: `brcmf_cfg80211_del_key`).
++    pub(crate) fn set_key(&mut self, key: &Key, remove: bool) -> radio::Result<()> {
++        if key.index >= MAX_DEFAULT_KEYS {
++            return Err(radio::Error::Invalid);
++        }
++        let (algo, wsec) = match key.cipher {
++            radio::CIPHER_WEP40 => (CRYPTO_ALGO_WEP1, WEP_ENABLED),
++            radio::CIPHER_WEP104 => (CRYPTO_ALGO_WEP128, WEP_ENABLED),
++            radio::CIPHER_TKIP => (CRYPTO_ALGO_TKIP, TKIP_ENABLED),
++            radio::CIPHER_CCMP | radio::CIPHER_BIP_CMAC => (CRYPTO_ALGO_AES_CCM, AES_ENABLED),
++            _ => return Err(radio::Error::Unsupported),
++        };
++        let mut wsec_key = [0u8; WSEC_KEY_LEN];
++        put_le32(&mut wsec_key, 0, key.index as u32);
++        if remove {
++            put_le32(&mut wsec_key, 116, PRIMARY_KEY);
++        } else {
++            if key.key.len() > 32 {
++                return Err(radio::Error::Invalid);
++            }
++            put_le32(&mut wsec_key, 4, key.key.len() as u32);
++            wsec_key[8..8 + key.key.len()].copy_from_slice(&key.key);
++            if key.cipher == radio::CIPHER_TKIP && key.key.len() == 32 {
++                // The firmware wants the RX and TX MIC keys the other way.
++                let (tx, rx) = (wsec_key[24..32].to_vec(), wsec_key[32..40].to_vec());
++                wsec_key[24..32].copy_from_slice(&rx);
++                wsec_key[32..40].copy_from_slice(&tx);
++            }
++            put_le32(&mut wsec_key, 112, algo);
++            if key.pairwise {
++                wsec_key[156..162].copy_from_slice(&self.bssid);
++            } else {
++                put_le32(&mut wsec_key, 116, PRIMARY_KEY);
++            }
++            if key.seq.len() >= 6 {
++                let iv = &key.seq;
++                let hi = u32::from_le_bytes([iv[2], iv[3], iv[4], iv[5]]);
++                put_le32(&mut wsec_key, 140, hi);
++                put_le16(&mut wsec_key, 144, u16::from_le_bytes([iv[0], iv[1]]));
++                put_le32(&mut wsec_key, 132, 1);
++            }
++        }
++        // The handshake's last frame goes out unencrypted first.
++        if key.pairwise && !remove {
++            let deadline = now_ms() + PEND_8021X_MS;
++            crate::WAKER.wait_event_timeout(
++                || {
++                    self.msg.pcie.acknowledge();
++                    self.msg.process();
++                    self.msg.pend_8021x == 0
++                },
++                deadline.saturating_sub(now_ms()),
++            );
++        }
++        self.msg.iovar_set("wsec_key", &wsec_key).map_err(|error| {
++            ostd::warn!("brcmfmac: the key was refused: {}", error);
++            radio::Error::Failed
++        })?;
++        if key.pairwise {
++            self.pairwise = !remove;
++        } else if !remove
++            && let Ok(current) = self.msg.iovar_int_get("wsec")
++        {
++            let _ = self.msg.iovar_int_set("wsec", current | wsec);
++        }
++        Ok(())
++    }
++
++    pub(crate) fn send(&mut self, ethernet: &[u8]) -> radio::Result<()> {
++        if !self.connected {
++            return Ok(());
++        }
++        let eapol = ethernet.len() >= 14 && u16::from_be_bytes([ethernet[12], ethernet[13]]) == wifi::ETHERTYPE_EAPOL;
++        self.msg.send(ethernet, eapol).map_err(|()| radio::Error::Busy)
++    }
++
++    /// `BRCMF_C_GET_RSSI` and `BRCMF_C_GET_RATE` for the link's numbers.
++    pub(crate) fn link_stats(&mut self) -> radio::LinkStats {
++        if !self.connected {
++            return radio::LinkStats::default();
++        }
++        let mut scb = [0u8; 12];
++        scb[4..10].copy_from_slice(&self.bssid);
++        if self.msg.cmd(C_GET_RSSI, &mut scb).is_ok() {
++            let rssi = get_le32(&scb, 0) as i32;
++            if (-127..0).contains(&rssi) {
++                self.signal = Some(rssi as i8);
++            }
++        }
++        // In units of 500 kbit/s.
++        let rate = self.msg.cmd_int_get(C_GET_RATE).ok().filter(|rate| *rate > 0).map(|rate| rate * 5);
++        radio::LinkStats { signal: self.signal, tx_rate: rate }
++    }
++
++    // ---- What the firmware says. ----
++
++    /// The rings read, frames handed on, events handled.
++    pub(crate) fn poll(&mut self) {
++        if self.msg.pcie.halted {
++            self.dead = true;
++            return;
++        }
++        self.msg.pcie.acknowledge();
++        self.msg.process();
++        while let Some(frame) = self.msg.frames.pop_front() {
++            if let Some(device) = &self.device {
++                device.received_ethernet(frame, self.pairwise);
++            }
++        }
++        while let Some(event) = self.msg.events.pop_front() {
++            if event.ifidx == 0 {
++                self.event(event);
++            }
++        }
++        self.msg.pcie.console_read(false);
++    }
++
++    fn event(&mut self, event: Event) {
++        match event.code {
++            E_ESCAN_RESULT => self.escan_result(&event),
++            E_SET_SSID => {
++                if !self.connecting {
++                    return;
++                }
++                if event.status == E_STATUS_SUCCESS {
++                    self.link_up(&event);
++                } else {
++                    // `brcmf_is_nonetwork`.
++                    self.link_down(wifi::REASON_UNSPECIFIED, false);
++                }
++            }
++            E_LINK => {
++                if event.status == E_STATUS_NO_NETWORKS && self.connecting {
++                    self.link_down(wifi::REASON_UNSPECIFIED, false);
++                } else if event.flags & EVENT_MSG_LINK == 0 && (self.connected || self.connecting) {
++                    self.link_down(0, false);
++                }
++            }
++            E_DEAUTH | E_DEAUTH_IND | E_DISASSOC_IND => {
++                if self.connected && event.addr != self.bssid {
++                    return;
++                }
++                if self.connected || self.connecting {
++                    let reason = event.reason as u16;
++                    self.link_down(if reason == 0 { wifi::REASON_UNSPECIFIED } else { reason }, event.code != E_DEAUTH);
++                }
++            }
++            E_ROAM if event.status == E_STATUS_SUCCESS && self.connecting => self.link_up(&event),
++            E_MIC_ERROR => ostd::notice!("brcmfmac: Michael MIC failure from {:02x?}", event.addr),
++            _ => {}
++        }
++    }
++
++    /// `brcmf_cfg80211_escan_handler`.
++    fn escan_result(&mut self, event: &Event) {
++        if !self.scanning {
++            return;
++        }
++        match event.status {
++            E_STATUS_PARTIAL => {
++                let data = &event.data;
++                if data.len() < ESCAN_RESULT_FIXED + 128 || get_le16(data, 10) != 1 {
++                    return;
++                }
++                let buflen = (get_le32(data, 0) as usize).min(data.len());
++                if let Some(bi) = data.get(ESCAN_RESULT_FIXED..buflen) {
++                    self.report_bss(bi);
++                }
++            }
++            E_STATUS_SUCCESS => self.scan_done(false),
++            _ => self.scan_done(true),
++        }
++    }
++
++    /// `brcmf_bss_connect_done` on success: the association's elements and
++    /// the network's description to the shared layer, then the answer.
++    fn link_up(&mut self, event: &Event) {
++        self.connecting = false;
++        self.connected = true;
++        if event.addr != [0; 6] {
++            self.bssid = event.addr;
++        }
++        let (request, response) = self.assoc_ies();
++        let mut bss = vec![0u8; WL_BSS_INFO_MAX];
++        put_le32(&mut bss, 0, WL_BSS_INFO_MAX as u32);
++        if self.msg.cmd(C_GET_BSS_INFO, &mut bss).is_ok() {
++            if let Some(bi) = bss.get(4..) {
++                if bi.len() >= 14 {
++                    self.bssid.copy_from_slice(&bi[8..14]);
++                }
++                self.report_bss(bi);
++            }
++        }
++        ostd::notice!("brcmfmac: associated with {:02x?}", self.bssid);
++        if let Some(device) = &self.device {
++            device.connect_done(Connected { bssid: self.bssid, status: 0, timed_out: false, request_elements: request, response_elements: response });
++        }
++    }
++
++    /// `brcmf_get_assoc_ies`.
++    fn assoc_ies(&mut self) -> (Vec<u8>, Vec<u8>) {
++        let mut info = [0u8; WL_ASSOC_INFO_MAX];
++        if self.msg.iovar_get("assoc_info", &mut info).is_err() {
++            return (Vec::new(), Vec::new());
++        }
++        let (req_len, resp_len) = (get_le32(&info, 0) as usize, get_le32(&info, 4) as usize);
++        let mut read = |name: &str, len: usize| -> Vec<u8> {
++            if len == 0 || len > WL_ASSOC_INFO_MAX {
++                return Vec::new();
++            }
++            let mut buf = vec![0u8; WL_ASSOC_INFO_MAX];
++            match self.msg.iovar_get(name, &mut buf) {
++                Ok(()) => {
++                    buf.truncate(len);
++                    buf
++                }
++                Err(_) => Vec::new(),
++            }
++        };
++        let request = read("assoc_req_ies", req_len);
++        let response = read("assoc_resp_ies", resp_len);
++        (request, response)
++    }
++
++    /// The link (or its attempt) ended: told to the shared layer, the
++    /// firmware's roaming stopped, the flow ring deleted (`brcmf_link_down`).
++    fn link_down(&mut self, reason: u16, by_ap: bool) {
++        let was = self.connected || self.connecting;
++        self.connecting = false;
++        self.connected = false;
++        self.pairwise = false;
++        self.signal = None;
++        if !was {
++            return;
++        }
++        let _ = self.msg.cmd_set(C_DISASSOC, &[0u8; 4]);
++        self.msg.delete_flow();
++        if let Some(device) = &self.device {
++            device.disconnected(reason, by_ap);
++        }
++    }
++}
++
++/// An RSN element's capabilities (`brcmf_set_key_mgmt`'s walk).
++fn rsn_capabilities(rsn: &[u8]) -> Option<u16> {
++    // Version, the group cipher.
++    let mut at = 2 + 4;
++    let count = get_le16(rsn.get(at..at + 2)?, 0) as usize;
++    at += 2 + count * 4;
++    let count = get_le16(rsn.get(at..at + 2)?, 0) as usize;
++    at += 2 + count * 4;
++    Some(get_le16(rsn.get(at..at + 2)?, 0))
++}
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index 3cbf1b4..32f2153 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -29,6 +29,7 @@ extern crate aster_mt7921 as _;
+ extern crate aster_rtw88 as _;
+ extern crate aster_ath10k as _;
+ extern crate aster_ath11k as _;
++extern crate aster_brcmfmac as _;
+ extern crate aster_rtw89 as _;
+ extern crate aster_ethernet as _;
+ 

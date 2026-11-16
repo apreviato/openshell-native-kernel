@@ -1,0 +1,916 @@
+diff --git a/kernel/core/src/net/iface/init.rs b/kernel/core/src/net/iface/init.rs
+index 3dbab66..7b0398d 100644
+--- a/kernel/core/src/net/iface/init.rs
++++ b/kernel/core/src/net/iface/init.rs
+@@ -38,7 +38,16 @@ const DHCP_HOST_NAME: &[u8] = b"openshell";
+ /// Ethernet interface named as the device, which asks a DHCP server for its
+ /// address.
+ pub(in crate::net) fn init_in_first_kthread() {
+-    aster_wlan::set_hooks(aster_wlan::Hooks { ifindex: wlan_ifindex, link_changed: wlan_link_changed });
++    aster_wlan::set_hooks(aster_wlan::Hooks {
++        ifindex: wlan_ifindex,
++        link_changed: wlan_link_changed,
++        sharing: wlan_sharing,
++    });
++    aster_bigtcp::iface::nat::set_hooks(aster_bigtcp::iface::nat::Hooks {
++        route: shared_route,
++        wake: wake_iface,
++        dns: shared_dns,
++    });
+     aster_bigtcp::iface::set_address_hook(address_changed);
+     aster_network::set_device_hook(device_changed);
+     for (name, _) in aster_network::all_devices() {
+@@ -98,6 +107,12 @@ fn device_changed(name: &str, added: bool) {
+     ostd::notice!("{}: asking for an address (DHCP)", name);
+ }
+ 
++/// Every interface of the initial network namespace, those added after
++/// boot (Ethernet, Wi-Fi) among them.
++fn init_namespace_ifaces() -> Vec<Arc<Iface>> {
++    crate::net::net_ns::NetNamespace::get_init_singleton().ifaces()
++}
++
+ fn init_iface_named(name: &str) -> Option<Arc<Iface>> {
+     let namespace = crate::net::net_ns::NetNamespace::get_init_singleton();
+     namespace.ifaces().into_iter().find(|iface| iface.name().as_str() == Ok(name))
+@@ -122,6 +137,96 @@ fn wlan_link_changed(name: &str, connected: bool) {
+     }
+ }
+ 
++/// The address a hotspot's interface takes, and its network's length, as
++/// NetworkManager gives a shared connection.
++const HOTSPOT_ADDRESS: [u8; 4] = [10, 42, 0, 1];
++const HOTSPOT_PREFIX_LEN: u8 = 24;
++
++/// A Wi-Fi interface started (or stopped) running a network of its own:
++/// it gets the hotspot's address and shares the connection the other
++/// interfaces have.
++fn wlan_sharing(name: &str, on: bool) {
++    let Some(iface) = init_iface_named(name) else { return };
++    if on {
++        let cidr = aster_bigtcp::wire::Ipv4Cidr::new(
++            aster_bigtcp::wire::Ipv4Address::from(HOTSPOT_ADDRESS),
++            HOTSPOT_PREFIX_LEN,
++        );
++        iface.share(Some(cidr));
++        aster_bigtcp::iface::nat::share(iface.index(), HOTSPOT_ADDRESS, HOTSPOT_PREFIX_LEN);
++        ostd::notice!(
++            "{}: sharing the connection as {}.{}.{}.{}/{}",
++            name,
++            HOTSPOT_ADDRESS[0],
++            HOTSPOT_ADDRESS[1],
++            HOTSPOT_ADDRESS[2],
++            HOTSPOT_ADDRESS[3],
++            HOTSPOT_PREFIX_LEN
++        );
++    } else {
++        aster_bigtcp::iface::nat::stop_sharing();
++        iface.share(None);
++        ostd::notice!("{}: no longer sharing the connection", name);
++    }
++    let index = iface.index();
++    crate::thread::work_queue::submit_work_func(
++        move || crate::net::socket::netlink::link_changed(index),
++        crate::thread::work_queue::WorkPriority::Normal,
++    );
++}
++
++/// The way out for a shared connection's packet to `destination`: an
++/// interface other than the serving one, on the destination's network or
++/// with a router, and its address.
++fn shared_route(destination: [u8; 4], inside: u32) -> Option<(u32, [u8; 4])> {
++    let destination = aster_bigtcp::wire::Ipv4Address::from(destination);
++    let mut routed = None;
++    for iface in &init_namespace_ifaces() {
++        if iface.index() == inside || iface.type_() == InterfaceType::LOOPBACK {
++            continue;
++        }
++        let Some(cidr) = iface.ipv4_cidr() else { continue };
++        if cidr.contains_addr(&destination) {
++            return Some((iface.index(), cidr.address().octets()));
++        }
++        let has_router = iface.dhcp_lease().is_some_and(|lease| lease.router.is_some())
++            || !iface.routes().is_empty();
++        if has_router && routed.is_none() {
++            routed = Some((iface.index(), cidr.address().octets()));
++        }
++    }
++    routed
++}
++
++/// Asks interface `index` to poll soon (a shared connection left packets
++/// for it).
++fn wake_iface(index: u32) {
++    use aster_bigtcp::iface::ScheduleNextPoll;
++
++    if let Some(iface) = init_namespace_ifaces().into_iter().find(|iface| iface.index() == index) {
++        let now = ostd::timer::Jiffies::elapsed().as_duration().as_millis() as u64;
++        iface.sched_poll().schedule_next_poll(Some(now.max(1)));
++    }
++}
++
++/// The DNS servers of the connection a hotspot shares.
++fn shared_dns(inside: u32) -> Vec<[u8; 4]> {
++    let mut servers = Vec::new();
++    for iface in &init_namespace_ifaces() {
++        if iface.index() == inside {
++            continue;
++        }
++        if let Some(lease) = iface.dhcp_lease() {
++            for server in lease.dns {
++                if !servers.contains(&server) {
++                    servers.push(server);
++                }
++            }
++        }
++    }
++    servers
++}
++
+ /// An interface's address changed: the route sockets hear it (from a
+ /// worker, as the change is seen while the interface is polled).
+ fn address_changed(
+diff --git a/kernel/libs/aster-bigtcp/src/iface/dhcpd.rs b/kernel/libs/aster-bigtcp/src/iface/dhcpd.rs
+new file mode 100644
+index 0000000..5de0c14
+--- /dev/null
++++ b/kernel/libs/aster-bigtcp/src/iface/dhcpd.rs
+@@ -0,0 +1,243 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The DHCP server of a shared network (`nat`): each device gets an
++//! address of the network by its hardware address, the serving interface
++//! as its router, and the DNS servers of the connection shared, as
++//! NetworkManager's dnsmasq gives them (RFC 2131: discover, offer,
++//! request, acknowledgement; release; inform).
++
++use alloc::{collections::BTreeMap, vec::Vec};
++
++const COOKIE: [u8; 4] = [99, 130, 83, 99];
++const LEASE_SECONDS: u32 = 3600;
++/// The devices' addresses: from .10 to .254 of the network.
++const FIRST_HOST: u8 = 10;
++const LAST_HOST: u8 = 254;
++
++const DISCOVER: u8 = 1;
++const OFFER: u8 = 2;
++const REQUEST: u8 = 3;
++const DECLINE: u8 = 4;
++const ACK: u8 = 5;
++const NAK: u8 = 6;
++const RELEASE: u8 = 7;
++const INFORM: u8 = 8;
++
++#[derive(Clone, Copy, Debug)]
++struct Lease {
++    address: [u8; 4],
++    expires: u64,
++}
++
++pub(crate) struct DhcpServer {
++    address: [u8; 4],
++    prefix_len: u8,
++    leases: BTreeMap<[u8; 6], Lease>,
++    /// Addresses a device said were taken by another.
++    declined: Vec<[u8; 4]>,
++}
++
++/// What a request carries that matters here.
++struct Request<'a> {
++    kind: u8,
++    xid: [u8; 4],
++    flags: [u8; 2],
++    ciaddr: [u8; 4],
++    chaddr: [u8; 6],
++    raw_chaddr: &'a [u8],
++    requested: Option<[u8; 4]>,
++    server: Option<[u8; 4]>,
++}
++
++fn parse(message: &[u8]) -> Option<Request<'_>> {
++    // A request (op 1) over Ethernet (htype 1, hlen 6) with the cookie.
++    if message.len() < 240 || message[0] != 1 || message[1] != 1 || message[2] != 6 || message[236..240] != COOKIE {
++        return None;
++    }
++    let mut request = Request {
++        kind: 0,
++        xid: message[4..8].try_into().ok()?,
++        flags: message[10..12].try_into().ok()?,
++        ciaddr: message[12..16].try_into().ok()?,
++        chaddr: message[28..34].try_into().ok()?,
++        raw_chaddr: &message[28..44],
++        requested: None,
++        server: None,
++    };
++    let mut options = &message[240..];
++    while let [code, rest @ ..] = options {
++        match *code {
++            0 => options = rest,
++            255 => break,
++            _ => {
++                let length = usize::from(*rest.first()?);
++                let value = rest.get(1..1 + length)?;
++                match (*code, length) {
++                    (53, 1) => request.kind = value[0],
++                    (50, 4) => request.requested = value.try_into().ok(),
++                    (54, 4) => request.server = value.try_into().ok(),
++                    _ => {}
++                }
++                options = &rest[1 + length..];
++            }
++        }
++    }
++    (request.kind != 0).then_some(request)
++}
++
++impl DhcpServer {
++    pub(crate) fn new(address: [u8; 4], prefix_len: u8) -> Self {
++        Self { address, prefix_len, leases: BTreeMap::new(), declined: Vec::new() }
++    }
++
++    fn netmask(&self) -> [u8; 4] {
++        (u32::MAX << (32 - self.prefix_len as u32)).to_be_bytes()
++    }
++
++    fn host(&self, last: u8) -> [u8; 4] {
++        let mut address = self.address;
++        address[3] = last;
++        address
++    }
++
++    fn in_pool(&self, address: [u8; 4]) -> bool {
++        address[..3] == self.address[..3] && (FIRST_HOST..=LAST_HOST).contains(&address[3]) && address != self.address
++    }
++
++    /// The address a device has, or a free one for it.
++    fn address_for(&mut self, chaddr: [u8; 6], wanted: Option<[u8; 4]>, now: u64) -> Option<[u8; 4]> {
++        if let Some(lease) = self.leases.get(&chaddr) {
++            return Some(lease.address);
++        }
++        self.leases.retain(|_, lease| lease.expires > now);
++        let taken = |address: [u8; 4], leases: &BTreeMap<[u8; 6], Lease>| leases.values().any(|lease| lease.address == address);
++        if let Some(wanted) = wanted
++            && self.in_pool(wanted)
++            && !taken(wanted, &self.leases)
++            && !self.declined.contains(&wanted)
++        {
++            return Some(wanted);
++        }
++        // The same device gets the same address each time it comes back
++        // while the address is free: start where its hardware address says.
++        let span = (LAST_HOST - FIRST_HOST) as u32 + 1;
++        let start = chaddr.iter().fold(0u32, |sum, byte| sum.wrapping_mul(31).wrapping_add(*byte as u32)) % span;
++        (0..span)
++            .map(|step| self.host(FIRST_HOST + ((start + step) % span) as u8))
++            .find(|address| *address != self.address && !taken(*address, &self.leases) && !self.declined.contains(address))
++    }
++
++    /// The answer to a DHCP message from a device (the UDP payload), as
++    /// the whole IPv4 packet to send to the network's broadcast address.
++    pub(crate) fn answer(&mut self, message: &[u8], dns: &[[u8; 4]], now: u64) -> Option<Vec<u8>> {
++        let request = parse(message)?;
++        // Messages for another server are not this one's.
++        if request.server.is_some_and(|server| server != self.address) {
++            if request.kind == REQUEST {
++                // The device chose another server's offer.
++                self.leases.remove(&request.chaddr);
++            }
++            return None;
++        }
++        let (kind, yiaddr) = match request.kind {
++            DISCOVER => (OFFER, self.address_for(request.chaddr, request.requested, now)?),
++            REQUEST => {
++                let wanted = request.requested.unwrap_or(request.ciaddr);
++                match self.address_for(request.chaddr, Some(wanted), now) {
++                    Some(address) if address == wanted => {
++                        self.leases.insert(request.chaddr, Lease { address, expires: now + LEASE_SECONDS as u64 * 1000 });
++                        (ACK, address)
++                    }
++                    _ => (NAK, [0; 4]),
++                }
++            }
++            DECLINE => {
++                if let Some(address) = request.requested {
++                    self.declined.push(address);
++                }
++                self.leases.remove(&request.chaddr);
++                return None;
++            }
++            RELEASE => {
++                self.leases.remove(&request.chaddr);
++                return None;
++            }
++            INFORM => (ACK, [0; 4]),
++            _ => return None,
++        };
++        Some(self.reply(&request, kind, yiaddr, dns))
++    }
++
++    fn reply(&self, request: &Request, kind: u8, yiaddr: [u8; 4], dns: &[[u8; 4]]) -> Vec<u8> {
++        let mut message = alloc::vec![0u8; 240];
++        message[0] = 2;
++        message[1] = 1;
++        message[2] = 6;
++        message[4..8].copy_from_slice(&request.xid);
++        message[10..12].copy_from_slice(&request.flags);
++        if kind == ACK && yiaddr == [0; 4] {
++            message[12..16].copy_from_slice(&request.ciaddr);
++        }
++        message[16..20].copy_from_slice(&yiaddr);
++        message[20..24].copy_from_slice(&self.address);
++        message[28..44].copy_from_slice(request.raw_chaddr);
++        message[236..240].copy_from_slice(&COOKIE);
++        message.extend_from_slice(&[53, 1, kind]);
++        message.extend_from_slice(&[54, 4]);
++        message.extend_from_slice(&self.address);
++        if kind != NAK {
++            if yiaddr != [0; 4] {
++                message.extend_from_slice(&[51, 4]);
++                message.extend_from_slice(&LEASE_SECONDS.to_be_bytes());
++                message.extend_from_slice(&[58, 4]);
++                message.extend_from_slice(&(LEASE_SECONDS / 2).to_be_bytes());
++                message.extend_from_slice(&[59, 4]);
++                message.extend_from_slice(&(LEASE_SECONDS / 8 * 7).to_be_bytes());
++            }
++            message.extend_from_slice(&[1, 4]);
++            message.extend_from_slice(&self.netmask());
++            message.extend_from_slice(&[3, 4]);
++            message.extend_from_slice(&self.address);
++            let mut broadcast = self.address;
++            for (byte, mask) in broadcast.iter_mut().zip(self.netmask()) {
++                *byte |= !mask;
++            }
++            message.extend_from_slice(&[28, 4]);
++            message.extend_from_slice(&broadcast);
++            // The connection's own DNS servers; without any, the devices
++            // ask the hotspot, which has none to answer with.
++            let servers: Vec<[u8; 4]> = if dns.is_empty() { alloc::vec![self.address] } else { dns.iter().take(3).copied().collect() };
++            message.push(6);
++            message.push((servers.len() * 4) as u8);
++            for server in servers {
++                message.extend_from_slice(&server);
++            }
++        }
++        message.push(255);
++        // Small messages are padded to the 300 bytes old clients expect.
++        if message.len() < 300 {
++            message.resize(300, 0);
++        }
++        datagram(self.address, [255; 4], &message)
++    }
++}
++
++/// An IPv4 packet with a UDP datagram from the server's port to the
++/// client's.
++fn datagram(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {
++    let udp_length = 8 + payload.len();
++    let total = 20 + udp_length;
++    let mut packet = Vec::with_capacity(total);
++    packet.extend_from_slice(&[0x45, 0x10]);
++    packet.extend_from_slice(&(total as u16).to_be_bytes());
++    packet.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
++    packet.extend_from_slice(&source);
++    packet.extend_from_slice(&destination);
++    packet.extend_from_slice(&67u16.to_be_bytes());
++    packet.extend_from_slice(&68u16.to_be_bytes());
++    packet.extend_from_slice(&(udp_length as u16).to_be_bytes());
++    packet.extend_from_slice(&[0xff, 0xff]);
++    packet.extend_from_slice(payload);
++    super::nat::fix_checksums(&mut packet);
++    packet
++}
+diff --git a/kernel/libs/aster-bigtcp/src/iface/iface.rs b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+index 81b0b41..7aa33d8 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/iface.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/iface.rs
+@@ -45,6 +45,11 @@ pub trait Iface<E>: internal::IfaceInternal<E> + Send + Sync {
+     /// interface's): an interface that asks for its address asks again,
+     /// or drops the one it had.
+     fn link_changed(&self, _up: bool) {}
++
++    /// The interface serves a network of its own (a hotspot) with this
++    /// fixed address, or no more: it stops asking for an address while it
++    /// does. The sharing itself is `nat`'s.
++    fn share(&self, _cidr: Option<Ipv4Cidr>) {}
+ }
+ 
+ impl<E: Ext> dyn Iface<E> {
+diff --git a/kernel/libs/aster-bigtcp/src/iface/mod.rs b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+index 923564a..9dca737 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/mod.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/mod.rs
+@@ -2,10 +2,12 @@
+ 
+ mod common;
+ mod dhcp;
++mod dhcpd;
+ pub mod firewall;
+ #[expect(clippy::module_inception)]
+ mod iface;
+ pub mod multicast;
++pub mod nat;
+ mod packet_slice;
+ mod phy;
+ mod poll;
+diff --git a/kernel/libs/aster-bigtcp/src/iface/nat.rs b/kernel/libs/aster-bigtcp/src/iface/nat.rs
+new file mode 100644
+index 0000000..8ee37f3
+--- /dev/null
++++ b/kernel/libs/aster-bigtcp/src/iface/nat.rs
+@@ -0,0 +1,390 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Sharing this computer's connection with the devices of a network it
++//! serves (a Wi-Fi hotspot), as Linux does for NetworkManager's shared
++//! connections: the serving interface gets a fixed address and a DHCP
++//! server (`dhcpd`), and the IPv4 packets its devices send elsewhere leave
++//! through the interface that has the way out, with that interface's
++//! address and a port of its own (source NAT, iptables' MASQUERADE); the
++//! answers come back translated. TCP, UDP and ICMP echo pass.
++//!
++//! A packet changes interface through a queue: the interface that
++//! received it leaves it for the other one's next poll, which it asks for,
++//! so that no poll waits on another interface's locks.
++
++use alloc::{collections::{BTreeMap, VecDeque}, vec::Vec};
++use core::sync::atomic::{AtomicBool, Ordering};
++
++use ostd::sync::{LocalIrqDisabled, SpinLock};
++use spin::Once;
++
++use super::dhcpd::DhcpServer;
++
++const PROTO_ICMP: u8 = 1;
++const PROTO_TCP: u8 = 6;
++const PROTO_UDP: u8 = 17;
++
++/// The ports (and ICMP identifiers) the translations take on the way out:
++/// above the range Linux gives programs.
++const PORT_FIRST: u16 = 61_000;
++const PORT_LAST: u16 = 65_000;
++/// How long a translation lasts unused.
++const TCP_IDLE_MS: u64 = 30 * 60 * 1000;
++const UDP_IDLE_MS: u64 = 3 * 60 * 1000;
++const ICMP_IDLE_MS: u64 = 30 * 1000;
++/// Packets waiting for an interface's poll, at most.
++const QUEUE_LEN: usize = 512;
++
++/// What the kernel does for sharing: the way out for a destination (the
++/// interface's index and its address), waking an interface's poll, and
++/// the DNS servers the devices get.
++#[derive(Clone, Copy)]
++pub struct Hooks {
++    pub route: fn(destination: [u8; 4], inside: u32) -> Option<(u32, [u8; 4])>,
++    pub wake: fn(index: u32),
++    pub dns: fn(inside: u32) -> Vec<[u8; 4]>,
++}
++
++static HOOKS: Once<Hooks> = Once::new();
++
++pub fn set_hooks(hooks: Hooks) {
++    HOOKS.call_once(|| hooks);
++}
++
++#[derive(Clone, Copy, Debug)]
++struct Mapping {
++    inside: ([u8; 4], u16),
++    remote: ([u8; 4], u16),
++    outside: u32,
++    outside_address: [u8; 4],
++    used: u64,
++}
++
++struct Sharing {
++    /// The serving interface and its network.
++    inside: u32,
++    address: [u8; 4],
++    prefix_len: u8,
++    dhcp: DhcpServer,
++    /// Translations by protocol and outside port.
++    by_outside: BTreeMap<(u8, u16), Mapping>,
++    /// The outside port of a flow from a device.
++    by_inside: BTreeMap<(u8, [u8; 4], u16, [u8; 4], u16), u16>,
++    next_port: u16,
++}
++
++static SHARING: SpinLock<Option<Sharing>, LocalIrqDisabled> = SpinLock::new(None);
++static ACTIVE: AtomicBool = AtomicBool::new(false);
++/// IPv4 packets for each interface's next poll, with where they go.
++static QUEUES: SpinLock<BTreeMap<u32, VecDeque<(Vec<u8>, [u8; 4])>>, LocalIrqDisabled> = SpinLock::new(BTreeMap::new());
++
++fn now_ms() -> u64 {
++    super::time::get_network_timestamp().total_millis() as u64
++}
++
++/// Starts sharing through the interface `inside`, whose address is
++/// `address`/`prefix_len`.
++pub fn share(inside: u32, address: [u8; 4], prefix_len: u8) {
++    *SHARING.lock() = Some(Sharing {
++        inside,
++        address,
++        prefix_len,
++        dhcp: DhcpServer::new(address, prefix_len),
++        by_outside: BTreeMap::new(),
++        by_inside: BTreeMap::new(),
++        next_port: PORT_FIRST,
++    });
++    ACTIVE.store(true, Ordering::Release);
++}
++
++pub fn stop_sharing() {
++    ACTIVE.store(false, Ordering::Release);
++    *SHARING.lock() = None;
++    QUEUES.lock().clear();
++}
++
++pub(crate) fn active() -> bool {
++    ACTIVE.load(Ordering::Acquire)
++}
++
++/// What becomes of a packet an interface received.
++pub(crate) enum Ingress {
++    /// The interface takes it as its own.
++    Local,
++    /// It went on to another interface (or was dropped as it should be).
++    Consumed,
++    /// The answer to send back on this interface (DHCP), with where it goes.
++    Reply(Vec<u8>, [u8; 4]),
++}
++
++fn in_network(address: [u8; 4], network: [u8; 4], prefix_len: u8) -> bool {
++    let mask = if prefix_len == 0 { 0 } else { u32::MAX << (32 - prefix_len as u32) };
++    u32::from_be_bytes(address) & mask == u32::from_be_bytes(network) & mask
++}
++
++/// The internet checksum of `bytes`, starting from `sum`.
++fn fold(mut sum: u32, bytes: &[u8]) -> u32 {
++    for pair in bytes.chunks(2) {
++        sum += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
++    }
++    sum
++}
++
++fn finish(mut sum: u32) -> u16 {
++    while sum >> 16 != 0 {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    !(sum as u16)
++}
++
++/// Writes the checksums of an IPv4 packet anew: the header's, and the TCP,
++/// UDP or ICMP one inside.
++pub(crate) fn fix_checksums(packet: &mut [u8]) {
++    let header = usize::from(packet[0] & 0x0f) * 4;
++    packet[10..12].fill(0);
++    let sum = finish(fold(0, &packet[..header]));
++    packet[10..12].copy_from_slice(&sum.to_be_bytes());
++    let total = usize::from(u16::from_be_bytes([packet[2], packet[3]])).min(packet.len());
++    let (protocol, source, destination) = (packet[9], [packet[12], packet[13], packet[14], packet[15]], [packet[16], packet[17], packet[18], packet[19]]);
++    let body = &mut packet[header..total];
++    let length = body.len() as u16;
++    let pseudo = |sum: u32| {
++        let sum = fold(sum, &source);
++        let sum = fold(sum, &destination);
++        let sum = fold(sum, &[0, protocol]);
++        fold(sum, &length.to_be_bytes())
++    };
++    match protocol {
++        PROTO_TCP if body.len() >= 20 => {
++            body[16..18].fill(0);
++            let sum = finish(fold(pseudo(0), body));
++            body[16..18].copy_from_slice(&sum.to_be_bytes());
++        }
++        PROTO_UDP if body.len() >= 8 => {
++            // A datagram sent without a checksum keeps it so.
++            if body[6..8] == [0, 0] {
++                return;
++            }
++            body[6..8].fill(0);
++            let sum = match finish(fold(pseudo(0), body)) {
++                0 => 0xffff,
++                sum => sum,
++            };
++            body[6..8].copy_from_slice(&sum.to_be_bytes());
++        }
++        PROTO_ICMP if body.len() >= 8 => {
++            body[2..4].fill(0);
++            let sum = finish(fold(0, body));
++            body[2..4].copy_from_slice(&sum.to_be_bytes());
++        }
++        _ => {}
++    }
++}
++
++/// The ports of a packet's flow: TCP and UDP's source and destination, an
++/// ICMP echo's identifier both ways. None for other packets.
++fn ports(packet: &[u8], header: usize) -> Option<(u16, u16)> {
++    let body = packet.get(header..)?;
++    match packet[9] {
++        PROTO_TCP | PROTO_UDP => Some((u16::from_be_bytes([*body.first()?, *body.get(1)?]), u16::from_be_bytes([*body.get(2)?, *body.get(3)?]))),
++        // Echo request (8) and reply (0).
++        PROTO_ICMP if matches!(body.first(), Some(0 | 8)) => {
++            let id = u16::from_be_bytes([*body.get(4)?, *body.get(5)?]);
++            Some((id, id))
++        }
++        _ => None,
++    }
++}
++
++fn set_ports(packet: &mut [u8], header: usize, source: Option<u16>, destination: Option<u16>) {
++    let protocol = packet[9];
++    let body = &mut packet[header..];
++    match protocol {
++        PROTO_TCP | PROTO_UDP => {
++            if let Some(port) = source {
++                body[0..2].copy_from_slice(&port.to_be_bytes());
++            }
++            if let Some(port) = destination {
++                body[2..4].copy_from_slice(&port.to_be_bytes());
++            }
++        }
++        PROTO_ICMP => {
++            if let Some(id) = source.or(destination) {
++                body[4..6].copy_from_slice(&id.to_be_bytes());
++            }
++        }
++        _ => {}
++    }
++}
++
++fn idle_limit(protocol: u8) -> u64 {
++    match protocol {
++        PROTO_TCP => TCP_IDLE_MS,
++        PROTO_UDP => UDP_IDLE_MS,
++        _ => ICMP_IDLE_MS,
++    }
++}
++
++impl Sharing {
++    /// Drops the translations unused for too long.
++    fn expire(&mut self, now: u64) {
++        let stale: Vec<(u8, u16)> = self
++            .by_outside
++            .iter()
++            .filter(|((protocol, _), mapping)| now.saturating_sub(mapping.used) > idle_limit(*protocol))
++            .map(|(key, _)| *key)
++            .collect();
++        for key in stale {
++            if let Some(mapping) = self.by_outside.remove(&key) {
++                self.by_inside.remove(&(key.0, mapping.inside.0, mapping.inside.1, mapping.remote.0, mapping.remote.1));
++            }
++        }
++    }
++
++    /// The outside port of a flow, a new one if it has none.
++    fn outside_port(&mut self, protocol: u8, inside: ([u8; 4], u16), remote: ([u8; 4], u16), outside: u32, outside_address: [u8; 4], now: u64) -> Option<u16> {
++        let key = (protocol, inside.0, inside.1, remote.0, remote.1);
++        if let Some(&port) = self.by_inside.get(&key)
++            && let Some(mapping) = self.by_outside.get_mut(&(protocol, port))
++            && mapping.outside == outside
++        {
++            mapping.used = now;
++            return Some(port);
++        }
++        let span = PORT_LAST - PORT_FIRST;
++        if self.by_outside.len() as u16 >= span / 2 {
++            self.expire(now);
++        }
++        for _ in 0..span {
++            let port = self.next_port;
++            self.next_port = if port >= PORT_LAST { PORT_FIRST } else { port + 1 };
++            if self.by_outside.contains_key(&(protocol, port)) {
++                continue;
++            }
++            self.by_outside.insert((protocol, port), Mapping { inside, remote, outside, outside_address, used: now });
++            self.by_inside.insert(key, port);
++            return Some(port);
++        }
++        None
++    }
++}
++
++/// Leaves a packet for interface `index`'s next poll and asks for it.
++fn queue(index: u32, packet: Vec<u8>, destination: [u8; 4]) {
++    {
++        let mut queues = QUEUES.lock();
++        let queue = queues.entry(index).or_default();
++        if queue.len() >= QUEUE_LEN {
++            return;
++        }
++        queue.push_back((packet, destination));
++    }
++    if let Some(hooks) = HOOKS.get() {
++        (hooks.wake)(index);
++    }
++}
++
++/// The packets waiting for interface `index`.
++pub(crate) fn take(index: u32) -> Vec<(Vec<u8>, [u8; 4])> {
++    if !active() {
++        return Vec::new();
++    }
++    let mut queues = QUEUES.lock();
++    match queues.get_mut(&index) {
++        Some(queue) if !queue.is_empty() => queue.drain(..).collect(),
++        _ => Vec::new(),
++    }
++}
++
++/// Decides what becomes of an IPv4 packet that interface `index`, whose
++/// address is `own`, received.
++pub(crate) fn ingress(index: u32, own: Option<[u8; 4]>, mut packet: Vec<u8>) -> Ingress {
++    if packet.len() < 20 || packet[0] >> 4 != 4 {
++        return Ingress::Local;
++    }
++    let header = usize::from(packet[0] & 0x0f) * 4;
++    let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
++    if header < 20 || total < header || total > packet.len() {
++        return Ingress::Local;
++    }
++    packet.truncate(total);
++    let source = [packet[12], packet[13], packet[14], packet[15]];
++    let destination = [packet[16], packet[17], packet[18], packet[19]];
++    let protocol = packet[9];
++    let fragment = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0;
++    let now = now_ms();
++    let Some(hooks) = HOOKS.get().copied() else { return Ingress::Local };
++
++    let mut guard = SHARING.lock();
++    let Some(sharing) = guard.as_mut() else { return Ingress::Local };
++
++    if index == sharing.inside {
++        let broadcast = destination == [255; 4]
++            || destination[0] >= 224
++            || (in_network(destination, sharing.address, sharing.prefix_len)
++                && u32::from_be_bytes(destination) | (u32::MAX << (32 - sharing.prefix_len as u32)) == u32::MAX);
++        // The devices' DHCP requests are the server's.
++        if protocol == PROTO_UDP && (broadcast || destination == sharing.address) && !fragment {
++            let body = &packet[header..];
++            if body.len() >= 8 && u16::from_be_bytes([body[2], body[3]]) == 67 {
++                let dns = (hooks.dns)(sharing.inside);
++                return match sharing.dhcp.answer(&body[8..], &dns, now) {
++                    Some(reply) => Ingress::Reply(reply, [255; 4]),
++                    None => Ingress::Consumed,
++                };
++            }
++        }
++        if broadcast || Some(destination) == own || destination == sharing.address {
++            return Ingress::Local;
++        }
++        if !in_network(source, sharing.address, sharing.prefix_len) || fragment {
++            return Ingress::Consumed;
++        }
++        // To the network of the serving interface itself: not ours to pass.
++        if in_network(destination, sharing.address, sharing.prefix_len) {
++            return Ingress::Consumed;
++        }
++        let Some((src_port, dst_port)) = ports(&packet, header) else { return Ingress::Consumed };
++        if packet[8] <= 1 {
++            // Its time to live is over.
++            return Ingress::Consumed;
++        }
++        let Some((outside, outside_address)) = (hooks.route)(destination, sharing.inside) else { return Ingress::Consumed };
++        let Some(port) = sharing.outside_port(protocol, (source, src_port), (destination, dst_port), outside, outside_address, now) else {
++            return Ingress::Consumed;
++        };
++        drop(guard);
++        packet[8] -= 1;
++        packet[12..16].copy_from_slice(&outside_address);
++        set_ports(&mut packet, header, Some(port), None);
++        fix_checksums(&mut packet);
++        queue(outside, packet, destination);
++        return Ingress::Consumed;
++    }
++
++    // An answer to a device, on the way back in.
++    if Some(destination) != own || fragment {
++        return Ingress::Local;
++    }
++    let Some((src_port, dst_port)) = ports(&packet, header) else { return Ingress::Local };
++    let Some(mapping) = sharing.by_outside.get_mut(&(protocol, dst_port)) else { return Ingress::Local };
++    if mapping.outside != index || mapping.outside_address != destination || mapping.remote != (source, src_port) {
++        return Ingress::Local;
++    }
++    // An echo reply carries the identifier the request had.
++    if protocol == PROTO_ICMP && packet.get(header) != Some(&0) {
++        return Ingress::Local;
++    }
++    mapping.used = now;
++    let (inside, inside_index) = (mapping.inside, sharing.inside);
++    drop(guard);
++    if packet[8] <= 1 {
++        return Ingress::Consumed;
++    }
++    packet[8] -= 1;
++    packet[16..20].copy_from_slice(&inside.0);
++    set_ports(&mut packet, header, None, Some(inside.1));
++    fix_checksums(&mut packet);
++    queue(inside_index, packet, inside.0);
++    Ingress::Consumed
++}
+diff --git a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+index d6c4920..564ae65 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/phy/ether.rs
+@@ -254,6 +254,25 @@ impl<D: WithDevice + 'static, E: Ext> Iface<E> for EtherIface<D, E> {
+         }
+     }
+ 
++    fn share(&self, cidr: Option<Ipv4Cidr>) {
++        // The DHCP client gives up what it had: the fixed address replaces it.
++        if let Some(dhcp) = &self.dhcp
++            && let Some(event) = dhcp.lock().link_changed(false, now_ms())
++        {
++            self.pending.lock().push(event);
++        }
++        self.apply_dhcp_events();
++        self.forget_neighbours();
++        let mut interface = self.common.interface();
++        let old = interface.ipv4_cidr();
++        interface.set_ipv4(cidr);
++        interface.set_ipv4_gateway(None);
++        drop(interface);
++        crate::iface::address_changed(self.common.index(), old, cidr);
++        crate::iface::bump_config_generation();
++        self.poll();
++    }
++
+     fn mtu(&self) -> usize {
+         self.driver
+             .with(|device| device.capabilities().max_transmission_unit)
+diff --git a/kernel/libs/aster-bigtcp/src/iface/poll.rs b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+index 4b93ac5..0daa731 100644
+--- a/kernel/libs/aster-bigtcp/src/iface/poll.rs
++++ b/kernel/libs/aster-bigtcp/src/iface/poll.rs
+@@ -2,7 +2,7 @@
+ 
+ use alloc::{sync::Arc, vec::Vec};
+ 
+-use ostd::mm::{Infallible, VmReader};
++use ostd::mm::{Infallible, VmReader, VmWriter};
+ use smoltcp::{
+     storage::SliceLike,
+     wire::{
+@@ -136,6 +136,21 @@ impl<E: Ext> PollContext<'_, E> {
+         packet: RxPacket<NetworkLayer>,
+         ip_version: Option<ip::Version>,
+     ) -> Option<TxPacketWithDst> {
++        // A shared connection's packets go on to another interface.
++        if super::nat::active() && ip_version != Some(ip::Version::V6) {
++            let mut bytes = alloc::vec![0u8; packet.len()];
++            let read = packet.reader().read(&mut VmWriter::from(bytes.as_mut_slice()));
++            bytes.truncate(read);
++            let own = self.iface.context().ipv4_addr().map(|address| address.octets());
++            match super::nat::ingress(self.index, own, bytes) {
++                super::nat::Ingress::Local => {}
++                super::nat::Ingress::Consumed => return None,
++                super::nat::Ingress::Reply(reply, destination) => {
++                    return Self::raw_ipv4(phy, &reply, destination);
++                }
++            }
++        }
++
+         // Parse the IP header. Ignore the packet if the header is ill-formed.
+         let checksum_caps = self.iface.context().checksum_caps();
+         let (packet, ip_repr) = ip::parse(packet, ip_version, checksum_caps.ipv4.rx())?;
+@@ -500,6 +515,23 @@ impl<E: Ext> PollContext<'_, E> {
+         Some(TxPacketWithDst { packet, dst_addr })
+     }
+ 
++    /// A whole IPv4 packet, ready for the link layer.
++    fn raw_ipv4(phy: &dyn PollPhy, bytes: &[u8], destination: [u8; 4]) -> Option<TxPacketWithDst> {
++        let mut builder = match phy.alloc_tx_buffer(bytes.len()) {
++            Ok(buffer) => buffer.to_builder_at_layer::<NetworkLayer>(),
++            Err(err) => {
++                ostd::error!("failed to allocate a network packet: {:?}", err);
++                return None;
++            }
++        };
++        let written = builder.append_writer().write(&mut VmReader::from(bytes));
++        builder.commit(written);
++        Some(TxPacketWithDst {
++            packet: builder.build(),
++            dst_addr: IpAddress::Ipv4(Ipv4Address::from(destination)),
++        })
++    }
++
+     fn copy_payload(phy: &dyn PollPhy, payload: &[u8]) -> Option<TxPacket<ApplicationLayer>> {
+         let mut builder = match phy.alloc_tx_buffer(payload.len()) {
+             Ok(buffer) => buffer.to_builder(),
+@@ -524,6 +556,16 @@ impl<E: Ext> PollContext<'_, E> {
+         phy: &dyn PollPhy,
+         counters: &IfaceCounters,
+     ) {
++        // What a shared connection passed on to this interface.
++        for (bytes, destination) in super::nat::take(self.index) {
++            if let Some(packet) = Self::raw_ipv4(phy, &bytes, destination)
++                && let Some(tx_packet) = phy.dispatch(packet, self.iface.context_mut())
++                && let Err(err) = counters.send(device, tx_packet)
++            {
++                ostd::error!("failed to send a network packet: {:?}", err);
++            }
++        }
++
+         while device.can_send() {
+             let (did_something, packet) = self.dispatch_ip(phy);
+ 
