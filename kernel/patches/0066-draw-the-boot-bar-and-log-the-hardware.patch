@@ -1,0 +1,656 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1b5e2bb..f5d9f41 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -341,6 +341,7 @@ name = "aster-framebuffer"
+ version = "0.1.0"
+ dependencies = [
+  "align_ext",
++ "aster-logger",
+  "bitflags 1.3.2",
+  "component",
+  "font8x8",
+@@ -487,6 +488,7 @@ name = "aster-pci"
+ version = "0.1.0"
+ dependencies = [
+  "align_ext",
++ "aster-logger",
+  "bitflags 1.3.2",
+  "component",
+  "fdt",
+diff --git a/kernel/comps/i8042/src/i2c_touchpads.rs b/kernel/comps/i8042/src/i2c_touchpads.rs
+new file mode 100755
+index 0000000..db92b3f
+--- /dev/null
++++ b/kernel/comps/i8042/src/i2c_touchpads.rs
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! The HID-over-I2C touchpads the firmware declares, named in the log.
++//!
++//! Most laptops since about 2016 put the touchpad on an I2C bus (ACPI's
++//! `PNP0C50`, HID over I2C, the Windows Precision Touchpad) and keep a PS/2
++//! fallback that moves the pointer and clicks, often without the Synaptics or
++//! ELAN protocol this driver turns into gestures. The kernel has no I2C-HID
++//! driver yet, so on those the pad stays a PS/2 mouse and two fingers do not
++//! scroll; this says so in the kernel log, with the pad's IDs.
++//!
++//! No AML interpreter runs: the DSDT and SSDTs are searched for the
++//! compatible ID as AML encodes it (a string, or `EisaId ("PNP0C50")`), and
++//! the device IDs written near it are the candidates (a DSDT often declares
++//! several pads, one per vendor, and enables the one fitted with `_STA`).
++
++use alloc::{string::String, vec::Vec};
++
++/// HID over I2C, as strings.
++const HID_OVER_I2C: [&[u8]; 2] = [b"PNP0C50", b"ACPI0C50"];
++/// `EisaId ("PNP0C50")`: a DWord constant, the compressed letters first.
++const HID_OVER_I2C_EISA: [u8; 5] = [0x0c, 0x41, 0xd0, 0x0c, 0x50];
++/// AML's string prefix.
++const STRING_PREFIX: u8 = 0x0d;
++/// How far around the compatible ID the device's own IDs are looked for, in
++/// bytes of AML: a device's `_HID`, `_CID` and `_SUB` are close together.
++const BEFORE: usize = 160;
++const AFTER: usize = 96;
++/// At most this many names in the log line.
++const MAX_NAMES: usize = 16;
++
++/// Names the firmware's HID-over-I2C devices in the kernel log, if any.
++pub(crate) fn log() {
++    let mut found = Found::default();
++    ostd::arch::kernel::for_each_aml_table(|aml| found.scan(aml));
++    if found.declared == 0 {
++        return;
++    }
++    let mut names = String::new();
++    for name in &found.names {
++        if !names.is_empty() {
++            names.push_str(", ");
++        }
++        names.extend(name.iter().map(|&byte| byte as char));
++    }
++    if names.is_empty() {
++        names.push_str("no ID near it");
++    }
++    ostd::notice!(
++        "the firmware declares {} HID-over-I2C device(s) ({}): a touchpad among them has no \
++         I2C driver yet and works as the PS/2 mouse, without two-finger scrolling unless that \
++         speaks Synaptics or ELAN",
++        found.declared,
++        names
++    );
++}
++
++#[derive(Default)]
++struct Found {
++    /// Times the compatible ID appears.
++    declared: usize,
++    /// The device IDs near it, each once.
++    names: Vec<Vec<u8>>,
++}
++
++impl Found {
++    fn scan(&mut self, aml: &[u8]) {
++        for at in 0..aml.len() {
++            let compatible = aml[at..].starts_with(&HID_OVER_I2C_EISA)
++                || string_at(aml, at).is_some_and(|text| HID_OVER_I2C.contains(&text));
++            if !compatible {
++                continue;
++            }
++            self.declared += 1;
++            let around = at.saturating_sub(BEFORE)..(at + AFTER).min(aml.len());
++            for near in around {
++                let Some(text) = string_at(aml, near) else {
++                    continue;
++                };
++                if is_device_id(text)
++                    && !HID_OVER_I2C.contains(&text)
++                    && self.names.len() < MAX_NAMES
++                    && !self.names.iter().any(|name| name.as_slice() == text)
++                {
++                    self.names.push(text.to_vec());
++                }
++            }
++        }
++    }
++}
++
++/// The string AML has at `at` (its prefix, then the text up to a NUL), if
++/// it is a short printable one.
++fn string_at(aml: &[u8], at: usize) -> Option<&[u8]> {
++    if aml.get(at) != Some(&STRING_PREFIX) {
++        return None;
++    }
++    let rest = &aml[at + 1..];
++    let end = rest.iter().take(10).position(|&byte| byte == 0)?;
++    let text = &rest[..end];
++    (!text.is_empty() && text.iter().all(|byte| byte.is_ascii_graphic())).then_some(text)
++}
++
++/// A PNP ID (three letters, four hex digits: `PNP0C50`) or an ACPI ID (four
++/// letters or digits, four hex digits: `ELAN0718`, `SYNA3602`, `MSFT0001`).
++fn is_device_id(text: &[u8]) -> bool {
++    let (vendor, product) = match text.len() {
++        7 => text.split_at(3),
++        8 => text.split_at(4),
++        _ => return false,
++    };
++    vendor[0].is_ascii_uppercase()
++        && vendor
++            .iter()
++            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
++        && product
++            .iter()
++            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(byte))
++}
++
++#[cfg(ktest)]
++mod test {
++    use alloc::vec::Vec;
++
++    use ostd::prelude::*;
++
++    use super::{Found, is_device_id};
++
++    fn string(text: &str) -> Vec<u8> {
++        let mut aml = Vec::from([0x0d]);
++        aml.extend_from_slice(text.as_bytes());
++        aml.push(0);
++        aml
++    }
++
++    #[ktest]
++    fn finds_the_pads_next_to_the_compatible_id() {
++        // Device (TPD0) { Name (_HID, "ELAN0718") Name (_CID, "PNP0C50") }
++        // and an EisaId one with a method's IDs (SYNA2393, then MSFT0001).
++        let mut aml = Vec::from(*b"[\x82TPD0");
++        aml.extend(string("ELAN0718"));
++        aml.extend(*b"\x08_CID");
++        aml.extend(string("PNP0C50"));
++        aml.extend([0u8; 300]);
++        aml.extend(string("SYNA2393"));
++        aml.extend(string("MSFT0001"));
++        aml.extend(*b"\x08_CID\x0c\x41\xd0\x0c\x50");
++        aml.extend([0u8; 300]);
++        aml.extend(string("INT33C3"));
++        let mut found = Found::default();
++        found.scan(&aml);
++        assert_eq!(found.declared, 2);
++        let names: Vec<&[u8]> = found.names.iter().map(Vec::as_slice).collect();
++        assert_eq!(names, [&b"ELAN0718"[..], b"SYNA2393", b"MSFT0001"]);
++    }
++
++    #[ktest]
++    fn device_ids() {
++        assert!(is_device_id(b"PNP0C50"));
++        assert!(is_device_id(b"ELAN0718"));
++        assert!(!is_device_id(b"10EC5682"));
++        assert!(!is_device_id(b"_SB_PCI0"));
++        assert!(!is_device_id(b"Elan0718"));
++    }
++}
+diff --git a/kernel/comps/i8042/src/lib.rs b/kernel/comps/i8042/src/lib.rs
+old mode 100644
+new mode 100755
+index 9234385..4a52047
+--- a/kernel/comps/i8042/src/lib.rs
++++ b/kernel/comps/i8042/src/lib.rs
+@@ -21,6 +21,7 @@ macro_rules! __log_prefix {
+ }
+ 
+ mod controller;
++mod i2c_touchpads;
+ mod keyboard;
+ mod mouse;
+ mod ps2;
+@@ -31,6 +32,7 @@ fn init() -> Result<(), ComponentInitError> {
+     if let Err(err) = controller::init() {
+         ostd::warn!("i8042 controller initialization failed: {:?}", err);
+     }
++    i2c_touchpads::log();
+     Ok(())
+ }
+ 
+diff --git a/kernel/core/comps/framebuffer/Cargo.toml b/kernel/core/comps/framebuffer/Cargo.toml
+index 4be4c78..4208ea7 100644
+--- a/kernel/core/comps/framebuffer/Cargo.toml
++++ b/kernel/core/comps/framebuffer/Cargo.toml
+@@ -7,6 +7,10 @@ edition.workspace = true
+ 
+ [dependencies]
+ align_ext.workspace = true
++# Started after the logger, so what this logs as it starts reaches /dev/kmsg
++# (the logger keeps notices from its start on; component priority follows
++# the dependencies).
++aster-logger.workspace = true
+ bitflags.workspace = true
+ component.workspace = true
+ font8x8.workspace = true
+diff --git a/kernel/core/comps/framebuffer/src/splash.rs b/kernel/core/comps/framebuffer/src/splash.rs
+old mode 100644
+new mode 100755
+index 7382759..ce774a0
+--- a/kernel/core/comps/framebuffer/src/splash.rs
++++ b/kernel/core/comps/framebuffer/src/splash.rs
+@@ -3,19 +3,22 @@
+ //! The boot splash's bar, kept moving.
+ //!
+ //! The boot loader may leave a splash on the screen (OpenShell's GRUB draws
+-//! one: the OPENSHELL wordmark over a 200x3 bar with a 60px segment in its
+-//! middle, as Plymouth's first frame on OpenShell Live). On Live, Plymouth
+-//! then moves the segment back and forth along the bar until the desktop's
+-//! boot screen, which has the same bar, takes over. Here the kernel does it,
+-//! from its start through unpacking the initramfs and the session's start,
+-//! until a display server shows a frame with something on it (see
++//! one: the OPENSHELL wordmark and "starting the system" on near-black, as
++//! Plymouth's first frame on OpenShell Live, without the bar: GRUB cannot
++//! move it while it reads the system, so a bar there would stand still for
++//! as long as the read takes). On Live, Plymouth moves a 60px segment back
++//! and forth along a 200x3 bar under the wordmark until the desktop's boot
++//! screen, which has the same bar, takes over. Here the kernel does it, from
++//! its start through unpacking the initramfs and the session's start, until
++//! a display server shows a frame with something on it (see
+ //! `aster-simpledrm`), a console draws text, or a program draws on `/dev/fb0`
+ //! ([`release`]).
+ //!
+ //! The splash is recognised on the screen, where the boot loader's stretch
+-//! put it (the near-black around the bar, the bar, the brighter segment at
+-//! its middle), so a screen without it is left as it is. The bar and the
+-//! segment are taken from the screen as they were drawn, then the segment
++//! put it (the near-black around the bar's place and the wordmark's stems),
++//! so a screen without it is left as it is. The bar is drawn in Plymouth's
++//! colours at the stretched place; a splash that already has it (an older
++//! ESP's) keeps its own, taken from the screen as drawn. The segment then
+ //! moves as Plymouth's script moves it: `(sin(frame / 12) + 1) / 2` of the
+ //! way along the bar, 50 frames a second.
+ 
+@@ -46,6 +49,29 @@ const TRACK_X: usize = 900;
+ const AROUND: [(usize, usize); 4] = [(820, 580), (1100, 580), (960, 569), (960, 589)];
+ /// The splash's background, #050607.
+ const BACKGROUND: [u8; 3] = [0x05, 0x06, 0x07];
++/// The middles of two of the wordmark's stems, 5px wide: the O's left one
++/// (blue) and the H's left one (light grey).
++const STEMS: [(usize, usize); 2] = [(814, 540), (1000, 540)];
++
++// Plymouth's bar (bar-track.png, bar-sweep.png), RGB, where the kernel draws
++// it: the track, the half-covered corners of its rounded ends, and the
++// segment's 58 columns, the same on its three rows.
++const TRACK: [u8; 3] = [22, 28, 41];
++const CORNER: [u8; 3] = [11, 13, 18];
++const SEGMENT: [[u8; 3]; 58] = [
++    [39, 51, 77], [48, 63, 94], [55, 73, 110], [61, 82, 122], [67, 90, 134], [72, 97, 144],
++    [77, 104, 154], [81, 110, 163], [85, 116, 171], [89, 123, 179], [93, 128, 186],
++    [96, 133, 194], [99, 138, 200], [102, 143, 206], [105, 147, 211], [107, 151, 216],
++    [110, 155, 221], [112, 159, 225], [113, 162, 230], [115, 165, 234], [117, 169, 237],
++    [118, 172, 240], [119, 175, 243], [120, 176, 244], [121, 179, 247], [122, 180, 249],
++    [123, 182, 250], [123, 183, 251], [123, 184, 251], [124, 185, 251], [124, 186, 251],
++    [124, 185, 250], [123, 185, 249], [122, 185, 249], [121, 185, 246], [120, 183, 245],
++    [119, 182, 242], [118, 181, 239], [116, 179, 235], [114, 177, 232], [112, 174, 229],
++    [110, 172, 225], [108, 169, 220], [106, 166, 215], [103, 161, 209], [100, 157, 203],
++    [97, 153, 196], [94, 148, 191], [90, 142, 183], [87, 136, 175], [83, 130, 166],
++    [78, 123, 157], [73, 115, 147], [68, 106, 136], [62, 97, 125], [56, 87, 112], [49, 74, 96],
++    [40, 59, 78],
++];
+ 
+ /// Plymouth's script moves the segment 50 times a second.
+ const FRAMES_PER_SECOND: u64 = 50;
+@@ -63,13 +89,25 @@ static SPLASH: Once<SpinLock<Splash>> = Once::new();
+ /// Looks for the boot splash on the screen and, where it is, keeps its bar
+ /// moving.
+ pub(crate) fn start(framebuffer: &Arc<FrameBuffer>) {
+-    let Some(splash) = Splash::find(framebuffer) else {
+-        return;
++    let splash = match Splash::find(framebuffer) {
++        Ok(splash) => splash,
++        Err(why) => {
++            ostd::notice!("no boot splash's bar to move: {}", why);
++            return;
++        }
++    };
++    let drawn = if splash.drawn_here {
++        "drawn by the kernel"
++    } else {
++        "the boot loader's"
+     };
+     SPLASH.call_once(|| SpinLock::new(splash));
+     STATE.store(MOVING, Ordering::Release);
+     ostd::timer::register_callback_on_cpu(tick);
+-    ostd::info!("the boot splash's bar moves until the session shows");
++    ostd::notice!(
++        "the boot splash's bar ({}) moves until the session shows",
++        drawn
++    );
+ }
+ 
+ /// Whether the splash's bar is moving on the screen.
+@@ -133,6 +171,8 @@ struct Splash {
+     line: Vec<u8>,
+     frame: u64,
+     drawn_at: Option<usize>,
++    /// Whether the bar was drawn here, the boot loader's splash having none.
++    drawn_here: bool,
+ }
+ 
+ impl core::fmt::Debug for Splash {
+@@ -141,15 +181,19 @@ impl core::fmt::Debug for Splash {
+             .field("rows", &self.rows)
+             .field("span", &self.span)
+             .field("segment_width", &self.segment_width)
++            .field("drawn_here", &self.drawn_here)
+             .finish_non_exhaustive()
+     }
+ }
+ 
+ impl Splash {
+-    /// The splash's bar as the boot loader drew it, if the screen has it.
+-    fn find(framebuffer: &Arc<FrameBuffer>) -> Option<Self> {
++    /// The splash's bar, as the boot loader drew it or drawn here where the
++    /// splash has none; why not, if the screen has no splash.
++    fn find(framebuffer: &Arc<FrameBuffer>) -> Result<Self, &'static str> {
++        const UNREADABLE: &str = "the screen cannot be read";
++        const NO_ROOM: &str = "no room for the bar";
+         if framebuffer.pixel_format() != PixelFormat::BgrReserved {
+-            return None;
++            return Err("the screen is not 32 bits a pixel");
+         }
+         let bytes = 4;
+         let (width, height) = (framebuffer.width(), framebuffer.height());
+@@ -157,14 +201,14 @@ impl Splash {
+         let x = |reference: usize| reference * width / REFERENCE_WIDTH;
+         let y = |reference: usize| reference * height / REFERENCE_HEIGHT;
+         if width < REFERENCE_WIDTH / 4 || height < REFERENCE_HEIGHT / 4 {
+-            return None;
++            return Err("the screen is too small");
+         }
+-        let pixel = |column: usize, row: usize| -> Option<[u8; 4]> {
++        let pixel = |column: usize, row: usize| -> Result<[u8; 4], &'static str> {
+             let mut value = [0u8; 4];
+             framebuffer
+                 .read_bytes_at(row * framebuffer.line_size() + column * bytes, &mut value)
+-                .ok()?;
+-            Some(value)
++                .map_err(|_| UNREADABLE)?;
++            Ok(value)
+         };
+         let brightest = |value: [u8; 4]| value[0].max(value[1]).max(value[2]);
+ 
+@@ -172,7 +216,7 @@ impl Splash {
+         let background = pixel(x(AROUND[0].0), y(AROUND[0].1))?;
+         for (column, row) in AROUND {
+             if pixel(x(column), y(row))? != background {
+-                return None;
++                return Err("no splash's background around the bar's place");
+             }
+         }
+         // #050607, in either byte order.
+@@ -181,14 +225,25 @@ impl Splash {
+             && near(background[0].min(background[2]), BACKGROUND[0])
+             && near(background[0].max(background[2]), BACKGROUND[2]))
+         {
+-            return None;
++            return Err("the screen's background is not the splash's");
+         }
+         let track = pixel(x(TRACK_X), middle)?;
+         let segment = pixel(x((SEGMENT_X.start + SEGMENT_X.end) / 2), middle)?;
++        if track == background && segment == background {
++            // The splash without its bar: the wordmark above the bar's place
++            // tells it from any near-black screen.
++            for (column, row) in STEMS {
++                let stem = pixel(x(column), y(row))?;
++                if brightest(stem) < brightest(background).saturating_add(64) {
++                    return Err("no wordmark over the bar's place");
++                }
++            }
++            return Self::draw(framebuffer, bytes).ok_or(NO_ROOM);
++        }
+         if brightest(track) < brightest(background) + 8
+             || brightest(segment) < brightest(track) + 64
+         {
+-            return None;
++            return Err("something else at the bar's place");
+         }
+ 
+         // The rows with the bar, its blended edges included.
+@@ -198,9 +253,11 @@ impl Splash {
+         let span = (x(BAR_X.start) + 2)..x(BAR_X.end - 1).saturating_sub(1);
+         let first_segment_column = x(SEGMENT_X.start).saturating_sub(1);
+         let segment_end = ((SEGMENT_X.end * width).div_ceil(REFERENCE_WIDTH) + 1).min(width);
+-        let segment_width = segment_end.checked_sub(first_segment_column)?;
++        let segment_width = segment_end
++            .checked_sub(first_segment_column)
++            .ok_or(NO_ROOM)?;
+         if span.is_empty() || rows.is_empty() || segment_width > span.len() {
+-            return None;
++            return Err(NO_ROOM);
+         }
+ 
+         let mut track_column = vec![0u8; rows.len() * bytes];
+@@ -216,15 +273,17 @@ impl Splash {
+                     row * framebuffer.line_size() + first_segment_column * bytes,
+                     &mut segment_pixels[start..start + segment_width * bytes],
+                 )
+-                .ok()?;
++                .map_err(|_| UNREADABLE)?;
+         }
+ 
+         // Plymouth's segment goes from the bar's left end to its right end.
+         let first_column = x(BAR_X.start).saturating_sub(1);
+         let last_column = x(BAR_X.end) + 1;
+-        let travel = last_column.checked_sub(first_column + segment_width)?;
++        let travel = last_column
++            .checked_sub(first_column + segment_width)
++            .ok_or(NO_ROOM)?;
+ 
+-        Some(Self {
++        Ok(Self {
+             framebuffer: framebuffer.clone(),
+             bytes,
+             rows,
+@@ -237,6 +296,82 @@ impl Splash {
+             travel,
+             frame: 0,
+             drawn_at: None,
++            drawn_here: false,
++        })
++    }
++
++    /// Draws Plymouth's bar where the stretched splash would have it (the
++    /// splash's background is there, checked by [`Self::find`]), scaled as
++    /// the boot loader scales the splash, and keeps it to move.
++    fn draw(framebuffer: &Arc<FrameBuffer>, bytes: usize) -> Option<Self> {
++        let (width, height) = (framebuffer.width(), framebuffer.height());
++        let x = |reference: usize| reference * width / REFERENCE_WIDTH;
++        let y = |reference: usize| reference * height / REFERENCE_HEIGHT;
++        // The memory's order, BGRX.
++        let pixel = |rgb: [u8; 3]| [rgb[2], rgb[1], rgb[0], 0];
++
++        // At least the reference's three rows, so a small screen's bar stays
++        // visible.
++        let top = y(BAR_Y.start);
++        let bottom = (BAR_Y.end * height)
++            .div_ceil(REFERENCE_HEIGHT)
++            .max(top + BAR_Y.len())
++            .min(height);
++        let rows = top..bottom;
++        let left = x(BAR_X.start);
++        let right = (BAR_X.end * width).div_ceil(REFERENCE_WIDTH).min(width);
++        let length = right.checked_sub(left)?;
++        if rows.is_empty() || length < 8 {
++            return None;
++        }
++        let segment_width = (SEGMENT.len() * width)
++            .div_ceil(REFERENCE_WIDTH)
++            .clamp(2, length / 2);
++
++        // The whole bar once, its rounded ends' corners half covered.
++        let line_size = framebuffer.line_size();
++        let mut line = vec![0u8; length * bytes];
++        for (index, row) in rows.clone().enumerate() {
++            let edge = index == 0 || index == rows.len() - 1;
++            for (offset, chunk) in line.chunks_exact_mut(bytes).enumerate() {
++                let end = offset == 0 || offset == length - 1;
++                let colour = if end && edge && rows.len() >= 3 {
++                    CORNER
++                } else {
++                    TRACK
++                };
++                chunk.copy_from_slice(&pixel(colour));
++            }
++            framebuffer
++                .write_bytes_at(row * line_size + left * bytes, &line)
++                .ok()?;
++        }
++
++        // The segment, scaled from its 58 columns (the nearest), on every row.
++        let mut segment = Vec::with_capacity(rows.len() * segment_width * bytes);
++        let mut track = Vec::with_capacity(rows.len() * bytes);
++        for _ in rows.clone() {
++            for column in 0..segment_width {
++                segment.extend_from_slice(&pixel(SEGMENT[column * SEGMENT.len() / segment_width]));
++            }
++            track.extend_from_slice(&pixel(TRACK));
++        }
++        // Redrawn: the bar without its ends' columns.
++        let span = (left + 1)..(right - 1);
++        Some(Self {
++            framebuffer: framebuffer.clone(),
++            bytes,
++            rows,
++            line: vec![0u8; span.len() * bytes],
++            span,
++            track,
++            segment,
++            segment_width,
++            first_column: left,
++            travel: length - segment_width,
++            frame: 0,
++            drawn_at: None,
++            drawn_here: true,
+         })
+     }
+ 
+diff --git a/kernel/core/comps/pci/Cargo.toml b/kernel/core/comps/pci/Cargo.toml
+index 4656583..ce27e29 100644
+--- a/kernel/core/comps/pci/Cargo.toml
++++ b/kernel/core/comps/pci/Cargo.toml
+@@ -7,6 +7,10 @@ edition.workspace = true
+ 
+ [dependencies]
+ align_ext.workspace = true
++# Started after the logger, so what this logs as it starts reaches /dev/kmsg
++# (the logger keeps notices from its start on; component priority follows
++# the dependencies).
++aster-logger.workspace = true
+ bitflags.workspace = true
+ component.workspace = true
+ int-to-c-enum.workspace = true
+diff --git a/kernel/core/comps/pci/src/bus.rs b/kernel/core/comps/pci/src/bus.rs
+old mode 100644
+new mode 100755
+index 63d201a..756c990
+--- a/kernel/core/comps/pci/src/bus.rs
++++ b/kernel/core/comps/pci/src/bus.rs
+@@ -5,9 +5,12 @@
+ use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+ use core::fmt::Debug;
+ 
+-use ostd::{bus::BusProbeError, debug, error};
++use ostd::{bus::BusProbeError, debug, error, notice};
+ 
+-use super::{PciCommonDevice, device_info::PciDeviceId};
++use super::{
++    PciCommonDevice,
++    device_info::{PciDeviceId, PciDeviceLocation},
++};
+ 
+ /// A trait that represents PCI devices.
+ pub trait PciDevice: Sync + Send + Debug {
+@@ -75,6 +78,7 @@ impl PciBus {
+     pub(super) fn register_common_device(&mut self, mut common_device: PciCommonDevice) {
+         debug!("found common device: {:#x?}", common_device);
+         let device_id = *common_device.device_id();
++        log_device(common_device.location(), &device_id);
+         for driver in self.drivers.iter() {
+             common_device = match driver.probe(common_device) {
+                 Ok(device) => {
+@@ -102,3 +106,32 @@ impl PciBus {
+         }
+     }
+ }
++
++/// One line per device in the kernel log (`/dev/kmsg`), as `lspci -nn` would
++/// name it: which network card or controller a computer has, whether a
++/// driver takes it or not.
++fn log_device(location: &PciDeviceLocation, id: &PciDeviceId) {
++    // The subsystem's IDs (the card's maker) are in a type 0 header only.
++    const HEADER_TYPE: u16 = 0x0e;
++    const SUBSYSTEM_VENDOR: u16 = 0x2c;
++    const SUBSYSTEM: u16 = 0x2e;
++    let (subsystem_vendor, subsystem) = if location.read8(HEADER_TYPE) & 0x7f == 0 {
++        (location.read16(SUBSYSTEM_VENDOR), location.read16(SUBSYSTEM))
++    } else {
++        (0, 0)
++    };
++    notice!(
++        "{:02x}:{:02x}.{} [{:02x}{:02x}] {:04x}:{:04x} (rev {:02x}, prog-if {:02x}, subsystem {:04x}:{:04x})",
++        location.bus,
++        location.device,
++        location.function,
++        id.class,
++        id.subclass,
++        id.vendor_id,
++        id.device_id,
++        id.revision_id,
++        id.prog_if,
++        subsystem_vendor,
++        subsystem,
++    );
++}
+diff --git a/ostd/src/arch/x86/kernel/acpi/mod.rs b/ostd/src/arch/x86/kernel/acpi/mod.rs
+old mode 100644
+new mode 100755
+index 0eea5a1..cf482bc
+--- a/ostd/src/arch/x86/kernel/acpi/mod.rs
++++ b/ostd/src/arch/x86/kernel/acpi/mod.rs
+@@ -130,6 +130,29 @@ pub struct PciEcamRegion {
+ /// The [`AcpiInfo`] singleton.
+ pub static ACPI_INFO: Once<AcpiInfo> = Once::new();
+ 
++/// Calls `f` with the AML of the DSDT and of each SSDT, as the firmware wrote
++/// them, for drivers that look for a device the kernel has no ACPI namespace
++/// for (no AML interpreter runs): the byte patterns of its IDs, for the log.
++pub fn for_each_aml_table(mut f: impl FnMut(&[u8])) {
++    let Some(acpi_tables) = get_acpi_tables() else {
++        return;
++    };
++    let mut visit = |table: acpi::AmlTable| {
++        let start = paddr_to_vaddr(table.address) as *const u8;
++        // SAFETY: The table is where the firmware's RSDT or FADT says, read through the linear
++        // mapping as `AcpiMemoryHandler` reads every table, and nothing writes it; the same trust
++        // in the firmware as there (see its FIXME).
++        let aml = unsafe { core::slice::from_raw_parts(start, table.length as usize) };
++        f(aml);
++    };
++    if let Ok(dsdt) = acpi_tables.dsdt() {
++        visit(dsdt);
++    }
++    for ssdt in acpi_tables.ssdts() {
++        visit(ssdt);
++    }
++}
++
+ pub(in crate::arch) fn init() {
+     let mut acpi_info = AcpiInfo {
+         century_register: None,
+diff --git a/ostd/src/arch/x86/kernel/mod.rs b/ostd/src/arch/x86/kernel/mod.rs
+old mode 100644
+new mode 100755
+index 5e6655f..b4fe2a3
+--- a/ostd/src/arch/x86/kernel/mod.rs
++++ b/ostd/src/arch/x86/kernel/mod.rs
+@@ -10,4 +10,4 @@ pub(super) mod apic;
+ pub(super) mod kvm_clock;
+ pub(super) mod tsc;
+ 
+-pub use acpi::{ACPI_INFO, AcpiInfo};
++pub use acpi::{ACPI_INFO, AcpiInfo, for_each_aml_table};

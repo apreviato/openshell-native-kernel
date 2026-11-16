@@ -14,8 +14,8 @@ As duas entradas novas não iniciam o Desktop. O `installed-session.sh` sobe só
 
 | Arquivo | O que é |
 | --- | --- |
-| `openshell_setup.py` | A tela, em GTK, com a aparência do atualizador do Live (`update_gui.py`, cujo CSS é o mesmo). Roda como o usuário da sessão sob o supervisor (`userspace/shell`), que faz o trabalho como root e liga e desliga o computador. |
-| `setup_model.py` | O que a tela sabe sem janela: as respostas do supervisor (`install.rs`, `usb_update.rs`, `power.rs`); os fusos de `/usr/share/zoneinfo/zone1970.tab` e os layouts de `/usr/share/X11/xkb/rules/base.lst`, os mesmos arquivos que Configurações usa; e a ordem entre releases. |
+| `openshell_setup.py` | A tela, em GTK, com as cores do atualizador do Live (`update_gui.py`), em etapas: à esquerda o wordmark e as etapas (feitas, a atual e as próximas), no meio um cartão por etapa com Voltar e Continuar (Enter continua, Esc volta). Fusos e teclados em listas com busca (digitar sobre a lista busca), a hora local do fuso escolhido, o layout aplicado ao escolher e uma caixa para testá-lo, os discos em cartões com o tipo (NVMe, SATA, USB), o resumo com "Change" em cada item e o progresso em porcentagem. Roda como o usuário da sessão sob o supervisor (`userspace/shell`), que faz o trabalho como root e liga e desliga o computador. |
+| `setup_model.py` | O que a tela sabe sem janela: as respostas do supervisor (`install.rs`, `usb_update.rs`, `power.rs`); o tipo de cada disco; os fusos de `/usr/share/zoneinfo/zone1970.tab` e os layouts de `/usr/share/X11/xkb/rules/base.lst`, os mesmos arquivos que Configurações usa; e a ordem entre releases. |
 | `test_setup_model.py` | Os testes do modelo (`python3 -m unittest test_setup_model`), sem GTK. |
 
 O trabalho fica com dois programas da mídia, que o supervisor roda como root:

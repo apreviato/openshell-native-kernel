@@ -57,6 +57,18 @@ class ImageData(unittest.TestCase):
             self.assertEqual(variants["br"], [("abnt2", "Portuguese (Brazil, ABNT2)")])
             self.assertEqual(model.keyboard_layouts(folder / "none.lst"), ([], {}))
 
+    def test_disk_kinds(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            for name, removable in (("sda", "0"), ("sdb", "1")):
+                (folder / name).mkdir()
+                (folder / name / "removable").write_text(removable + "\n")
+            self.assertEqual(model.disk_kind("/dev/nvme0n1", folder), "NVMe")
+            self.assertEqual(model.disk_kind("/dev/vda", folder), "VirtIO")
+            self.assertEqual(model.disk_kind("/dev/sda", folder), "SATA")
+            self.assertEqual(model.disk_kind("/dev/sdb", folder), "USB")
+            self.assertEqual(model.disk_kind("/dev/sdc", folder), "")
+
 
 class SupervisorSocket(unittest.TestCase):
     def test_a_line_each_way(self):

@@ -104,6 +104,25 @@ def disk_model(device, sysfs=Path("/sys/block")):
     return " ".join(words)
 
 
+def disk_kind(device, sysfs=Path("/sys/block")):
+    """How the disk is attached, for its badge: NVMe, VirtIO, eMMC or SD,
+    USB (a medium the kernel calls removable) or SATA; "" when unknown."""
+    name = Path(device).name
+    if name.startswith("nvme"):
+        return "NVMe"
+    if name.startswith("vd"):
+        return "VirtIO"
+    if name.startswith("mmcblk"):
+        return "eMMC · SD"
+    if name.startswith("sd"):
+        try:
+            removable = (sysfs / name / "removable").read_text().strip() == "1"
+        except OSError:
+            return ""
+        return "USB" if removable else "SATA"
+    return ""
+
+
 def time_zones(zoneinfo=ZONEINFO):
     """The time zones, by region: {"America": ["Sao_Paulo", …], …}, as tzdata's
     zone1970.tab lists them (Settings ▸ Date & time shows the same files)."""

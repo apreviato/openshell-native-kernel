@@ -678,6 +678,8 @@ let
       install -m 0644 ${probes}/image-boot.sh "$out/opt/openshell-compat/image-boot.sh"
       install -m 0644 ${probes}/installed-session.sh "$out/opt/openshell-compat/installed-session.sh"
       install -m 0644 ${probes}/installed-storage.sh "$out/opt/openshell-compat/installed-storage.sh"
+      # The live medium's diagnostic report on the stick (installed-session.sh).
+      install -m 0644 ${probes}/diagnostics.sh "$out/opt/openshell-compat/diagnostics.sh"
       install -m 0644 ${bootRoot} "$out/opt/openshell-compat/boot-root.cpio"
     ''}
     install -m 0644 ${probes}/hostd-smoke.mjs ${probes}/unprivileged.py ${probes}/node.mjs ${probes}/python.py ${probes}/inotify.py ${probes}/namespaces.py "$out/opt/openshell-compat/"

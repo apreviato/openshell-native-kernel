@@ -707,6 +707,14 @@ EOF
 fi
 "$root/bin/openshell-session" "$config" >> "$data/openshell/session-logs/supervisor.log" 2>&1 &
 supervisor=$!
+# The live medium's diagnostic report (diagnostics.sh), OSNDIAG.TXT on the
+# stick: a minute after the session starts, once the drivers and the Wi-Fi
+# service have had their go, and again eight minutes later.
+diagnostics=
+if [ "$mode" = live ] && [ -f "$root/diagnostics.sh" ]; then
+    sh "$root/diagnostics.sh" "$data/openshell/session-logs" 60 480 >> "$data/openshell/session-logs/diagnostics.log" 2>&1 &
+    diagnostics=$!
+fi
 trap 'kill -TERM "$supervisor" 2>/dev/null || true' HUP INT TERM
 status=0
 wait "$supervisor" || status=$?
@@ -721,6 +729,10 @@ if [ -n "$wifi" ]; then
 fi
 killall hostapd 2>/dev/null || true
 rm -f /run/openshell-wifi/hostapd.conf /run/openshell-wifi/hostapd.pid
+# A report not written yet is not (the live session starts it again).
+if [ -n "$diagnostics" ]; then
+    kill "$diagnostics" 2>/dev/null || true
+fi
 # And the SSH server, with whoever is signed in, and the printing scheduler.
 if [ -n "$ssh_service" ]; then
     kill "$ssh_service" 2>/dev/null || true

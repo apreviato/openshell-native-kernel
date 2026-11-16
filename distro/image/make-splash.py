@@ -11,8 +11,13 @@ by its geometry (openshelllive scripts/make-boot-splash.py, measured at
 1920x1080):
 
   wordmark  its left edge 151px left of the centre, baseline 18px under it
-  bar       200x3, top 39px under the centre, the 60px segment in the middle
   status    centred, baseline 67px under the centre
+
+The bar (200x3, top 39px under the centre) is not in it: GRUB cannot move
+it while it reads the system, which takes a minute from a slow stick, and a
+bar standing still looks like a hang. The kernel draws it there in
+Plymouth's colours as it starts and moves it until the session shows
+(kernel/core/comps/framebuffer/src/splash.rs, patch 0066).
 
 The image is checked in, so building the media needs no Pillow:
 
@@ -36,11 +41,6 @@ def main(theme: Path) -> None:
     frame = Image.new("RGBA", (WIDTH, HEIGHT), (*BACKGROUND, 255))
     mark = piece("wordmark.png")
     frame.alpha_composite(mark, (centre_x - 151, centre_y + 18 - WORDMARK_ASCENT))
-    track = piece("bar-track.png")
-    track_x, track_y = centre_x - track.width // 2, centre_y + 39
-    frame.alpha_composite(track, (track_x, track_y))
-    sweep = piece("bar-sweep.png")
-    frame.alpha_composite(sweep, (track_x + (track.width - sweep.width) // 2, track_y))
     status = piece("status.png")
     frame.alpha_composite(status, (centre_x - status.width // 2, centre_y + 67 - 12))
     # GRUB reads 24-bit PNGs; no alpha.
