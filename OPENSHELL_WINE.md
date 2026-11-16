@@ -1,49 +1,49 @@
-# OpenShell Native — Plano de ação para integração de aplicações Windows via Wine
+# OpenShell Native — Action plan for running Windows applications through Wine
 
-**Versão:** 1.0  
-**Data:** 12 de novembro de 2026  
-**Estado:** proposta executável; implementação de Wine no Asterinas **não validada**  
-**Base:** `OPENSHELL_NATIVE_ARCHITECTURE_FINAL.md` e *OpenShell Native — Migração do Electron para CEF*  
-**Alvo inicial:** x86-64, Asterinas + Linux ABI, OpenShell shell em Rust/CEF, apps Debian via X11/Xpra, Wine no userspace.
+**Version:** 1.0  
+**Date:** November 12, 2026  
+**Status:** actionable proposal; Wine on Asterinas **not validated**  
+**Based on:** `OPENSHELL_NATIVE_ARCHITECTURE_FINAL.md` and *OpenShell Native — Migrating from Electron to CEF*  
+**Initial target:** x86-64, Asterinas + Linux ABI, OpenShell shell in Rust/CEF, Debian apps through X11/Xpra, Wine in userspace.
 
-> **Decisão:** adicionar compatibilidade Windows como um runtime opcional gerenciado pelo mesmo App Manager usado para aplicações Linux. Manter Windows PE/Win32 fora do kernel, preservar a integração gráfica Debian e não modificar o frontend principal além de adaptadores e UX específicos.
+> **Decision:** add Windows compatibility as an optional runtime managed by the same App Manager used for Linux applications. Keep Windows PE/Win32 out of the kernel, preserve the Debian graphics integration and leave the main frontend unchanged apart from adapters and specific UX.
 
-## 1. Resultado esperado
+## 1. Expected result
 
-Ao abrir um `.exe` pelo Files ou App Launcher, OpenShell deve detectar o formato PE, selecionar Wine, preparar um prefix isolado, lançar o processo sob um usuário não privilegiado e apresentar a janela dentro do desktop web OpenShell. A janela participa de dock, foco, resize, minimize, workspace e encerramento como uma aplicação Debian. Os dados e permissões sobrevivem ao fechamento da sessão, sem conceder acesso irrestrito a arquivos do usuário.
+When a `.exe` is opened from Files or the App Launcher, OpenShell should detect the PE format, select Wine, prepare an isolated prefix, launch the process as an unprivileged user and present the window inside the OpenShell web desktop. The window takes part in the dock, focus, resize, minimise, workspaces and shutdown like a Debian application. Data and permissions survive the end of the session, without granting unrestricted access to the user's files.
 
-A primeira entrega **não** promete que todo `.exe` será compatível. Suporte a PE/Win32 depende simultaneamente da implementação Wine, das bibliotecas do userspace Debian e da semântica Linux disponível no Asterinas.
+The first delivery does **not** promise that every `.exe` will be compatible. PE/Win32 support depends at once on the Wine implementation, on the Debian userspace libraries and on the Linux semantics available on Asterinas.
 
-### 1.1 Requisitos obrigatórios
+### 1.1 Mandatory requirements
 
-- Preservar a execução de aplicações Debian ELF, GTK/Qt e CLI, incluindo a integração existente via Xpra.
-- Manter CEF multiprocesso e seu sandbox separados do Wine e de executáveis não confiáveis.
-- Usar o mesmo `Surface Registry` e o mesmo modelo lógico de janelas para apps Linux e Windows.
-- Não adicionar runtime Wine à inicialização padrão do desktop; inicializar sob demanda.
-- Usar prefix e diretórios de dados por aplicação; suporte a import/export e backup.
-- Registrar capabilities, logs, métricas e estado de compatibilidade por app.
-- Manter fallback OpenShell Live/Debian e rollback da imagem Native.
+- Preserve the execution of Debian ELF, GTK/Qt and CLI applications, including the existing Xpra integration.
+- Keep multi-process CEF and its sandbox separate from Wine and from untrusted executables.
+- Use the same `Surface Registry` and the same logical window model for Linux and Windows apps.
+- Do not add the Wine runtime to the desktop's default startup; start it on demand.
+- Use a prefix and data directories per application; support import/export and backup.
+- Record capabilities, logs, metrics and compatibility status per app.
+- Keep the OpenShell Live/Debian fallback and the Native image rollback.
 
-### 1.2 Fora do escopo inicial
+### 1.2 Out of scope at first
 
-- Drivers Windows `.sys`, anti-cheat em kernel, serviços de kernel NT e compatibilidade universal com jogos.
-- DXVK/VKD3D-Proton, DirectX 12, suporte GPU dedicado e otimizações NTSync sem prova prévia.
-- Reescrever Wine, executar processos Windows dentro do renderer CEF ou criar kernel NT.
-- Executar automaticamente instaladores desconhecidos com privilégios elevados.
+- Windows `.sys` drivers, kernel-level anti-cheat, NT kernel services and universal game compatibility.
+- DXVK/VKD3D-Proton, DirectX 12, dedicated GPU support and NTSync optimisations without prior proof.
+- Rewriting Wine, running Windows processes inside the CEF renderer or creating an NT kernel.
+- Automatically running unknown installers with elevated privileges.
 
-## 2. Arquitetura-alvo
+## 2. Target architecture
 
 ```mermaid
 flowchart TD
-  FE["OpenShell UI web — Files / Apps / Dock"] --> API["Host API — invoke / events"]
+  FE["OpenShell web UI — Files / Apps / Dock"] --> API["Host API — invoke / events"]
   API --> AM["Unified App Manager — Rust"]
-  AM --> E{ "Tipo de aplicação" }
+  AM --> E{ "Application type" }
   E -->|Web| CEF["CEF app/browser context"]
   E -->|ELF| LIN["Debian App Runner"]
   E -->|PE32 / PE32+| WIN["Wine Runner"]
   WIN --> PM["Wine Prefix Manager"]
   WIN --> WI["Wine + wineserver + Win32 DLLs"]
-  LIN --> GB["Linux Graphics Bridge — Xpra/X11 inicial"]
+  LIN --> GB["Linux Graphics Bridge — Xpra/X11 first"]
   WI --> GB
   GB --> SR["OpenShell Surface Registry"]
   CEF --> SR
@@ -54,32 +54,32 @@ flowchart TD
   ABI --> K["Asterinas Rust kernel"]
 ```
 
-**Princípio de coesão:** reconhecer PE e iniciar Wine são responsabilidades do App Manager/runner; tradução Win32 é responsabilidade do Wine; integração de janelas é responsabilidade da ponte gráfica; governança de janelas continua no frontend via Surface Registry. Não criar um segundo window manager Windows.
+**Cohesion principle:** recognising PE and starting Wine are the App Manager's/runner's responsibilities; Win32 translation is Wine's; window integration is the graphics bridge's; window governance stays in the frontend through the Surface Registry. Do not create a second, Windows window manager.
 
-### 2.1 Responsabilidades e limites
+### 2.1 Responsibilities and limits
 
-| Componente | Responsabilidade | Não deve fazer |
+| Component | Responsibility | Must not |
 |---|---|---|
-| `AppRegistry` | Cadastro, associação de arquivos, ícones, comandos, tipo de runtime | Interpretar DLLs/PE ou executar comandos arbitrários |
-| `AppManager` | Lifecycle e identidade da aplicação, capabilities, escolha de runner | Implementar lógica Wine internamente |
-| `WineRunner` | Resolver runtime, iniciar `wine`, acompanhar PID, wineserver, exit, logs | Controlar layout de janelas |
-| `WinePrefixManager` | Criar, migrar, fazer backup e limpar prefix por app | Tratar prefix como sandbox de segurança |
-| `LinuxGraphicsBridge` | Associar janelas X11/Xpra e eventos à aplicação | Reescrever widgets do aplicativo |
-| `SurfaceRegistry` | Geometria, foco, z-order, visibilidade, workspace | Transportar pixels pela API JS |
-| `PermissionBroker` | Exigir consentimento e limitar filesystem/rede/dispositivos | Confiar apenas nas permissões do Wine |
-| `Asterinas` | ABI Linux, processos, VFS, memória, sinais, IPC e drivers | Expor Win32 como syscalls de kernel |
+| `AppRegistry` | Registration, file associations, icons, commands, runtime type | Interpret DLLs/PE or run arbitrary commands |
+| `AppManager` | Application lifecycle and identity, capabilities, choice of runner | Implement Wine logic internally |
+| `WineRunner` | Resolve the runtime, start `wine`, track PID, wineserver, exit, logs | Control window layout |
+| `WinePrefixManager` | Create, migrate, back up and clean the per-app prefix | Treat the prefix as a security sandbox |
+| `LinuxGraphicsBridge` | Associate X11/Xpra windows and events with the application | Rewrite the application's widgets |
+| `SurfaceRegistry` | Geometry, focus, z-order, visibility, workspace | Carry pixels through the JS API |
+| `PermissionBroker` | Require consent and limit filesystem/network/devices | Rely on Wine's permissions alone |
+| `Asterinas` | Linux ABI, processes, VFS, memory, signals, IPC and drivers | Expose Win32 as kernel syscalls |
 
-## 3. Formato de execução e contrato
+## 3. Execution format and contract
 
-### 3.1 Detecção de executáveis
+### 3.1 Detecting executables
 
-- Reconhecer magic `MZ`, localizar e validar o cabeçalho `PE\0\0`, machine e seções sem confiar na extensão `.exe`.
-- `PE32` e `PE32+` são candidatos a Wine; não executar DLL isolada como aplicativo sem um entry point apropriado.
-- Bloquear PE de arquitetura não suportada, binários malformados e caminhos fora das capabilities concedidas.
-- Não usar detecção de extensão como evidência suficiente; mostrar a origem, assinatura quando houver e risco de execução.
-- Para `.msi`, expor fluxo separado via `msiexec`, somente após a primeira fase de instaladores.
+- Recognise the `MZ` magic, locate and validate the `PE\0\0` header, machine and sections without trusting the `.exe` extension.
+- `PE32` and `PE32+` are Wine candidates; do not run a standalone DLL as an application without a proper entry point.
+- Block PE files of unsupported architectures, malformed binaries and paths outside the granted capabilities.
+- Do not treat the extension as sufficient evidence; show the origin, the signature when there is one and the risk of running it.
+- For `.msi`, expose a separate flow through `msiexec`, only after the first installer phase.
 
-### 3.2 Contrato sugerido
+### 3.2 Suggested contract
 
 ```rust
 pub enum RuntimeKind {
@@ -110,15 +110,15 @@ pub enum LaunchStatus {
 }
 ```
 
-O exemplo define o modelo lógico, não uma API Rust já existente. Em implementação real, `LaunchRequest` deve referir identificadores/capabilities, não aceitar caminhos arbitrários fornecidos diretamente pelo renderer; validações, quotas e autorização devem ocorrer no host.
+The example defines the logical model, not an existing Rust API. In a real implementation, `LaunchRequest` should refer to identifiers/capabilities and not accept arbitrary paths supplied directly by the renderer; validation, quotas and authorisation must happen in the host.
 
-### 3.3 Eventos de lifecycle
+### 3.3 Lifecycle events
 
-`app.started`, `app.window-attached`, `app.focus-changed`, `app.exited`, `app.crashed`, `app.permission-required`, `wine.prefix-created`, `wine.prefix-migration-failed`, `wine.compatibility-warning`. Todos carregam `app_id`, `instance_id`, geração e timestamp; IDs de janela são atribuídos pelo host e vinculados à identidade do processo.
+`app.started`, `app.window-attached`, `app.focus-changed`, `app.exited`, `app.crashed`, `app.permission-required`, `wine.prefix-created`, `wine.prefix-migration-failed`, `wine.compatibility-warning`. All of them carry `app_id`, `instance_id`, generation and timestamp; window IDs are assigned by the host and bound to the process identity.
 
-## 4. Organização do código
+## 4. Code organisation
 
-Ajustar os diretórios depois de conferir os repositórios reais; esta árvore é um alvo proposto, não uma afirmação sobre os arquivos atuais.
+Adjust the directories after checking the real repositories; this tree is a proposed target, not a statement about the current files.
 
 ```text
 openshell-native/
@@ -150,32 +150,32 @@ openshell-native/
 
 openshell/
 └── apps/desktop/src/
-    └── host/                  # Adaptador UI: Apps / Files / launch
+    └── host/                  # UI adapter: Apps / Files / launch
 ```
 
-## 5. Fases de implementação e critérios de aceite
+## 5. Implementation phases and acceptance criteria
 
-### Fase W0 — Inventário e baseline (bloqueante)
+### Phase W0 — Inventory and baseline (blocking)
 
-**Ações**
-1. Fixar commit de Asterinas, patches, rootfs, CEF, Xpra e versão Wine; usar Wine 11.0 estável como baseline inicial ou outra versão explicitamente fixada após comparação.
-2. Inspecionar integração Linux existente: como o App Manager lança ELF, como Xpra mapeia janelas ao desktop, como foco/resize/close são propagados.
-3. Definir fixtures reproducíveis e observar `wine --version`, dependências `ldd`, ambiente de display, filesystem e permissões.
-4. Montar a mesma imagem userspace de Wine no Linux de controle e no guest Asterinas, sem mudar versão das bibliotecas entre os experimentos.
+**Actions**
+1. Pin the commit of Asterinas, patches, rootfs, CEF, Xpra and the Wine version; use stable Wine 11.0 as the initial baseline or another version explicitly pinned after comparison.
+2. Inspect the existing Linux integration: how the App Manager launches ELF, how Xpra maps windows to the desktop, how focus/resize/close are propagated.
+3. Define reproducible fixtures and observe `wine --version`, `ldd` dependencies, the display environment, filesystem and permissions.
+4. Build the same Wine userspace image on the control Linux and in the Asterinas guest, without changing library versions between experiments.
 
-**Entrega:** `compatibility-matrix.md`, manifest de versões, runners e captura de baseline.  
-**Gate W0:** execução de app Debian continua íntegra; ambiente Wine reproduzível no Linux de controle.
+**Delivery:** `compatibility-matrix.md`, version manifest, runners and baseline capture.  
+**Gate W0:** Debian app execution remains intact; the Wine environment is reproducible on the control Linux.
 
-### Fase W1 — Wine em userspace, sem integração com desktop
+### Phase W1 — Wine in userspace, without desktop integration
 
-**Ações**
-1. Empacotar Wine, bibliotecas, fontes, dependências X11 e utilitários necessários no rootfs; registrar licença e checksum dos pacotes.
-2. Criar prefix isolado em diretório persistente do usuário e executar `wineboot -i`, `winecfg` e `wine notepad.exe` sob X11/Xpra.
-3. Capturar primeira falha em Asterinas: syscall, flag, errno, ioctl, IPC, mmap, futex, sinal ou dependência userspace ausente. Reproduzir com um caso mínimo.
-4. Criar testes Linux controle vs Asterinas e abrir issue upstream apenas quando o bug estiver localizado.
-5. Não desativar sandbox ou rodar Wine como root para contornar bloqueios.
+**Actions**
+1. Package Wine, libraries, fonts, X11 dependencies and the required utilities in the rootfs; record each package's licence and checksum.
+2. Create an isolated prefix in a persistent user directory and run `wineboot -i`, `winecfg` and `wine notepad.exe` under X11/Xpra.
+3. Capture the first failure on Asterinas: syscall, flag, errno, ioctl, IPC, mmap, futex, signal or missing userspace dependency. Reproduce it with a minimal case.
+4. Create control-Linux vs Asterinas tests and open an upstream issue only once the bug is located.
+5. Do not disable the sandbox or run Wine as root to get around blockers.
 
-**Comandos de diagnóstico (somente laboratório, paths de exemplo):**
+**Diagnostic commands (lab only, example paths):**
 
 ```bash
 export WINEPREFIX="$HOME/.local/share/openshell/wine/prefixes/smoke-notepad"
@@ -185,183 +185,183 @@ wine notepad.exe
 wineserver -w
 ```
 
-**Gate W1:** `wineboot` conclui, Notepad abre e fecha sem processos órfãos no Linux controle e no Asterinas; logs identificam versão e configuração. Se o guest falhar, fase permanece aberta com lacunas documentadas.
+**Gate W1:** `wineboot` completes, Notepad opens and closes without orphan processes on the control Linux and on Asterinas; the logs identify the version and configuration. If the guest fails, the phase stays open with the gaps documented.
 
-### Fase W2 — App Manager + associação de `.exe`
+### Phase W2 — App Manager + `.exe` association
 
-**Ações**
-1. Adicionar `RuntimeKind::Wine` ao registro de apps e detecção PE no host.
-2. Criar `WineRunner` como adaptador do App Manager; runner inicia somente sob demanda, sem daemon global obrigatório.
-3. Associar `.exe` a ação **Abrir com Wine**, inicialmente explícita e sujeita a confirmação para executáveis não confiáveis.
-4. Controlar process group, PID, wineserver, cancelamento, timeout, logs e cleanup. Não confundir fechamento de uma janela com conclusão de um instalador multiprocesso.
-5. Expor estados `starting/running/failed/exited` e erros compreensíveis na UI do OpenShell.
+**Actions**
+1. Add `RuntimeKind::Wine` to the app registry and PE detection to the host.
+2. Create `WineRunner` as an App Manager adapter; the runner starts only on demand, with no mandatory global daemon.
+3. Associate `.exe` with an **Open with Wine** action, explicit at first and subject to confirmation for untrusted executables.
+4. Control the process group, PID, wineserver, cancellation, timeout, logs and cleanup. Do not mistake the closing of one window for the completion of a multi-process installer.
+5. Expose `starting/running/failed/exited` states and understandable errors in the OpenShell UI.
 
-**Gate W2:** clicar duas vezes em um `.exe` suportado abre a aplicação com ícone e identidade no App Manager; fechar o app limpa os processos previstos sem encerrar outras aplicações.
+**Gate W2:** double-clicking a supported `.exe` opens the application with its icon and identity in the App Manager; closing the app cleans up the expected processes without ending other applications.
 
-### Fase W3 — Janelas Wine incorporadas ao desktop
+### Phase W3 — Wine windows embedded in the desktop
 
-**Ações**
-1. Reutilizar o caminho X11/Xpra de aplicações Debian e vincular janelas Wine à instância do App Manager; garantir vínculo por X11 metadata, PID/process tree e tokens da sessão, sem confiar apenas em títulos.
-2. Publicar `surfaceId`, `appId`, `instanceId`, `generation`, retângulo, escala, foco, z-order e visibilidade no `SurfaceRegistry`.
-3. Testar múltiplas janelas de um mesmo processo, diálogos modais, menus, file picker, clipboard, drag/drop, IME, resize, minimize e workspace.
-4. Evitar transportar bitmap inteiro através de JS; a UI apenas organiza a janela, enquanto a ponte transporta a superfície.
-5. Manter Xpra como caminho validado; Wayland/XWayland é experimento posterior, não dependência do MVP.
+**Actions**
+1. Reuse the X11/Xpra path of Debian applications and bind Wine windows to the App Manager instance; ensure the binding through X11 metadata, PID/process tree and session tokens, without relying on titles alone.
+2. Publish `surfaceId`, `appId`, `instanceId`, `generation`, rectangle, scale, focus, z-order and visibility in the `SurfaceRegistry`.
+3. Test multiple windows of one process, modal dialogs, menus, the file picker, clipboard, drag and drop, IME, resize, minimise and workspaces.
+4. Avoid carrying whole bitmaps through JS; the UI only arranges the window, while the bridge carries the surface.
+5. Keep Xpra as the validated path; Wayland/XWayland is a later experiment, not an MVP dependency.
 
-**Gate W3:** Notepad integrado ao dock e ao window manager do OpenShell, sem janelas órfãs e sem quebrar menus do desktop, apps Debian ou Browser CEF.
+**Gate W3:** Notepad integrated with OpenShell's dock and window manager, with no orphan windows and without breaking desktop menus, Debian apps or the CEF Browser.
 
-### Fase W4 — Prefix Manager, instalação e estado persistente
+### Phase W4 — Prefix Manager, installation and persistent state
 
-**Ações**
-1. Prefix por aplicativo: `data/wine/prefixes/<app-id>`; persistir registry, drives e arquivos. Manter cache e temporários em localização separada.
-2. Criar wizard de instalação `.exe`/`.msi` com origem, destino, prefix, componentes solicitados, progressão e log; processos de instalação podem abrir várias janelas.
-3. Expor `winecfg`, versão Wine, dependências, arquitetura e export/import de prefix (com backups e compatibilidade de versão).
-4. Mapear discos Windows apenas para diretórios explicitamente permitidos. Pasta C: virtual não equivale ao filesystem inteiro do usuário.
-5. Registrar apps instalados e atalhos; não confiar cegamente em entradas de registro nem nomes de executáveis.
-6. Em upgrades A/B, migrar prefix com backup e versão gravada; permitir rollback sem corromper perfil persistente.
+**Actions**
+1. One prefix per application: `data/wine/prefixes/<app-id>`; persist the registry, drives and files. Keep cache and temporary files in a separate location.
+2. Create an `.exe`/`.msi` installation wizard showing source, destination, prefix, requested components, progress and log; installation processes may open several windows.
+3. Expose `winecfg`, the Wine version, dependencies, architecture and prefix export/import (with backups and version compatibility).
+4. Map Windows drives only to explicitly allowed directories. A virtual C: folder is not the user's whole filesystem.
+5. Register installed apps and shortcuts; do not blindly trust registry entries or executable names.
+6. On A/B upgrades, migrate the prefix with a backup and a recorded version; allow rollback without corrupting the persistent profile.
 
-**Gate W4:** instalar e reiniciar uma aplicação de teste, conservar configurações, desinstalar e restaurar backup de prefix; confirmar que o rollback da imagem não danifica os dados.
+**Gate W4:** install and restart a test application, keep its settings, uninstall it and restore a prefix backup; confirm that an image rollback does not damage the data.
 
-### Fase W5 — Compatibilidade e performance avançadas
+### Phase W5 — Advanced compatibility and performance
 
-**Ações**
-1. Testar primeiro Win32 64-bit, depois 32-bit via WoW64, aplicações .NET e bibliotecas adicionais, com fixtures separadas.
-2. Avaliar Wine Mono, fontes e VC runtimes como dependências sob demanda, com licenças e origens verificadas.
-3. Medir lançamento, RAM e latência em apps com múltiplos processos; separar custo Wine, Xpra, CEF e kernel.
-4. Avaliar Wine Wayland driver e compositor mais direto quando existir suporte real no guest; não trocar Xpra por hipótese.
-5. Considerar NTSync apenas se um aplicativo real demonstrar gargalo relevante. Asterinas não herda automaticamente o módulo Linux; interface equivalente exigiria desenvolvimento e validação específicos.
-6. DXVK/VKD3D e jogos ficam condicionados à evolução de Vulkan/GPU e ao suporte do userspace.
+**Actions**
+1. Test 64-bit Win32 first, then 32-bit through WoW64, .NET applications and additional libraries, with separate fixtures.
+2. Evaluate Wine Mono, fonts and VC runtimes as on-demand dependencies, with verified licences and sources.
+3. Measure launch, RAM and latency in multi-process apps; separate the cost of Wine, Xpra, CEF and the kernel.
+4. Evaluate the Wine Wayland driver and a more direct compositor once the guest really supports them; do not replace Xpra on a hypothesis.
+5. Consider NTSync only if a real application shows a relevant bottleneck. Asterinas does not automatically inherit the Linux module; an equivalent interface would require specific development and validation.
+6. DXVK/VKD3D and games depend on the evolution of Vulkan/GPU and on userspace support.
 
-**Gate W5:** matriz de compatibilidade publicada, regressões monitoradas e otimizações adotadas somente após benchmark comparável.
+**Gate W5:** compatibility matrix published, regressions monitored and optimisations adopted only after a comparable benchmark.
 
-## 6. Segurança e políticas de execução
+## 6. Security and execution policies
 
-**Modelo de ameaça:** `.exe` executável é código não confiável. Wine converte chamadas do app em operações do userspace e não cria isolamento por si só. Prefix isolado previne conflito de configurações; **não é uma sandbox**.
+**Threat model:** an executable `.exe` is untrusted code. Wine turns the app's calls into userspace operations and does not create isolation by itself. An isolated prefix prevents configuration conflicts; **it is not a sandbox**.
 
-Controles obrigatórios:
-- Executar como usuário não privilegiado, nunca como root.
-- Permissões por app/capability, com consentimento para diretórios adicionais, rede e integração de clipboard quando aplicável.
-- Restringir montagem de volumes e symlinks; impedir que o mapeamento `Z:` exponha todo o filesystem sem consentimento.
-- Isolamento adicional por namespaces, credenciais e filtros somente onde houver suporte real no Asterinas e testes de fronteira; declarar explicitamente quando uma proteção estiver indisponível.
-- Não permitir chamadas diretas de sites web ao `WineRunner`; acesso somente pelo App Manager autenticado e autorizado.
-- Limites de processo, memória, I/O e recursos, quando o kernel disponibilizar mecanismos adequados; fallback controlado, não simulacro de isolamento.
-- Instalação de dependências com fontes verificadas; logs devem redigir tokens, diretórios privados sensíveis e outras credenciais.
-- Diferenciar confiança do `.exe` de sua assinatura: assinatura não garante segurança.
+Mandatory controls:
+- Run as an unprivileged user, never as root.
+- Per-app/capability permissions, with consent for additional directories, network and clipboard integration where applicable.
+- Restrict volume mounts and symlinks; prevent the `Z:` mapping from exposing the whole filesystem without consent.
+- Additional isolation through namespaces, credentials and filters only where Asterinas really supports them and boundary tests exist; state explicitly when a protection is unavailable.
+- Do not allow websites to call the `WineRunner` directly; access only through the authenticated and authorised App Manager.
+- Process, memory, I/O and resource limits, when the kernel offers suitable mechanisms; a controlled fallback, not a pretence of isolation.
+- Install dependencies from verified sources; logs must redact tokens, sensitive private directories and other credentials.
+- Distinguish trust in a `.exe` from its signature: a signature does not guarantee safety.
 
-**Bloqueio de lançamento:** se não houver isolamento mínimo para o perfil de risco de um aplicativo, o OpenShell deve negar a execução ou comunicar claramente o ambiente experimental; nunca conceder permissões silenciosamente.
+**Launch block:** if there is no minimum isolation for an application's risk profile, OpenShell must refuse to run it or clearly communicate that the environment is experimental; never grant permissions silently.
 
-## 7. Compatibilidade Linux/Asterinas — checklist de diagnóstico
+## 7. Linux/Asterinas compatibility — diagnostic checklist
 
-Verificar no Linux controle e no Asterinas (sem presumir suporte):
+Check on the control Linux and on Asterinas (without assuming support):
 
-| Área | Exemplos de testes | Sintoma |
+| Area | Example tests | Symptom |
 |---|---|---|
-| Processos | clone/fork/exec, wait, signals, process groups | Wine não inicia ou processos órfãos |
-| Memória | mmap/mprotect, TLS, shared memory | crash em loader/DLL |
-| Sincronização | futex, waits, timers, eventfd | deadlock/CPU alto |
-| IPC | Unix sockets, pipes, wineserver | programas travam na inicialização |
-| Filesystem | case sensitivity, symlinks, rename, locking, fsync | prefix/instalador danificado |
-| Desktop | X11 sockets, clipboard, IME, dialogs | janela invisível ou input incorreto |
-| Rede | TCP/UDP, DNS, TLS, proxy | aplicações sem conectividade |
-| Áudio | backend disponível no userspace | reprodução/gravação indisponíveis |
-| GPU | OpenGL, Vulkan, Mesa, DRM | fallback software / tela preta |
-| Isolamento | user/pid/mount namespaces e filtros suportados | app sem fronteira de segurança |
+| Processes | clone/fork/exec, wait, signals, process groups | Wine does not start, or orphan processes |
+| Memory | mmap/mprotect, TLS, shared memory | crash in the loader/DLL |
+| Synchronisation | futex, waits, timers, eventfd | deadlock/high CPU |
+| IPC | Unix sockets, pipes, wineserver | programs hang at startup |
+| Filesystem | case sensitivity, symlinks, rename, locking, fsync | damaged prefix/installer |
+| Desktop | X11 sockets, clipboard, IME, dialogs | invisible window or wrong input |
+| Network | TCP/UDP, DNS, TLS, proxy | applications without connectivity |
+| Audio | backend available in userspace | playback/recording unavailable |
+| GPU | OpenGL, Vulkan, Mesa, DRM | software fallback / black screen |
+| Isolation | supported user/pid/mount namespaces and filters | app without a security boundary |
 
-Registrar a **primeira falha reproduzível**, versão kernel/Wine, host/guest, syscall, retorno, trace e fixture. Abrir alterações no kernel apenas quando o teste demonstrar que o problema está realmente na ABI e não no rootfs, Wine ou bridge gráfica.
+Record the **first reproducible failure**, kernel/Wine version, host/guest, syscall, return value, trace and fixture. Make kernel changes only when the test shows the problem really is in the ABI and not in the rootfs, Wine or the graphics bridge.
 
-## 8. Matriz de testes de aceitação
+## 8. Acceptance test matrix
 
-| ID | Cenário | Critério |
+| ID | Scenario | Criterion |
 |---|---|---|
-| WIN-001 | Inicializar prefix | `wineboot` sem erro e sem acesso fora das permissões |
-| WIN-002 | Executar Wine Notepad | Janela visível e funcional; fechamento limpo |
-| WIN-003 | Abrir `.exe` via Files | PE detectado; seleção Wine; identidade no dock |
-| WIN-004 | Foco e resize | Input, z-index, escala e resize corretos |
-| WIN-005 | Diálogos e múltiplas janelas | Filhos/modais vinculados à instância original |
-| WIN-006 | Múltiplos apps | Dois prefixes isolados e processos independentes |
-| WIN-007 | Reabrir sessão | Estado preservado; sem processos órfãos |
-| WIN-008 | App não confiável | Nenhuma permissão extra sem autorização |
-| WIN-009 | Apps Debian | GTK/Qt continuam funcionando no mesmo desktop |
-| WIN-010 | Browser CEF | Cookies e sandbox de páginas não expõem Wine/host |
-| WIN-011 | Upgrade e rollback | Prefix íntegro ao retornar versão anterior |
-| WIN-012 | Falha Wine/Xpra | Erro diagnosticável sem derrubar OpenShell UI |
-| WIN-013 | WoW64 | App 32-bit de teste sob runtime compatível |
-| WIN-014 | Performance | Diferenças medidas contra Linux controle |
+| WIN-001 | Initialise a prefix | `wineboot` without errors and without access outside the permissions |
+| WIN-002 | Run Wine Notepad | Visible, working window; clean shutdown |
+| WIN-003 | Open a `.exe` from Files | PE detected; Wine selected; identity in the dock |
+| WIN-004 | Focus and resize | Correct input, z-index, scale and resize |
+| WIN-005 | Dialogs and multiple windows | Children/modals bound to the original instance |
+| WIN-006 | Multiple apps | Two isolated prefixes and independent processes |
+| WIN-007 | Reopening the session | State preserved; no orphan processes |
+| WIN-008 | Untrusted app | No extra permission without authorisation |
+| WIN-009 | Debian apps | GTK/Qt keep working on the same desktop |
+| WIN-010 | CEF Browser | Cookies and the page sandbox do not expose Wine/host |
+| WIN-011 | Upgrade and rollback | Prefix intact when going back to the previous version |
+| WIN-012 | Wine/Xpra failure | A diagnosable error without bringing down the OpenShell UI |
+| WIN-013 | WoW64 | 32-bit test app under a compatible runtime |
+| WIN-014 | Performance | Differences measured against the control Linux |
 
-**Critério de liberação experimental:** WIN-001 a WIN-012, exceto WIN-011 que só se torna obrigatório quando a instalação A/B estiver habilitada. WIN-013 e WIN-014 são gates para ampliar compatibilidade, não para a primeira prova técnica.
+**Experimental release criterion:** WIN-001 to WIN-012, except WIN-011, which only becomes mandatory once A/B installation is enabled. WIN-013 and WIN-014 are gates for broadening compatibility, not for the first technical proof.
 
-## 9. Observabilidade e medição
+## 9. Observability and measurement
 
-Cada execução deve gerar `run_id`, `app_id`, `instance_id`, versão Wine, hash do `.exe` (sem compartilhar binário), kernel build ID, versão do rootfs, backend gráfico, prefix ID, tempos `request → wine spawned → first window → interactive`, RAM, CPU e código de saída.
+Each run should produce `run_id`, `app_id`, `instance_id`, Wine version, the `.exe` hash (without sharing the binary), kernel build ID, rootfs version, graphics backend, prefix ID, the times `request → wine spawned → first window → interactive`, RAM, CPU and exit code.
 
-Métricas prioritárias: startup frio/quente, RAM adicional em repouso, processos persistentes, tempo para primeira janela interativa, latência de entrada e resize, FPS quando relevante, falhas de render, operações de disco e estabilidade em múltiplas sessões. Comparar Wine no mesmo Linux de controle com e sem a integração OpenShell; depois comparar com Asterinas usando as mesmas fixtures.
+Priority metrics: cold/warm startup, extra RAM at rest, persistent processes, time to the first interactive window, input and resize latency, FPS when relevant, rendering failures, disk operations and stability across multiple sessions. Compare Wine on the same control Linux with and without the OpenShell integration; then compare with Asterinas using the same fixtures.
 
-Não estabelecer metas numéricas arbitrárias antes de medir baseline. Registrar p50/p95 e regressões por versão.
+Do not set arbitrary numeric targets before measuring a baseline. Record p50/p95 and regressions per version.
 
-## 10. Riscos e mitigação
+## 10. Risks and mitigation
 
-| Risco | Impacto | Mitigação |
+| Risk | Impact | Mitigation |
 |---|---|---|
-| Falta de syscall/semântica em Asterinas | Alto | repro mínima, patch direcionado, upstream |
-| Wine inicia mas não mostra janela | Alto | validar X11/Xpra isolado antes da UI |
-| Wine exige bibliotecas adicionais | Médio | rootfs de compatibilidade com dependências fixadas |
-| Executável Windows acessa arquivos privados | Crítico | capabilities, usuário limitado, isolamento comprovado |
-| Prefix corrompido após atualização | Alto | backup, migração versionada e rollback |
-| Performance ruim de composição | Médio/alto | superfície nativa, medir cópias, evitar JS pixels |
-| Instalações multiprocesso | Médio | lifecycle por árvore de processos e wineserver |
-| GPU/Vulkan insuficiente | Alto para jogos | não prometer jogos no MVP; fallback software |
-| Atualizações Wine quebram apps | Médio | runtime versionado e compatibilidade por prefix |
+| Missing syscall/semantics in Asterinas | High | minimal repro, targeted patch, upstream |
+| Wine starts but shows no window | High | validate X11/Xpra in isolation before the UI |
+| Wine needs additional libraries | Medium | compatibility rootfs with pinned dependencies |
+| A Windows executable reads private files | Critical | capabilities, limited user, proven isolation |
+| Prefix corrupted after an update | High | backup, versioned migration and rollback |
+| Poor composition performance | Medium/high | native surface, measure copies, avoid JS pixels |
+| Multi-process installations | Medium | lifecycle by process tree and wineserver |
+| Insufficient GPU/Vulkan | High for games | do not promise games in the MVP; software fallback |
+| Wine updates break apps | Medium | versioned runtime and per-prefix compatibility |
 
-## 11. Plano de entrega e dependências
+## 11. Delivery plan and dependencies
 
-| Prioridade | Entrega | Depende de | Resultado |
+| Priority | Delivery | Depends on | Result |
 |---|---|---|---|
-| P0 | W0 baseline | acesso aos builds e smoke atuais | ambiente reproduzível |
-| P0 | W1 `wineboot`/Notepad | X11/Xpra, Linux ABI | primeira janela Windows |
-| P1 | W2 launcher PE | App Manager / host API | abrir `.exe` no Files |
-| P1 | W3 integração gráfica | LinuxGraphicsBridge / Surface Registry | janela Windows gerenciada pelo OpenShell |
-| P1 | Segurança mínima auditável | permissões / isolamento real | lançamento controlado |
-| P2 | W4 instaladores/prefixes | persistência e A/B | aplicações instaláveis |
-| P3 | W5 WoW64/.NET/DXVK | compatibilidade e drivers | ecossistema expandido |
+| P0 | W0 baseline | access to the current builds and smokes | reproducible environment |
+| P0 | W1 `wineboot`/Notepad | X11/Xpra, Linux ABI | first Windows window |
+| P1 | W2 PE launcher | App Manager / host API | open `.exe` from Files |
+| P1 | W3 graphics integration | LinuxGraphicsBridge / Surface Registry | Windows window managed by OpenShell |
+| P1 | Auditable minimum security | permissions / real isolation | controlled launch |
+| P2 | W4 installers/prefixes | persistence and A/B | installable applications |
+| P3 | W5 WoW64/.NET/DXVK | compatibility and drivers | broader ecosystem |
 
-### Política de fallback
+### Fallback policy
 
-- Feature flag `native.wine.enabled=false` por padrão até WIN-001..012 exigidos para release experimental.
-- Em erro do Wine, preservar sessão CEF/host; mostrar diagnóstico e opção de tentar novamente.
-- Em falha do backend gráfico, manter launcher Linux e Wine desabilitados, sem comprometer as aplicações web.
-- Não reverter prefix automaticamente sem snapshot/backup; informar migração incompatível.
-- Manter OpenShell Live/Debian como referência e caminho de retorno.
+- Feature flag `native.wine.enabled=false` by default until WIN-001..012 are required for an experimental release.
+- On a Wine error, keep the CEF/host session; show diagnostics and an option to try again.
+- If the graphics backend fails, keep the Linux and Wine launchers disabled, without affecting the web applications.
+- Do not revert a prefix automatically without a snapshot/backup; report an incompatible migration.
+- Keep OpenShell Live/Debian as the reference and the way back.
 
-## 12. Definition of Done para o primeiro marco integrado
+## 12. Definition of Done for the first integrated milestone
 
-- [ ] Mesma versão Wine inicia no Linux controle e no Asterinas.
-- [ ] `wineboot` passa em prefix isolado persistente.
-- [ ] Notepad do Wine é renderizado via X11/Xpra na janela OpenShell.
-- [ ] Dock, focus, resize, minimizar, maximizar e fechar funcionam.
-- [ ] Não há processos Wine órfãos após o encerramento esperado da aplicação/sessão.
-- [ ] Abertura de `.exe` pelo Files usa o App Manager e pede autorização.
-- [ ] Aplicações Debian e Browser CEF passam novamente pelos seus smokes.
-- [ ] Dados privados não são expostos implicitamente via drives Wine.
-- [ ] Logs e relatórios guardam Wine/kernel/rootfs/CEF e falhas reproduzíveis.
-- [ ] Release pode desabilitar Wine por configuração, sem alterar o fluxo Linux/web.
+- [ ] The same Wine version starts on the control Linux and on Asterinas.
+- [ ] `wineboot` passes in a persistent isolated prefix.
+- [ ] Wine's Notepad is rendered through X11/Xpra in the OpenShell window.
+- [ ] Dock, focus, resize, minimise, maximise and close work.
+- [ ] No orphan Wine processes remain after the application/session ends as expected.
+- [ ] Opening a `.exe` from Files goes through the App Manager and asks for authorisation.
+- [ ] Debian applications and the CEF Browser pass their smokes again.
+- [ ] Private data is not implicitly exposed through Wine drives.
+- [ ] Logs and reports record Wine/kernel/rootfs/CEF and reproducible failures.
+- [ ] A release can disable Wine by configuration, without changing the Linux/web flow.
 
-## 13. ADRs propostos
+## 13. Proposed ADRs
 
-- **WIN-ADR-01 — Wine em userspace opcional:** aceito como direção; não incluir no kernel.
-- **WIN-ADR-02 — Unified App Manager:** estender runner existente, sem gerenciador paralelo Windows.
-- **WIN-ADR-03 — Xpra/X11 primeiro:** adotado como caminho de prova; Wayland é evolutivo.
-- **WIN-ADR-04 — Prefix por app:** isolamento de configuração obrigatório, não substitui sandbox.
-- **WIN-ADR-05 — Wine versionado:** manifest por release, upgrades testados e rollback de dados.
-- **WIN-ADR-06 — NTSync/DXVK condicionais:** não entram no MVP sem evidência de necessidade e suporte.
+- **WIN-ADR-01 — Optional Wine in userspace:** accepted as the direction; not included in the kernel.
+- **WIN-ADR-02 — Unified App Manager:** extend the existing runner, with no parallel Windows manager.
+- **WIN-ADR-03 — Xpra/X11 first:** adopted as the proof path; Wayland comes later.
+- **WIN-ADR-04 — One prefix per app:** mandatory configuration isolation; it does not replace a sandbox.
+- **WIN-ADR-05 — Versioned Wine:** a manifest per release, tested upgrades and data rollback.
+- **WIN-ADR-06 — NTSync/DXVK conditional:** not part of the MVP without evidence of need and support.
 
-## 14. Fontes e notas de verificação
+## 14. Sources and verification notes
 
-**Documentos do projeto fornecidos:** `OPENSHELL_NATIVE_ARCHITECTURE_FINAL.md` (12/11/2026) e *OpenShell Native — Migração do Electron para CEF* (11/11/2026). O segundo descreve shell Rust/CEF, X11/Openbox, `hostd`, Browser overlay, Xpra e smoke tests. Este plano não afirma ter executado ou auditado esses testes.
+**Project documents provided:** `OPENSHELL_NATIVE_ARCHITECTURE_FINAL.md` (11/12/2026) and *OpenShell Native — Migrating from Electron to CEF* (11/11/2026). The second describes the Rust/CEF shell, X11/Openbox, `hostd`, the Browser overlay, Xpra and the smoke tests. This plan does not claim to have run or audited those tests.
 
-**Referências externas:**
+**External references:**
 
-- WineHQ, *Wine 11.0 Released* (13/01/2026): https://www.winehq.org/news/2026011301 — versão estável, WoW64 e NTSync.
-- WineHQ, notícias e lançamentos: https://www.winehq.org/news/ — validar patches e versões antes de congelar runtime de produção.
-- Wine source/documentação: https://gitlab.winehq.org/wine/wine/-/wikis/Documentation
-- Asterinas: https://asterinas.github.io/book/ — compatibilidade Linux e limitações específicas da revisão usada.
+- WineHQ, *Wine 11.0 Released* (01/13/2026): https://www.winehq.org/news/2026011301 — stable version, WoW64 and NTSync.
+- WineHQ, news and releases: https://www.winehq.org/news/ — validate patches and versions before freezing a production runtime.
+- Wine source/documentation: https://gitlab.winehq.org/wine/wine/-/wikis/Documentation
+- Asterinas: https://asterinas.github.io/book/ — Linux compatibility and the limitations specific to the revision used.
 
-**Condição para execução do plano:** validar o estado real do repositório e os testes do guest antes de aplicar paths, patches, APIs ou estimativas. A árvore proposta e as interfaces são desenhos de implementação, não código já integrado.
+**Condition for carrying out the plan:** validate the real state of the repository and the guest's tests before applying paths, patches, APIs or estimates. The proposed tree and the interfaces are implementation designs, not code already integrated.

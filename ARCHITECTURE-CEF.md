@@ -1,301 +1,301 @@
-# OpenShell Native — Migração do Electron para CEF
+# OpenShell Native — Migrating from Electron to CEF
 
-**Decisão de arquitetura · 11 de novembro de 2026**  
-**Status** Implementação experimental, com adoção condicionada à validação em Asterinas.
+**Architecture decision · November 11, 2026**  
+**Status** Experimental implementation, with adoption conditional on validation on Asterinas.
 
-O alvo do OpenShell Native passa a ser um shell em espaço de usuário que incorpora Chromium via **Chromium Embedded Framework (CEF)**. O shell em Rust, provisoriamente chamado `openshell-shell`, gerencia a sessão gráfica e integra a UI existente ao sistema. Chromium continua multiprocesso. O `hostd` atual em Node.js continua como processo local de serviços na primeira versão.
+OpenShell Native's target becomes a userspace shell that embeds Chromium through the **Chromium Embedded Framework (CEF)**. The Rust shell, provisionally called `openshell-shell`, manages the graphical session and integrates the existing UI with the system. Chromium stays multi-process. The current Node.js `hostd` stays as the local services process in the first version.
 
-Este documento atualiza a direção das etapas gráficas, de integração do Desktop e de supervisão do [plano original](ARCHITECTURE.md). A edição OpenShell Live, baseada em Debian, continua como referência funcional e opção de retorno, com o Electron existente. Os marcos de ABI Linux, armazenamento, instalação, atualização A/B e recuperação continuam definidos no plano original. A seção 10 registra as provas em Linux e no guest Asterinas.
+This document updates the direction of the graphics, Desktop integration and supervision stages of the [original plan](ARCHITECTURE.md). The OpenShell Live edition, based on Debian, remains the functional reference and the fallback option, with the existing Electron. The Linux ABI, storage, installation, A/B update and recovery milestones remain as defined in the original plan. Section 10 records the evidence on Linux and in the Asterinas guest.
 
-## 1. Decisão e alternativas
+## 1. Decision and alternatives
 
-| Opção | O que oferece | Decisão |
+| Option | What it offers | Decision |
 | --- | --- | --- |
-| CEF em um shell próprio | Biblioteca `libcef`, API C, subprocessos Chromium e controle sobre criação de browsers, navegação e integração nativa. | Alvo para a edição Native. |
-| Chromium em modo kiosk | Uma janela de navegador pronta para carregar a UI e medir a compatibilidade básica do motor. | Sonda opcional para diagnóstico. O Browser integrado exige controle de views, contexto e navegação que o shell precisará expor. |
-| Chromium Content API | Integração de baixo nível com a camada multiprocesso de renderização do Chromium. Exige assumir a manutenção do embedder e do build correspondente. | Reavaliar se surgir um requisito indispensável que o CEF não consiga atender. |
-| Electron existente | Implementação atual do Desktop, com as pontes de sistema e o Browser integrado já disponíveis. | Referência de comportamento e de desempenho no OpenShell Live durante a transição. |
+| CEF in a custom shell | The `libcef` library, a C API, Chromium subprocesses and control over browser creation, navigation and native integration. | Target for the Native edition. |
+| Chromium in kiosk mode | A ready-made browser window to load the UI and measure the engine's basic compatibility. | Optional probe for diagnostics. The integrated Browser needs control over views, context and navigation that the shell will have to expose. |
+| Chromium Content API | Low-level integration with Chromium's multi-process rendering layer. It means taking on the maintenance of the embedder and the matching build. | Reconsider if an essential requirement arises that CEF cannot meet. |
+| Existing Electron | The current Desktop implementation, with the system bridges and the integrated Browser already available. | Behaviour and performance reference on OpenShell Live during the transition. |
 
-A decisão dá ao Native controle sobre o ciclo de vida da sessão, as superfícies do Browser e a fronteira de privilégios. O ganho em tamanho, RAM e tempo de boot deve ser medido. A distribuição CEF ainda inclui Chromium, subprocessos e recursos, e o Node continua necessário para o `hostd` nessa etapa. [Componentes de uma aplicação CEF](https://github.com/chromiumembedded/cef/blob/master/docs/tutorial.md) · [Chromium Content Module](https://chromium.googlesource.com/chromium/src/+/HEAD/content/README.md)
+The decision gives Native control over the session lifecycle, the Browser surfaces and the privilege boundary. The gains in size, RAM and boot time must be measured. The CEF distribution still includes Chromium, subprocesses and resources, and Node is still needed for `hostd` at this stage. [Components of a CEF application](https://github.com/chromiumembedded/cef/blob/master/docs/tutorial.md) · [Chromium Content Module](https://chromium.googlesource.com/chromium/src/+/HEAD/content/README.md)
 
-## 2. Componentes e responsabilidades
+## 2. Components and responsibilities
 
 ```mermaid
 flowchart TD
-    OS["Asterinas e sessão X11"] --> Shell["Shell Rust e libcef"]
-    Shell --> Desktop["Renderer do Desktop"]
-    Shell --> Browser["Renderers do Browser"]
-    Shell --> Services["hostd em Node"]
+    OS["Asterinas and the X11 session"] --> Shell["Rust shell and libcef"]
+    Shell --> Desktop["Desktop renderer"]
+    Shell --> Browser["Browser renderers"]
+    Shell --> Services["hostd in Node"]
     Desktop --> Services
-    Services --> System["Arquivos, PTY e serviços do sistema"]
+    Services --> System["Files, PTY and system services"]
 ```
 
-| Componente | Responsabilidade |
+| Component | Responsibility |
 | --- | --- |
-| Asterinas e userspace Linux | Boot, ABI Linux, isolamento do kernel, memória, IPC, entrada e dispositivos de vídeo. O primeiro perfil gráfico usa X11, DRM/KMS e renderização por software conforme a pilha disponível no guest. |
-| Sessão do sistema | Iniciar a sessão gráfica, estabelecer usuário e diretórios, exigir autenticação nativa em modo instalado e supervisionar o shell. |
-| Shell Rust | Inicializar CEF, criar views, aplicar regras de navegação e permissões, traduzir entrada e geometria, intermediar operações nativas e controlar o encerramento da sessão. |
-| CEF/Chromium | Renderização, JavaScript, workers, rede web, armazenamento por contexto, subprocessos de renderer e GPU. |
-| UI compartilhada | Desktop, sessões, Files, Terminal, Coder, Browser, ferramentas e demais apps. A implementação da ponte do Desktop é selecionada pelo ambiente de execução. |
-| `hostd` e `@openshell/host-api` | Servir o bundle e fornecer o protocolo existente para operações do sistema. O `hostd` continua em Node; eventual porte para Rust é uma decisão independente. |
+| Asterinas and Linux userspace | Boot, Linux ABI, kernel isolation, memory, IPC, input and video devices. The first graphics profile uses X11, DRM/KMS and software rendering according to the stack available in the guest. |
+| System session | Start the graphical session, set up the user and directories, require native authentication in installed mode and supervise the shell. |
+| Rust shell | Initialise CEF, create views, apply navigation and permission rules, translate input and geometry, mediate native operations and control the end of the session. |
+| CEF/Chromium | Rendering, JavaScript, workers, web networking, per-context storage, renderer and GPU subprocesses. |
+| Shared UI | Desktop, sessions, Files, Terminal, Coder, Browser, tools and the other apps. The Desktop bridge implementation is selected by the runtime environment. |
+| `hostd` and `@openshell/host-api` | Serve the bundle and provide the existing protocol for system operations. `hostd` stays in Node; an eventual Rust port is a separate decision. |
 
-A sessão inicial continua usando o init disponível no guest. O shell é o único responsável pelo `hostd` que inicia. A supervisão externa acompanha o shell e sua prontidão. Se a supervisão do `hostd` migrar para o serviço de sessão, a mudança deve transferir a propriedade do processo e definir como o shell reconecta. Registrar erros de sessão com um estado de diagnóstico independente do renderer.
+The initial session keeps using the init available in the guest. The shell alone is responsible for the `hostd` it starts. External supervision watches the shell and its readiness. If `hostd` supervision moves to the session service, the change must transfer ownership of the process and define how the shell reconnects. Record session errors with a diagnostic state independent of the renderer.
 
-## 3. Da integração Electron à integração CEF
+## 3. From Electron integration to CEF integration
 
-O levantamento do código atual parte de `openshell/apps/desktop/electron/{main,preload,guestPreload}.ts`, `apps/desktop/src/{host,windows}`, `apps/desktop/hostd/{main,server}.ts` e `packages/host-api/src/{client,methods,protocol}.ts`.
+The survey of the current code starts from `openshell/apps/desktop/electron/{main,preload,guestPreload}.ts`, `apps/desktop/src/{host,windows}`, `apps/desktop/hostd/{main,server}.ts` and `packages/host-api/src/{client,methods,protocol}.ts`.
 
-| Integração existente | Alvo na edição Native | Evidência de paridade |
+| Existing integration | Target in the Native edition | Evidence of parity |
 | --- | --- | --- |
-| `BrowserWindow`, fullscreen, tela e ciclo de vida | Janela nativa do shell, com view do Desktop e observação de mudanças de tela. | Iniciar no boot, restaurar foco após diálogos e sair do fullscreen corretamente. Testar escala fracionária e mais de uma tela depois do primeiro perfil. |
-| `contextBridge` e `window.openshellElectron` | Adaptador TypeScript de capacidades do shell. Ponte assíncrona CEF restrita ao frame principal do Desktop. | Abrir UI existente, validar handshake, eventos, cancelamento e resposta a capacidades indisponíveis. |
-| `<webview>` e `guestPreload` | Instâncias de Browser CEF gerenciadas pelo shell. Eventos específicos do Browser atravessam handlers restritos. | Abas, histórico, recarga, abertura de nova janela, estado de carregamento, falha e recuperação de renderer. |
-| `session`, perfis e cookies | Contextos de requisição separados para Desktop, Browser normal e navegação privada. | Login web permanece no perfil normal, janela privada inicia vazia, cookies do shell ficam no contexto interno. |
-| Downloads, permissões, pop-ups e menus | Handlers CEF com políticas do produto e UI nativa de autorização. | Downloads concorrentes, cancelamento, diretório escolhido, permissão por origem e pop-up corretamente associado ao contexto. |
-| Clipboard, atalhos, mídia e IME | Serviços da sessão gráfica e chamadas explicitamente autorizadas pela ponte. | Ações por usuário, foco correto e ausência de entrega de eventos à aba em segundo plano. |
-| Apps Linux incorporados | Manter Xpra na trilha de apps Linux e integrar a superfície correspondente no shell. | Lançar um app GTK ou Qt real, interagir, redimensionar e fechar sem processos órfãos. |
+| `BrowserWindow`, fullscreen, display and lifecycle | A native shell window, with the Desktop view and observation of display changes. | Start at boot, restore focus after dialogs and leave fullscreen correctly. Test fractional scaling and more than one display after the first profile. |
+| `contextBridge` and `window.openshellElectron` | A TypeScript adapter for the shell's capabilities. An asynchronous CEF bridge restricted to the Desktop's main frame. | Open the existing UI, validate the handshake, events, cancellation and the answer to unavailable capabilities. |
+| `<webview>` and `guestPreload` | CEF Browser instances managed by the shell. Browser-specific events go through restricted handlers. | Tabs, history, reload, opening a new window, loading state, renderer failure and recovery. |
+| `session`, profiles and cookies | Separate request contexts for the Desktop, the normal Browser and private browsing. | Web sign-in stays in the normal profile, a private window starts empty, the shell's cookies stay in the internal context. |
+| Downloads, permissions, pop-ups and menus | CEF handlers with product policies and a native authorisation UI. | Concurrent downloads, cancellation, chosen directory, per-origin permission and pop-ups correctly tied to their context. |
+| Clipboard, shortcuts, media and IME | Graphical session services and calls explicitly authorised by the bridge. | Per-user actions, correct focus and no events delivered to a background tab. |
+| Embedded Linux apps | Keep Xpra on the Linux apps track and integrate the matching surface in the shell. | Launch a real GTK or Qt app, interact with it, resize it and close it without orphan processes. |
 
-Usar os tipos e os pontos de integração existentes sempre que a semântica coincidir. Uma fachada compatível com `window.openshellElectron` pode facilitar o primeiro protótipo se expuser apenas os métodos implementados. O alvo é um contrato de capacidades comum e versionado, com adaptadores Electron e CEF. Métodos com semântica própria do Electron devem ter comportamento equivalente demonstrado antes de entrarem no adaptador CEF.
+Use the existing types and integration points whenever the semantics match. A facade compatible with `window.openshellElectron` can ease the first prototype if it exposes only the implemented methods. The target is a common, versioned capability contract, with Electron and CEF adapters. Methods with Electron-specific semantics must have equivalent behaviour demonstrated before they enter the CEF adapter.
 
-### Integração Rust e CEF
+### Rust and CEF integration
 
-1. Executar primeiro o `cefsimple` do SDK selecionado para isolar dependências de X11, carregador dinâmico e sandbox. A aplicação Rust entra depois da comparação mínima com o binário de referência.
-2. Fixar versão de CEF/Chromium, cabeçalhos, bindings e recursos correspondentes. Usar a API C com bindings gerados a partir desses cabeçalhos ou um adaptador C++ estreito se algum ponto de integração tornar essa opção mais simples. Validar versão e compatibilidade de ABI no build e ao iniciar. [Versionamento da API CEF](https://chromiumembedded.github.io/cef/api_versioning.html)
-3. Estruturar o entry point segundo o ciclo de vida CEF. Chamar `cef_execute_process` para distinguir os subprocessos. O processo principal inicializa CEF, cria a primeira view após o contexto estar disponível e controla o loop de mensagens. O encerramento fecha os browsers, espera os callbacks de fechamento e só então encerra CEF.
-4. Confinar o FFI a um módulo, com regras explícitas de referências, ownership, strings e callbacks. Transferir trabalho bloqueante para fora das threads de UI e I/O do CEF. Nenhum panic deve atravessar a fronteira FFI. Respeitar a thread exigida por cada API e invalidar mensagens pendentes quando a view for destruída. [Processos, threads e ciclo de vida do CEF](https://chromiumembedded.github.io/cef/general_usage.html)
-5. Implementar as primeiras capacidades por contratos assíncronos. Uma requisição leva versão, ID, método e parâmetros. A resposta leva resultado ou erro tipado. O shell limita payloads, valida esquema, aplica autorização por método, impõe prazo e descarta respostas de frames que já perderam a autorização. [IPC e JavaScript no CEF](https://chromiumembedded.github.io/cef/general_usage.html#asynchronous-javascript-bindings)
+1. First run the selected SDK's `cefsimple` to isolate dependencies on X11, the dynamic loader and the sandbox. The Rust application comes after the minimal comparison with the reference binary.
+2. Pin the CEF/Chromium version, headers, bindings and the matching resources. Use the C API with bindings generated from those headers, or a narrow C++ adapter if some integration point makes that option simpler. Validate the version and ABI compatibility at build time and at startup. [CEF API versioning](https://chromiumembedded.github.io/cef/api_versioning.html)
+3. Structure the entry point according to the CEF lifecycle. Call `cef_execute_process` to tell the subprocesses apart. The main process initialises CEF, creates the first view once the context is available and controls the message loop. Shutdown closes the browsers, waits for the close callbacks and only then shuts down CEF.
+4. Confine the FFI to one module, with explicit rules for references, ownership, strings and callbacks. Move blocking work off CEF's UI and I/O threads. No panic may cross the FFI boundary. Respect the thread each API requires and invalidate pending messages when the view is destroyed. [CEF processes, threads and lifecycle](https://chromiumembedded.github.io/cef/general_usage.html)
+5. Implement the first capabilities as asynchronous contracts. A request carries a version, ID, method and parameters. The response carries a result or a typed error. The shell limits payloads, validates the schema, applies per-method authorisation, enforces a deadline and discards responses for frames that have lost their authorisation. [IPC and JavaScript in CEF](https://chromiumembedded.github.io/cef/general_usage.html#asynchronous-javascript-bindings)
 
-## 4. Origem do Desktop, hostd e isolamento
+## 4. Desktop origin, hostd and isolation
 
-### Bootstrap e ponte
+### Bootstrap and bridge
 
-O `hostd` já emite `OPENSHELL_HOSTD_READY` com uma URL inicial autenticada. Seu servidor troca o token por cookie `HttpOnly` e `SameSite=Strict` e valida a origem das conexões do protocolo. O primeiro adaptador CEF mantém o bundle servido pelo `hostd`, o transporte existente e o fluxo de autenticação, reduzindo as alterações iniciais na UI.
+`hostd` already emits `OPENSHELL_HOSTD_READY` with an authenticated initial URL. Its server exchanges the token for an `HttpOnly`, `SameSite=Strict` cookie and validates the origin of protocol connections. The first CEF adapter keeps the bundle served by `hostd`, the existing transport and the authentication flow, reducing the initial changes to the UI.
 
-1. A sessão inicia o shell com diretórios e argumentos controlados. O shell inicia o `hostd`, lê o sinal de prontidão, valida a URL como loopback na origem esperada e aplica um timeout de inicialização.
-2. O shell abre a URL inicial no contexto reservado ao Desktop. A URL com token fica restrita ao bootstrap e deve ser ocultada de logs, relatórios, menus e informações expostas ao Browser. Após a troca pelo cookie, a credencial permanece no contexto interno e a navegação segue na origem autorizada.
-3. O frontend usa o contrato `@openshell/host-api` para serviços que já existem. O IPC CEF cobre operações que pertencem à janela ou à sessão, como abrir uma aba e posicionar uma view. Identidade do browser, frame principal, origem efetiva e estado da navegação são verificados no processo principal, usando informações do CEF.
-4. A ponte revoga capacidades em navegação, reload, encerramento de frame e perda da sessão. Em uma reinicialização do `hostd`, o shell refaz o bootstrap e o renderer reconecta com uma nova sessão. O sistema descarta chamadas em andamento e informa falhas de operações que exigem intervenção.
-5. Para instalação, definir uma origem estável por perfil ou uma estratégia explícita de migração antes de ativar dados reais. Uma mudança de host, porta ou esquema afeta cookies e armazenamento web. O protótipo pode usar portas efêmeras com perfis descartáveis.
+1. The session starts the shell with controlled directories and arguments. The shell starts `hostd`, reads the readiness signal, validates the URL as loopback on the expected origin and applies a startup timeout.
+2. The shell opens the initial URL in the context reserved for the Desktop. The URL with the token is restricted to the bootstrap and must be hidden from logs, reports, menus and information exposed to the Browser. After the exchange for the cookie, the credential stays in the internal context and navigation continues on the authorised origin.
+3. The frontend uses the `@openshell/host-api` contract for services that already exist. CEF IPC covers operations that belong to the window or the session, such as opening a tab and positioning a view. The browser's identity, the main frame, the effective origin and the navigation state are checked in the main process, using CEF's information.
+4. The bridge revokes capabilities on navigation, reload, frame teardown and loss of the session. When `hostd` restarts, the shell redoes the bootstrap and the renderer reconnects with a new session. The system discards calls in flight and reports failures of operations that need intervention.
+5. For installation, define a stable origin per profile or an explicit migration strategy before enabling real data. A change of host, port or scheme affects cookies and web storage. The prototype may use ephemeral ports with disposable profiles.
 
-Uma origem interna registrada no CEF pode ser avaliada posteriormente para servir recursos do sistema. Isso exige projetar secure context, armazenamento, CSP, fetch e compatibilidade com o transporte do `hostd`. A origem precisa preservar separação de privilégios e funcionamento de workers, WebAssembly e recursos do editor. [Esquemas e recursos no CEF](https://github.com/chromiumembedded/cef/blob/master/include/cef_scheme.h)
+An internal origin registered in CEF may be evaluated later to serve system resources. That requires designing the secure context, storage, CSP, fetch and compatibility with the `hostd` transport. The origin must preserve privilege separation and the working of workers, WebAssembly and the editor's resources. [Schemes and resources in CEF](https://github.com/chromiumembedded/cef/blob/master/include/cef_scheme.h)
 
-### Contextos de navegação e autorização
+### Browsing contexts and authorisation
 
-| Contexto | Armazenamento | Privilégios |
+| Context | Storage | Privileges |
 | --- | --- | --- |
-| Desktop | Perfil próprio com dados do bundle e sessão do `hostd`. | Apenas a UI confiável e seu frame principal recebem as capacidades definidas para o Desktop. |
-| Browser normal | Perfil separado do Desktop, compartilhado apenas pelas abas da sessão normal. | Handlers de navegação e permissões web por origem. A política do shell bloqueia acesso ao endpoint privado do `hostd`. |
-| Browser privado | Contexto efêmero, descartado ao terminar a sessão privada. | Mesmas fronteiras de privilégios do Browser normal, com armazenamento próprio. |
-| Apps incorporados de terceiros | Contexto conforme identidade e política do app. | Capacidades explícitas e revogáveis. O frame incorporado usa a interface específica do app. |
+| Desktop | Its own profile with the bundle's data and the `hostd` session. | Only the trusted UI and its main frame receive the capabilities defined for the Desktop. |
+| Normal Browser | A profile separate from the Desktop, shared only by the normal session's tabs. | Navigation handlers and per-origin web permissions. The shell's policy blocks access to `hostd`'s private endpoint. |
+| Private Browser | An ephemeral context, discarded when the private session ends. | The same privilege boundaries as the normal Browser, with its own storage. |
+| Embedded third-party apps | A context according to the app's identity and policy. | Explicit, revocable capabilities. The embedded frame uses the app-specific interface. |
 
-Validar a fronteira no processo principal para cada chamada. Dados recebidos de páginas, subframes, pop-ups, callbacks de navegação ou parâmetros do renderer passam por validação. O `hostd` conserva autenticação e validações de origem e acesso. O cliente CEF separa cookies e bloqueia a navegação, os recursos e os redirecionamentos do Browser que alcancem a origem interna. Testes devem abranger aliases de loopback, redirecionamentos, requisições a subrecursos, tentativas via WebSocket e retomada após a troca de página. A política para sites locais do usuário pode permitir endereços de desenvolvimento, com proteção específica para os serviços privados do OpenShell. [Contextos de requisição no CEF](https://github.com/chromiumembedded/cef/blob/master/include/cef_request_context.h)
+Validate the boundary in the main process for every call. Data received from pages, subframes, pop-ups, navigation callbacks or renderer parameters goes through validation. `hostd` keeps its authentication and its origin and access checks. The CEF client separates cookies and blocks Browser navigation, resources and redirects that reach the internal origin. Tests must cover loopback aliases, redirects, subresource requests, WebSocket attempts and resumption after a page change. The policy for the user's local sites may allow development addresses, with specific protection for OpenShell's private services. [Request contexts in CEF](https://github.com/chromiumembedded/cef/blob/master/include/cef_request_context.h)
 
 
-## 5. Composição do Browser e entrada
+## 5. Browser composition and input
 
-A UI atual organiza as janelas no DOM. No CEF, o shell precisa ligar cada janela lógica a uma view de navegador. Uma view nativa é uma superfície da janela do shell, com geometria, foco e empilhamento próprios. A primeira prova usa uma aba e uma região retangular controlada pelo shell.
+The current UI arranges windows in the DOM. With CEF, the shell has to bind each logical window to a browser view. A native view is a surface of the shell's window, with its own geometry, focus and stacking. The first proof uses one tab and a rectangular region controlled by the shell.
 
-1. A UI publica retângulo, escala, visibilidade, ordem e foco da janela ativa por uma operação tipada. O shell valida os limites contra a área útil e associa os dados ao ID da janela lógica.
-2. O shell aplica a conversão entre pixels CSS, unidades de janela e pixels físicos uma vez por atualização. Mudanças de DPI, tela, movimento ou zoom invalidam a geometria anterior.
-3. A entrada vai à view visível e focalizada. A UI mantém controle sobre título da janela, dock e atalhos globais. Minimizar, trocar de workspace e fechar uma aba revogam a captura de entrada correspondente.
-4. Durante modais, menus e animações sobre a página, o compositor precisa respeitar a ordem visual e o recorte da UI. Testar pop-ups de formulário, menus contextuais, drag and drop, teclado, IME, seleção e acessibilidade no fluxo completo.
-5. A etapa de fullscreen valida entrada, saída, restauração de geometria e recuperação de foco em uma tela. Depois, adicionar o caso com dois monitores e conferir o comportamento em escalas diferentes.
+1. The UI publishes the active window's rectangle, scale, visibility, order and focus through a typed operation. The shell validates the bounds against the usable area and associates the data with the logical window's ID.
+2. The shell converts between CSS pixels, window units and physical pixels once per update. DPI, display, movement or zoom changes invalidate the previous geometry.
+3. Input goes to the visible, focused view. The UI keeps control of the window title, the dock and global shortcuts. Minimising, switching workspaces and closing a tab revoke the corresponding input capture.
+4. During modals, menus and animations over the page, the compositor must respect the UI's visual order and clipping. Test form pop-ups, context menus, drag and drop, keyboard, IME, selection and accessibility in the full flow.
+5. The fullscreen stage validates entering, leaving, restoring geometry and recovering focus on one display. Then add the dual-monitor case and check the behaviour at different scales.
 
-Começar com `CefBrowserView` ou uma view nativa equivalente oferecida pelo SDK fixado. Se a composição de views não conseguir preservar o empilhamento e os recortes do Desktop, testar **off-screen rendering** para o Browser. Nesse caminho, o shell recebe frames e regiões alteradas e repassa entrada ao CEF. A fila de frames deve ter limite e descarte de frames antigos, especialmente durante resize e scroll. A prova inicial pode usar renderização por software. A aceleração e o compartilhamento de buffers dependem da combinação entre CEF, Ozone, Mesa e drivers do guest, e devem ser medidos antes da adoção. [API de BrowserView](https://cef-builds.spotifycdn.com/docs/147.0/classCefBrowserView.html) · [Off-screen rendering no CEF](https://chromiumembedded.github.io/cef/general_usage.html#off-screen-rendering) · [Callbacks de renderização](https://github.com/chromiumembedded/cef/blob/master/include/cef_render_handler.h)
+Start with `CefBrowserView` or an equivalent native view offered by the pinned SDK. If view composition cannot preserve the Desktop's stacking and clipping, test **off-screen rendering** for the Browser. On that path, the shell receives frames and damaged regions and forwards input to CEF. The frame queue must be bounded and drop old frames, especially during resize and scrolling. The initial proof may use software rendering. Acceleration and buffer sharing depend on the combination of CEF, Ozone, Mesa and the guest's drivers, and must be measured before adoption. [BrowserView API](https://cef-builds.spotifycdn.com/docs/147.0/classCefBrowserView.html) · [Off-screen rendering in CEF](https://chromiumembedded.github.io/cef/general_usage.html#off-screen-rendering) · [Render callbacks](https://github.com/chromiumembedded/cef/blob/master/include/cef_render_handler.h)
 
-A escolha da composição só se fecha depois de testar uma aba com Worker, uma janela modal sobre a página e uma animação de mover e redimensionar o Browser. O resultado precisa registrar latência de entrada, uso de CPU, frequência de frames e qualidade visual em comparação com Electron no mesmo hardware ou perfil de VM.
+The choice of composition is only settled after testing a tab with a Worker, a modal window over the page and an animation that moves and resizes the Browser. The result must record input latency, CPU use, frame rate and visual quality compared with Electron on the same hardware or VM profile.
 
-## 6. Sandbox e requisitos do kernel
+## 6. Sandbox and kernel requirements
 
-O CEF usa o sandbox multiprocesso do Chromium. Em Linux, as camadas efetivas dependem da versão e das capacidades do sistema. A revisão fixada do Asterinas não implementa `seccomp`, `PR_GET_SECCOMP` nem `PR_SET_SECCOMP`. A [série de patches](kernel/patches/README.md) adiciona essas operações, e a sonda de seccomp comprova no guest a instalação e a aplicação de filtros. A mesma revisão rejeitava novos namespaces de usuário, PID e rede, que formam a outra camada do sandbox do Chromium. A série também adiciona esses namespaces, e a sonda de namespaces comprova o isolamento de identidade, processos, rede e sockets abstratos. Um resultado positivo nessas sondas é evidência de uma operação de kernel. A aprovação do Desktop exige prova de isolamento no processo Chromium real. [Sandbox do CEF no Linux](https://chromiumembedded.github.io/cef/sandbox_setup#linux) · [Sandbox Linux do Chromium](https://chromium.googlesource.com/chromium/src/+/HEAD/sandbox/linux/README.md) · [Operações documentadas no Asterinas](https://asterinas.github.io/book/kernel/linux-compatibility/syscall-flag-coverage/namespaces-cgroups-and-security/)
+CEF uses Chromium's multi-process sandbox. On Linux, the layers in effect depend on the version and on the system's capabilities. The pinned Asterinas revision does not implement `seccomp`, `PR_GET_SECCOMP` or `PR_SET_SECCOMP`. The [patch series](kernel/patches/README.md) adds those operations, and the seccomp probe proves in the guest that filters are installed and applied. The same revision rejected new user, PID and network namespaces, which form the other layer of Chromium's sandbox. The series also adds those namespaces, and the namespace probe proves the isolation of identity, processes, network and abstract sockets. A positive result in these probes is evidence of a kernel operation. Approving the Desktop requires proof of isolation in the real Chromium process. [CEF sandbox on Linux](https://chromiumembedded.github.io/cef/sandbox_setup#linux) · [Chromium's Linux sandbox](https://chromium.googlesource.com/chromium/src/+/HEAD/sandbox/linux/README.md) · [Operations documented for Asterinas](https://asterinas.github.io/book/kernel/linux-compatibility/syscall-flag-coverage/namespaces-cgroups-and-security/)
 
-| Prova | Evidência exigida |
+| Proof | Evidence required |
 | --- | --- |
-| ABI e serviços básicos | Carregamento de `libcef` e dependências, threads, memória compartilhada, sinais, IPC e sockets Unix, renderização e entrada. Usar logs e identificar a primeira syscall ou operação incompatível. |
-| Sandbox do kernel | Executar o modo `sandbox` do runner e guardar o log da aplicação do filtro. Validar os namespaces e demais mecanismos usados pela distribuição CEF fixada. |
-| Sandbox do Chromium | Iniciar como usuário comum com política de sandbox habilitada. Confirmar a criação dos subprocessos e registrar a evidência de filtragem e isolamento dos renderers. Quando a execução ocorrer sob uma sandbox externa, distinguir as restrições do host das aplicadas pelo Chromium. |
-| Fronteira da ponte | Tentar chamar operações nativas de um site, iframe, pop-up, aba privada e documento que foi navegado para outra origem. As operações devem ser negadas e a sessão do Desktop deve continuar utilizável. |
-| Operações privilegiadas | Confirmar política e consentimento para downloads, acesso a arquivos, clipboard, abertura de apps e mudanças de sistema. O Browser recebe somente as capacidades web e as ações de produto autorizadas para seu contexto. |
+| ABI and basic services | Loading `libcef` and its dependencies, threads, shared memory, signals, IPC and Unix sockets, rendering and input. Use logs and identify the first incompatible syscall or operation. |
+| Kernel sandbox | Run the runner's `sandbox` mode and keep the log of the filter being applied. Validate the namespaces and the other mechanisms used by the pinned CEF distribution. |
+| Chromium sandbox | Start as a regular user with the sandbox policy enabled. Confirm that the subprocesses are created and record the evidence of the renderers' filtering and isolation. When running under an external sandbox, distinguish the host's restrictions from those applied by Chromium. |
+| Bridge boundary | Try to call native operations from a site, an iframe, a pop-up, a private tab and a document navigated to another origin. The operations must be denied and the Desktop session must remain usable. |
+| Privileged operations | Confirm the policy and consent for downloads, file access, clipboard, opening apps and system changes. The Browser receives only the web capabilities and product actions authorised for its context. |
 
-Executar as provas primeiro em Linux de controle, depois no Asterinas com a mesma distribuição CEF e configuração. A aprovação requer sandbox efetivo e fronteiras testadas. Se o guest falhar, registrar a operação incompatível, reduzir o caso e avaliar correção no upstream ou mudança de versão. A navegação externa e a adoção como runtime de produção dependem do resultado.
+Run the proofs first on a control Linux, then on Asterinas with the same CEF distribution and configuration. Approval requires an effective sandbox and tested boundaries. If the guest fails, record the incompatible operation, reduce the case and consider an upstream fix or a version change. External browsing and adoption as the production runtime depend on the result.
 
-## 7. Build, distribuição e ciclo de vida
+## 7. Build, distribution and lifecycle
 
-- Fixar origem, versão, arquitetura e checksum do SDK e do bundle OpenShell em manifestos reproduzíveis. Usar a mesma revisão de Asterinas nos testes de comparação até que uma mudança seja justificada por evidência.
-- Empacotar `libcef`, executável ou helper de subprocessos, arquivos de recursos, locale, dados ICU e demais arquivos exigidos pelo SDK escolhido. Validar dependências dinâmicas e seus caminhos no rootfs Native. Registrar também o backend gráfico e as versões das bibliotecas usadas.
-- Executar o smoke do CEF em um rootfs limpo. O resultado deve comprovar que a imagem contém as dependências e os recursos necessários. Registrar a versão efetiva do CEF/Chromium, build ID da UI, versão do Node e ID do kernel.
-- Guardar perfis, caches regeneráveis e dados da UI em diretórios identificáveis. Manter o perfil CEF separado do Electron e preservar identidade de origem. Importar dados apenas por contratos conhecidos, começando por preferências, bookmarks e dados próprios do OpenShell. Cookies, perfis Chromium e credenciais exigem estratégia específica e teste de retorno.
-- Integrar o runtime ao manifesto da release e às atualizações A/B do Native. O conjunto kernel, userspace, shell, CEF, UI e `hostd` precisa ter compatibilidade identificável. Testar nova versão com perfil de usuário isolado antes de confirmar o slot. O OpenShell Live continua disponível para retorno durante a migração.
-- Acompanhar atualizações de segurança do Chromium e CEF, revalidar as dependências e manter avisos de licença, SBOM e checksums junto ao build. Usar o mecanismo A/B para retomar a última release aprovada em caso de regressão.
+- Pin the source, version, architecture and checksum of the SDK and of the OpenShell bundle in reproducible manifests. Use the same Asterinas revision in comparison tests until evidence justifies a change.
+- Package `libcef`, the executable or subprocess helper, resource files, locales, ICU data and the other files the chosen SDK requires. Validate the dynamic dependencies and their paths in the Native rootfs. Also record the graphics backend and the versions of the libraries used.
+- Run the CEF smoke on a clean rootfs. The result must prove that the image contains the needed dependencies and resources. Record the effective CEF/Chromium version, the UI build ID, the Node version and the kernel ID.
+- Keep profiles, regenerable caches and UI data in identifiable directories. Keep the CEF profile separate from Electron's and preserve the origin's identity. Import data only through known contracts, starting with preferences, bookmarks and OpenShell's own data. Cookies, Chromium profiles and credentials need a specific strategy and a return test.
+- Integrate the runtime into the release manifest and Native's A/B updates. The kernel, userspace, shell, CEF, UI and `hostd` set must have identifiable compatibility. Test a new version with an isolated user profile before confirming the slot. OpenShell Live remains available as a way back during the migration.
+- Follow Chromium and CEF security updates, revalidate the dependencies and keep licence notices, the SBOM and checksums with the build. Use the A/B mechanism to return to the last approved release on a regression.
 
-Estrutura proposta para o código quando a implementação iniciar:
+Proposed code layout when implementation starts:
 
-| Local | Conteúdo |
+| Location | Contents |
 | --- | --- |
-| `userspace/shell/` no Native | Processo Rust, integração CEF, regras de sessão e gestão das views. |
-| `graphics/kiosk/` no Native | Configuração de sessão X11, perfis gráficos e lançador do shell. |
-| `tools/desktop/` e `tests/` no Native | Testes CEF e testes de paridade com a referência Electron já disponível. |
-| `apps/desktop/src/host/` no OpenShell | Contrato de capacidades e adaptadores de frontend, após identificar os pontos atuais de acoplamento. |
-| `openshell/integration/` no Native | Integração do bundle da UI e `hostd` com o shell e a imagem do sistema. |
+| `userspace/shell/` in Native | The Rust process, CEF integration, session rules and view management. |
+| `graphics/kiosk/` in Native | X11 session configuration, graphics profiles and the shell launcher. |
+| `tools/desktop/` and `tests/` in Native | CEF tests and parity tests against the Electron reference already available. |
+| `apps/desktop/src/host/` in OpenShell | The capability contract and frontend adapters, after identifying the current coupling points. |
+| `openshell/integration/` in Native | Integration of the UI bundle and `hostd` with the shell and the system image. |
 
-## 8. Fases e critérios de avanço
+## 8. Phases and criteria for moving on
 
-| Fase | Entrega | Critério para avançar |
+| Phase | Delivery | Criterion for moving on |
 | --- | --- | --- |
-| 0 · Referências | Resultado de `smoke`, `control`, `compat` e `sandbox` no Native, mais o comportamento de referência Electron no OpenShell Live. | Build IDs e logs guardados. Diagnóstico dos bloqueios de ABI e isolamento. |
-| 1 · CEF mínimo | `cefsimple` com uma fixture local em X11 no Linux de controle e no guest Asterinas. | Janela aparece, recebe teclado e mouse, renderiza e fecha. Subprocessos e sandbox são comprovados. |
-| 2 · Shell Rust e Desktop | FFI, ciclo de vida CEF, sessão, bootstrap do `hostd` e UI real. | Desktop, Files e Terminal iniciam. Reiniciar `hostd` e renderer recupera a sessão com erros observáveis e sem vazar credenciais. |
-| 3 · Browser integrado | Aba CEF gerenciada pelo shell, contexto separado, entrada, geometria e Web Worker. | Aba, Worker, modais, resize, troca de foco e casos negativos da ponte passam. A composição atende à UI atual. |
-| 4 · Paridade do Desktop | Abas normais e privadas, downloads, pop-ups, permissões, fullscreen, atalhos e clipboard. | Matriz de cenários passa no Native e é comparada com Electron. As diferenças têm decisões de produto explícitas. |
-| 5 · Candidato instalável | Runtime empacotado, persistência, atualização A/B e recuperação em VM. | Boot e atualização repetíveis. Perfis preservados ou migrados, rollback validado e release do runtime rastreável. |
+| 0 · References | Results of `smoke`, `control`, `compat` and `sandbox` on Native, plus the Electron reference behaviour on OpenShell Live. | Build IDs and logs kept. Diagnosis of the ABI and isolation blockers. |
+| 1 · Minimal CEF | `cefsimple` with a local fixture on X11 on the control Linux and in the Asterinas guest. | The window appears, receives keyboard and mouse, renders and closes. Subprocesses and the sandbox are proven. |
+| 2 · Rust shell and Desktop | FFI, CEF lifecycle, session, `hostd` bootstrap and the real UI. | Desktop, Files and Terminal start. Restarting `hostd` and the renderer recovers the session with observable errors and without leaking credentials. |
+| 3 · Integrated Browser | A CEF tab managed by the shell, a separate context, input, geometry and Web Worker. | Tab, Worker, modals, resize, focus changes and the bridge's negative cases pass. The composition serves the current UI. |
+| 4 · Desktop parity | Normal and private tabs, downloads, pop-ups, permissions, fullscreen, shortcuts and clipboard. | The scenario matrix passes on Native and is compared with Electron. Differences have explicit product decisions. |
+| 5 · Installable candidate | Packaged runtime, persistence, A/B updates and recovery in a VM. | Repeatable boot and update. Profiles preserved or migrated, rollback validated and the runtime release traceable. |
 
-O modo `sandbox` e o [smoke Electron já implementado](tools/desktop/smoke.mjs) são pontos de partida para as provas. O teste Electron continua como referência. O smoke CEF deve emitir relatório próprio com revisão do kernel, versão do SDK, tipo de composição, backend gráfico, resultados de isolamento, log e captura da fixture.
+The `sandbox` mode and the [Electron smoke already implemented](tools/desktop/smoke.mjs) are starting points for the proofs. The Electron test remains the reference. The CEF smoke must produce its own report with the kernel revision, SDK version, composition type, graphics backend, isolation results, log and a capture of the fixture.
 
-Para comparar desempenho, registrar boot até o primeiro frame utilizável, tempo até o `hostd` autenticado, primeira aba, consumo de RAM em repouso e com abas, frames durante resize e recuperação de uma falha. Usar as mesmas fixtures, resolução e alocação de CPU/RAM. Medir CEF e Electron primeiro no mesmo Linux de controle para isolar a diferença do runtime. Medir o Native separadamente para observar o custo do kernel e da pilha gráfica. Estabelecer limites após medir a referência. Repetir os testes ao trocar kernel, CEF, renderizador ou rootfs.
+To compare performance, record boot to the first usable frame, time to an authenticated `hostd`, the first tab, RAM use at rest and with tabs, frames during resize and recovery from a failure. Use the same fixtures, resolution and CPU/RAM allocation. Measure CEF and Electron first on the same control Linux to isolate the runtime difference. Measure Native separately to observe the cost of the kernel and the graphics stack. Set limits after measuring the reference. Repeat the tests when changing the kernel, CEF, renderer or rootfs.
 
-## 9. Decisões condicionadas aos primeiros resultados
+## 9. Decisions conditional on the first results
 
-| Decisão | Evidência necessária |
+| Decision | Evidence needed |
 | --- | --- |
-| Versão e distribuição do CEF | Compatibilidade do SDK no Linux de controle e no Asterinas, manutenção de segurança e requisitos de empacotamento. |
-| View nativa ou off-screen | Correção de empilhamento e recortes, entrada e desempenho no Browser incorporado. A primeira composição usa views nativas sobrepostas (seção 10). |
-| Origem interna do Desktop | Preservação de armazenamento, CSP, workers e transporte do `hostd`, com política testada para origens externas. |
-| Lacunas de kernel | Diferença reproduzível entre Linux e Asterinas, com caso mínimo e impacto no sandbox ou na operação da UI. |
-| Migração de perfil | Lista de dados suportados, exportação ou migração testada e retorno para a última release funcional. |
+| CEF version and distribution | SDK compatibility on the control Linux and on Asterinas, security maintenance and packaging requirements. |
+| Native view or off-screen | Correct stacking and clipping, input and performance in the embedded Browser. The first composition uses overlaid native views (section 10). |
+| Internal origin for the Desktop | Preservation of storage, CSP, workers and the `hostd` transport, with a tested policy for external origins. |
+| Kernel gaps | A reproducible difference between Linux and Asterinas, with a minimal case and impact on the sandbox or on the UI's operation. |
+| Profile migration | List of supported data, tested export or migration and a way back to the last working release. |
 
-## 10. Estado da implementação
+## 10. Implementation status
 
-As provas abaixo passam no Linux de controle, com o sandbox do Chromium efetivo, e no guest Asterinas com a [série de patches](kernel/patches/README.md). O [README](README.md) lista os comandos e os relatórios.
+The proofs below pass on the control Linux, with Chromium's sandbox in effect, and in the Asterinas guest with the [patch series](kernel/patches/README.md). The [README](README.md) lists the commands and the reports.
 
-**Fase 1.** O host do shell substitui o `cefsimple`, que o CEF do nixpkgs não inclui. A ação `graphics` abre a fixture numa janela X11 e verifica mouse, teclado e Web Worker. O modo `isolation` usa dois contextos lado a lado e exige o isolamento de cookies e requisições antes e depois de redimensionar a janela. Nas duas provas, os renderers rodam com o sandbox do Chromium.
+**Phase 1.** The shell's host replaces `cefsimple`, which nixpkgs' CEF does not include. The `graphics` action opens the fixture in an X11 window and checks mouse, keyboard and Web Worker. The `isolation` mode uses two contexts side by side and requires cookie and request isolation before and after the window is resized. In both proofs, the renderers run with Chromium's sandbox.
 
-**Fase 2.** O launcher Rust inicia o `hostd`, valida a prontidão e abre o bundle Desktop real no contexto do Desktop, cujo perfil fica em `cef/desktop`. O [smoke do shell](tools/desktop/shell-smoke.mjs) usa apenas entrada X11 e o que o `hostd` grava em disco:
+**Phase 2.** The Rust launcher starts `hostd`, validates its readiness and opens the real Desktop bundle in the Desktop context, whose profile lives in `cef/desktop`. The [shell smoke](tools/desktop/shell-smoke.mjs) uses only X11 input and what `hostd` writes to disk:
 
-- Desktop: a UI grava os documentos padrão pelo `hostd`.
-- Files: Ctrl+A, Enter e F2 renomeiam um arquivo de prova.
-- Terminal: um comando digitado roda no PTY do `hostd`.
-- Recuperação do renderer e do `hostd`, com o Terminal funcionando de novo depois de cada uma.
-- Encerramento limpo e segunda sessão no mesmo perfil.
-- Nenhum log contém a URL de bootstrap.
+- Desktop: the UI writes the default documents through `hostd`.
+- Files: Ctrl+A, Enter and F2 rename a test file.
+- Terminal: a typed command runs in `hostd`'s PTY.
+- Recovery of the renderer and of `hostd`, with the Terminal working again after each.
+- Clean shutdown and a second session on the same profile.
+- No log contains the bootstrap URL.
 
-O launcher reinicia o `hostd` até 5 vezes por minuto, com espera crescente, na mesma porta e com a mesma origem. O stdin do host CEF continua aberto como canal de controle. Por ele, o launcher envia o novo bootstrap, e o host só aceita uma URL de bootstrap na origem original. Quando o launcher fecha o canal, a sessão termina. O host recarrega o Desktop até 3 vezes por minuto quando o renderer morre e reativa a janela: a view mantém o foco do Views, mas o renderer novo não o recebe. Os erros do `hostd` ficam em `hostd.log`, no estado da sessão. O segredo de bootstrap trafega só por pipes.
+The launcher restarts `hostd` up to 5 times a minute, with an increasing wait, on the same port and with the same origin. The CEF host's stdin stays open as a control channel. Through it, the launcher sends the new bootstrap, and the host only accepts a bootstrap URL on the original origin. When the launcher closes the channel, the session ends. The host reloads the Desktop up to 3 times a minute when the renderer dies and reactivates the window: the view keeps Views' focus, but the new renderer does not receive it. `hostd`'s errors go to `hostd.log`, in the session state. The bootstrap secret travels only through pipes.
 
-**Fase 3, composição.** As abas do Browser são views do host sobrepostas à janela (`CefWindow::AddOverlayView`, modo custom), no retângulo do elemento da aba. A UI publica em `browser/layout` um snapshot da sessão com geração crescente, visibilidade, retângulo de cada aba e, na primeira apresentação de uma aba ativa, uma solicitação opcional de foco. O host valida o snapshot antes de aplicá-lo, descarta gerações obsoletas e oculta as views de saída antes de exibir as de entrada na mesma tarefa do CEF. O `hello` anuncia `surfaceLayout` e `shortcutPhases`. Bundles anteriores continuam usando `browser/bounds` por aba.
+**Phase 3, composition.** The Browser's tabs are host views overlaid on the window (`CefWindow::AddOverlayView`, custom mode), in the rectangle of the tab's element. The UI publishes in `browser/layout` a snapshot of the session with an increasing generation, visibility, each tab's rectangle and, the first time an active tab is shown, an optional focus request. The host validates the snapshot before applying it, discards stale generations and hides the outgoing views before showing the incoming ones in the same CEF task. `hello` announces `surfaceLayout` and `shortcutPhases`. Older bundles keep using `browser/bounds` per tab.
 
-- **Ponte.** A página do Desktop envia `POST /_shell/<comando>`. O host responde no processo principal e nunca repassa a requisição ao `hostd`. Só o frame principal do browser do Desktop é aceito; frames, abas e navegações recebem 403. Os eventos das abas chegam à página como `openshell-native-browser`. O adaptador fica em `apps/desktop/src/host/nativeBrowser.tsx`, no repositório `openshell`. O Browser usa o mesmo componente de aba do Electron, com um elemento que implementa a interface do `<webview>`.
-- **Contextos.** Uma aba normal usa o perfil `cef/browser`, separado do Desktop. Uma aba privada usa um contexto em memória, descartado quando termina a sessão privada.
-- **Política.** As abas abrem http(s), `about:blank` e os serviços locais do usuário. Nenhum alias de loopback alcança a porta do `hostd`: `localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`, `[::1]` e o IPv4 mapeado. Outros esquemas, como `file:` e `chrome:`, são recusados. Pop-ups e links para uma janela nova abrem uma aba, criada pelo Desktop.
-- **Visibilidade.** Uma aba pode permanecer visível atrás de outra janela quando as áreas não se cruzam. A UI verifica os retângulos de janelas acima e de elementos como sugestões da barra de endereço, menus e o seletor de janelas. Para os demais elementos, consulta `elementFromPoint` numa grade com margem para as alças de redimensionamento. Um diálogo do Desktop pode suspender a apresentação. A UI adia a reexibição de uma aba oculta enquanto um campo editável ou iframe do Desktop mantém o teclado, pois mostrar o overlay CEF pode tomar o foco. Clicar numa view visível ativa sua janela lógica.
-- **Teclado.** O Desktop registra os atalhos que compartilha com as abas e indica quais precisam transferir o foco antes de executar. O host encaminha pressionamento e soltura aos bundles que anunciam suporte na inscrição. Ctrl+L transfere o foco para o Desktop, que seleciona o endereço. O Openbox empacotado libera Alt+Tab, Alt+F4 e as combinações com Super para o OpenShell. O seletor usa a soltura real de Alt. Quando uma aba focada se oculta, o Desktop recebe o foco. Uma aba focada antes de ter renderer, como um pop-up, recebe o teclado quando a página termina de carregar. Depois que o overlay de uma aba teve o teclado, o Chromium pode deixar as teclas sem destino, embora o Views conte um navegador como focado: elas chegam à janela sem passar por nenhum navegador. A janela entrega essas teclas ao navegador focado, com o caractere que digitam, e deixa em paz as que uma página recebeu e não tratou.
-- **DevTools.** O frontend usa uma janela CEF Chrome sem moldura, vinculada à janela Alloy do Desktop. A UI posiciona a janela no painel inferior ou lateral da aba ativa e a oculta quando o painel está coberto. O frontend tem seu próprio cliente CEF, e o fechamento da aba encerra o DevTools associado.
-- **Fontes.** O perfil gráfico inclui Cascadia Code e JetBrains Mono, usadas pelo Desktop, além de Liberation, DejaVu e Noto para os fallbacks. O initramfs instala a configuração do Fontconfig em `/etc/fonts/fonts.conf` para disponibilizar as famílias offline.
+- **Bridge.** The Desktop page sends `POST /_shell/<command>`. The host answers in the main process and never forwards the request to `hostd`. Only the main frame of the Desktop's browser is accepted; frames, tabs and navigations get 403. The tabs' events reach the page as `openshell-native-browser`. The adapter lives in `apps/desktop/src/host/nativeBrowser.tsx`, in the `openshell` repository. The Browser uses the same tab component as Electron, with an element that implements the `<webview>` interface.
+- **Contexts.** A normal tab uses the `cef/browser` profile, separate from the Desktop. A private tab uses an in-memory context, discarded when the private session ends.
+- **Policy.** Tabs open http(s), `about:blank` and the user's local services. No loopback alias reaches `hostd`'s port: `localhost`, `*.localhost`, `127.0.0.0/8`, `0.0.0.0`, `[::1]` and the mapped IPv4. Other schemes, such as `file:` and `chrome:`, are refused. Pop-ups and links to a new window open a tab, created by the Desktop.
+- **Visibility.** A tab can stay visible behind another window when the areas do not overlap. The UI checks the rectangles of windows above and of elements such as address bar suggestions, menus and the window switcher. For other elements, it queries `elementFromPoint` on a grid with a margin for the resize handles. A Desktop dialog can suspend presentation. The UI delays re-showing a hidden tab while an editable field or iframe of the Desktop holds the keyboard, because showing the CEF overlay can take the focus. Clicking a visible view activates its logical window.
+- **Keyboard.** The Desktop registers the shortcuts it shares with the tabs and says which ones must move the focus before running. The host forwards key presses and releases to bundles that announce support when subscribing. Ctrl+L moves the focus to the Desktop, which selects the address. The packaged Openbox releases Alt+Tab, Alt+F4 and the Super combinations to OpenShell. The switcher uses the real Alt release. When a focused tab is hidden, the Desktop receives the focus. A tab focused before it has a renderer, such as a pop-up, receives the keyboard when the page finishes loading. After a tab's overlay has had the keyboard, Chromium may leave keys without a target, even though Views counts a browser as focused: they reach the window without going through any browser. The window hands those keys to the focused browser, with the character they type, and leaves alone those a page received and did not handle.
+- **DevTools.** The frontend uses a frameless CEF Chrome window, tied to the Desktop's Alloy window. The UI positions the window in the active tab's bottom or side panel and hides it when the panel is covered. The frontend has its own CEF client, and closing the tab ends the associated DevTools.
+- **Fonts.** The graphics profile includes Cascadia Code and JetBrains Mono, used by the Desktop, plus Liberation, DejaVu and Noto for fallbacks. The initramfs installs the Fontconfig configuration in `/etc/fonts/fonts.conf` to make the families available offline.
 
-**Fase 4, paridade com o processo principal do Electron.** No OpenShell Live, o processo principal do Electron (`electron/main.ts`) oferece à UI a interface `OpenShellElectronApi`. No Native, `apps/desktop/src/host/nativeShell.ts`, no repositório `openshell`, implementa a mesma interface sobre a ponte `/_shell/`, com `isElectron: false`. Assim, os componentes do Desktop não precisam distinguir os dois runtimes, exceto nos pontos que dependem do Electron (o encaminhamento de teclas pelo processo principal), que testam `isElectron`, e não a presença da ponte. Os ids numéricos de `webContents` viram ids de convidado, que o adaptador associa às abas. No host, [browser_features.cc](userspace/shell/cef/browser_features.cc) reúne os recursos, [session.h](userspace/shell/cef/session.h) o estado compartilhado com `main.cc`, e a ponte aceita respostas assíncronas para os comandos que dependem do Chromium ou de uma resposta da pessoa.
+**Phase 4, parity with Electron's main process.** On OpenShell Live, Electron's main process (`electron/main.ts`) offers the UI the `OpenShellElectronApi` interface. On Native, `apps/desktop/src/host/nativeShell.ts`, in the `openshell` repository, implements the same interface over the `/_shell/` bridge, with `isElectron: false`. That way the Desktop's components do not need to tell the two runtimes apart, except at the points that depend on Electron (key forwarding through the main process), which test `isElectron`, not the presence of the bridge. Numeric `webContents` ids become guest ids, which the adapter associates with tabs. In the host, [browser_features.cc](userspace/shell/cef/browser_features.cc) gathers the features, [session.h](userspace/shell/cef/session.h) the state shared with `main.cc`, and the bridge accepts asynchronous answers for commands that depend on Chromium or on an answer from the person.
 
-- **Downloads.** Vão para `~/Downloads`, com nome saneado e sem sobrescrever arquivos. O Desktop recebe o progresso, com no máximo um evento a cada 400 ms, e pode pausar, retomar e cancelar o download.
-- **Perguntas.** O Desktop responde aos pedidos de câmera e microfone e à seleção de arquivos, pelo seletor do OpenShell, tanto para as abas quanto para a própria página do Desktop. As respostas de câmera e microfone valem por site durante a sessão, separadas na janela privada. Os demais pedidos de permissão são recusados, como no Live.
-- **Certificados.** Um certificado não confiável é recusado, a menos que a pessoa abra uma exceção para aquele host e aquela impressão digital.
-- **Protocolo DevTools.** As ferramentas do agente usam `ExecuteDevToolsMethod`, limitado a uma lista de métodos: avaliação, captura, PDF, entrada sintética e limpeza de cache nas abas, e só captura e entrada na página do Desktop.
-- **Impressão.** Ctrl+P exporta a aba para PDF, em `openshell-print` na pasta temporária, e o Desktop abre o arquivo.
-- **Capturas.** A captura do shell combina a imagem da página do Desktop com cada aba visível, no retângulo do último layout aplicado, e recompõe as sobreposições dentro desse retângulo. Assim, Print e Shift+Print incluem as abas e as notificações que passam sobre elas.
-- **Dicas.** O Chromium desenha a dica de um `title` numa caixa branca simples, fora do tema. O host desliga essa caixa para a página do Desktop (`OnTooltip`), que desenha as suas nas cores do tema (`apps/web/src/lib/themedTooltips.ts`, no repositório `openshell`, também no Live e na web), e repassa a dica de uma aba com o lugar do ponteiro (evento `tooltip`): o Desktop a desenha igual, acima das abas como as notificações.
-- **Clipboard.** Um observador XFixes, com thread e conexão X próprias, recebe cada cópia do sistema, em texto UTF-8 ou PNG, inclusive por transferência INCR, até 1 MB de texto e 16 MB de imagem. O Desktop guarda a cópia no histórico, exceto quando o programa a marca como secreta. Super+V, numa aba ou no Desktop, abre o histórico, e colar devolve o item à aba ou ao campo onde a tecla foi pressionada.
-- **Teclas de hardware.** Volume, mudo e brilho seguem `shared/hardwareKeys.ts`, mesmo quando uma aba tem o teclado. O OSD aparece por cima da aba, que continua visível e com o teclado.
+- **Downloads.** They go to `~/Downloads`, with a sanitised name and without overwriting files. The Desktop receives the progress, with at most one event every 400 ms, and can pause, resume and cancel the download.
+- **Prompts.** The Desktop answers camera and microphone requests and file selection, through OpenShell's chooser, both for the tabs and for the Desktop page itself. Camera and microphone answers apply per site for the session, separate in the private window. Other permission requests are refused, as on Live.
+- **Certificates.** An untrusted certificate is refused, unless the person opens an exception for that host and that fingerprint.
+- **DevTools protocol.** The agent's tools use `ExecuteDevToolsMethod`, limited to a list of methods: evaluation, capture, PDF, synthetic input and cache clearing in the tabs, and only capture and input on the Desktop page.
+- **Printing.** Ctrl+P exports the tab to PDF, in `openshell-print` in the temporary folder, and the Desktop opens the file.
+- **Captures.** The shell's capture combines the Desktop page's image with each visible tab, in the rectangle of the last applied layout, and recomposes the overlays inside that rectangle. That way, Print and Shift+Print include the tabs and the notifications that pass over them.
+- **Tooltips.** Chromium draws a `title` tooltip in a plain white box, outside the theme. The host turns that box off for the Desktop page (`OnTooltip`), which draws its own in the theme's colours (`apps/web/src/lib/themedTooltips.ts`, in the `openshell` repository, also on Live and the web), and forwards a tab's tooltip with the pointer's position (the `tooltip` event): the Desktop draws it the same way, above the tabs like the notifications.
+- **Clipboard.** An XFixes observer, with its own thread and X connection, receives every system copy, as UTF-8 text or PNG, including through INCR transfers, up to 1 MB of text and 16 MB of image. The Desktop keeps the copy in the history, except when the program marks it as secret. Super+V, in a tab or on the Desktop, opens the history, and pasting returns the item to the tab or field where the key was pressed.
+- **Hardware keys.** Volume, mute and brightness follow `shared/hardwareKeys.ts`, even when a tab has the keyboard. The OSD appears over the tab, which stays visible and keeps the keyboard.
 
-O smoke abre um site pelo `xdg-open` do Terminal e comprova:
+The smoke opens a site with the Terminal's `xdg-open` and proves:
 
-- a página e um Web Worker;
+- the page and a Web Worker;
 - WebGL;
-- clique e tecla confiáveis, navegação digitada após Ctrl+L, prioridade do seletor sobre a aba com Alt mantido e retorno do clique após dispensar o seletor;
-- Alt+S pressionado num pop-up abre a busca do Desktop, e o texto digitado em seguida chega a ela;
-- zoom e download para a pasta `Downloads` do perfil descartável;
-- transparência do canto arredondado da notificação de download sobre a aba e apresentação do indicador de brilho;
-- abertura do DevTools com F12, execução de um comando no console da aba e fechamento com F12 a partir do próprio painel;
-- seleção de arquivos de um `<input type=file>` da aba pelo seletor do OpenShell, sem janela nova no X;
-- Ctrl+P gera o PDF da aba;
-- Shift+Print grava uma captura em que o pixel da aba tem a cor da página;
-- texto copiado na aba volta ao histórico do clipboard e é colado com Super+V;
-- um pop-up aberto como aba;
-- renderers filtrados;
-- que a página não alcança o `hostd`.
+- trusted clicks and keys, navigation typed after Ctrl+L, the switcher's priority over the tab with Alt held and clicks working again after dismissing the switcher;
+- Alt+S pressed in a pop-up opens the Desktop search, and the text typed next reaches it;
+- zoom and download to the disposable profile's `Downloads` folder;
+- transparency of the download notification's rounded corner over the tab and the brightness indicator showing;
+- opening DevTools with F12, running a command in the tab's console and closing it with F12 from the panel itself;
+- selecting files for a tab's `<input type=file>` through OpenShell's chooser, without a new X window;
+- Ctrl+P produces the tab's PDF;
+- Shift+Print saves a capture in which the tab's pixel has the page's colour;
+- text copied in the tab goes to the clipboard history and is pasted with Super+V;
+- a pop-up opened as a tab;
+- filtered renderers;
+- that the page cannot reach `hostd`.
 
-Limites conhecidos desta composição:
+Known limits of this composition:
 
-- **WebSocket.** A API de recursos do CEF não intercepta o handshake de WebSocket. O `hostd` recusa a origem estrangeira sem cookie e fecha o socket antes da primeira mensagem, e o smoke exige esse resultado.
-- **DNS rebinding.** O bloqueio do host compara o endereço literal da URL. Um domínio que resolve para o loopback na porta do `hostd` passa pelo CEF. Quando escuta em loopback, o `hostd` responde 421 a qualquer `Host` que não seja `127.0.0.1`, `localhost` ou `[::1]` na sua porta, e recusa o upgrade de WebSocket nesse caso.
-- **Sobreposição.** Menus, diálogos e janelas que cruzam a aba ocultam a view CEF inteira, sem recorte parcial. No lugar dela, o Desktop mostra a captura da página tirada antes de ocultá-la, e a página continua visível, parada, sob o que a cobre; a view volta, ao vivo, quando nada a cobre. Elementos fora dos tipos conhecidos que sejam menores que o espaçamento da grade podem escapar da detecção.
-- **Atalhos.** A entrega depende das teclas que chegam ao CEF pelo X11. Sessões com outro gerenciador de janelas podem capturar teclas antes do CEF. Outros layouts de teclado e IME ainda precisam de validação.
-- **Recursos de Browser.** As respostas de câmera e microfone valem até a sessão terminar, como no Live, que também as esquece ao reiniciar. O indicador de áudio da aba também falta, porque o CEF 147 não expõe se uma aba toca som. O mute funciona. A pergunta de câmera e microfone não tem prova no smoke, porque a VM não tem dispositivos.
-- **Miniaturas do dock.** Não há miniaturas das janelas no dock (`captureRect`). Capturar a página do Desktop a cada poucos segundos deixava a tela preta durante a captura.
-- **Sobreposições transparentes.** O OSD, o pop-up de senhas e as notificações são desenhados em imagens PNG com transparência sobre as abas. A composição preserva os cantos CSS. O recorte ainda termina no retângulo do elemento, e o desfoque do fundo da aba não faz parte da imagem.
-- **Uma tela, sem bloqueio.** O Native mostra uma única tela, e sem `screens` o Desktop mantém esse comportamento. O bloqueio de tela do Live (`onScreenLocked`) depende da autenticação nativa.
-- **Fullscreen e gravação.** Uma página em fullscreen cobre a tela inteira, como no Live: o host avisa o Desktop (`OnFullscreenModeChange`), que leva a aba à tela toda, e Escape ou a troca de janelas a encerram. Enquanto a aba cobre a página do Desktop, o Chromium a conta como oculta e não lhe dá quadros: o layout segue por um temporizador. A gravação de tela usa a tela X inteira como fonte (`screen:-1:0`), que a janela do kiosk ocupa, e a página do Desktop recebe câmera, microfone e tela sem perguntar, como no Live.
+- **WebSocket.** CEF's resource API does not intercept the WebSocket handshake. `hostd` refuses a foreign origin without a cookie and closes the socket before the first message, and the smoke requires that result.
+- **DNS rebinding.** The host's block compares the URL's literal address. A domain that resolves to loopback on `hostd`'s port gets through CEF. When it listens on loopback, `hostd` answers 421 to any `Host` other than `127.0.0.1`, `localhost` or `[::1]` on its port, and refuses the WebSocket upgrade in that case.
+- **Overlap.** Menus, dialogs and windows that cross the tab hide the whole CEF view, without partial clipping. In its place, the Desktop shows the capture of the page taken before hiding it, and the page stays visible, frozen, under whatever covers it; the view comes back, live, when nothing covers it. Elements outside the known types that are smaller than the grid spacing may escape detection.
+- **Shortcuts.** Delivery depends on the keys that reach CEF through X11. Sessions with another window manager may capture keys before CEF. Other keyboard layouts and IME still need validation.
+- **Browser features.** Camera and microphone answers last until the session ends, as on Live, which also forgets them on restart. The tab's audio indicator is also missing, because CEF 147 does not expose whether a tab is playing sound. Mute works. The camera and microphone prompt has no proof in the smoke, because the VM has no devices.
+- **Dock thumbnails.** There are no window thumbnails in the dock (`captureRect`). Capturing the Desktop page every few seconds turned the screen black during the capture.
+- **Transparent overlays.** The OSD, the password pop-up and the notifications are drawn as PNG images with transparency over the tabs. The composition preserves the CSS corners. The clip still ends at the element's rectangle, and the blur of the tab's background is not part of the image.
+- **One display, no lock.** Native shows a single display, and without `screens` the Desktop keeps that behaviour. Live's screen lock (`onScreenLocked`) depends on native authentication.
+- **Fullscreen and recording.** A fullscreen page covers the whole screen, as on Live: the host notifies the Desktop (`OnFullscreenModeChange`), which takes the tab to the whole screen, and Escape or switching windows ends it. While the tab covers the Desktop page, Chromium counts it as hidden and gives it no frames: the layout follows a timer. Screen recording uses the whole X screen as its source (`screen:-1:0`), which the kiosk window fills, and the Desktop page receives camera, microphone and screen without asking, as on Live.
 
-A composição off-screen continua sendo a alternativa se a sobreposição de elementos se mostrar insuficiente.
+Off-screen composition remains the alternative if overlaying elements proves insufficient.
 
-**Apps Linux.** O Desktop integra Xpra por meio do `hostd`, como no OpenShell Live: para cada app, o `hostd` inicia um servidor Xpra com Xvfb próprio, protegido por senha e ligado ao loopback, e a janela do OpenShell mostra o cliente HTML5 do Xpra num `iframe` servido pelo `hostd`. A ação `apps` acrescenta à imagem o perfil de apps de [initramfs.nix](userspace/compatibility/initramfs.nix): Xpra 6.4 com Xvfb, o cliente HTML5 17.1, D-Bus, o Python com dbus-python e PyGObject que o portal do `hostd` usa, e dois apps de prova, um GTK 3 e um Qt 6, em [probes](userspace/compatibility/probes). A imagem põe o cliente HTML5, a configuração de sessão do D-Bus e as entradas `.desktop` onde o `hostd` e o D-Bus as procuram no Debian.
+**Linux apps.** The Desktop integrates Xpra through `hostd`, as on OpenShell Live: for each app, `hostd` starts an Xpra server with its own Xvfb, password-protected and bound to loopback, and the OpenShell window shows Xpra's HTML5 client in an `iframe` served by `hostd`. The `apps` action adds the apps profile of [initramfs.nix](userspace/compatibility/initramfs.nix) to the image: Xpra 6.4 with Xvfb, the HTML5 client 17.1, D-Bus, the Python with dbus-python and PyGObject that `hostd`'s portal uses, and two test apps, one GTK 3 and one Qt 6, in [probes](userspace/compatibility/probes). The image puts the HTML5 client, the D-Bus session configuration and the `.desktop` entries where `hostd` and D-Bus look for them on Debian.
 
-Fazer o caminho funcionar com essas versões exigiu correções no `hostd` e na UI, no repositório `openshell`:
+Making the path work with these versions required fixes in `hostd` and the UI, in the `openshell` repository:
 
-- a autenticação do socket usa `auth=file,filename=…`; o Xpra 6.4 ignora a forma `auth=file:filename=…` e então recusa qualquer senha;
-- o servidor recebe `XPRA_DELAY_KEYBOARD_DATA=0`; sem isso, o Xpra 6 só aplica o mapa de teclado do cliente quando o cliente avisa uma mudança de mapa, o que o cliente HTML5 nunca faz, e toda tecla resolve para nada;
-- o lançador do app nomeia o `python3` e o `dbus-run-session` do `hostd`, porque o wrapper do Xpra no Nix põe o próprio Python no PATH dos filhos;
-- a UI lê o tipo das janelas do cliente nas duas formas, lista ou valor único (o cliente 17 removeu `has_windowtype`), e dá o teclado à janela do app quando ela aparece e quando é clicada, porque o cliente só foca uma janela pela barra de título, que o OpenShell esconde;
-- os atalhos do Desktop pressionados dentro do app vão para o Desktop, pelas mesmas definições de `shellKeys`, quando não há Electron para encaminhá-los;
-- o launcher repassa `XDG_DATA_DIRS` ao `hostd`;
-- o `cursorTheme.py` carrega as bibliotecas X das pastas de `OPENSHELL_X11_LIBRARY_PATH`, que o wrapper do Python do perfil define, e procura os temas de ícones também nas pastas `icons` de `XDG_DATA_DIRS`. O perfil inclui o Adwaita, de onde o script desenha o cursor do OpenShell, e o `xsettingsd` e o `xrdb`, com que ele o entrega aos toolkits;
-- quando o Xpra morre, o `hostd` encerra a sessão inteira do app (todos os processos com o mesmo identificador de sessão), porque o Xpra põe o seu Xvfb num grupo de processos próprio, que sobrevivia a ele;
-- na página do Desktop, os atalhos de Alt do shell (busca, troca e fechamento de janelas) chegam aos ouvintes do shell antes dos campos, como no Live, em que o Electron os desvia. Antes, o Terminal recebia o "s" de Alt+S enquanto a busca abria.
+- the socket authentication uses `auth=file,filename=…`; Xpra 6.4 ignores the `auth=file:filename=…` form and then refuses every password;
+- the server gets `XPRA_DELAY_KEYBOARD_DATA=0`; without it, Xpra 6 only applies the client's keymap when the client reports a keymap change, which the HTML5 client never does, and every key resolves to nothing;
+- the app launcher names `hostd`'s `python3` and `dbus-run-session`, because Xpra's Nix wrapper puts its own Python in the children's PATH;
+- the UI reads the client's window types in both forms, a list or a single value (client 17 removed `has_windowtype`), and gives the keyboard to the app's window when it appears and when it is clicked, because the client only focuses a window through its title bar, which OpenShell hides;
+- Desktop shortcuts pressed inside the app go to the Desktop, through the same `shellKeys` definitions, when there is no Electron to forward them;
+- the launcher passes `XDG_DATA_DIRS` on to `hostd`;
+- `cursorTheme.py` loads the X libraries from the folders in `OPENSHELL_X11_LIBRARY_PATH`, which the profile's Python wrapper sets, and also looks for icon themes in the `icons` folders of `XDG_DATA_DIRS`. The profile includes Adwaita, from which the script draws OpenShell's cursor, and `xsettingsd` and `xrdb`, with which it hands it to the toolkits;
+- when Xpra dies, `hostd` ends the app's whole session (every process with the same session ID), because Xpra puts its Xvfb in a process group of its own, which used to outlive it;
+- on the Desktop page, the shell's Alt shortcuts (search, switching and closing windows) reach the shell's listeners before the fields, as on Live, where Electron diverts them. Before, the Terminal received the "s" of Alt+S while the search opened.
 
-O [smoke de apps](tools/desktop/apps-smoke.mjs) prova pela API do `hostd` o catálogo, o lançamento, a página do cliente, o WebSocket até o Xpra e a senha que a UI recebe, o cursor do OpenShell no app e o encerramento sem órfãos (app, Xpra e Xvfb) pelo Desktop, pelo próprio app e quando o Xpra é morto. A fase `linux-apps` do smoke do Desktop abre os dois apps pela busca, digita na janela do OpenShell, maximiza com Super+↑ e exige que o app assuma o tamanho, e fecha o GTK com Alt+F4 e o Qt pelo próprio app. No GTK, um diálogo aparece na janela do OpenShell e recebe o teclado, e um texto copiado no app chega ao histórico do clipboard e volta ao app com Super+V. Por fim, um documento de um tipo que só o GTK declara abre nele pelo `open` do Terminal e pelo Enter no Files, com o arquivo como argumento.
+The [apps smoke](tools/desktop/apps-smoke.mjs) proves through `hostd`'s API the catalogue, launching, the client page, the WebSocket to Xpra and the password the UI receives, OpenShell's cursor in the app and shutdown without orphans (app, Xpra and Xvfb) from the Desktop, from the app itself and when Xpra is killed. The `linux-apps` phase of the Desktop smoke opens both apps from the search, types in the OpenShell window, maximises with Super+↑ and requires the app to take the size, and closes the GTK one with Alt+F4 and the Qt one from the app itself. In GTK, a dialog appears in the OpenShell window and receives the keyboard, and text copied in the app reaches the clipboard history and comes back to the app with Super+V. Finally, a document of a type only the GTK app declares opens in it through the Terminal's `open` and through Enter in Files, with the file as its argument.
 
-**Gráficos.** O image inclui o Mesa do nixpkgs fixado em `/run/opengl-driver`, como no NixOS. O Xvfb oferece GLX, e o ANGLE renderiza com llvmpipe. O host passa `ignore-gpu-blocklist`, porque o blocklist do Chromium, feito para drivers desconhecidos, recusa WebGL no llvmpipe e o image fixa o driver. Os smokes registram o renderer efetivo e conferem um pixel lido de volta.
+**Graphics.** The image includes the pinned nixpkgs' Mesa in `/run/opengl-driver`, as on NixOS. Xvfb offers GLX, and ANGLE renders with llvmpipe. The host passes `ignore-gpu-blocklist`, because Chromium's blocklist, made for unknown drivers, refuses WebGL on llvmpipe and the image pins the driver. The smokes record the effective renderer and check a pixel read back.
 
-**Supervisão (etapa 5 do plano original).** O `openshell-session` roda como serviço do init, como root:
+**Supervision (stage 5 of the original plan).** `openshell-session` runs as an init service, as root:
 
-- depois de criar o home e o diretório de logs, mantém só `CAP_SETUID`, `CAP_SETGID`, `CAP_KILL` e `CAP_FOWNER`;
-- inicia o X, o Openbox e o launcher como o usuário da sessão, cada um no seu grupo de processos;
-- espera o socket do X antes de iniciar o resto;
-- reinicia o shell até 5 vezes por minuto e o gerenciador de janelas até 5 vezes por minuto;
-- quando o X morre, reinicia a sessão inteira, até 3 vezes em 5 minutos;
-- como subreaper, recolhe os órfãos da sessão;
-- encerra shell, gerenciador de janelas e X nessa ordem;
-- guarda os logs de cada boot num diretório próprio e mantém os 5 mais recentes.
+- after creating the home and the log directory, it keeps only `CAP_SETUID`, `CAP_SETGID`, `CAP_KILL` and `CAP_FOWNER`;
+- it starts X, Openbox and the launcher as the session user, each in its own process group;
+- it waits for the X socket before starting the rest;
+- it restarts the shell up to 5 times a minute and the window manager up to 5 times a minute;
+- when X dies, it restarts the whole session, up to 3 times in 5 minutes;
+- as a subreaper, it reaps the session's orphans;
+- it ends the shell, the window manager and X in that order;
+- it keeps each boot's logs in a directory of their own and keeps the 5 most recent.
 
-O [smoke da sessão](tools/desktop/session-smoke.mjs) confere as capabilities do supervisor, mata o host CEF e exige uma sessão nova, sem processos da anterior. Depois, exige que o SIGTERM encerre todos os processos da sessão. O smoke do shell registra memória (soma de RSS e PSS, quando o kernel informa) e tempo de CPU do CEF e do `hostd` com o Desktop pronto, com o Browser aberto e em repouso.
+The [session smoke](tools/desktop/session-smoke.mjs) checks the supervisor's capabilities, kills the CEF host and requires a new session, with no processes from the previous one. Then it requires SIGTERM to end every process of the session. The shell smoke records memory (sum of RSS and PSS, when the kernel reports it) and CPU time of CEF and `hostd` with the Desktop ready, with the Browser open and at rest.
 
-**Contratos e linha de base.** Os testes de contrato do `@openshell/host-api` ficam em `apps/desktop/hostd/contract.test.ts`, no repositório `openshell`, e falam com o hostd pelo mesmo `HostClient` da UI, num WebSocket real: arquivos (escrita, leitura por faixas, listagem, cópia, renomeação, remoção e códigos de erro), `exec` com cwd, stdin, timeout e cancelamento, terminal, observação de pastas, o serviço de senhas, métricas, métodos desconhecidos, a recusa do socket sem token ou de outra origem e as rotas HTTP com o cookie de sessão. Por padrão sobem o hostd Node no processo; com `OPENSHELL_CONTRACT_URL`, `OPENSHELL_CONTRACT_TOKEN` e `OPENSHELL_CONTRACT_ROOT` rodam contra outra implementação, como um porte de serviço para Rust, iniciada com `--home <root>/home --ui <root>/ui` em modo dev.
+**Contracts and baseline.** The `@openshell/host-api` contract tests live in `apps/desktop/hostd/contract.test.ts`, in the `openshell` repository, and talk to hostd through the UI's own `HostClient`, over a real WebSocket: files (writing, ranged reads, listing, copying, renaming, removal and error codes), `exec` with cwd, stdin, timeout and cancellation, the terminal, folder watching, the password service, metrics, unknown methods, refusing the socket without a token or from another origin and the HTTP routes with the session cookie. By default they bring up the Node hostd in-process; with `OPENSHELL_CONTRACT_URL`, `OPENSHELL_CONTRACT_TOKEN` and `OPENSHELL_CONTRACT_ROOT` they run against another implementation, such as a Rust service port, started with `--home <root>/home --ui <root>/ui` in dev mode.
 
-No Linux de controle (Xvfb 1280×800, llvmpipe), o smoke do shell mede o lado CEF:
+On the control Linux (Xvfb 1280×800, llvmpipe), the shell smoke measures the CEF side:
 
-| Momento | CEF: processos, RSS/PSS | hostd: RSS/PSS |
+| Moment | CEF: processes, RSS/PSS | hostd: RSS/PSS |
 | --- | --- | --- |
-| Desktop pronto (janela em 316 ms, UI em 566 ms) | 9 processos, 1110/649 MiB | 108/79 MiB |
-| Com o Browser aberto | 12 processos, 1733/974 MiB | 144/96 MiB |
-| Em repouso, ao fim das fases | 10 processos, 1710/1173 MiB | 111/74 MiB |
+| Desktop ready (window at 316 ms, UI at 566 ms) | 9 processes, 1110/649 MiB | 108/79 MiB |
+| With the Browser open | 12 processes, 1733/974 MiB | 144/96 MiB |
+| At rest, at the end of the phases | 10 processes, 1710/1173 MiB | 111/74 MiB |
 
-A mesma medida do Electron 44.5.1 do `BUILD.json`, no mesmo controle, falta: o bundle Linux não traz o executável do Electron, e o controle não o tem.
+The same measurement for Electron 44.5.1 from `BUILD.json`, on the same control, is missing: the Linux bundle does not ship Electron's executable, and the control does not have it.
 
-## 11. Decisões e próximos passos
+## 11. Decisions and next steps
 
-A proposta de evolução de 12/11/2026 (*OpenShell Native — Arquitetura final proposta e oportunidades de otimização*) foi avaliada contra a implementação. As decisões abaixo valem até que uma medição as reabra.
+The evolution proposal of 11/12/2026 (*OpenShell Native — Proposed final architecture and optimisation opportunities*) was evaluated against the implementation. The decisions below hold until a measurement reopens them.
 
-| Decisão | Situação |
+| Decision | Status |
 | --- | --- |
-| A UI define o layout, e o shell valida e apresenta as superfícies | Adotada. As abas enviam retângulo, visibilidade e solicitação de foco em um snapshot por geração. A UI usa z-order para decidir quais views retangulares podem aparecer. Recorte parcial, escala e um segundo tipo de superfície seguem pendentes. |
-| Views sobrepostas como composição de base, com off-screen só se a sobreposição não bastar | Adotada. Composição off-screen e compositor próprio dependem de medição de cópias, CPU, latência e quadros descartados. |
-| X11 e Xpra mantidos até uma alternativa ter paridade | Adotada. Openbox e Xorg só saem do caminho quando os apps Linux tiverem outro caminho validado. |
-| Proteção do `hostd` independente do bloqueio no CEF | Adotada: Origin, cookie e validação de `Host`. |
-| `hostd` em Rust | Condicionada a testes de contrato do `@openshell/host-api`, portados método a método com as duas implementações sob os mesmos testes. O `hostd-smoke` é a semente desses testes. |
-| IPC nativo do CEF no lugar de `/_shell/` | Condicionada. Exige um handler no processo renderer. A ponte HTTP atual aceita só o frame principal do Desktop e só `POST`. |
-| Assets servidos por um esquema interno do CEF | Experimento. Muda a origem do perfil do Desktop e exige plano de migração do armazenamento e dos cookies. |
-| Rootfs A/B separado da camada de compatibilidade Debian | Adotada no desenho de `distro/ab`: os slots guardam a base, e apps e pacotes Debian ficam numa área atualizável com rollback próprio. |
+| The UI defines the layout, and the shell validates and presents the surfaces | Adopted. Tabs send rectangle, visibility and focus request in one snapshot per generation. The UI uses z-order to decide which rectangular views may appear. Partial clipping, scaling and a second kind of surface are still pending. |
+| Overlaid views as the base composition, with off-screen only if overlaying is not enough | Adopted. Off-screen composition and a custom compositor depend on measuring copies, CPU, latency and dropped frames. |
+| X11 and Xpra kept until an alternative reaches parity | Adopted. Openbox and Xorg only leave the path once Linux apps have another validated path. |
+| `hostd`'s protection independent of the block in CEF | Adopted: Origin, cookie and `Host` validation. |
+| `hostd` in Rust | Conditional on the `@openshell/host-api` contract tests, ported method by method with both implementations under the same tests. `hostd-smoke` is the seed of those tests. |
+| Native CEF IPC instead of `/_shell/` | Conditional. It needs a handler in the renderer process. The current HTTP bridge accepts only the Desktop's main frame and only `POST`. |
+| Assets served by an internal CEF scheme | Experiment. It changes the origin of the Desktop profile and needs a migration plan for storage and cookies. |
+| A/B rootfs separate from the Debian compatibility layer | Adopted in the design of `distro/ab`: the slots hold the base, and Debian apps and packages live in an updatable area with its own rollback. |
 
-Próximos passos, em ordem:
+Next steps, in order:
 
-1. ~~Apps Linux~~: concluído. Abertura pelo Terminal e pelo Files, recuperação quando o Xpra morre, diálogos, clipboard e cursor do app têm prova no smoke (seção 10).
-2. ~~Contrato de superfícies~~: concluído. As janelas Xpra fazem parte do DOM do Desktop e seguem seu z-order e recorte. Nas abas, o que cobre a view mostra a captura da página no lugar, as partes do Desktop que ficam acima delas (OSD, lista de logins, notificações) são imagens acima das views com cliques devolvidos ao Desktop, e o fullscreen leva a aba à tela toda. O clipboard passa pelo histórico nos dois sentidos. O arrastar do Files leva só dados internos do OpenShell, como no Live. Fica fora: dois monitores (o Native tem uma tela) e IME (a sessão não tem um).
-3. ~~Paridade do Browser~~: concluída. Cofre de senhas, OSD e notificações sobre as abas, fullscreen e gravação de tela estão feitos; as permissões seguem o Live, que não as guarda entre sessões. A matriz de atalhos é um teste do `openshell` (`shared/nativeKeyRoutes.test.ts`): todo atalho do Browser, em cada tecla imprimível e cada combinação de modificadores, chega de uma aba com foco ao Desktop, como no Live. O teste achou Ctrl++ e Ctrl+_ fora da rota. O smoke do shell troca o layout para `de` e confere o Alt+S e o texto digitado no Terminal.
-4. Testes de contrato do `host-api` (feitos, seção 10) e a medida do Electron no mesmo Linux de controle, que depende do executável Linux do Electron 44.5.1, antes de portar serviços do `hostd`.
-5. ~~Autenticação nativa antes da sessão e Xorg sobre DRM~~: feitos. O supervisor inicia o Desktop como greeter e só inicia o shell depois da senha, com o hash guardado por root ([README](README.md#entrada)). O Xorg usa `modesetting` no simpledrm e `evdev` sem udev, como o usuário da sessão ([README](README.md#tela-teclado-e-mouse)).
-6. ~~Imagem A/B e instalador~~: feitos. A imagem experimental integra as partições `system_a`, `system_b`, `recovery` e `data`, a seleção de slot no GRUB e a atualização assinada do slot inativo em execução, e a ação `desktop-image` exercita a confirmação ligada à saúde do Desktop instalado ([README](README.md#atualização-ab)). O pendrive live instala o sistema no disco interno pelo Desktop, como o Calamares no Live, e o disco instalado inicia sozinho pela cadeia assinada ([README](README.md#instalação)). A paridade de sessão com o Live inclui a tela de carregamento, a entrada, o bloqueio de tela e desligar/reiniciar ([README](README.md#carregamento), [bloqueio](README.md#bloqueio-de-tela-e-energia)).
+1. ~~Linux apps~~: done. Opening from the Terminal and from Files, recovery when Xpra dies, dialogs, clipboard and the app's cursor have proofs in the smoke (section 10).
+2. ~~Surface contract~~: done. Xpra windows are part of the Desktop's DOM and follow its z-order and clipping. On tabs, whatever covers the view shows the page's capture in its place, the parts of the Desktop that sit above them (OSD, login list, notifications) are images above the views with clicks handed back to the Desktop, and fullscreen takes the tab to the whole screen. The clipboard goes through the history in both directions. Dragging from Files carries only OpenShell's internal data, as on Live. Left out: dual monitors (Native has one display) and IME (the session has none).
+3. ~~Browser parity~~: done. Password vault, OSD and notifications over the tabs, fullscreen and screen recording are done; permissions follow Live, which does not keep them between sessions. The shortcut matrix is an `openshell` test (`shared/nativeKeyRoutes.test.ts`): every Browser shortcut, on every printable key and every modifier combination, reaches the Desktop from a focused tab, as on Live. The test found Ctrl++ and Ctrl+_ off the route. The shell smoke switches the layout to `de` and checks Alt+S and the text typed in the Terminal.
+4. The `host-api` contract tests (done, section 10) and the Electron measurement on the same control Linux, which depends on the Linux executable of Electron 44.5.1, before porting `hostd` services.
+5. ~~Native authentication before the session and Xorg on DRM~~: done. The supervisor starts the Desktop as a greeter and only starts the shell after the password, with the hash kept by root ([README](README.md#sign-in)). Xorg uses `modesetting` on simpledrm and `evdev` without udev, as the session user ([README](README.md#screen-keyboard-and-mouse)).
+6. ~~A/B image and installer~~: done. The experimental image integrates the `system_a`, `system_b`, `recovery` and `data` partitions, slot selection in GRUB and the signed update of the inactive slot while running, and the `desktop-image` action exercises the confirmation tied to the installed Desktop's health ([README](README.md#ab-updates)). The live stick installs the system to the internal disk from the Desktop, like Calamares on Live, and the installed disk boots on its own through the signed chain ([README](README.md#installation)). Session parity with Live includes the loading screen, sign-in, the screen lock and shut down/restart ([README](README.md#loading-screen), [lock](README.md#screen-lock-and-power)).

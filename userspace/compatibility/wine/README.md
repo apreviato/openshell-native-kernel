@@ -1,46 +1,46 @@
-# Wine no OpenShell Native — matriz de compatibilidade
+# Wine on OpenShell Native — compatibility matrix
 
-Estado das fases do [plano de Wine](../../../OPENSHELL_WINE.md). A ação `wine` de `tools/build/native.mjs` monta o perfil de apps Windows sobre o de apps Linux e roda as provas abaixo no Linux de controle e no guest Asterinas.
+Status of the phases of the [Wine plan](../../../OPENSHELL_WINE.md). The `wine` action of `tools/build/native.mjs` builds the Windows apps profile on top of the Linux apps one and runs the checks below on the control Linux and in the Asterinas guest.
 
-## Versões fixadas
+## Pinned versions
 
-| Peça | Versão | Origem |
+| Piece | Version | Source |
 | --- | --- | --- |
-| Wine | 11.0, 64 bits com WoW64 (`wineWow64Packages.stable`) | nixpkgs fixado em `distro/nixpkgs.nix` |
-| Kernel | Asterinas v0.19.0 (`c4b7ed5`) com os patches 0001 a 0017 | [kernel/patches](../../../kernel/patches/README.md) |
-| CEF | 147.0.10 | nixpkgs fixado |
-| Xpra e cliente HTML5 | 6.4 e 17.1 | nixpkgs fixado |
+| Wine | 11.0, 64-bit with WoW64 (`wineWow64Packages.stable`) | nixpkgs pinned in `distro/nixpkgs.nix` |
+| Kernel | Asterinas v0.19.0 (`c4b7ed5`) with patches 0001 to 0017 | [kernel/patches](../../../kernel/patches/README.md) |
+| CEF | 147.0.10 | pinned nixpkgs |
+| Xpra and HTML5 client | 6.4 and 17.1 | pinned nixpkgs |
 
-Wine Mono e Gecko não fazem parte do prefixo padrão: ele é criado sem eles (`WINEDLLOVERRIDES=mscoree,mshtml=`). Um programa .NET recebe o Wine Mono no próprio prefixo (W5); programas que embutem o motor HTML do Windows (Gecko) seguem fora.
+Wine Mono and Gecko are not part of the default prefix: it is created without them (`WINEDLLOVERRIDES=mscoree,mshtml=`). A .NET program gets Wine Mono in its own prefix (W5); programs that embed the Windows HTML engine (Gecko) remain out of scope.
 
-## Execução
+## Running
 
-- [openshell-wine.sh](openshell-wine.sh) é o runner do perfil Wine. A abertura avulsa usa o prefixo `default`, e o fluxo de instalação cria um prefixo por app em `~/.local/share/openshell/wine/prefixes`. O prefixo é criado sem display com `wineboot`. O runner remove o mapeamento Z: e mapeia a pasta do arquivo aberto como P:. O processo roda com as permissões do usuário da sessão, inclusive para acessos fora dos mapeamentos de drives.
-- O Desktop reconhece `.exe` e `.msi` (`apps/desktop/src/host/openWith.ts`, no repositório `openshell`). Abrir um desses arquivos pelo Files ou pelo `open` do Terminal mostra o seletor, com o Wine recomendado; a execução é sempre uma escolha explícita.
+- [openshell-wine.sh](openshell-wine.sh) is the Wine profile's runner. Opening a single file uses the `default` prefix, and the install flow creates one prefix per app in `~/.local/share/openshell/wine/prefixes`. The prefix is created without a display with `wineboot`. The runner removes the Z: mapping and maps the opened file's folder as P:. The process runs with the session user's permissions, including for accesses outside the drive mappings.
+- The Desktop recognises `.exe` and `.msi` (`apps/desktop/src/host/openWith.ts`, in the `openshell` repository). Opening one of these files from Files or with the Terminal's `open` shows the chooser, with Wine recommended; running is always an explicit choice.
 
-## Provas
+## Checks
 
-| Prova | Como | Linux de controle | Asterinas |
+| Check | How | Control Linux | Asterinas |
 | --- | --- | --- | --- |
-| `wine --version`, `wineboot -i` num prefixo isolado | [wine-smoke.mjs](../../../tools/desktop/wine-smoke.mjs) | Passa: prefixo em 13 s | Pendente |
-| Notepad abre em X11 e fecha com Alt+F4 | `wine-smoke.mjs` | Passa: janela em 0,8 s | Pendente |
-| Nada do prefixo fica para trás, `wineserver` incluído | `wine-smoke.mjs` | Passa | Pendente |
-| Um `.exe` aberto pelo Terminal escolhe o Wine e abre numa janela do Desktop (Xpra) | fase `linux-apps` do [smoke do shell](../../../tools/desktop/shell-smoke.mjs), com `OPENSHELL_SMOKE_WINE=1` | Passa | Pendente |
-| O prefixo do OpenShell não tem a unidade Z: | idem | Passa | Pendente |
-| Fechar a janela encerra o Wine | idem | Passa | Pendente |
-| W4: um instalador MSI ([probe.wxs](probe.wxs)) instala num prefixo próprio, com atalho no Desktop e sem associações de arquivo do Wine | `wine-smoke.mjs`, com `OPENSHELL_WINE_PROBE_MSI` | Passa | Pendente |
-| W4: o programa abre pelo atalho, como o Desktop o abre, e a configuração sobrevive entre execuções | idem | Passa | Pendente |
-| W4: backup, remoção (com o atalho) e restauração do prefixo, com a configuração | idem | Passa | Pendente |
-| W4: outro Wine rodou o prefixo por último: backup antes da atualização, e a versão registrada | idem | Passa | Pendente |
-| W4: desinstalação pelo MSI, e remoção do prefixo sem processos restantes | idem | Passa | Pendente |
+| `wine --version`, `wineboot -i` in an isolated prefix | [wine-smoke.mjs](../../../tools/desktop/wine-smoke.mjs) | Passes: prefix in 13 s | Pending |
+| Notepad opens on X11 and closes with Alt+F4 | `wine-smoke.mjs` | Passes: window in 0.8 s | Pending |
+| Nothing from the prefix is left behind, `wineserver` included | `wine-smoke.mjs` | Passes | Pending |
+| An `.exe` opened from the Terminal chooses Wine and opens in a Desktop window (Xpra) | `linux-apps` phase of the [shell smoke](../../../tools/desktop/shell-smoke.mjs), with `OPENSHELL_SMOKE_WINE=1` | Passes | Pending |
+| The OpenShell prefix has no Z: drive | same | Passes | Pending |
+| Closing the window ends Wine | same | Passes | Pending |
+| W4: an MSI installer ([probe.wxs](probe.wxs)) installs into its own prefix, with a Desktop shortcut and without Wine's file associations | `wine-smoke.mjs`, with `OPENSHELL_WINE_PROBE_MSI` | Passes | Pending |
+| W4: the program opens from the shortcut, as the Desktop opens it, and its settings survive between runs | same | Passes | Pending |
+| W4: backup, removal (with the shortcut) and restore of the prefix, with its settings | same | Passes | Pending |
+| W4: another Wine ran the prefix last: backup before the update, and the recorded version | same | Passes | Pending |
+| W4: uninstall through the MSI, and removal of the prefix with no processes left | same | Passes | Pending |
 
-## Estado das fases
+## Phase status
 
-| Fase | Estado |
+| Phase | Status |
 | --- | --- |
-| W0 · inventário e baseline | Versões fixadas e provas no Linux de controle. |
-| W1 · Wine em userspace | Passa no Linux de controle; o guest roda a mesma prova na ação `wine`. |
-| W2 · abrir `.exe` | Associação de `.exe` e `.msi`, runner em primeiro plano, limpeza pelo `hostd` ao fechar (a sessão Xpra inteira). |
-| W3 · janelas no Desktop | Pelo caminho Xpra dos apps Linux: a janela do programa é uma janela do OpenShell, com dock, foco, teclado e clipboard dos apps Linux. |
-| W4 · prefixos por app, instalação | Runner e painel de Configurações oferecem prefixos por instalação, logs, backup e restauração. O gate W4 do `wine-smoke` passa no Linux de controle. No Asterinas, roda na ação `wine` e segue pendente. Os prefixos ficam nos dados da pessoa (`XDG_DATA_HOME`), fora dos slots que uma atualização ou um rollback substitui. |
-| W5 · compatibilidade avançada | Em andamento. Programas .NET: o runner reconhece o cabeçalho CLR do PE (PE32 e PE32+) e instala o Wine Mono do pacote do Wine só no prefixo desse programa, na primeira execução; os outros prefixos seguem sem ele. Faltam as provas no `wine-smoke` (Win32 por WoW64, .NET), o Gecko e os VC runtimes sob demanda e as medições de lançamento e RAM. |
+| W0 · inventory and baseline | Pinned versions and checks on the control Linux. |
+| W1 · Wine in userspace | Passes on the control Linux; the guest runs the same check in the `wine` action. |
+| W2 · opening `.exe` | `.exe` and `.msi` association, foreground runner, cleanup by `hostd` on close (the whole Xpra session). |
+| W3 · windows on the Desktop | Through the Linux apps' Xpra path: the program's window is an OpenShell window, with the Linux apps' dock, focus, keyboard and clipboard. |
+| W4 · per-app prefixes, installation | The runner and a Settings panel offer per-installation prefixes, logs, backup and restore. The `wine-smoke` W4 gate passes on the control Linux. On Asterinas, it runs in the `wine` action and is still pending. Prefixes live in the person's data (`XDG_DATA_HOME`), outside the slots an update or a rollback replaces. |
+| W5 · advanced compatibility | In progress. .NET programs: the runner recognises the PE's CLR header (PE32 and PE32+) and installs the Wine Mono from Wine's package only in that program's prefix, on its first run; the other prefixes stay without it. Still missing: the `wine-smoke` checks (Win32 through WoW64, .NET), Gecko and the VC runtimes on demand, and the launch and RAM measurements. |

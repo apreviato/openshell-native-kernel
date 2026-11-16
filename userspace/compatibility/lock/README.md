@@ -1,29 +1,30 @@
-# Bloqueio de tela
+# Screen lock
 
-O bloqueio de tela do OpenShell Native é o do OpenShell Live: o XSecureLock
-cobre a tela e segura teclado e mouse, e a tela de bloqueio do OpenShell é o
-módulo de autenticação dele. Muda só quem confere a senha: no Live, o PAM do
-Debian (`authproto_pam`); aqui, o supervisor da sessão, que guarda o hash da
-senha escolhida no instalador (`userspace/shell`, `login.rs`). O boot também
-abre nesta tela: a entrada do sistema instalado é a mesma tela de bloqueio.
+OpenShell Native's screen lock is OpenShell Live's: XSecureLock covers the
+screen and grabs the keyboard and mouse, and the OpenShell lock screen is its
+authentication module. Only the password check changes: on Live, Debian's PAM
+(`authproto_pam`); here, the session supervisor, which keeps the hash of the
+password chosen in the installer (`userspace/shell`, `login.rs`). Boot also
+opens on this screen: signing in to the installed system uses the same lock
+screen.
 
-| Arquivo | O que é |
+| File | What it is |
 | --- | --- |
-| `lock_screen.py`, `lock_view.py`, `lock_auth.py`, `lock_settings.py` | A tela de bloqueio do Live, sem mudanças (openshelllive `f27d2db`, `live/config/includes.chroot/usr/local/lib/openshell/`). O `initramfs.nix` troca os caminhos do Debian pelos do Nix: o XSecureLock, o `setxkbmap`, o ajudante de senha (`openshell-authproto` no lugar do `authproto_pam`) e o de energia (`openshell-power` no lugar do `systemctl`), e lê as escolhas de Configurações ▸ Tela de bloqueio e a foto da conta no `$HOME` da sessão, não na pasta pessoal do `/etc/passwd`. Para atualizar, copie os arquivos do Live de novo. |
-| `lock.sh` | `openshell-lock`: abre o XSecureLock com a tela de bloqueio e as mesmas opções do `lock.sh` do Live, e fica em primeiro plano até desbloquear. |
-| `lock-ready.sh` | O XSecureLock o roda quando a tela e o teclado já estão presos: grava o pid em `$XDG_RUNTIME_DIR/openshell-locked`, onde o Desktop vê que a tela está bloqueada, e mostra o campo de senha. |
-| `numlock.py` | O ajudante de Num Lock do Live, sem mudanças: segue os modificadores do XKB (também enquanto o XSecureLock segura o teclado), guarda a escolha em `$XDG_STATE_HOME/openshell/numlock` e a aplica de novo no próximo boot, antes da primeira senha. |
-| `openshell-wm.sh` | `openshell-wm`, o gerenciador de janelas da sessão (`wm=` do supervisor): inicia o `numlock.py` e depois o Openbox, no mesmo grupo de processos, antes do greeter e da tela de bloqueio. |
+| `lock_screen.py`, `lock_view.py`, `lock_auth.py`, `lock_settings.py` | Live's lock screen, unchanged (openshelllive `f27d2db`, `live/config/includes.chroot/usr/local/lib/openshell/`). `initramfs.nix` swaps Debian's paths for Nix's: XSecureLock, `setxkbmap`, the password helper (`openshell-authproto` instead of `authproto_pam`) and the power helper (`openshell-power` instead of `systemctl`), and reads the Settings ▸ Lock screen choices and the account photo from the session's `$HOME`, not from the home folder in `/etc/passwd`. To update, copy Live's files again. |
+| `lock.sh` | `openshell-lock`: opens XSecureLock with the lock screen and the same options as Live's `lock.sh`, and stays in the foreground until unlocked. |
+| `lock-ready.sh` | XSecureLock runs it once the screen and keyboard are grabbed: it writes the pid to `$XDG_RUNTIME_DIR/openshell-locked`, where the Desktop sees that the screen is locked, and shows the password field. |
+| `numlock.py` | Live's Num Lock helper, unchanged: it follows the XKB modifiers (also while XSecureLock holds the keyboard), saves the choice in `$XDG_STATE_HOME/openshell/numlock` and applies it again on the next boot, before the first password. |
+| `openshell-wm.sh` | `openshell-wm`, the session's window manager (the supervisor's `wm=`): starts `numlock.py` and then Openbox, in the same process group, before the greeter and the lock screen. |
 
-Quem bloqueia é o serviço de bloqueio do hostd (`apps/desktop/hostd/services/lock.ts`):
-o botão Bloquear e o tempo sem uso escolhido em Configurações ▸ Tela de
-bloqueio. No Live, o tempo sem uso é do `xss-lock`, que precisa do logind; no
-Native, o Desktop informa o tempo sem uso ao hostd.
+Locking is done by hostd's lock service (`apps/desktop/hostd/services/lock.ts`):
+the Lock button and the idle time chosen in Settings ▸ Lock screen. On Live,
+the idle time belongs to `xss-lock`, which needs logind; on Native, the Desktop
+reports the idle time to hostd.
 
-Duas peças do sistema tornam isso possível no Native:
+Two pieces of the system make this possible on Native:
 
-- `openshell-authproto` (`userspace/shell/src/bin`): fala o protocolo de
-  autenticação do XSecureLock e pergunta ao supervisor pelo socket do sistema
-  (`login <senha>`). Uma senha errada espera 2 s, como no login.
-- O patch de kernel 0024: a tela de bloqueio guarda a senha só em memória
-  travada (`mlock`), e o kernel passou a aceitar essas chamadas (não há swap).
+- `openshell-authproto` (`userspace/shell/src/bin`): speaks XSecureLock's
+  authentication protocol and asks the supervisor over the system socket
+  (`login <password>`). A wrong password waits 2 s, as at sign-in.
+- Kernel patch 0024: the lock screen keeps the password only in locked memory
+  (`mlock`), and the kernel now accepts those calls (there is no swap).

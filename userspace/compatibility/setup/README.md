@@ -1,26 +1,26 @@
-# Tela de configuração da mídia live
+# Live media setup screen
 
-O menu de boot do pendrive do OpenShell Native é o do OpenShell Live
+The boot menu of the OpenShell Native stick is OpenShell Live's
 (`distro/image/build-media.sh`):
 
-| Entrada | O que inicia |
+| Entry | What it starts |
 | --- | --- |
-| Start OpenShell Native Live | O Desktop live, como antes. É a padrão, depois de cinco segundos. |
-| Install OpenShell Native on this computer | Esta tela, no modo `install`: fuso horário, teclado, disco, conta, resumo e a cópia, como o Calamares pergunta no Live. |
-| Update installed OpenShell Native (keep files) | Esta tela, no modo `update`: as instalações encontradas nos discos, a atualização pelo pendrive ou a volta ao release anterior. Só aparece numa mídia feita com a chave de release. |
-| More options | A chave do Secure Boot (MokManager), as configurações do firmware UEFI, reiniciar e desligar. |
+| Start OpenShell Native Live | The live Desktop, as before. It is the default, after five seconds. |
+| Install OpenShell Native on this computer | This screen, in `install` mode: time zone, keyboard, disk, account, summary and the copy, as Calamares asks them on Live. |
+| Update installed OpenShell Native (keep files) | This screen, in `update` mode: the installations found on the disks, the update from the stick or the return to the previous release. It only appears on media made with the release key. |
+| More options | The Secure Boot key (MokManager), the UEFI firmware settings, restart and shut down. |
 
-As duas entradas novas não iniciam o Desktop. O `installed-session.sh` sobe só o X, o Openbox e esta tela, sem nenhum serviço da sessão. "Try OpenShell Native", na tela, sai dela e inicia o Desktop live.
+The two new entries do not start the Desktop. `installed-session.sh` brings up only X, Openbox and this screen, without any session service. "Try OpenShell Native", on the screen, leaves it and starts the live Desktop.
 
-| Arquivo | O que é |
+| File | What it is |
 | --- | --- |
-| `openshell_setup.py` | A tela, em GTK, com as cores do atualizador do Live (`update_gui.py`), em etapas: à esquerda o wordmark e as etapas (feitas, a atual e as próximas), no meio um cartão por etapa com Voltar e Continuar (Enter continua, Esc volta). Fusos e teclados em listas com busca (digitar sobre a lista busca), a hora local do fuso escolhido, o layout aplicado ao escolher e uma caixa para testá-lo, os discos em cartões com o tipo (NVMe, SATA, USB), o resumo com "Change" em cada item e o progresso em porcentagem. Roda como o usuário da sessão sob o supervisor (`userspace/shell`), que faz o trabalho como root e liga e desliga o computador. |
-| `setup_model.py` | O que a tela sabe sem janela: as respostas do supervisor (`install.rs`, `usb_update.rs`, `power.rs`); o tipo de cada disco; os fusos de `/usr/share/zoneinfo/zone1970.tab` e os layouts de `/usr/share/X11/xkb/rules/base.lst`, os mesmos arquivos que Configurações usa; e a ordem entre releases. |
-| `test_setup_model.py` | Os testes do modelo (`python3 -m unittest test_setup_model`), sem GTK. |
+| `openshell_setup.py` | The screen, in GTK, with the colours of Live's updater (`update_gui.py`), in steps: on the left the wordmark and the steps (done, current and upcoming), in the middle one card per step with Back and Continue (Enter continues, Esc goes back). Time zones and keyboards in searchable lists (typing over the list searches), the local time of the chosen zone, the layout applied when chosen and a box to test it, the disks as cards with their type (NVMe, SATA, USB), the summary with "Change" on each item and the progress as a percentage. It runs as the session user under the supervisor (`userspace/shell`), which does the work as root and powers the computer on and off. |
+| `setup_model.py` | What the screen knows without a window: the supervisor's answers (`install.rs`, `usb_update.rs`, `power.rs`); each disk's type; the time zones from `/usr/share/zoneinfo/zone1970.tab` and the layouts from `/usr/share/X11/xkb/rules/base.lst`, the same files Settings uses; and the ordering between releases. |
+| `test_setup_model.py` | The model's tests (`python3 -m unittest test_setup_model`), without GTK. |
 
-O trabalho fica com dois programas da mídia, que o supervisor roda como root:
+The work is done by two programs on the media, which the supervisor runs as root:
 
-- `openshell-native-install` (`distro/image/install.sh`): apaga o disco escolhido e grava nele o sistema da memória. Antes, quando a mídia tem manifesto, confere se o que o computador leu do pendrive é o que foi gerado (`medium.sh`, `release_intact`).
-- `openshell-native-update` (`distro/image/update.sh`): grava o release da mídia no slot do sistema instalado que não está em uso (`openshell-ab update-offline`), que confere o manifesto assinado e cada arquivo gravado. Na partida seguinte, o novo release roda em teste. A sessão o confirma, e três partidas sem sucesso voltam ao release anterior. Os dados, a conta e as configurações ficam como estavam. "Put back the previous release" põe em teste o release de antes da última atualização (`openshell-ab restore`).
+- `openshell-native-install` (`distro/image/install.sh`): erases the chosen disk and writes the system from memory onto it. First, when the media has a manifest, it checks that what the computer read from the stick is what was generated (`medium.sh`, `release_intact`).
+- `openshell-native-update` (`distro/image/update.sh`): writes the media's release to the installed system's slot that is not in use (`openshell-ab update-offline`), which checks the signed manifest and every file written. On the next start, the new release runs on trial. The session confirms it, and three unsuccessful starts go back to the previous release. Data, the account and settings stay as they were. "Put back the previous release" puts the release from before the last update on trial (`openshell-ab restore`).
 
-O manifesto assinado do release vai na linha de comando do kernel da mídia (`openshell.manifest`, `openshell.manifest_sig`), não no initramfs, porque ele cobre o próprio initramfs.
+The release's signed manifest goes on the media kernel's command line (`openshell.manifest`, `openshell.manifest_sig`), not in the initramfs, because it covers the initramfs itself.
